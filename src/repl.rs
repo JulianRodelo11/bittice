@@ -8,12 +8,12 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::*};
 use std::time::Duration;
 
-use crate::commands::load::execute_load;
-
 // Pasos para el proceso de carga
 enum LoadStep {
-    Standby,
-    Executing,
+    InputPath,
+    InputEntity,
+    InputTable,
+    Processing,
     Done,
 }
 
@@ -28,6 +28,9 @@ struct App {
     // Estado de Input para el contenedor de abajo
     input_buffer: String,
     load_step: LoadStep,
+    ndjson_path: String,
+    entity_name: String,
+    table_name: String,
 }
 
 impl App {
@@ -39,7 +42,10 @@ impl App {
             menu_state,
             active_task: None,
             input_buffer: String::new(),
-            load_step: LoadStep::Standby,
+            load_step: LoadStep::InputPath,
+            ndjson_path: String::new(),
+            entity_name: String::new(),
+            table_name: String::new(),
         }
     }
 
@@ -87,54 +93,42 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if let Some(task) = app.active_task {
-                        match task {
-                            "Load" => {
+                    // Si hay una tarea activa y estamos en modo Input, capturamos texto
+                    if app.active_task.is_some() {
+                        match key.code {
+                            KeyCode::Enter => {
                                 match app.load_step {
-                                    LoadStep::Standby => {
-                                        if key.code == KeyCode::Enter {
-                                            // Temporarily switch to a non-TUI mode to allow dialoguer to interact.
-                                            // This is a simplification; a proper solution would manage TUI state during external command execution.
-                                            disable_raw_mode()?;
-                                            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-                                            terminal.show_cursor()?;
-
-                                            println!("\n\n"); // Add some spacing
-                                            match execute_load() {
-                                                Ok(_) => println!("\nLoad process finished successfully! Press Enter in the TUI to continue."),
-                                                Err(e) => println!("\nError during load process: {:?}\nPress Enter in the TUI to continue.", e),
-                                            }
-                                            println!("\n"); // Add some spacing
-                                            
-                                            enable_raw_mode()?;
-                                            execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
-                                            app.load_step = LoadStep::Done;
-                                        }
+                                    LoadStep::InputPath => {
+                                        app.ndjson_path = app.input_buffer.clone();
+                                        app.input_buffer.clear();
+                                        app.load_step = LoadStep::InputEntity;
+                                    }
+                                    LoadStep::InputEntity => {
+                                        app.entity_name = app.input_buffer.clone();
+                                        app.input_buffer.clear();
+                                        app.load_step = LoadStep::InputTable;
+                                    }
+                                    LoadStep::InputTable => {
+                                        app.table_name = app.input_buffer.clone();
+                                        app.input_buffer.clear();
+                                        app.load_step = LoadStep::Processing;
+                                        // Aquí llamarías a tu lógica de bittice::core::writer
+                                        app.load_step = LoadStep::Done;
                                     }
                                     LoadStep::Done => {
-                                        if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
-                                            app.active_task = None;
-                                            app.load_step = LoadStep::Standby;
-                                        }
-                                    }
-                                    LoadStep::Executing => {
-                                        // This state is primarily for UI feedback, the actual blocking call happens in Standby
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Handle other active tasks if any, or default input (e.g., search)
-                                match key.code {
-                                    KeyCode::Char(c) => app.input_buffer.push(c),
-                                    KeyCode::Backspace => { app.input_buffer.pop(); }
-                                    KeyCode::Esc => {
-                                        app.active_task = None; 
-                                        app.input_buffer.clear();
-                                        app.load_step = LoadStep::Standby; // Reset load state if user escapes other tasks
+                                        app.active_task = None;
+                                        app.load_step = LoadStep::InputPath;
                                     }
                                     _ => {}
                                 }
                             }
+                            KeyCode::Char(c) => app.input_buffer.push(c),
+                            KeyCode::Backspace => { app.input_buffer.pop(); }
+                            KeyCode::Esc => { 
+                                app.active_task = None; 
+                                app.input_buffer.clear();
+                            }
+                            _ => {}
                         }
                     } else {
                         // Navegación del menú principal
@@ -144,10 +138,7 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                             KeyCode::Up => app.menu_previous(),
                             KeyCode::Enter => {
                                 match app.menu_state.selected() {
-                                    Some(0) => {
-                                        app.active_task = Some("Load");
-                                        app.load_step = LoadStep::Standby; // Ensure it starts in standby
-                                    }
+                                    Some(0) => app.active_task = Some("Load"),
                                     Some(1) => app.active_task = Some("Search"),
                                     Some(2) => return Ok(()),
                                     _ => {}
