@@ -7,6 +7,7 @@ use crossterm::{
 };
 use ratatui::{prelude::*, widgets::*};
 use std::time::Duration;
+use crate::commands::load::execute_load_tui;
 
 // Pasos para el proceso de carga
 enum LoadStep {
@@ -31,6 +32,7 @@ struct App {
     ndjson_path: String,
     entity_name: String,
     table_name: String,
+    processing_message: String,
 }
 
 impl App {
@@ -46,6 +48,7 @@ impl App {
             ndjson_path: String::new(),
             entity_name: String::new(),
             table_name: String::new(),
+            processing_message: String::new(),
         }
     }
 
@@ -112,7 +115,13 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                                         app.table_name = app.input_buffer.clone();
                                         app.input_buffer.clear();
                                         app.load_step = LoadStep::Processing;
+                                        
                                         // Aquí llamarías a tu lógica de bittice::core::writer
+                                        match execute_load_tui(&app.ndjson_path, &app.entity_name, &app.table_name) {
+                                            Ok(_) => app.processing_message = "Carga completada exitosamente!".to_string(),
+                                            Err(e) => app.processing_message = format!("Error: {}", e),
+                                        }
+
                                         app.load_step = LoadStep::Done;
                                     }
                                     LoadStep::Done => {
@@ -180,15 +189,20 @@ fn ui(f: &mut Frame, app: &mut App, purple: Color) {
 
     let central_area = main_layout[1];
 
-    // Dividir el área central en: Menú (Arriba) y Acción (Abajo)
+    let action_height = match app.load_step {
+        LoadStep::Processing => 7,
+        LoadStep::Done => 6,
+        _ => 5, // inputs normales
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Altura fija para el menú
-            Constraint::Length(3), // Altura fija para el separador
-            Constraint::Min(0),    // El resto para la acción
+            Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(action_height),
         ])
-        .split(central_area);
+    .split(central_area);
 
     // --- 1. RENDERIZAR MENÚ SUPERIOR ---
     let menu_block = Block::default()
@@ -216,21 +230,44 @@ fn ui(f: &mut Frame, app: &mut App, purple: Color) {
             .border_style(Style::default().fg(purple_muted))
             .padding(Padding::new(2, 2, 0, 0));
 
-        let action_inner = action_block.inner(chunks[1]);
-        f.render_widget(action_block, chunks[1]);
+        f.render_widget(&action_block, chunks[2]);
 
-        // Texto tipo input
-        let input = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("> ", Style::default().fg(purple)),
-                Span::styled(
-                    "File path .ndjson",
-                    Style::default().fg(Color::DarkGray),
-                )
+        let action_inner = action_block.inner(chunks[2]);
+
+        // 👇 DIVIDIR el inner en 3 filas
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),     // espacio arriba
+                Constraint::Length(1),  // 👈 INPUT (una sola línea)
+                Constraint::Min(0),     // espacio abajo
             ])
-        ])
-        .wrap(Wrap { trim: true });
+            .split(action_inner);
 
-        f.render_widget(input, action_inner);
+        let placeholder = match app.load_step {
+            LoadStep::InputPath => "File path .ndjson",
+            LoadStep::InputEntity => "Entity name",
+            LoadStep::InputTable => "Table name",
+            _ => "",
+        };
+
+        let line = Line::from(vec![
+            Span::styled("> ", Style::default().fg(purple)),
+            if app.input_buffer.is_empty() {
+                Span::styled(
+                    placeholder,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )
+            } else {
+                Span::raw(&app.input_buffer)
+            },
+        ]);
+
+        let input = Paragraph::new(line);
+
+        // 👇 renderizamos SOLO en la fila central
+        f.render_widget(input, inner_chunks[1]);
     }
 }
