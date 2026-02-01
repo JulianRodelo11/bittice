@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use indicatif::ProgressBar;
 use roaring::RoaringBitmap;
 use serde_json::Value;
@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::config::{Config, FieldConfig, FieldMetadata, FieldStats};
 use crate::core::date_utils::{extract_day, extract_hour_bucket, extract_month};
@@ -24,7 +25,8 @@ pub fn process_and_write(
     input_path: &str,
     output_dir: &Path,
     detected_fields: &HashMap<String, FieldStats>,
-    pb: &ProgressBar,
+    _pb: &ProgressBar,
+    cancel_flag: &AtomicBool,
 ) -> Result<()> {
     // Preparar directorios
     fs::create_dir_all(output_dir.join("index"))?;
@@ -87,15 +89,17 @@ pub fn process_and_write(
     let reader = BufReader::new(file);
 
     for (i, line) in reader.lines().enumerate() {
+        if cancel_flag.load(Ordering::Relaxed) {
+             return Err(anyhow!("Operation cancelled by user"));
+        }
+
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
 
-        // Actualizar barra de progreso
-        if i % 1000 == 0 {
-            pb.inc(1000);
-        }
+        // La barra de progreso se actualiza automáticamente por tiempo (steady_tick),
+        // no necesitamos incrementar manualmente la posición si no la mostramos.
 
         let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         let internal_id = i as u32;

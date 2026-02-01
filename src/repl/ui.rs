@@ -158,29 +158,8 @@ pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
 
         match app.load_step {
             LoadStep::Processing => {
-                let area = centered_rect(60, 20, f.size());
-
-                f.render_widget(Clear, area);
-
-                f.render_widget(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .title(" Cargando ")
-                        .border_style(Style::default().fg(purple)),
-                    area,
-                );
-
-                f.render_widget(
-                    Paragraph::new("\nAnalizando y procesando archivos...\nPor favor espera.")
-                        .alignment(Alignment::Center),
-                    area.inner(&Margin {
-                        vertical: 1,
-
-                        horizontal: 2,
-                    }),
-                );
-
+                // Dejamos el área inferior vacía para que el spinner de CLI (toast)
+                // se renderice sin obstrucciones visuales ni popups superpuestos.
                 return;
             }
 
@@ -217,9 +196,9 @@ pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
         let placeholder = match app.load_step {
             LoadStep::InputPath => "Browse or type file path (ends in .ndjson)...",
 
-            LoadStep::InputEntity => "Nombre de la entidad (ej: users)",
+            LoadStep::InputEntity => "Entity name (e.g. users)",
 
-            LoadStep::InputTable => "Nombre de la tabla (ej: main)",
+            LoadStep::InputTable => "Table name (e.g. main)",
 
             _ => "",
         };

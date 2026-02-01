@@ -14,7 +14,7 @@ use state::{App, LoadStep};
 use std::io;
 use std::time::Duration;
 use ui::ui;
-use utils::get_path_suggestions;
+use utils::{get_path_suggestions, get_loaded_data};
 
 pub fn run_interactive() -> Result<()> {
     enable_raw_mode()?;
@@ -45,6 +45,45 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
 
     loop {
         terminal.draw(|f| ui(f, app, custom_purple))?;
+
+        // Si estamos en estado de procesamiento, ejecutamos la tarea y luego limpiamos
+        if let LoadStep::Processing = app.load_step {
+             // Calcular posición Y para el spinner (Misma lógica que ui.rs)
+            // Top Margin (2) + Menu (7) + LoadedData + Separator (1)
+            let loaded_data = get_loaded_data();
+            let loaded_height = if loaded_data.is_empty() {
+                0
+            } else {
+                (loaded_data.len() as u16).min(8) + 1
+            };
+            
+            // Y exacto donde empieza el bloque de input
+            let spinner_y = 2 + 7 + loaded_height + 1;
+            // X alineado con el margen: 4 (margin)
+            let spinner_x = 4;
+
+            // Ejecutar tarea bloqueante (CLI Spinner)
+            let _ = execute_load_tui(
+                &app.ndjson_path,
+                &app.entity_name,
+                &app.table_name,
+                spinner_x,
+                spinner_y
+            );
+
+            // Finalizamos la tarea y volvemos al menú principal
+            app.active_task = None;
+            app.load_step = LoadStep::InputPath;
+            app.input_buffer.clear();
+            app.ndjson_path.clear();
+            app.entity_name.clear();
+            app.table_name.clear();
+            app.suggestions.clear();
+            app.suggestion_index = None;
+            
+            // Forzar redibujado inmediato con el nuevo estado
+            continue;
+        }
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
@@ -104,25 +143,6 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                                         app.table_name = app.input_buffer.clone();
                                         app.input_buffer.clear();
                                         app.load_step = LoadStep::Processing;
-
-                                        // Aquí llamarías a tu lógica de bittice::core::writer
-                                        match execute_load_tui(
-                                            &app.ndjson_path,
-                                            &app.entity_name,
-                                            &app.table_name,
-                                        ) {
-                                            _ => {}
-                                        }
-
-                                        // Finalizamos la tarea y volvemos al menú principal
-                                        app.active_task = None;
-                                        app.load_step = LoadStep::InputPath;
-                                        app.input_buffer.clear();
-                                        app.ndjson_path.clear();
-                                        app.entity_name.clear();
-                                        app.table_name.clear();
-                                        app.suggestions.clear();
-                                        app.suggestion_index = None;
                                     }
                                     LoadStep::Done => {
                                         // Este estado ya no se alcanza con la lógica nueva,
