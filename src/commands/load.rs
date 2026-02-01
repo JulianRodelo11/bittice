@@ -39,26 +39,3 @@ pub fn execute_load_tui(input_path: &str, entity: &str, table: &str) -> Result<(
     //println!("{}", style(format!("Datos guardados en: {}", output_dir.display())).green());
     Ok(())
 }
-
-// Función para el modo CLI tradicional
-pub fn execute_load() -> Result<()> {
-    println!("{}", style("Bienvenido al Data Ingestor").bold().cyan());
-
-    // 1. Pedir inputs al usuario
-    let input_path: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Ruta del archivo NDJSON")
-        .default("input.ndjson".into())
-        .interact_text()?;
-
-    let entity: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Nombre de la Entidad")
-        .default("entity".into())
-        .interact_text()?;
-
-    let table: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Nombre de la Tabla")
-        .default("table".into())
-        .interact_text()?;
-    
-    execute_load_tui(&input_path, &entity, &table)
-}

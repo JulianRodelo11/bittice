@@ -38,11 +38,11 @@ pub fn process_and_write(
     for (name, stats) in detected_fields {
         let mut subfields = vec![name.clone()];
         if stats.is_date {
-            subfields.push(format!("{}_DATE", name));
-            subfields.push(format!("{}_DAY", name));
-            subfields.push(format!("{}_MONTH", name));
+            subfields.push(format!("{}_date", name));
+            subfields.push(format!("{}_day", name));
+            subfields.push(format!("{}_month", name));
             if stats.has_time {
-                subfields.push(format!("{}_HOUR_BUCKET", name));
+                subfields.push(format!("{}_hour_bucket", name));
             }
         }
         for sf in &subfields { all_target_fields.insert(sf.clone()); }

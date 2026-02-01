@@ -118,8 +118,9 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                                         
                                         // Aquí llamarías a tu lógica de bittice::core::writer
                                         match execute_load_tui(&app.ndjson_path, &app.entity_name, &app.table_name) {
-                                            Ok(_) => app.processing_message = "Carga completada exitosamente!".to_string(),
-                                            Err(e) => app.processing_message = format!("Error: {}", e),
+                                            //Ok(_) => app.processing_message = "Carga completada exitosamente!".to_string(),
+                                            //Err(e) => app.processing_message = format!("Error: {}", e),
+                                            _ => {}
                                         }
 
                                         app.load_step = LoadStep::Done;
@@ -189,18 +190,15 @@ fn ui(f: &mut Frame, app: &mut App, purple: Color) {
 
     let central_area = main_layout[1];
 
-    let action_height = match app.load_step {
-        LoadStep::Processing => 7,
-        LoadStep::Done => 6,
-        _ => 5, // inputs normales
-    };
+    let action_height = 3; // Altura fija y mínima para un input tipo "barra"
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
-            Constraint::Length(1),
-            Constraint::Length(action_height),
+            Constraint::Length(7),             // Menú (alto fijo)
+            Constraint::Length(1),             // Espacio pequeño entre menú e input
+            Constraint::Length(action_height), // Barra de input (3 líneas)
+            Constraint::Min(0),                // Todo el espacio sobrante queda abajo
         ])
     .split(central_area);
 
@@ -222,52 +220,75 @@ fn ui(f: &mut Frame, app: &mut App, purple: Color) {
 
     f.render_stateful_widget(list, chunks[0], &mut app.menu_state);
 
-    // --- 2. RENDERIZAR CONTENEDOR DE ACCIÓN ---
+    // --- 2. RENDERIZAR BARRA DE ENTRADA (Minimalista) ---
     if let Some(_task) = app.active_task {
-        let action_block = Block::default()
+        let input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(purple_muted))
-            .padding(Padding::new(2, 2, 0, 0));
+            .border_style(Style::default().fg(purple_muted));
 
-        f.render_widget(&action_block, chunks[2]);
+        f.render_widget(&input_block, chunks[2]);
 
-        let action_inner = action_block.inner(chunks[2]);
+        let inner_area = input_block.inner(chunks[2]);
+        let input_area = inner_area.inner(&layout::Margin {
+            vertical: 0,
+            horizontal: 1,
+        });
 
-        // 👇 DIVIDIR el inner en 3 filas
-        let inner_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(0),     // espacio arriba
-                Constraint::Length(1),  // 👈 INPUT (una sola línea)
-                Constraint::Min(0),     // espacio abajo
-            ])
-            .split(action_inner);
-
-        let placeholder = match app.load_step {
-            LoadStep::InputPath => "File path .ndjson",
-            LoadStep::InputEntity => "Entity name",
-            LoadStep::InputTable => "Table name",
-            _ => "",
+        let centered_input_area = Rect {
+            x: input_area.x,
+            y: input_area.y + (input_area.height / 2),
+            width: input_area.width,
+            height: 1,
         };
 
-        let line = Line::from(vec![
-            Span::styled("> ", Style::default().fg(purple)),
-            if app.input_buffer.is_empty() {
-                Span::styled(
-                    placeholder,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )
+        let placeholder = match app.load_step {
+            LoadStep::InputPath => "path/to/file.ndjson",
+            LoadStep::InputEntity => "entity name",
+            LoadStep::InputTable => "table name",
+            _ => "unknown step",
+        };
+
+        let prompt_str = " > ";
+        
+        // 1. CONSTRUCCIÓN VISUAL
+        let mut spans = vec![
+            Span::styled(prompt_str, Style::default().fg(purple).add_modifier(Modifier::BOLD)),
+        ];
+
+        if app.input_buffer.is_empty() {
+            // DIBUJAMOS EL CURSOR BLANCO MANUALMENTE
+            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
+            // Espacio de separación y placeholder
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(placeholder, Style::default().fg(Color::DarkGray)));
+        } else {
+            // Si hay texto, espacio de respiro y el texto del usuario
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(&app.input_buffer));
+        }
+
+        f.render_widget(Paragraph::new(Line::from(spans)), centered_input_area);
+
+        // 2. GESTIÓN DEL CURSOR DEL SISTEMA (LA BARRITA AZUL)
+        if matches!(
+            app.load_step,
+            LoadStep::InputPath | LoadStep::InputEntity | LoadStep::InputTable
+        ) {
+            if !app.input_buffer.is_empty() {
+                // SOLO mostramos el cursor real cuando el usuario empieza a escribir
+                // así evitamos que el cuadro azul tape nuestro bloque blanco inicial
+                let cursor_x = centered_input_area.x 
+                    + prompt_str.chars().count() as u16 
+                    + 1 
+                    + app.input_buffer.chars().count() as u16;
+                
+                f.set_cursor(cursor_x, centered_input_area.y);
             } else {
-                Span::raw(&app.input_buffer)
-            },
-        ]);
-
-        let input = Paragraph::new(line);
-
-        // 👇 renderizamos SOLO en la fila central
-        f.render_widget(input, inner_chunks[1]);
+                // OPCIONAL: Si quieres que el cursor "exista" pero no tape el bloque, 
+                // puedes mandarlo a una esquina oculta, o simplemente no llamar a set_cursor.
+                // Al no llamarlo, se verá el bloque blanco que dibujamos arriba.
+            }
+        }
     }
 }
