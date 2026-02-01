@@ -1,6 +1,7 @@
 use ratatui::widgets::ListState;
 
 // Pasos para el proceso de carga
+#[derive(PartialEq)]
 pub enum LoadStep {
     InputPath,
     InputEntity,
@@ -9,55 +10,112 @@ pub enum LoadStep {
     Done,
 }
 
+// Paneles principales en el modo búsqueda
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum SearchCriteria {
+    Entity,
+    Table,
+    Filters,
+}
+
+// Sub-paneles o pasos dentro de la sección de Filtros
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum FilterStep {
+    Field,
+    Op,
+    Value,
+}
+
+// Para manejar el foco en la UI de búsqueda
+#[derive(PartialEq, Debug)]
+pub enum FocusPanel {
+    Left,   // Entity, Table, Filters
+    Middle, // Opciones de Entity/Table, o Pasos de Filtro
+    Right,  // Opciones de Field/Op
+    Bottom, // Input para el valor del filtro
+}
+
 pub struct App {
-    // Estado del menú superior
+    // --- Estado General ---
     pub menu_items: Vec<&'static str>,
     pub menu_state: ListState,
+    pub active_task: Option<&'static str>,
 
-    // Estado de la tarea activa
-    pub active_task: Option<&'static str>, // None, Some("Load"), Some("Search")
-
-    // Estado de Input para el contenedor de abajo
+    // --- Tarea: Load ---
     pub input_buffer: String,
     pub load_step: LoadStep,
     pub ndjson_path: String,
     pub entity_name: String,
     pub table_name: String,
-    pub processing_message: String,
-
-    // Estado de autocompletado
     pub suggestions: Vec<String>,
     pub suggestion_index: Option<usize>,
+
+    // --- Tarea: Search ---
+    pub search_criteria: SearchCriteria,
+    pub focus_panel: FocusPanel,
+    
+    // Datos y selecciones
+    pub search_entities: Vec<String>,
+    pub search_tables: Vec<String>,
+    pub selected_entity: Option<String>,
+    pub selected_table: Option<String>,
+    
+    // Estados de las listas en los paneles
+    pub left_panel_state: ListState,
+    pub middle_panel_state: ListState,
+    pub right_panel_state: ListState,
+
+    // --- Sub-tarea: Filters ---
+    pub filter_step: FilterStep,
+    pub available_fields: Vec<String>,
+    pub selected_field: Option<String>,
+    pub selected_op: String,
+    pub filter_value_input: String,
 }
 
 impl App {
     pub fn new() -> App {
         let mut menu_state = ListState::default();
         menu_state.select(Some(0));
+
+        let mut left_panel_state = ListState::default();
+        left_panel_state.select(Some(0));
+
         App {
+            // General
             menu_items: vec!["Load Data", "Search Data", "Exit"],
             menu_state,
             active_task: None,
+            // Load
             input_buffer: String::new(),
             load_step: LoadStep::InputPath,
             ndjson_path: String::new(),
             entity_name: String::new(),
             table_name: String::new(),
-            processing_message: String::new(),
             suggestions: Vec::new(),
             suggestion_index: None,
+            // Search
+            search_criteria: SearchCriteria::Entity,
+            focus_panel: FocusPanel::Left,
+            search_entities: Vec::new(),
+            search_tables: Vec::new(),
+            selected_entity: None,
+            selected_table: None,
+            left_panel_state,
+            middle_panel_state: ListState::default(),
+            right_panel_state: ListState::default(),
+            // Filters
+            filter_step: FilterStep::Field,
+            available_fields: Vec::new(),
+            selected_field: None,
+            selected_op: "Eq".to_string(),
+            filter_value_input: String::new(),
         }
     }
 
     pub fn menu_next(&mut self) {
         let i = match self.menu_state.selected() {
-            Some(i) => {
-                if i >= self.menu_items.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
+            Some(i) => if i >= self.menu_items.len() - 1 { 0 } else { i + 1 },
             None => 0,
         };
         self.menu_state.select(Some(i));
@@ -65,47 +123,25 @@ impl App {
 
     pub fn menu_previous(&mut self) {
         let i = match self.menu_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.menu_items.len() - 1
-                } else {
-                    i - 1
-                }
-            }
+            Some(i) => if i == 0 { self.menu_items.len() - 1 } else { i - 1 },
             None => 0,
         };
         self.menu_state.select(Some(i));
     }
-
+    
     pub fn suggestion_next(&mut self) {
-        if self.suggestions.is_empty() {
-            return;
-        }
+        if self.suggestions.is_empty() { return; }
         let i = match self.suggestion_index {
-            Some(i) => {
-                if i >= self.suggestions.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
+            Some(i) => if i >= self.suggestions.len() - 1 { 0 } else { i + 1 },
             None => 0,
         };
         self.suggestion_index = Some(i);
     }
 
     pub fn suggestion_previous(&mut self) {
-        if self.suggestions.is_empty() {
-            return;
-        }
+        if self.suggestions.is_empty() { return; }
         let i = match self.suggestion_index {
-            Some(i) => {
-                if i == 0 {
-                    self.suggestions.len() - 1
-                } else {
-                    i - 1
-                }
-            }
+            Some(i) => if i == 0 { self.suggestions.len() - 1 } else { i - 1 },
             None => 0,
         };
         self.suggestion_index = Some(i);

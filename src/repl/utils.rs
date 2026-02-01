@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::path::Path;
 
 pub fn get_path_suggestions(input: &str) -> Vec<String> {
@@ -114,4 +115,100 @@ pub fn get_loaded_data() -> Vec<String> {
         }
     }
     tree_lines
+}
+
+#[derive(Deserialize)]
+struct Config {
+    indexed_fields: Vec<IndexedField>,
+}
+
+#[derive(Deserialize)]
+struct IndexedField {
+    field_name: String,
+    indexed: bool,
+}
+
+pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
+    let config_path = data_path.join(entity).join(table).join("config.json");
+
+    let mut fields = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(config_path) {
+        if let Ok(config) = serde_json::from_str::<Config>(&content) {
+            for item in config.indexed_fields {
+                if item.indexed {
+                    fields.push(item.field_name);
+                }
+            }
+        }
+    }
+
+    fields.sort();
+    fields
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_get_path_suggestions() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Create dummy files and directories
+        fs::create_dir(dir_path.join("subdir")).unwrap();
+        fs::File::create(dir_path.join("file1.ndjson")).unwrap();
+        fs::File::create(dir_path.join("file2.txt")).unwrap();
+        fs::create_dir(dir_path.join(".hidden_dir")).unwrap();
+        fs::File::create(dir_path.join(".hidden_file")).unwrap();
+
+        // Test case 1: Empty input, should suggest from root
+        // Note: This test is environment-dependent, so we'll test relative paths
+
+        // Test case 2: Suggest directories and .ndjson files
+        let mut input = dir_path.to_str().unwrap().to_string();
+        input.push('/');
+        let suggestions = get_path_suggestions(&input);
+        assert!(suggestions.iter().any(|s| s.ends_with("subdir/")));
+        assert!(suggestions.iter().any(|s| s.ends_with("file1.ndjson")));
+        assert!(!suggestions.iter().any(|s| s.ends_with("file2.txt")));
+        assert!(!suggestions.iter().any(|s| s.ends_with(".hidden_dir/")));
+        assert!(!suggestions.iter().any(|s| s.ends_with(".hidden_file")));
+
+        // Test case 3: Suggest with a prefix
+        let path_buf = dir_path.join("f");
+        let prefix_input = path_buf.to_str().unwrap();
+        let suggestions_prefix = get_path_suggestions(prefix_input);
+        assert!(suggestions_prefix.iter().any(|s| s.ends_with("file1.ndjson")));
+        assert!(!suggestions_prefix.iter().any(|s| s.ends_with("subdir/")));
+    }
+
+    #[test]
+    fn test_get_indexed_fields() {
+        let dir = tempdir().unwrap();
+        let data_path = dir.path();
+        let entity = "test_entity";
+        let table = "test_table";
+        let config_dir = data_path.join(entity).join(table);
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let config_content = r#"
+        {
+            "indexed_fields": [
+                {"field_name": "id", "indexed": true},
+                {"field_name": "name", "indexed": false},
+                {"field_name": "age", "indexed": true}
+            ]
+        }
+        "#;
+        fs::write(config_dir.join("config.json"), config_content).unwrap();
+
+        let fields = get_indexed_fields(data_path, entity, table);
+
+        assert_eq!(fields, vec!["age", "id"]);
+    }
 }

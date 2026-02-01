@@ -1,265 +1,202 @@
-use crate::repl::state::{App, LoadStep};
+use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
 use crate::repl::utils::get_loaded_data;
-use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
 
-pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
+pub fn ui(f: &mut Frame, app: &mut App) {
+    let purple = Color::Rgb(197, 137, 249);
     let purple_muted = Color::Rgb(244, 230, 255);
+    
     let size = f.size();
 
-    // 🔹 Layout raíz con margen superior
-    let root_layout = Layout::default()
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)]) // Margen superior
+        .split(size);
+    
+    let content_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(4), Constraint::Min(0), Constraint::Length(4)]) // Márgenes laterales
+        .split(chunks[1])[1];
+
+    if app.active_task == Some("Search") {
+        draw_search_ui(f, app, content_area);
+    } else if app.active_task == Some("Load") {
+        draw_load_ui(f, app, content_area, purple, purple_muted);
+    } else {
+        draw_main_menu(f, app, content_area, purple, purple_muted);
+    }
+}
+
+fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .split(area);
+
+    let top_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(3)])
+        .split(chunks[0]);
+
+    let (prompt_text, placeholder) = match app.load_step {
+        LoadStep::InputPath => ("Enter path to .ndjson file:", " /path/to/your/file.ndjson"),
+        LoadStep::InputEntity => ("Enter entity name:", " (e.g., customers, products)"),
+        LoadStep::InputTable => ("Enter table name:", " (e.g., 2024_sales, user_profiles)"),
+        _ => ("", ""),
+    };
+
+    let prompt_block = Block::default()
+        .borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(purple))
+        .padding(Padding::new(2, 2, 1, 1));
+    
+    let prompt_paragraph = Paragraph::new(prompt_text).block(prompt_block);
+    f.render_widget(prompt_paragraph, top_chunks[0]);
+    
+    let input_text: Vec<Span> = vec![
+        Span::raw(&app.input_buffer),
+        Span::styled(placeholder, Style::default().fg(Color::DarkGray)),
+    ];
+    let input_line = Line::from(input_text);
+
+    let input_paragraph = Paragraph::new(input_line)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(purple_muted))
+            .padding(Padding::new(2, 2, 1, 1)));
+    f.render_widget(input_paragraph, top_chunks[1]);
+    f.set_cursor(top_chunks[1].x + 3 + app.input_buffer.len() as u16, top_chunks[1].y + 2);
+
+    if !app.suggestions.is_empty() {
+        let mut suggestion_state = ListState::default();
+        suggestion_state.select(app.suggestion_index);
+        
+        let suggestion_items: Vec<ListItem> = app.suggestions.iter().map(|s| ListItem::new(s.as_str())).collect();
+        let list = List::new(suggestion_items)
+            .block(Block::default().padding(Padding::new(0, 0, 1, 0)))
+            .highlight_style(Style::default().bg(purple).fg(Color::Black));
+        f.render_stateful_widget(list, chunks[1], &mut suggestion_state);
+    }
+}
+
+fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .split(area);
+
+    let menu_block = Block::default()
+        .borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(purple_muted))
+        .padding(Padding::new(2, 2, 1, 1));
+
+    let items: Vec<ListItem> = app.menu_items.iter().map(|i| ListItem::new(*i)).collect();
+    let list = List::new(items)
+        .block(menu_block)
+        .highlight_style(Style::default().fg(purple))
+        .highlight_symbol("◉ ");
+    f.render_stateful_widget(list, chunks[0], &mut app.menu_state);
+
+    let loaded_data = get_loaded_data();
+    if !loaded_data.is_empty() {
+        let loaded_items: Vec<ListItem> = loaded_data.iter().map(|s| ListItem::new(s.as_str())).collect();
+        let list = List::new(loaded_items).block(Block::default().padding(Padding::new(0, 0, 1, 0)));
+        f.render_widget(list, chunks[1]);
+    }
+}
+
+fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
+    let active_color = Color::Rgb(128, 222, 152);
+    let inactive_color = Color::Rgb(244, 230, 255);//
+
+    let left_len = 3;
+    let middle_len = match app.search_criteria {
+        SearchCriteria::Entity => app.search_entities.len(),
+        SearchCriteria::Table => app.search_tables.len(),
+        SearchCriteria::Filters => 3,
+    };
+    let right_len = if app.search_criteria == SearchCriteria::Filters {
+        match app.filter_step {
+            FilterStep::Field => app.available_fields.len(),
+            _ => 1,
+        }
+    } else { 0 };
+    
+    // Altura exacta: items + padding vertical (2) + bordes (2)
+    let content_height = (left_len as u16 + 4).max(middle_len as u16 + 4).max(right_len as u16 + 4);
+
+    let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // 👈 margen superior
-            Constraint::Min(0),
+            Constraint::Length(7), // Menu superior
+            Constraint::Length(content_height), // Paneles de búsqueda
+            Constraint::Min(0), // Espacio restante (para simetría/balance)
+            Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
         ])
-        .split(size);
-
-    let content_area = root_layout[1];
-
-    // Layout Principal: Margen de 4 columnas
-    let main_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(0),
-            Constraint::Length(4),
-        ])
-        .split(content_area);
-
-    let central_area = main_layout[1];
-    let action_height = 3;
-
-    // 2. Renderizar Datos Cargados
-    let loaded_data = get_loaded_data();
-
-    // Determinamos el layout según si hay tarea activa o no
-    if app.active_task.is_none() {
-        // MODO MENÚ: Menú + Lista de Datos Cargados
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(7), // Menú
-                Constraint::Min(0),    // Datos cargados (todo el espacio restante)
-            ])
-            .split(central_area);
-
-        // 1. Renderizar Menú
-        let menu_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(purple_muted))
-            .padding(Padding::new(2, 2, 1, 1));
-
-        let items: Vec<ListItem> = app
-            .menu_items
-            .iter()
-            .enumerate()
-            .map(|(i, m)| ListItem::new(format!("{}. {}", i + 1, m)))
-            .collect();
-
-        let list = List::new(items)
-            .block(menu_block)
-            .highlight_style(Style::default().fg(purple))
-            .highlight_symbol("◉ ");
-
-        f.render_stateful_widget(list, chunks[0], &mut app.menu_state);
-
-        // 2. Renderizar Datos Cargados
-        if !loaded_data.is_empty() {
-            let loaded_items: Vec<ListItem> = loaded_data
-                .iter()
-                .map(|s| ListItem::new(Span::styled(s, Style::default().fg(Color::DarkGray))))
-                .collect();
-
-            let loaded_list =
-                List::new(loaded_items).block(Block::default().padding(Padding::new(0, 0, 1, 0)));
-
-            f.render_widget(loaded_list, chunks[1]);
-        }
+        .split(area);
+    
+    draw_main_menu(f, app, main_chunks[0], active_color, inactive_color);
+    
+    let panel_layout = if app.search_criteria == SearchCriteria::Filters {
+        Layout::default().direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(50)])
+            .split(main_chunks[1])
     } else {
-        // MODO TAREA: Menú + Datos Cargados + Espacio + Input + Sugerencias
+        Layout::default().direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(main_chunks[1])
+    };
 
-        let loaded_height = if loaded_data.is_empty() {
-            0
-        } else {
-            (loaded_data.len() as u16).min(8) + 1
+    let create_panel = |focus: bool| {
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .padding(Padding::new(2, 2, 1, 1))
+            .border_style(Style::default().fg(if focus { active_color } else { inactive_color }))
+    };
+
+    // --- Panel Izquierdo ---
+    let left_items = vec![ListItem::new("Entity"), ListItem::new("Table"), ListItem::new("Filters")];
+    let left_list = List::new(left_items)
+        .block(create_panel(app.focus_panel == FocusPanel::Left))
+        .highlight_style(Style::default().fg(active_color))
+        .highlight_symbol("◉ ");
+    f.render_stateful_widget(left_list, panel_layout[0], &mut app.left_panel_state);
+
+    // --- Panel Medio ---
+    let middle_items: Vec<ListItem> = match app.search_criteria {
+        SearchCriteria::Entity => app.search_entities.iter().map(|s| ListItem::new(s.as_str())).collect(),
+        SearchCriteria::Table => app.search_tables.iter().map(|s| ListItem::new(s.as_str())).collect(),
+        SearchCriteria::Filters => vec![ListItem::new("Field"), ListItem::new("Op"), ListItem::new("Value")],
+    };
+    let middle_list = List::new(middle_items)
+        .block(create_panel(app.focus_panel == FocusPanel::Middle))
+        .highlight_style(Style::default().fg(active_color))
+        .highlight_symbol("◉ ");
+    f.render_stateful_widget(middle_list, panel_layout[1], &mut app.middle_panel_state);
+
+    // --- Panel Derecho (Solo Filtros) ---
+    if app.search_criteria == SearchCriteria::Filters {
+        let right_items: Vec<ListItem> = match app.filter_step {
+            FilterStep::Field => app.available_fields.iter().map(|s| ListItem::new(s.as_str())).collect(),
+            FilterStep::Op => vec![ListItem::new("Eq")],
+            FilterStep::Value => vec![ListItem::new(if app.filter_value_input.is_empty() { "Press Enter to type..." } else { app.filter_value_input.as_str() })],
         };
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(7), // Menú (alto fijo)
-                Constraint::Length(loaded_height), // Datos cargados (altura dinámica limitada)
-                Constraint::Length(1), // Espacio de separación (AJUSTADO)
-                Constraint::Length(action_height), // Barra de input (3 líneas)
-                Constraint::Min(0),    // Sugerencias inmediatamente debajo
-            ])
-            .split(central_area);
-
-        // 1. Renderizar Menú
-
-        let menu_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(purple_muted))
-            .padding(Padding::new(2, 2, 1, 1));
-
-        let items: Vec<ListItem> = app
-            .menu_items
-            .iter()
-            .enumerate()
-            .map(|(i, m)| ListItem::new(format!("{}. {}", i + 1, m)))
-            .collect();
-
-        let list = List::new(items)
-            .block(menu_block)
-            .highlight_style(Style::default().fg(purple))
+        let right_list = List::new(right_items)
+            .block(create_panel(app.focus_panel == FocusPanel::Right))
+            .highlight_style(Style::default().fg(active_color))
             .highlight_symbol("◉ ");
-
-        f.render_stateful_widget(list, chunks[0], &mut app.menu_state);
-
-        // 2. Renderizar Datos Cargados (Si existen)
-
-        if !loaded_data.is_empty() {
-            let loaded_items: Vec<ListItem> = loaded_data
-                .iter()
-                .map(|s| ListItem::new(Span::styled(s, Style::default().fg(Color::DarkGray))))
-                .collect();
-
-            let loaded_list =
-                List::new(loaded_items).block(Block::default().padding(Padding::new(0, 0, 1, 0)));
-
-            f.render_widget(loaded_list, chunks[1]);
-        }
-
-        // 3. RENDERIZAR BARRA DE ENTRADA Y ESTADOS
-
-        match app.load_step {
-            LoadStep::Processing => {
-                // Dejamos el área inferior vacía para que el spinner de CLI (toast)
-                // se renderice sin obstrucciones visuales ni popups superpuestos.
-                return;
-            }
-
-            LoadStep::Done => {}
-
-            _ => {}
-        }
-
+        f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
+    }
+    
+    // --- Input Inferior ---
+    if app.focus_panel == FocusPanel::Bottom {
         let input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(purple_muted));
-
-        f.render_widget(&input_block, chunks[3]); // Input ahora en chunks[3] (antes era 2)
-
-        let inner_area = input_block.inner(chunks[3]);
-
-        let input_area = inner_area.inner(&Margin {
-            vertical: 0,
-
-            horizontal: 1,
-        });
-
-        let centered_input_area = Rect {
-            x: input_area.x,
-
-            y: input_area.y + (input_area.height / 2),
-
-            width: input_area.width,
-
-            height: 1,
-        };
-
-        let placeholder = match app.load_step {
-            LoadStep::InputPath => "Browse or type file path (ends in .ndjson)...",
-
-            LoadStep::InputEntity => "Entity name (e.g. users)",
-
-            LoadStep::InputTable => "Table name (e.g. main)",
-
-            _ => "",
-        };
-
-        let prompt_str = " > ";
-
-        let mut spans = vec![Span::styled(
-            prompt_str,
-            Style::default().fg(purple).add_modifier(Modifier::BOLD),
-        )];
-
-        if app.input_buffer.is_empty() {
-            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-
-            spans.push(Span::raw(" "));
-
-            spans.push(Span::styled(
-                placeholder,
-                Style::default().fg(Color::DarkGray),
-            ));
-        } else {
-            spans.push(Span::raw(" "));
-
-            spans.push(Span::raw(&app.input_buffer));
-        }
-
-        f.render_widget(Paragraph::new(Line::from(spans)), centered_input_area);
-
-        if !app.input_buffer.is_empty() {
-            let cursor_x = centered_input_area.x
-                + prompt_str.chars().count() as u16
-                + 1
-                + app.input_buffer.chars().count() as u16;
-
-            f.set_cursor(cursor_x, centered_input_area.y);
-        }
-
-        // 4. RENDERIZAR SUGERENCIAS
-
-        if !app.suggestions.is_empty() {
-            let suggestions_items: Vec<ListItem> = app
-                .suggestions
-                .iter()
-                .map(|m| {
-                    ListItem::new(Span::styled(
-                        m.as_str(),
-                        Style::default().fg(Color::DarkGray),
-                    ))
-                })
-                .collect();
-
-            let mut suggestion_state = ListState::default();
-
-            suggestion_state.select(app.suggestion_index);
-
-            let list_widget = List::new(suggestions_items)
-                .highlight_style(Style::default().fg(purple).add_modifier(Modifier::BOLD))
-                .highlight_symbol("   > ");
-
-            f.render_stateful_widget(list_widget, chunks[4], &mut suggestion_state);
-            // Sugerencias ahora en chunks[4]
-        }
+            .border_style(Style::default().fg(active_color))
+            .padding(Padding::new(2, 2, 0, 0)); // Padding para alinear texto
+        let p = Paragraph::new(app.filter_value_input.as_str()).block(input_block);
+        f.render_widget(p, main_chunks[3]);
+        f.set_cursor(main_chunks[3].x + 3 + app.filter_value_input.len() as u16, main_chunks[3].y + 1);
     }
 }
