@@ -15,7 +15,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 use ui::ui;
-use utils::{get_indexed_fields, get_path_suggestions};
+use utils::{get_indexed_fields, get_path_suggestions, get_loaded_data};
 
 pub fn run_interactive() -> Result<()> {
     enable_raw_mode()?;
@@ -44,15 +44,48 @@ pub fn run_interactive() -> Result<()> {
 }
 
 fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    loop {
-        terminal.draw(|f| ui(f, app))?;
+    let custom_purple = Color::Rgb(197, 137, 249);
 
-        if app.active_task == Some("Load") && app.load_step == LoadStep::Processing {
-            terminal.draw(|f| ui(f, app))?;
-            let _ = execute_load_tui(&app.ndjson_path, &app.entity_name, &app.table_name, 0, 0);
+    loop {
+        terminal.draw(|f| ui(f, app, custom_purple))?;
+
+        // Si estamos en estado de procesamiento, ejecutamos la tarea y luego limpiamos
+        if let LoadStep::Processing = app.load_step {
+             // Calcular posición Y para el spinner (Misma lógica que ui.rs)
+            // Top Margin (2) + Menu (7) + LoadedData + Separator (1)
+            let loaded_data = get_loaded_data();
+            let loaded_height = if loaded_data.is_empty() {
+                0
+            } else {
+                (loaded_data.len() as u16).min(8) + 1
+            };
+            
+            // Y exacto donde empieza el bloque de input
+            let spinner_y = 2 + 7 + loaded_height + 1;
+            // X alineado con el margen: 4 (margin)
+            let spinner_x = 4;
+
+            // Ejecutar tarea bloqueante (CLI Spinner)
+            let _ = execute_load_tui(
+                &app.ndjson_path,
+                &app.entity_name,
+                &app.table_name,
+                spinner_x,
+                spinner_y
+            );
+
+            // Finalizamos la tarea y volvemos al menú principal
             app.active_task = None;
             app.load_step = LoadStep::InputPath;
             app.input_buffer.clear();
+            app.ndjson_path.clear();
+            app.entity_name.clear();
+            app.table_name.clear();
+            app.suggestions.clear();
+            app.suggestion_index = None;
+            
+            // Forzar redibujado inmediato con el nuevo estado
+            continue;
         }
 
         if event::poll(Duration::from_millis(50))? {
@@ -79,7 +112,16 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
         KeyCode::Down => app.menu_next(),
         KeyCode::Up => app.menu_previous(),
         KeyCode::Enter => match app.menu_state.selected() {
-            Some(0) => app.active_task = Some("Load"),
+            Some(0) => {
+                app.active_task = Some("Load");
+                // Iniciar sugerencias desde ROOT inmediatamente al entrar
+                app.suggestions = get_path_suggestions("");
+                app.suggestion_index = if app.suggestions.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+            }
             Some(1) => {
                 app.active_task = Some("Search");
                 app.focus_panel = FocusPanel::Left;
@@ -112,66 +154,98 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
 
 fn handle_load_input(app: &mut App, key: event::KeyEvent) {
     match key.code {
+        KeyCode::Enter => {
+            // 1. Manejo de selección de sugerencia (Prioritario)
+            if let Some(idx) = app.suggestion_index {
+                if !app.suggestions.is_empty() && idx < app.suggestions.len() {
+                    let selected = &app.suggestions[idx];
+
+                    // Si es directorio (termina en /), navegamos
+                    if selected.ends_with(std::path::MAIN_SEPARATOR) {
+                        app.input_buffer = selected.clone();
+                        app.suggestions = get_path_suggestions(&app.input_buffer);
+                        app.suggestion_index = if app.suggestions.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                        return;
+                    }
+                    // Si es archivo .ndjson, LO SELECCIONAMOS Y AVANZAMOS
+                    else if selected.ends_with(".ndjson") {
+                        app.ndjson_path = selected.clone();
+                        app.input_buffer.clear();
+                        app.suggestions.clear();
+                        app.suggestion_index = None;
+                        app.load_step = LoadStep::InputEntity;
+                        return;
+                    }
+                }
+            }
+
+            // 2. Manejo normal de Enter
+            match app.load_step {
+                LoadStep::InputPath => {
+                    if !app.input_buffer.is_empty() {
+                        app.ndjson_path = app.input_buffer.clone();
+                        app.input_buffer.clear();
+                        app.suggestions.clear();
+                        app.suggestion_index = None;
+                        app.load_step = LoadStep::InputEntity;
+                    }
+                }
+                LoadStep::InputEntity => {
+                    app.entity_name = app.input_buffer.clone();
+                    app.input_buffer.clear();
+                    app.load_step = LoadStep::InputTable;
+                }
+                LoadStep::InputTable => {
+                    app.table_name = app.input_buffer.clone();
+                    app.input_buffer.clear();
+                    app.load_step = LoadStep::Processing;
+                }
+                _ => {}
+            }
+        }
         KeyCode::Char(c) => {
             app.input_buffer.push(c);
-            if app.load_step == LoadStep::InputPath {
+            if let LoadStep::InputPath = app.load_step {
                 app.suggestions = get_path_suggestions(&app.input_buffer);
                 app.suggestion_index = if app.suggestions.is_empty() { None } else { Some(0) };
             }
         }
         KeyCode::Backspace => {
             app.input_buffer.pop();
-             if app.load_step == LoadStep::InputPath {
+            if let LoadStep::InputPath = app.load_step {
                 app.suggestions = get_path_suggestions(&app.input_buffer);
                 app.suggestion_index = if app.suggestions.is_empty() { None } else { Some(0) };
             }
-        }
-        KeyCode::Enter => {
-            if let Some(index) = app.suggestion_index {
-                app.input_buffer = app.suggestions[index].clone();
-            }
-
-            match app.load_step {
-                LoadStep::InputPath => {
-                    app.ndjson_path = app.input_buffer.clone();
-                    app.load_step = LoadStep::InputEntity;
-                }
-                LoadStep::InputEntity => {
-                    app.entity_name = app.input_buffer.clone();
-                    app.load_step = LoadStep::InputTable;
-                }
-                LoadStep::InputTable => {
-                    app.table_name = app.input_buffer.clone();
-                    app.load_step = LoadStep::Processing;
-                }
-                _ => {}
-            }
-            app.input_buffer.clear();
-            app.suggestions.clear();
-            app.suggestion_index = None;
         }
         KeyCode::Esc => {
             app.active_task = None;
             app.input_buffer.clear();
             app.suggestions.clear();
             app.suggestion_index = None;
-        }
-        KeyCode::Tab => {
-            if !app.suggestions.is_empty() {
-                let s_index = app.suggestion_index.unwrap_or(0);
-                app.input_buffer = app.suggestions[s_index].clone();
-            }
-        }
-        KeyCode::Down => {
-            if !app.suggestions.is_empty() {
-                app.suggestion_next();
-            }
+            app.load_step = LoadStep::InputPath;
         }
         KeyCode::Up => {
-            if !app.suggestions.is_empty() {
-                app.suggestion_previous();
+            if !app.suggestions.is_empty() { app.suggestion_previous(); }
+        }
+        KeyCode::Down => {
+            if !app.suggestions.is_empty() { app.suggestion_next(); }
+        }
+        KeyCode::Tab => {
+            if let Some(idx) = app.suggestion_index {
+                if idx < app.suggestions.len() {
+                    let selected = &app.suggestions[idx];
+                    app.input_buffer = selected.clone();
+                    if selected.ends_with(std::path::MAIN_SEPARATOR) {
+                        app.suggestions = get_path_suggestions(&app.input_buffer);
+                        app.suggestion_index = if app.suggestions.is_empty() { None } else { Some(0) };
+                    }
+                }
             }
-        },
+        }
         _ => {}
     }
 }

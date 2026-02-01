@@ -1,114 +1,93 @@
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
 use crate::repl::utils::get_loaded_data;
+use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
 
-pub fn ui(f: &mut Frame, app: &mut App) {
-    let purple = Color::Rgb(197, 137, 249);
+pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
     let purple_muted = Color::Rgb(244, 230, 255);
-    
     let size = f.size();
 
-    let chunks = Layout::default()
+    // 🔹 Layout raíz con margen superior
+    let root_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)]) // Margen superior
+        .constraints([
+            Constraint::Length(2), // 👈 margen superior
+            Constraint::Min(0),
+        ])
         .split(size);
-    
-    let content_area = Layout::default()
+
+    let content_area = root_layout[1];
+
+    // Layout Principal: Margen de 4 columnas
+    let main_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(4), Constraint::Min(0), Constraint::Length(4)]) // Márgenes laterales
-        .split(chunks[1])[1];
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(0),
+            Constraint::Length(4),
+        ])
+        .split(content_area);
+
+    let central_area = main_layout[1];
 
     if app.active_task == Some("Search") {
-        draw_search_ui(f, app, content_area);
+        draw_search_ui(f, app, central_area, purple, purple_muted);
     } else if app.active_task == Some("Load") {
-        draw_load_ui(f, app, content_area, purple, purple_muted);
+        draw_load_ui(f, app, central_area, purple, purple_muted);
     } else {
-        draw_main_menu(f, app, content_area, purple, purple_muted);
+        draw_main_menu(f, app, central_area, purple, purple_muted);
     }
 }
 
 fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
-        .split(area);
-
-    let top_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3)])
-        .split(chunks[0]);
-
-    let (prompt_text, placeholder) = match app.load_step {
-        LoadStep::InputPath => ("Enter path to .ndjson file:", " /path/to/your/file.ndjson"),
-        LoadStep::InputEntity => ("Enter entity name:", " (e.g., customers, products)"),
-        LoadStep::InputTable => ("Enter table name:", " (e.g., 2024_sales, user_profiles)"),
-        _ => ("", ""),
-    };
-
-    let prompt_block = Block::default()
-        .borders(Borders::ALL).border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(purple))
-        .padding(Padding::new(2, 2, 1, 1));
-    
-    let prompt_paragraph = Paragraph::new(prompt_text).block(prompt_block);
-    f.render_widget(prompt_paragraph, top_chunks[0]);
-    
-    let input_text: Vec<Span> = vec![
-        Span::raw(&app.input_buffer),
-        Span::styled(placeholder, Style::default().fg(Color::DarkGray)),
-    ];
-    let input_line = Line::from(input_text);
-
-    let input_paragraph = Paragraph::new(input_line)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(purple_muted))
-            .padding(Padding::new(2, 2, 1, 1)));
-    f.render_widget(input_paragraph, top_chunks[1]);
-    f.set_cursor(top_chunks[1].x + 3 + app.input_buffer.len() as u16, top_chunks[1].y + 2);
-
-    if !app.suggestions.is_empty() {
-        let mut suggestion_state = ListState::default();
-        suggestion_state.select(app.suggestion_index);
-        
-        let suggestion_items: Vec<ListItem> = app.suggestions.iter().map(|s| ListItem::new(s.as_str())).collect();
-        let list = List::new(suggestion_items)
-            .block(Block::default().padding(Padding::new(0, 0, 1, 0)))
-            .highlight_style(Style::default().bg(purple).fg(Color::Black));
-        f.render_stateful_widget(list, chunks[1], &mut suggestion_state);
+    if app.load_step == LoadStep::Processing {
+        return;
     }
-}
-
-fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
-        .split(area);
-
-    let menu_block = Block::default()
-        .borders(Borders::ALL).border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(purple_muted))
-        .padding(Padding::new(2, 2, 1, 1));
-
-    let items: Vec<ListItem> = app.menu_items.iter().map(|i| ListItem::new(*i)).collect();
-    let list = List::new(items)
-        .block(menu_block)
-        .highlight_style(Style::default().fg(purple))
-        .highlight_symbol("◉ ");
-    f.render_stateful_widget(list, chunks[0], &mut app.menu_state);
 
     let loaded_data = get_loaded_data();
+    let loaded_height = if loaded_data.is_empty() {
+        0
+    } else {
+        (loaded_data.len() as u16).min(8) + 1
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7), // Menú
+            Constraint::Length(loaded_height), // Datos cargados
+            Constraint::Length(1), // Separador
+            Constraint::Length(3), // Input
+            Constraint::Min(0),    // Sugerencias
+        ])
+        .split(area);
+
+    // 1. Menú
+    draw_menu_widget(f, app, chunks[0], purple, purple_muted);
+
+    // 2. Datos Cargados
     if !loaded_data.is_empty() {
-        let loaded_items: Vec<ListItem> = loaded_data.iter().map(|s| ListItem::new(s.as_str())).collect();
-        let list = List::new(loaded_items).block(Block::default().padding(Padding::new(0, 0, 1, 0)));
-        f.render_widget(list, chunks[1]);
+        draw_loaded_data_widget(f, &loaded_data, chunks[1]);
+    }
+
+    // 3. Input
+    let placeholder = match app.load_step {
+        LoadStep::InputPath => "Browse or type file path (ends in .ndjson)...",
+        LoadStep::InputEntity => "Entity name (e.g. users)",
+        LoadStep::InputTable => "Table name (e.g. main)",
+        _ => "",
+    };
+    draw_input_widget(f, app, chunks[3], placeholder, purple, purple_muted);
+
+    // 4. Sugerencias
+    if !app.suggestions.is_empty() {
+        draw_suggestions_widget(f, app, chunks[4], purple);
     }
 }
 
-fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
     let active_color = Color::Rgb(128, 222, 152);
-    let inactive_color = Color::Rgb(244, 230, 255);//
+    let inactive_color = Color::Rgb(244, 230, 255);
 
     let left_len = 3;
     let middle_len = match app.search_criteria {
@@ -123,29 +102,28 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         }
     } else { 0 };
     
-    // Altura exacta: items + padding vertical (2) + bordes (2)
     let content_height = (left_len as u16 + 4).max(middle_len as u16 + 4).max(right_len as u16 + 4);
 
-    let main_chunks = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Menu superior
-            Constraint::Length(content_height), // Paneles de búsqueda
-            Constraint::Min(0), // Espacio restante (para simetría/balance)
+            Constraint::Length(7), // Menú
+            Constraint::Length(content_height), // Paneles
+            Constraint::Min(0),
             Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
         ])
         .split(area);
     
-    draw_main_menu(f, app, main_chunks[0], active_color, inactive_color);
+    draw_menu_widget(f, app, chunks[0], active_color, inactive_color);
     
     let panel_layout = if app.search_criteria == SearchCriteria::Filters {
         Layout::default().direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(50)])
-            .split(main_chunks[1])
+            .split(chunks[1])
     } else {
         Layout::default().direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(main_chunks[1])
+            .split(chunks[1])
     };
 
     let create_panel = |focus: bool| {
@@ -154,7 +132,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             .border_style(Style::default().fg(if focus { active_color } else { inactive_color }))
     };
 
-    // --- Panel Izquierdo ---
+    // Panel Izquierdo
     let left_items = vec![ListItem::new("Entity"), ListItem::new("Table"), ListItem::new("Filters")];
     let left_list = List::new(left_items)
         .block(create_panel(app.focus_panel == FocusPanel::Left))
@@ -162,7 +140,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("◉ ");
     f.render_stateful_widget(left_list, panel_layout[0], &mut app.left_panel_state);
 
-    // --- Panel Medio ---
+    // Panel Medio
     let middle_items: Vec<ListItem> = match app.search_criteria {
         SearchCriteria::Entity => app.search_entities.iter().map(|s| ListItem::new(s.as_str())).collect(),
         SearchCriteria::Table => app.search_tables.iter().map(|s| ListItem::new(s.as_str())).collect(),
@@ -174,7 +152,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("◉ ");
     f.render_stateful_widget(middle_list, panel_layout[1], &mut app.middle_panel_state);
 
-    // --- Panel Derecho (Solo Filtros) ---
+    // Panel Derecho
     if app.search_criteria == SearchCriteria::Filters {
         let right_items: Vec<ListItem> = match app.filter_step {
             FilterStep::Field => app.available_fields.iter().map(|s| ListItem::new(s.as_str())).collect(),
@@ -188,15 +166,98 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
     }
     
-    // --- Input Inferior ---
+    // Input Inferior
     if app.focus_panel == FocusPanel::Bottom {
         let input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(active_color))
-            .padding(Padding::new(2, 2, 0, 0)); // Padding para alinear texto
+            .padding(Padding::new(2, 2, 0, 0));
         let p = Paragraph::new(app.filter_value_input.as_str()).block(input_block);
-        f.render_widget(p, main_chunks[3]);
-        f.set_cursor(main_chunks[3].x + 3 + app.filter_value_input.len() as u16, main_chunks[3].y + 1);
+        f.render_widget(p, chunks[3]);
+        f.set_cursor(chunks[3].x + 3 + app.filter_value_input.len() as u16, chunks[3].y + 1);
     }
+}
+
+fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .split(area);
+
+    draw_menu_widget(f, app, chunks[0], purple, purple_muted);
+
+    let loaded_data = get_loaded_data();
+    if !loaded_data.is_empty() {
+        draw_loaded_data_widget(f, &loaded_data, chunks[1]);
+    }
+}
+
+// --- Helpers de UI ---
+
+fn draw_menu_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
+    let menu_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(purple_muted))
+        .padding(Padding::new(2, 2, 1, 1));
+
+    let items: Vec<ListItem> = app.menu_items.iter().enumerate()
+        .map(|(i, m)| ListItem::new(format!("{}. {}", i + 1, m)))
+        .collect();
+
+    let list = List::new(items)
+        .block(menu_block)
+        .highlight_style(Style::default().fg(purple))
+        .highlight_symbol("◉ ");
+
+    f.render_stateful_widget(list, area, &mut app.menu_state);
+}
+
+fn draw_loaded_data_widget(f: &mut Frame, data: &[String], area: Rect) {
+    let items: Vec<ListItem> = data.iter()
+        .map(|s| ListItem::new(Span::styled(s, Style::default().fg(Color::DarkGray))))
+        .collect();
+    let list = List::new(items).block(Block::default().padding(Padding::new(0, 0, 1, 0)));
+    f.render_widget(list, area);
+}
+
+fn draw_input_widget(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str, purple: Color, purple_muted: Color) {
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(purple_muted));
+    f.render_widget(&input_block, area);
+
+    let inner = input_block.inner(area).inner(&Margin { vertical: 0, horizontal: 1 });
+    let centered_area = Rect { x: inner.x, y: inner.y + (inner.height / 2), width: inner.width, height: 1 };
+
+    let prompt_str = " > ";
+    let mut spans = vec![Span::styled(prompt_str, Style::default().fg(purple).add_modifier(Modifier::BOLD))];
+
+    if app.input_buffer.is_empty() {
+        spans.push(Span::styled(" ", Style::default().bg(Color::White)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(placeholder, Style::default().fg(Color::DarkGray)));
+    } else {
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(&app.input_buffer));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), centered_area);
+    if !app.input_buffer.is_empty() {
+        f.set_cursor(centered_area.x + prompt_str.chars().count() as u16 + 1 + app.input_buffer.chars().count() as u16, centered_area.y);
+    }
+}
+
+fn draw_suggestions_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Color) {
+    let items: Vec<ListItem> = app.suggestions.iter()
+        .map(|m| ListItem::new(Span::styled(m.as_str(), Style::default().fg(Color::DarkGray))))
+        .collect();
+    let mut state = ListState::default();
+    state.select(app.suggestion_index);
+    let list = List::new(items)
+        .highlight_style(Style::default().fg(purple).add_modifier(Modifier::BOLD))
+        .highlight_symbol("   > ");
+    f.render_stateful_widget(list, area, &mut state);
 }
