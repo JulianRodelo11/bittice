@@ -31,7 +31,7 @@ pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
     let central_area = main_layout[1];
 
     if app.active_task == Some("Search") {
-        draw_search_ui(f, app, central_area, purple, purple_muted);
+        draw_search_ui(f, app, central_area);
     } else if app.active_task == Some("Load") {
         draw_load_ui(f, app, central_area, purple, purple_muted);
     } else {
@@ -40,10 +40,6 @@ pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
 }
 
 fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
-    if app.load_step == LoadStep::Processing {
-        return;
-    }
-
     let loaded_data = get_loaded_data();
     let loaded_height = if loaded_data.is_empty() {
         0
@@ -62,15 +58,20 @@ fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_
         ])
         .split(area);
 
-    // 1. Menú
+    // 1. Menú (Se dibuja SIEMPRE)
     draw_menu_widget(f, app, chunks[0], purple, purple_muted);
 
-    // 2. Datos Cargados
+    // 2. Datos Cargados (Se dibujan SIEMPRE)
     if !loaded_data.is_empty() {
         draw_loaded_data_widget(f, &loaded_data, chunks[1]);
     }
 
-    // 3. Input
+    // Si estamos procesando, nos detenemos aquí para dejar espacio al spinner de terminal
+    if app.load_step == LoadStep::Processing {
+        return;
+    }
+
+    // 3. Input (Solo si no estamos procesando)
     let placeholder = match app.load_step {
         LoadStep::InputPath => "Browse or type file path (ends in .ndjson)...",
         LoadStep::InputEntity => "Entity name (e.g. users)",
@@ -85,8 +86,10 @@ fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_
     }
 }
 
-fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
-    let active_color = Color::Rgb(128, 222, 152);
+fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
+    let purple = Color::Rgb(197, 137, 249);
+    let purple_muted = Color::Rgb(244, 230, 255);
+    let active_color = Color::Rgb(137, 180, 249);
     let inactive_color = Color::Rgb(244, 230, 255);
 
     let left_len = 3;
@@ -109,12 +112,14 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purpl
         .constraints([
             Constraint::Length(7), // Menú
             Constraint::Length(content_height), // Paneles
-            Constraint::Min(0),
             Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
+            Constraint::Length(1), // Instrucciones justo debajo
+            Constraint::Min(0),    // Resto del espacio al final
         ])
         .split(area);
     
-    draw_menu_widget(f, app, chunks[0], active_color, inactive_color);
+    // Aquí mantenemos los colores PÚRPURA para el menú superior
+    draw_menu_widget(f, app, chunks[0], purple, purple_muted);
     
     let panel_layout = if app.search_criteria == SearchCriteria::Filters {
         Layout::default().direction(Direction::Horizontal)
@@ -127,42 +132,90 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purpl
     };
 
     let create_panel = |focus: bool| {
-        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .padding(Padding::new(2, 2, 1, 1))
             .border_style(Style::default().fg(if focus { active_color } else { inactive_color }))
     };
 
     // Panel Izquierdo
-    let left_items = vec![ListItem::new("Entity"), ListItem::new("Table"), ListItem::new("Filters")];
+    let left_items = vec![
+        ListItem::new("Entity"),
+        ListItem::new(Span::styled(
+            "Table",
+            if app.selected_entity.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) }
+        )),
+        ListItem::new(Span::styled(
+            "Filters",
+            if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) }
+        )),
+    ];
     let left_list = List::new(left_items)
         .block(create_panel(app.focus_panel == FocusPanel::Left))
         .highlight_style(Style::default().fg(active_color))
-        .highlight_symbol("◉ ");
+        .highlight_symbol("> ");
     f.render_stateful_widget(left_list, panel_layout[0], &mut app.left_panel_state);
 
     // Panel Medio
     let middle_items: Vec<ListItem> = match app.search_criteria {
-        SearchCriteria::Entity => app.search_entities.iter().map(|s| ListItem::new(s.as_str())).collect(),
-        SearchCriteria::Table => app.search_tables.iter().map(|s| ListItem::new(s.as_str())).collect(),
-        SearchCriteria::Filters => vec![ListItem::new("Field"), ListItem::new("Op"), ListItem::new("Value")],
+        SearchCriteria::Entity => app.search_entities.iter().map(|s| {
+            let is_selected = Some(s.clone()) == app.selected_entity;
+            let circle = if is_selected {
+                Span::styled("◉", Style::default().fg(active_color))
+            } else {
+                Span::raw("○")
+            };
+            ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
+        }).collect(),
+        SearchCriteria::Table => app.search_tables.iter().map(|s| {
+            let is_selected = Some(s.clone()) == app.selected_table;
+            let circle = if is_selected {
+                Span::styled("◉", Style::default().fg(active_color))
+            } else {
+                Span::raw("○")
+            };
+            ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
+        }).collect(),
+        SearchCriteria::Filters => vec![
+            ListItem::new("Field"),
+            ListItem::new("Op"),
+            ListItem::new("Value"),
+        ],
     };
-    let middle_list = List::new(middle_items)
+    let mut middle_list = List::new(middle_items)
         .block(create_panel(app.focus_panel == FocusPanel::Middle))
-        .highlight_style(Style::default().fg(active_color))
-        .highlight_symbol("◉ ");
+        .highlight_style(Style::default().fg(active_color));
+    
+    if app.search_criteria == SearchCriteria::Filters {
+        middle_list = middle_list.highlight_symbol("> ");
+    }
+    
     f.render_stateful_widget(middle_list, panel_layout[1], &mut app.middle_panel_state);
 
     // Panel Derecho
     if app.search_criteria == SearchCriteria::Filters {
         let right_items: Vec<ListItem> = match app.filter_step {
-            FilterStep::Field => app.available_fields.iter().map(|s| ListItem::new(s.as_str())).collect(),
-            FilterStep::Op => vec![ListItem::new("Eq")],
+            FilterStep::Field => app.available_fields.iter().map(|s| {
+                let is_selected = Some(s.clone()) == app.selected_field;
+                let circle = if is_selected {
+                    Span::styled("◉", Style::default().fg(active_color))
+                } else {
+                    Span::raw("○")
+                };
+                ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
+            }).collect(),
+            FilterStep::Op => vec![
+                ListItem::new(Line::from(vec![
+                    Span::styled("◉", Style::default().fg(active_color)),
+                    Span::raw(format!(" {}", app.selected_op))
+                ]))
+            ],
             FilterStep::Value => vec![ListItem::new(if app.filter_value_input.is_empty() { "Press Enter to type..." } else { app.filter_value_input.as_str() })],
         };
         let right_list = List::new(right_items)
             .block(create_panel(app.focus_panel == FocusPanel::Right))
-            .highlight_style(Style::default().fg(active_color))
-            .highlight_symbol("◉ ");
+            .highlight_style(Style::default().fg(active_color));
         f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
     }
     
@@ -177,6 +230,27 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purpl
         f.render_widget(p, chunks[3]);
         f.set_cursor(chunks[3].x + 3 + app.filter_value_input.len() as u16, chunks[3].y + 1);
     }
+
+    // Instrucciones minimalistas con descripciones claras
+    let desc_style = Style::default().fg(purple);
+    let separator = "  •  ";
+
+    let help_text = match app.focus_panel {
+        FocusPanel::Left => format!("↑↓ Navigate{}→ Next Panel{}esq Quit", separator, separator),
+        FocusPanel::Middle => format!("↑↓ Navigate{}↵ Toggle Selection{}←→ Switch Panel{}esq Quit", separator, separator, separator),
+        FocusPanel::Right => format!("↑↓ Navigate{}↵ Toggle Selection{}← Prev Panel{}esq Quit", separator, separator, separator),
+        FocusPanel::Bottom => format!("↵ Accept{}esq Cancel", separator),
+    };
+
+    let instructions_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)]) 
+        .split(chunks[3]);
+
+    f.render_widget(
+        Paragraph::new(help_text).style(desc_style).alignment(Alignment::Right),
+        instructions_layout[0]
+    );
 }
 
 fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {

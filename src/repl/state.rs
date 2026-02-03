@@ -27,7 +27,7 @@ pub enum FilterStep {
 }
 
 // Para manejar el foco en la UI de búsqueda
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub enum FocusPanel {
     Left,   // Entity, Table, Filters
     Middle, // Opciones de Entity/Table, o Pasos de Filtro
