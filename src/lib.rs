@@ -6,8 +6,8 @@ pub mod core {
 }
 
 pub mod commands {
-
     pub mod load;
+    pub mod search;
 }
 
 pub mod cli;
