@@ -25,16 +25,34 @@ pub fn init_search(app: &mut App) {
     
     // Inicializar estados
     app.search_criteria = SearchCriteria::Entity;
+    app.filter_value_options = vec!["Write value".to_string()];
+    app.selected_value = None;
     update_middle_panel_content(app);
 }
 
 pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
     if app.focus_panel == FocusPanel::Bottom {
         match key.code {
-            KeyCode::Enter => app.focus_panel = FocusPanel::Middle,
+            KeyCode::Enter => {
+                if !app.filter_value_input.is_empty() {
+                    let val = app.filter_value_input.clone();
+                    if !app.filter_value_options.contains(&val) {
+                        app.filter_value_options.push(val.clone());
+                    }
+                    app.selected_value = Some(val.clone());
+                    
+                    // Encontrar el índice del valor seleccionado para actualizar la lista
+                    if let Some(idx) = app.filter_value_options.iter().position(|x| x == &val) {
+                        app.right_panel_state.select(Some(idx));
+                    }
+                    
+                    app.filter_value_input.clear();
+                }
+                app.focus_panel = FocusPanel::Right;
+            },
             KeyCode::Esc => {
                 app.filter_value_input.clear();
-                app.focus_panel = FocusPanel::Middle;
+                app.focus_panel = FocusPanel::Right;
             },
             KeyCode::Char(c) => app.filter_value_input.push(c),
             KeyCode::Backspace => { app.filter_value_input.pop(); },
@@ -106,10 +124,24 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     }
                 }
                 (FocusPanel::Right, SearchCriteria::Filters) => {
-                    if app.filter_step == FilterStep::Field {
-                        if let Some(idx) = app.right_panel_state.selected() {
-                            app.selected_field = app.available_fields.get(idx).cloned();
-                        }
+                    match app.filter_step {
+                        FilterStep::Field => {
+                            if let Some(idx) = app.right_panel_state.selected() {
+                                app.selected_field = app.available_fields.get(idx).cloned();
+                            }
+                        },
+                        FilterStep::Value => {
+                            if let Some(idx) = app.right_panel_state.selected() {
+                                if let Some(val) = app.filter_value_options.get(idx) {
+                                    if val == "Write value" {
+                                        app.focus_panel = FocusPanel::Bottom;
+                                    } else {
+                                        app.selected_value = Some(val.clone());
+                                    }
+                                }
+                            }
+                        },
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -121,12 +153,13 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
 
 fn navigate_list(app: &mut App, delta: isize) {
     let (state, len) = match app.focus_panel {
-        FocusPanel::Left => (&mut app.left_panel_state, 3),
+        FocusPanel::Left => (&mut app.left_panel_state, 7),
         FocusPanel::Middle => {
             let len = match app.search_criteria {
                 SearchCriteria::Entity => app.search_entities.len(),
                 SearchCriteria::Table => app.search_tables.len(),
                 SearchCriteria::Filters => 3,
+                _ => 0,
             };
             (&mut app.middle_panel_state, len)
         },
@@ -134,6 +167,7 @@ fn navigate_list(app: &mut App, delta: isize) {
             let len = if app.search_criteria == SearchCriteria::Filters {
                 match app.filter_step {
                     FilterStep::Field => app.available_fields.len(),
+                    FilterStep::Value => app.filter_value_options.len(),
                     _ => 1,
                 }
             } else { 0 };
@@ -149,15 +183,24 @@ fn navigate_list(app: &mut App, delta: isize) {
     // Update derived state based on new selection
     match app.focus_panel {
         FocusPanel::Left => {
-            let next_criteria = match next { 0 => SearchCriteria::Entity, 1 => SearchCriteria::Table, _ => SearchCriteria::Filters };
+            let next_criteria = match next { 
+                0 => SearchCriteria::Entity, 
+                1 => SearchCriteria::Table, 
+                2 => SearchCriteria::Filters,
+                3 => SearchCriteria::Aggregations,
+                4 => SearchCriteria::OrderBy,
+                5 => SearchCriteria::Limit,
+                6 => SearchCriteria::Fields,
+                _ => SearchCriteria::Entity 
+            };
             
             // Requisitos para navegar:
             // Para ir a Table, debe haber Entity seleccionado
             if next_criteria == SearchCriteria::Table && app.selected_entity.is_none() {
                 return;
             }
-            // Para ir a Filters, debe haber Table seleccionado
-            if next_criteria == SearchCriteria::Filters && app.selected_table.is_none() {
+            // Para ir a Filters o cualquier otro menu avanzado, debe haber Table seleccionado
+            if matches!(next_criteria, SearchCriteria::Filters | SearchCriteria::Aggregations | SearchCriteria::OrderBy | SearchCriteria::Limit | SearchCriteria::Fields) && app.selected_table.is_none() {
                 return;
             }
 
@@ -209,6 +252,9 @@ pub fn update_middle_panel_content(app: &mut App) {
         },
         SearchCriteria::Filters => {
             app.right_panel_state.select(Some(0));
+        },
+        _ => {
+            // Placeholder for other criteria
         }
     }
 }

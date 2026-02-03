@@ -16,6 +16,17 @@ pub enum SearchCriteria {
     Entity,
     Table,
     Filters,
+    Aggregations,
+    OrderBy,
+    Limit,
+    Fields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Filter {
+    pub field: String,
+    pub op: String,
+    pub value: String,
 }
 
 // Sub-paneles o pasos dentro de la sección de Filtros
@@ -66,11 +77,15 @@ pub struct App {
     pub right_panel_state: ListState,
 
     // --- Sub-tarea: Filters ---
+    pub filters: Vec<Filter>,
+    pub filters_op: String, // "And" | "Or"
     pub filter_step: FilterStep,
     pub available_fields: Vec<String>,
     pub selected_field: Option<String>,
     pub selected_op: String,
     pub filter_value_input: String,
+    pub filter_value_options: Vec<String>,
+    pub selected_value: Option<String>,
 }
 
 impl App {
@@ -105,11 +120,15 @@ impl App {
             middle_panel_state: ListState::default(),
             right_panel_state: ListState::default(),
             // Filters
+            filters: Vec::new(),
+            filters_op: "And".to_string(),
             filter_step: FilterStep::Field,
             available_fields: Vec::new(),
             selected_field: None,
             selected_op: "Eq".to_string(),
             filter_value_input: String::new(),
+            filter_value_options: vec!["Write value".to_string()],
+            selected_value: None,
         }
     }
 

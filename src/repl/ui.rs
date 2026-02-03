@@ -97,6 +97,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         SearchCriteria::Entity => app.search_entities.len(),
         SearchCriteria::Table => app.search_tables.len(),
         SearchCriteria::Filters => 3,
+        _ => 0,
     };
     let right_len = if app.search_criteria == SearchCriteria::Filters {
         match app.filter_step {
@@ -112,8 +113,10 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([
             Constraint::Length(7), // Menú
             Constraint::Length(content_height), // Paneles
-            Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
             Constraint::Length(1), // Instrucciones justo debajo
+            Constraint::Length(10), // Preview de Query (Expanded)
+            Constraint::Length(1), // Espacio de separación
+            Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
             Constraint::Min(0),    // Resto del espacio al final
         ])
         .split(area);
@@ -150,6 +153,22 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             "Filters",
             if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) }
         )),
+        ListItem::new(Span::styled(
+            "Aggregations",
+            if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) }
+        )),
+        ListItem::new(Span::styled(
+            "Order By",
+            if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) }
+        )),
+        ListItem::new(Span::styled(
+            "Limit",
+            if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) }
+        )),
+        ListItem::new(Span::styled(
+            "Fields",
+            if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) }
+        )),
     ];
     let left_list = List::new(left_items)
         .block(create_panel(app.focus_panel == FocusPanel::Left))
@@ -182,6 +201,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new("Op"),
             ListItem::new("Value"),
         ],
+        _ => vec![], // Placeholder for others
     };
     let mut middle_list = List::new(middle_items)
         .block(create_panel(app.focus_panel == FocusPanel::Middle))
@@ -211,24 +231,20 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::raw(format!(" {}", app.selected_op))
                 ]))
             ],
-            FilterStep::Value => vec![ListItem::new(if app.filter_value_input.is_empty() { "Press Enter to type..." } else { app.filter_value_input.as_str() })],
+            FilterStep::Value => app.filter_value_options.iter().map(|s| {
+                let is_selected = Some(s.clone()) == app.selected_value;
+                let circle = if is_selected {
+                    Span::styled("◉", Style::default().fg(active_color))
+                } else {
+                    Span::raw("○")
+                };
+                ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
+            }).collect(),
         };
         let right_list = List::new(right_items)
             .block(create_panel(app.focus_panel == FocusPanel::Right))
             .highlight_style(Style::default().fg(active_color));
         f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
-    }
-    
-    // Input Inferior
-    if app.focus_panel == FocusPanel::Bottom {
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(active_color))
-            .padding(Padding::new(2, 2, 0, 0));
-        let p = Paragraph::new(app.filter_value_input.as_str()).block(input_block);
-        f.render_widget(p, chunks[3]);
-        f.set_cursor(chunks[3].x + 3 + app.filter_value_input.len() as u16, chunks[3].y + 1);
     }
 
     // Instrucciones minimalistas con descripciones claras
@@ -241,16 +257,24 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         FocusPanel::Right => format!("↑↓ Navigate{}↵ Toggle Selection{}← Prev Panel{}esq Quit", separator, separator, separator),
         FocusPanel::Bottom => format!("↵ Accept{}esq Cancel", separator),
     };
-
+    
     let instructions_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(1)]) 
-        .split(chunks[3]);
+        .split(chunks[2]);
 
     f.render_widget(
         Paragraph::new(help_text).style(desc_style).alignment(Alignment::Right),
         instructions_layout[0]
     );
+
+    // Query Preview
+    draw_query_preview(f, app, chunks[3]);
+
+    // Input Inferior
+    if app.focus_panel == FocusPanel::Bottom {
+        draw_input_widget(f, app, chunks[5], "Type filter value...", active_color, inactive_color);
+    }
 }
 
 fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
@@ -309,18 +333,24 @@ fn draw_input_widget(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str
     let prompt_str = " > ";
     let mut spans = vec![Span::styled(prompt_str, Style::default().fg(purple).add_modifier(Modifier::BOLD))];
 
-    if app.input_buffer.is_empty() {
+    let buffer = if app.active_task == Some("Search") {
+        &app.filter_value_input
+    } else {
+        &app.input_buffer
+    };
+
+    if buffer.is_empty() {
         spans.push(Span::styled(" ", Style::default().bg(Color::White)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(placeholder, Style::default().fg(Color::DarkGray)));
     } else {
         spans.push(Span::raw(" "));
-        spans.push(Span::raw(&app.input_buffer));
+        spans.push(Span::raw(buffer));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), centered_area);
-    if !app.input_buffer.is_empty() {
-        f.set_cursor(centered_area.x + prompt_str.chars().count() as u16 + 1 + app.input_buffer.chars().count() as u16, centered_area.y);
+    if !buffer.is_empty() {
+        f.set_cursor(centered_area.x + prompt_str.chars().count() as u16 + 1 + buffer.chars().count() as u16, centered_area.y);
     }
 }
 
@@ -334,4 +364,101 @@ fn draw_suggestions_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Col
         .highlight_style(Style::default().fg(purple).add_modifier(Modifier::BOLD))
         .highlight_symbol("   > ");
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_query_preview(f: &mut Frame, app: &mut App, area: Rect) {
+    let active_color = Color::Rgb(137, 180, 249);
+    
+    // Función auxiliar para colorear las claves y valores
+    let key_style = Style::default().fg(Color::DarkGray);
+    let val_style = Style::default().fg(Color::Cyan);
+    let branch_style = Style::default().fg(Color::DarkGray);
+
+    let mut lines = Vec::new();
+
+    // Root
+    lines.push(Line::from(Span::styled("Query Preview", Style::default().fg(active_color))));
+
+    // Entity
+    lines.push(Line::from(vec![
+        Span::styled("├── ", branch_style),
+        Span::styled("Entity: ", key_style),
+        Span::styled(app.selected_entity.as_deref().unwrap_or("?"), val_style),
+    ]));
+
+    // Table
+    lines.push(Line::from(vec![
+        Span::styled("├── ", branch_style),
+        Span::styled("Table: ", key_style),
+        Span::styled(app.selected_table.as_deref().unwrap_or("?"), val_style),
+    ]));
+
+    // Filters
+    lines.push(Line::from(vec![
+        Span::styled("├── ", branch_style),
+        Span::styled("Filters: ", key_style),
+    ]));
+    
+    // Mostrar filtros guardados (si los hubiera)
+    if !app.filters.is_empty() {
+        for f in &app.filters {
+             lines.push(Line::from(vec![
+                Span::styled("│   ├── ", branch_style),
+                Span::raw(format!("Field: {} Op: {} Value: {}", f.field, f.op, f.value)),
+            ]));
+        }
+    }
+    
+    // Mostrar filtro en progreso (Draft)
+    if let Some(field) = &app.selected_field {
+        let op = &app.selected_op;
+        let val = app.selected_value.as_deref().unwrap_or("?");
+        lines.push(Line::from(vec![
+            Span::styled("│   └── ", branch_style),
+            Span::styled("(Draft) ", Style::default().fg(Color::Yellow)),
+            Span::styled(format!("Field: {}  Op: {}  Value: {}", field, op, val), Style::default().fg(Color::White)),
+        ]));
+    } else if app.filters.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("│   └── ", branch_style),
+            Span::styled("(None)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    // Filters Op
+    lines.push(Line::from(vec![
+        Span::styled("├── ", branch_style),
+        Span::styled("Filters Op: ", key_style),
+        Span::styled(&app.filters_op, val_style),
+    ]));
+
+    // Aggregations
+    lines.push(Line::from(vec![
+        Span::styled("├── ", branch_style),
+        Span::styled("Aggregations: ", key_style),
+        Span::styled("[]", val_style),
+    ]));
+
+    // Order By
+    lines.push(Line::from(vec![
+        Span::styled("├── ", branch_style),
+        Span::styled("Order By: ", key_style),
+        Span::styled("None", val_style),
+    ]));
+
+    // Limit
+    lines.push(Line::from(vec![
+        Span::styled("├── ", branch_style),
+        Span::styled("Limit: ", key_style),
+        Span::styled("None", val_style),
+    ]));
+
+    // Fields
+    lines.push(Line::from(vec![
+        Span::styled("└── ", branch_style),
+        Span::styled("Fields: ", key_style),
+        Span::styled("All", val_style),
+    ]));
+
+    f.render_widget(Paragraph::new(lines), area);
 }
