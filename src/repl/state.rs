@@ -16,6 +16,7 @@ pub enum SearchCriteria {
     Entity,
     Table,
     Filters,
+    FiltersOp,
     Aggregations,
     OrderBy,
     Limit,
@@ -27,23 +28,36 @@ pub struct Filter {
     pub field: String,
     pub op: String,
     pub value: String,
+    pub value_options: Vec<String>,
 }
 
 // Sub-paneles o pasos dentro de la sección de Filtros
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum FilterStep {
+    List, 
     Field,
     Op,
     Value,
 }
 
+#[derive(PartialEq, Clone, Debug)]
+pub enum AggregationStep {
+    Main,
+}
+
+pub struct OrderBy {
+    pub field: String,
+    pub direction: String, // "Asc" | "Desc"
+}
+
 // Para manejar el foco en la UI de búsqueda
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum FocusPanel {
-    Left,   // Entity, Table, Filters
-    Middle, // Opciones de Entity/Table, o Pasos de Filtro
-    Right,  // Opciones de Field/Op
-    Bottom, // Input para el valor del filtro
+    Left,   // Entity, Table, Filters, Aggregations...
+    Middle, // Lista de Filtros / Lista de Agregaciones
+    Right,  // Pasos de Filtro (Field, Op, Value) / Pasos de Agregación
+    Extra,  // Opciones de Field/Op/Value
+    Bottom, // Input para el valor
 }
 
 pub struct App {
@@ -75,6 +89,7 @@ pub struct App {
     pub left_panel_state: ListState,
     pub middle_panel_state: ListState,
     pub right_panel_state: ListState,
+    pub extra_panel_state: ListState,
 
     // --- Sub-tarea: Filters ---
     pub filters: Vec<Filter>,
@@ -86,6 +101,22 @@ pub struct App {
     pub filter_value_input: String,
     pub filter_value_options: Vec<String>,
     pub selected_value: Option<String>,
+
+    // --- Sub-tarea: Aggregations ---
+    pub aggregations: Vec<serde_json::Value>,
+    pub agg_step: AggregationStep,
+    pub agg_type_options: Vec<String>,
+    pub agg_op_options: Vec<String>,
+    pub agg_value_options: Vec<String>,
+
+    // --- Sub-tarea: Order By ---
+    pub order_by: Option<OrderBy>,
+
+    // --- Sub-tarea: Limit ---
+    pub limit: Option<usize>,
+
+    // --- Sub-tarea: Fields ---
+    pub selected_fields: Vec<String>,
 }
 
 impl App {
@@ -119,16 +150,37 @@ impl App {
             left_panel_state,
             middle_panel_state: ListState::default(),
             right_panel_state: ListState::default(),
+            extra_panel_state: ListState::default(),
             // Filters
             filters: Vec::new(),
             filters_op: "And".to_string(),
-            filter_step: FilterStep::Field,
+            filter_step: FilterStep::List,
             available_fields: Vec::new(),
             selected_field: None,
             selected_op: "Eq".to_string(),
             filter_value_input: String::new(),
             filter_value_options: vec!["Write value".to_string()],
             selected_value: None,
+            // Aggregations
+            aggregations: Vec::new(),
+            agg_step: AggregationStep::Main,
+            agg_type_options: vec![
+                "TopN".to_string(), "GroupBy".to_string(), "Sum".to_string(), 
+                "Avg".to_string(), "Min".to_string(), "Max".to_string(),
+                "ConsecutiveBuckets".to_string(), "RetentionByBucket".to_string(),
+                "InactiveSinceBucket".to_string()
+            ],
+            agg_op_options: vec![
+                "Sum".to_string(), "Count".to_string(), "Avg".to_string(), 
+                "Min".to_string(), "Max".to_string()
+            ],
+            agg_value_options: vec!["Write value".to_string()],
+            // Order By
+            order_by: None,
+            // Limit
+            limit: None,
+            // Fields
+            selected_fields: Vec::new(),
         }
     }
 

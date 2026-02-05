@@ -1,7 +1,7 @@
 use crossterm::event::{self, KeyCode};
 use std::path::Path;
 
-use crate::repl::state::{App, SearchCriteria, FilterStep, FocusPanel};
+use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel};
 use crate::repl::utils::get_indexed_fields;
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
@@ -27,6 +27,11 @@ pub fn init_search(app: &mut App) {
     app.search_criteria = SearchCriteria::Entity;
     app.filter_value_options = vec!["Write value".to_string()];
     app.selected_value = None;
+    app.filters.clear();
+    app.aggregations.clear();
+    app.order_by = None;
+    app.limit = None;
+    app.selected_fields.clear();
     update_middle_panel_content(app);
 }
 
@@ -36,23 +41,72 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             KeyCode::Enter => {
                 if !app.filter_value_input.is_empty() {
                     let val = app.filter_value_input.clone();
-                    if !app.filter_value_options.contains(&val) {
-                        app.filter_value_options.push(val.clone());
-                    }
-                    app.selected_value = Some(val.clone());
                     
-                    // Encontrar el índice del valor seleccionado para actualizar la lista
+                    match app.search_criteria {
+                        SearchCriteria::Filters => {
+                             if let Some(f_idx) = app.middle_panel_state.selected() {
+                                if f_idx < app.filters.len() {
+                                    app.filters[f_idx].value = val.clone();
+                                    if !app.filters[f_idx].value_options.contains(&val) {
+                                        app.filters[f_idx].value_options.push(val.clone());
+                                    }
+                                    app.filter_value_options = app.filters[f_idx].value_options.clone();
+                                }
+                            }
+                        }
+                        SearchCriteria::Aggregations => {
+                             if let Some(f_idx) = app.middle_panel_state.selected() {
+                                if f_idx < app.aggregations.len() {
+                                    let agg = &mut app.aggregations[f_idx];
+                                    let selected_step_idx = app.right_panel_state.selected().unwrap_or(0);
+                                    if selected_step_idx > 0 {
+                                        if let Some(inner) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
+                                            let keys: Vec<String> = inner.keys().cloned().collect();
+                                            if let Some(key) = keys.get(selected_step_idx - 1) {
+                                                let num_keys = vec!["n", "top_n", "limit", "page", "min_streak"];
+                                                if num_keys.contains(&key.as_str()) {
+                                                    if let Ok(num) = val.parse::<u64>() {
+                                                        inner.insert(key.clone(), serde_json::json!(num));
+                                                    } else {
+                                                        inner.insert(key.clone(), serde_json::json!(val));
+                                                    }
+                                                } else {
+                                                    inner.insert(key.clone(), serde_json::json!(val));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !app.agg_value_options.contains(&val) {
+                                        app.agg_value_options.push(val.clone());
+                                    }
+                                    if let Some(pos) = app.agg_value_options.iter().position(|x| x == &val) {
+                                        app.extra_panel_state.select(Some(pos));
+                                    }
+                                }
+                            }
+                            app.focus_panel = FocusPanel::Extra;
+                        }
+                        SearchCriteria::Limit => {
+                            app.limit = val.parse::<usize>().ok();
+                            app.focus_panel = FocusPanel::Middle;
+                            app.filter_value_input.clear();
+                            return;
+                        }
+                        _ => {}
+                    }
+                    
+                    // Encontrar el índice del valor seleccionado para actualizar la lista en Extra
                     if let Some(idx) = app.filter_value_options.iter().position(|x| x == &val) {
-                        app.right_panel_state.select(Some(idx));
+                        app.extra_panel_state.select(Some(idx));
                     }
                     
                     app.filter_value_input.clear();
                 }
-                app.focus_panel = FocusPanel::Right;
+                app.focus_panel = FocusPanel::Extra;
             },
             KeyCode::Esc => {
                 app.filter_value_input.clear();
-                app.focus_panel = FocusPanel::Right;
+                app.focus_panel = FocusPanel::Extra;
             },
             KeyCode::Char(c) => app.filter_value_input.push(c),
             KeyCode::Backspace => { app.filter_value_input.pop(); },
@@ -68,6 +122,11 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             app.selected_entity = None;
             app.selected_table = None;
             app.selected_field = None;
+            app.filters.clear();
+            app.aggregations.clear();
+            app.order_by = None;
+            app.limit = None;
+            app.selected_fields.clear();
             app.filter_value_input.clear();
             app.search_tables.clear();
             app.available_fields.clear();
@@ -79,12 +138,34 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
         }
         KeyCode::Right | KeyCode::Tab => match app.focus_panel {
             FocusPanel::Left => app.focus_panel = FocusPanel::Middle,
-            FocusPanel::Middle => if app.search_criteria == SearchCriteria::Filters { app.focus_panel = FocusPanel::Right },
+            FocusPanel::Middle => {
+                if app.search_criteria == SearchCriteria::OrderBy {
+                    app.focus_panel = FocusPanel::Extra;
+                } else if matches!(app.search_criteria, SearchCriteria::Filters | SearchCriteria::Aggregations) {
+                    let idx = app.middle_panel_state.selected().unwrap_or(0);
+                    let len = if app.search_criteria == SearchCriteria::Filters { app.filters.len() } else { app.aggregations.len() };
+                    if idx < len {
+                        app.focus_panel = FocusPanel::Right;
+                    }
+                }
+            },
+            FocusPanel::Right => {
+                if matches!(app.search_criteria, SearchCriteria::Filters | SearchCriteria::Aggregations) {
+                    app.focus_panel = FocusPanel::Extra;
+                }
+            },
             _ => {}
         },
         KeyCode::Left => match app.focus_panel {
             FocusPanel::Middle => app.focus_panel = FocusPanel::Left,
             FocusPanel::Right => app.focus_panel = FocusPanel::Middle,
+            FocusPanel::Extra => {
+                if app.search_criteria == SearchCriteria::OrderBy {
+                    app.focus_panel = FocusPanel::Middle;
+                } else {
+                    app.focus_panel = FocusPanel::Right;
+                }
+            },
             _ => {}
         },
         KeyCode::Up => navigate_list(app, -1),
@@ -118,30 +199,200 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         update_middle_panel_content(app);
                     }
                 }
+                (FocusPanel::Middle, SearchCriteria::FiltersOp) => {
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        match idx {
+                            0 => app.filters_op = "And".to_string(),
+                            1 => app.filters_op = "Or".to_string(),
+                            _ => {}
+                        }
+                    }
+                }
                 (FocusPanel::Middle, SearchCriteria::Filters) => {
-                    if app.filter_step == FilterStep::Value {
-                        app.focus_panel = FocusPanel::Bottom;
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        let add_new_idx = app.filters.len();
+                        let delete_idx = if !app.filters.is_empty() { Some(app.filters.len() + 1) } else { None };
+
+                        if idx == add_new_idx {
+                            app.filters.push(crate::repl::state::Filter {
+                                field: "?".to_string(), op: "Eq".to_string(), value: "?".to_string(),
+                                value_options: vec!["Write value".to_string()],
+                            });
+                            app.middle_panel_state.select(Some(app.filters.len() - 1));
+                            app.filter_value_options = vec!["Write value".to_string()];
+                        } else if delete_idx == Some(idx) {
+                            if !app.filters.is_empty() {
+                                app.filters.pop();
+                                let new_idx = app.filters.len().saturating_sub(1);
+                                app.middle_panel_state.select(Some(new_idx));
+                                if let Some(f) = app.filters.get(new_idx) {
+                                    app.filter_value_options = f.value_options.clone();
+                                } else {
+                                    app.filter_value_options = vec!["Write value".to_string()];
+                                }
+                            }
+                        } else {
+                            if let Some(f) = app.filters.get(idx) {
+                                app.filter_value_options = f.value_options.clone();
+                            }
+                            app.focus_panel = FocusPanel::Right;
+                        }
+                    }
+                }
+                (FocusPanel::Middle, SearchCriteria::Aggregations) => {
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        let add_new_idx = app.aggregations.len();
+                        let delete_idx = if !app.aggregations.is_empty() { Some(app.aggregations.len() + 1) } else { None };
+
+                        if idx == add_new_idx {
+                            app.aggregations.push(serde_json::json!({"TopN": {"field": "?", "n": 0}}));
+                            app.middle_panel_state.select(Some(app.aggregations.len() - 1));
+                        } else if delete_idx == Some(idx) {
+                            if !app.aggregations.is_empty() {
+                                app.aggregations.pop();
+                                app.middle_panel_state.select(Some(app.aggregations.len().saturating_sub(1)));
+                            }
+                        } else {
+                            app.focus_panel = FocusPanel::Right;
+                        }
+                    }
+                }
+                (FocusPanel::Middle, SearchCriteria::OrderBy) => {
+                    app.focus_panel = FocusPanel::Extra;
+                }
+                (FocusPanel::Middle, SearchCriteria::Limit) => {
+                    app.focus_panel = FocusPanel::Bottom;
+                }
+                (FocusPanel::Middle, SearchCriteria::Fields) => {
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        if let Some(field) = app.available_fields.get(idx).cloned() {
+                            if app.selected_fields.contains(&field) {
+                                app.selected_fields.retain(|f| f != &field);
+                            } else {
+                                app.selected_fields.push(field);
+                            }
+                        }
                     }
                 }
                 (FocusPanel::Right, SearchCriteria::Filters) => {
+                    app.focus_panel = FocusPanel::Extra;
+                }
+                (FocusPanel::Right, SearchCriteria::Aggregations) => {
+                    app.focus_panel = FocusPanel::Extra;
+                }
+                (FocusPanel::Extra, SearchCriteria::Filters) => {
                     match app.filter_step {
                         FilterStep::Field => {
-                            if let Some(idx) = app.right_panel_state.selected() {
-                                app.selected_field = app.available_fields.get(idx).cloned();
+                            if let Some(idx) = app.extra_panel_state.selected() {
+                                if let Some(field) = app.available_fields.get(idx) {
+                                    if let Some(f_idx) = app.middle_panel_state.selected() {
+                                        if f_idx < app.filters.len() {
+                                            app.filters[f_idx].field = field.clone();
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        FilterStep::Op => {
+                            if let Some(idx) = app.extra_panel_state.selected() {
+                                let ops = vec!["Eq", "In", "Gte", "Lt"];
+                                if let Some(op) = ops.get(idx) {
+                                    if let Some(f_idx) = app.middle_panel_state.selected() {
+                                        if f_idx < app.filters.len() {
+                                            app.filters[f_idx].op = op.to_string();
+                                        }
+                                    }
+                                }
                             }
                         },
                         FilterStep::Value => {
-                            if let Some(idx) = app.right_panel_state.selected() {
+                            if let Some(idx) = app.extra_panel_state.selected() {
                                 if let Some(val) = app.filter_value_options.get(idx) {
                                     if val == "Write value" {
                                         app.focus_panel = FocusPanel::Bottom;
                                     } else {
-                                        app.selected_value = Some(val.clone());
+                                        if let Some(f_idx) = app.middle_panel_state.selected() {
+                                            if f_idx < app.filters.len() {
+                                                app.filters[f_idx].value = val.clone();
+                                            }
+                                        }
                                     }
                                 }
                             }
                         },
                         _ => {}
+                    }
+                }
+                (FocusPanel::Extra, SearchCriteria::Aggregations) => {
+                    if let Some(f_idx) = app.middle_panel_state.selected() {
+                        if f_idx < app.aggregations.len() {
+                            let agg = &mut app.aggregations[f_idx];
+                            let selected_step_idx = app.right_panel_state.selected().unwrap_or(0);
+
+                            if selected_step_idx == 0 {
+                                // Change Type logic
+                                if let Some(idx) = app.extra_panel_state.selected() {
+                                    let new_type = &app.agg_type_options[idx];
+                                    *agg = match new_type.as_str() {
+                                        "GroupBy" => serde_json::json!({"GroupBy": {"field": "?", "operation": "Count"}}),
+                                        "TopN" => serde_json::json!({"TopN": {"field": "?", "n": 10}}),
+                                        "Sum" | "Avg" | "Min" | "Max" => serde_json::json!({new_type: {"field": "?"}}),
+                                        "ConsecutiveBuckets" => serde_json::json!({"ConsecutiveBuckets": {"key_field": "?", "bucket_field": "?"}}),
+                                        "RetentionByBucket" => serde_json::json!({"RetentionByBucket": {"key_field": "?", "bucket_field": "?"}}),
+                                        "InactiveSinceBucket" => serde_json::json!({"InactiveSinceBucket": {"key_field": "?", "bucket_field": "?"}}),
+                                        _ => serde_json::json!({new_type: {"field": "?"}}),
+                                    };
+                                }
+                            } else if let Some(inner) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
+                                let keys: Vec<String> = inner.keys().cloned().collect();
+                                if let Some(key) = keys.get(selected_step_idx - 1) {
+                                    if let Some(idx) = app.extra_panel_state.selected() {
+                                        match key.as_str() {
+                                            "field" | "key_field" | "bucket_field" | "value_field" => {
+                                                if let Some(field) = app.available_fields.get(idx) {
+                                                    inner.insert(key.clone(), serde_json::json!(field));
+                                                }
+                                            }
+                                            "operation" => {
+                                                if let Some(op) = app.agg_op_options.get(idx) {
+                                                    inner.insert(key.clone(), serde_json::json!(op));
+                                                }
+                                            }
+                                            _ => {
+                                                // Manejar valores de agg_value_options (Write value + history)
+                                                if let Some(val) = app.agg_value_options.get(idx) {
+                                                    if val == "Write value" {
+                                                        app.focus_panel = FocusPanel::Bottom;
+                                                    } else {
+                                                        let num_keys = vec!["n", "top_n", "limit", "page", "min_streak"];
+                                                        if num_keys.contains(&key.as_str()) {
+                                                            if let Ok(num) = val.parse::<u64>() {
+                                                                inner.insert(key.clone(), serde_json::json!(num));
+                                                            } else {
+                                                                inner.insert(key.clone(), serde_json::json!(val));
+                                                            }
+                                                        } else {
+                                                            inner.insert(key.clone(), serde_json::json!(val));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                (FocusPanel::Extra, SearchCriteria::OrderBy) => {
+                    if let Some(idx) = app.extra_panel_state.selected() {
+                        let mut current = app.order_by.take().unwrap_or(crate::repl::state::OrderBy { field: "?".to_string(), direction: "Asc".to_string() });
+                        match app.middle_panel_state.selected() {
+                            Some(0) => current.field = app.available_fields[idx].clone(),
+                            Some(1) => current.direction = if idx == 0 { "Asc".to_string() } else { "Desc".to_string() },
+                            _ => {}
+                        }
+                        app.order_by = Some(current);
                     }
                 }
                 _ => {}
@@ -153,26 +404,85 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
 
 fn navigate_list(app: &mut App, delta: isize) {
     let (state, len) = match app.focus_panel {
-        FocusPanel::Left => (&mut app.left_panel_state, 7),
+        FocusPanel::Left => {
+            let len = 7 + if app.filters.len() > 1 { 1 } else { 0 };
+            (&mut app.left_panel_state, len)
+        },
         FocusPanel::Middle => {
             let len = match app.search_criteria {
                 SearchCriteria::Entity => app.search_entities.len(),
                 SearchCriteria::Table => app.search_tables.len(),
-                SearchCriteria::Filters => 3,
-                _ => 0,
+                SearchCriteria::Filters => {
+                     app.filters.len() + 1 + if !app.filters.is_empty() { 1 } else { 0 }
+                },
+                SearchCriteria::Aggregations => {
+                    app.aggregations.len() + 1 + if !app.aggregations.is_empty() { 1 } else { 0 }
+                },
+                SearchCriteria::FiltersOp => 2,
+                SearchCriteria::OrderBy => 2,
+                SearchCriteria::Limit => 1,
+                SearchCriteria::Fields => app.available_fields.len(),
             };
             (&mut app.middle_panel_state, len)
         },
         FocusPanel::Right => {
-            let len = if app.search_criteria == SearchCriteria::Filters {
-                match app.filter_step {
-                    FilterStep::Field => app.available_fields.len(),
-                    FilterStep::Value => app.filter_value_options.len(),
-                    _ => 1,
-                }
-            } else { 0 };
+            let len = match app.search_criteria {
+                SearchCriteria::Filters => 3,
+                SearchCriteria::Aggregations => {
+                    let mut count = 1; // "Change Type"
+                    let current_idx = app.middle_panel_state.selected().unwrap_or(0);
+                    if let Some(agg) = app.aggregations.get(current_idx) {
+                        if let Some(inner) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                            count += inner.keys().count();
+                        }
+                    }
+                    count
+                },
+                _ => 0,
+            };
             (&mut app.right_panel_state, len)
         },
+        FocusPanel::Extra => {
+            let len = match app.search_criteria {
+                SearchCriteria::Filters => {
+                    match app.filter_step {
+                        FilterStep::Field => app.available_fields.len(),
+                        FilterStep::Value => app.filter_value_options.len(),
+                        FilterStep::Op => 4, // Eq, In, Gte, Lt
+                        _ => 0,
+                    }
+                },
+                SearchCriteria::Aggregations => {
+                    let selected_step_idx = app.right_panel_state.selected().unwrap_or(0);
+                    if selected_step_idx == 0 {
+                        app.agg_type_options.len()
+                    } else {
+                        let current_idx = app.middle_panel_state.selected().unwrap_or(0);
+                        if let Some(agg) = app.aggregations.get(current_idx) {
+                            if let Some(inner) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                                let keys: Vec<&String> = inner.keys().collect();
+                                if let Some(key) = keys.get(selected_step_idx - 1) {
+                                    match key.as_str() {
+                                        "field" | "key_field" | "bucket_field" | "value_field" => app.available_fields.len(),
+                                        "operation" => app.agg_op_options.len(),
+                                        _ => 1, // "Write value"
+                                    }
+                                } else { 0 }
+                            } else { 0 }
+                        } else { 0 }
+                    }
+                },
+                SearchCriteria::OrderBy => {
+                    match app.middle_panel_state.selected() {
+                        Some(0) => app.available_fields.len(),
+                        Some(1) => 2, // Asc, Desc
+                        _ => 0,
+                    }
+                },
+                _ => 0,
+            };
+            (&mut app.extra_panel_state, len)
+        }
         _ => return,
     };
 
@@ -183,39 +493,78 @@ fn navigate_list(app: &mut App, delta: isize) {
     // Update derived state based on new selection
     match app.focus_panel {
         FocusPanel::Left => {
+            let has_filters_op = app.filters.len() > 1;
             let next_criteria = match next { 
                 0 => SearchCriteria::Entity, 
                 1 => SearchCriteria::Table, 
                 2 => SearchCriteria::Filters,
-                3 => SearchCriteria::Aggregations,
-                4 => SearchCriteria::OrderBy,
-                5 => SearchCriteria::Limit,
-                6 => SearchCriteria::Fields,
-                _ => SearchCriteria::Entity 
+                3 if has_filters_op => SearchCriteria::FiltersOp,
+                idx => {
+                    let offset = if has_filters_op { 0 } else { 1 };
+                    match idx + offset {
+                        4 => SearchCriteria::Aggregations,
+                        5 => SearchCriteria::OrderBy,
+                        6 => SearchCriteria::Limit,
+                        7 => SearchCriteria::Fields,
+                        _ => SearchCriteria::Entity 
+                    }
+                }
             };
             
             // Requisitos para navegar:
-            // Para ir a Table, debe haber Entity seleccionado
-            if next_criteria == SearchCriteria::Table && app.selected_entity.is_none() {
-                return;
-            }
-            // Para ir a Filters o cualquier otro menu avanzado, debe haber Table seleccionado
-            if matches!(next_criteria, SearchCriteria::Filters | SearchCriteria::Aggregations | SearchCriteria::OrderBy | SearchCriteria::Limit | SearchCriteria::Fields) && app.selected_table.is_none() {
-                return;
-            }
+            if next_criteria == SearchCriteria::Table && app.selected_entity.is_none() { return; }
+            if matches!(next_criteria, SearchCriteria::Filters | SearchCriteria::FiltersOp | SearchCriteria::Aggregations | SearchCriteria::OrderBy | SearchCriteria::Limit | SearchCriteria::Fields) && app.selected_table.is_none() { return; }
 
             state.select(Some(next));
             app.search_criteria = next_criteria;
+            
+            // Inicializar estados según el criterio
+            match app.search_criteria {
+                SearchCriteria::Filters => {
+                    app.filter_step = FilterStep::Field;
+                }
+                SearchCriteria::Aggregations => {
+                    app.agg_value_options = vec!["Write value".to_string()];
+                    app.agg_step = AggregationStep::Main;
+                }
+                _ => {}
+            }
+
             app.middle_panel_state.select(Some(0));
             app.right_panel_state.select(Some(0));
-            // Update the middle panel content based on the new criteria
+            app.extra_panel_state.select(Some(0));
             update_middle_panel_content(app);
         },
         FocusPanel::Middle => {
             state.select(Some(next));
-            if app.search_criteria == SearchCriteria::Filters {
+            match app.search_criteria {
+                SearchCriteria::Filters => {
+                    app.right_panel_state.select(Some(0));
+                    app.filter_step = FilterStep::Field;
+                    if let Some(f) = app.filters.get(next) { app.filter_value_options = f.value_options.clone(); }
+                }
+                SearchCriteria::Aggregations => {
+                    app.right_panel_state.select(Some(0));
+                    app.agg_step = AggregationStep::Main;
+                    app.agg_value_options = vec!["Write value".to_string()];
+                    // Sincronizar extra panel si es un agg existente
+                    if next < app.aggregations.len() {
+                        app.extra_panel_state.select(Some(0));
+                    }
+                }
+                SearchCriteria::OrderBy => {
+                    app.extra_panel_state.select(Some(0));
+                }
+                _ => {}
+            }
+        },
+        FocusPanel::Right => {
+            state.select(Some(next));
+            if app.search_criteria == SearchCriteria::Aggregations {
+                 app.extra_panel_state.select(Some(0));
+            } else if app.search_criteria == SearchCriteria::Filters {
                  app.filter_step = match next { 0 => FilterStep::Field, 1 => FilterStep::Op, _ => FilterStep::Value };
-                 app.right_panel_state.select(Some(0));
+                 app.extra_panel_state.select(Some(0));
             }
         },
         _ => {
@@ -252,6 +601,9 @@ pub fn update_middle_panel_content(app: &mut App) {
         },
         SearchCriteria::Filters => {
             app.right_panel_state.select(Some(0));
+        },
+        SearchCriteria::FiltersOp => {
+             app.right_panel_state.select(None);
         },
         _ => {
             // Placeholder for other criteria
