@@ -110,7 +110,7 @@ pub struct App {
     pub agg_value_options: Vec<String>,
 
     // --- Sub-tarea: Order By ---
-    pub order_by: Option<OrderBy>,
+    pub order_by: Vec<OrderBy>,
 
     // --- Sub-tarea: Limit ---
     pub limit: Option<usize>,
@@ -176,7 +176,7 @@ impl App {
             ],
             agg_value_options: vec!["Write value".to_string()],
             // Order By
-            order_by: None,
+            order_by: Vec::new(),
             // Limit
             limit: None,
             // Fields

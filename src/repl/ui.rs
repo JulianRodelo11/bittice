@@ -1,10 +1,11 @@
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
 use crate::repl::utils::get_loaded_data;
+use crate::ui::colors;
 use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
 
 pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
-    let purple_muted = Color::Rgb(244, 230, 255);
+    let purple_muted = colors::MUTED_COLOR;
     let size = f.size();
 
     // 🔹 Layout raíz con simetría vertical
@@ -88,10 +89,10 @@ fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_
 }
 
 fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
-    let purple = Color::Rgb(197, 137, 249);
-    let purple_muted = Color::Rgb(244, 230, 255);
-    let active_color = Color::Rgb(137, 180, 249);
-    let inactive_color = Color::Rgb(244, 230, 255);
+    let purple = colors::PRIMARY_COLOR;
+    let purple_muted = colors::MUTED_COLOR;
+    let active_color = colors::ACTIVE_COLOR;
+    let inactive_color = colors::INACTIVE_COLOR;
 
     let content_height = 10; // Altura fija reducida para mayor simetría y compacidad
 
@@ -142,22 +143,20 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                 .split(chunks[1])
         }
     } else if app.search_criteria == SearchCriteria::OrderBy {
-        Layout::default().direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(20), 
-                Constraint::Percentage(20), 
-                Constraint::Percentage(20), 
-                Constraint::Percentage(40)
-            ])
-            .split(chunks[1])
-    } else if app.search_criteria == SearchCriteria::OrderBy {
-        Layout::default().direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(25), 
-                Constraint::Percentage(25), 
-                Constraint::Percentage(50)
-            ])
-            .split(chunks[1])
+        if app.order_by.is_empty() {
+            Layout::default().direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(chunks[1])
+        } else {
+            Layout::default().direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(20), 
+                    Constraint::Percentage(20), 
+                    Constraint::Percentage(20), 
+                    Constraint::Percentage(40)
+                ])
+                .split(chunks[1])
+        }
     } else {
         Layout::default().direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -208,7 +207,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .padding(Padding::new(1, 1, 1, 1))
-            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Left { active_color } else { inactive_color })))
+            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Left { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
         .highlight_style(Style::default().fg(active_color))
         .highlight_symbol("> ");
     f.render_stateful_widget(left_list, panel_layout[0], &mut app.left_panel_state);
@@ -240,9 +239,9 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(active_color)
                 ))
             }).collect();
-            items.push(ListItem::new(Span::styled("+ Add Next Filter", Style::default().fg(Color::Rgb(130, 200, 160)))));
+            items.push(ListItem::new(Span::styled("+ Add Next Filter", Style::default().fg(colors::ADD_COLOR))));
             if !app.filters.is_empty() {
-                items.push(ListItem::new(Span::styled("- Delete Filter", Style::default().fg(Color::Rgb(249, 137, 197)))));
+                items.push(ListItem::new(Span::styled("- Delete Filter", Style::default().fg(colors::DELETE_COLOR))));
             }
             items
         },
@@ -254,16 +253,22 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     .unwrap_or("Unknown");
                 ListItem::new(format!("Agg {}: {}", i + 1, agg_type))
             }).collect();
-            items.push(ListItem::new(Span::styled("+ Add Next Aggregation", Style::default().fg(Color::Rgb(130, 200, 160)))));
+            items.push(ListItem::new(Span::styled("+ Add Next Aggregation", Style::default().fg(colors::ADD_COLOR))));
             if !app.aggregations.is_empty() {
-                items.push(ListItem::new(Span::styled("- Delete Aggregation", Style::default().fg(Color::Rgb(249, 137, 197)))));
+                items.push(ListItem::new(Span::styled("- Delete Aggregation", Style::default().fg(colors::DELETE_COLOR))));
             }
             items
         },
-        SearchCriteria::OrderBy => vec![
-            ListItem::new(format!("Field: {}", app.order_by.as_ref().map(|o| o.field.as_str()).unwrap_or("?"))),
-            ListItem::new(format!("Direction: {}", app.order_by.as_ref().map(|o| o.direction.as_str()).unwrap_or("?"))),
-        ],
+        SearchCriteria::OrderBy => {
+            let mut items: Vec<ListItem> = app.order_by.iter().enumerate().map(|(i, o)| {
+                ListItem::new(format!("{}: {} {}", i + 1, o.field, o.direction))
+            }).collect();
+            items.push(ListItem::new(Span::styled("+ Add Next OrderBy", Style::default().fg(colors::ADD_COLOR))));
+            if !app.order_by.is_empty() {
+                items.push(ListItem::new(Span::styled("- Delete OrderBy", Style::default().fg(colors::DELETE_COLOR))));
+            }
+            items
+        },
         SearchCriteria::Limit => vec![
             ListItem::new(format!("Value: {}", app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string()))),
         ],
@@ -298,7 +303,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .padding(Padding::new(1, 1, 1, 1))
-            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Middle { active_color } else { inactive_color })))
+            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Middle { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
         .highlight_style(Style::default().fg(active_color))
         .highlight_symbol("> ");
     f.render_stateful_widget(middle_list, panel_layout[1], &mut app.middle_panel_state);
@@ -335,7 +340,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
 
                             .padding(Padding::new(1, 1, 1, 1))
 
-                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { active_color } else { inactive_color })))
+                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
 
                         .highlight_style(Style::default().fg(active_color))
 
@@ -403,7 +408,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
 
                             .padding(Padding::new(1, 1, 1, 1))
 
-                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { active_color } else { inactive_color })))
+                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
 
                         .highlight_style(Style::default().fg(active_color))
 
@@ -449,7 +454,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
 
                             .padding(Padding::new(1, 1, 1, 1))
 
-                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { active_color } else { inactive_color })))
+                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
 
                         .highlight_style(Style::default().fg(active_color))
 
@@ -571,7 +576,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
 
                             .padding(Padding::new(1, 1, 1, 1))
 
-                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { active_color } else { inactive_color })))
+                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
 
                         .highlight_style(Style::default().fg(active_color))
 
@@ -581,25 +586,44 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
 
                 }
 
-            } else if app.search_criteria == SearchCriteria::OrderBy {
-        let extra_items = match app.middle_panel_state.selected() {
-            Some(0) => app.available_fields.iter().map(|f| ListItem::new(f.as_str())).collect(),
-            Some(1) => vec![ListItem::new("Asc"), ListItem::new("Desc")],
-            _ => vec![],
-        };
-        let extra_list = List::new(extra_items)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .padding(Padding::new(1, 1, 1, 1))
-                .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { active_color } else { inactive_color })))
-            .highlight_style(Style::default().fg(active_color))
-            .highlight_symbol("> ");
-        f.render_stateful_widget(extra_list, panel_layout[2], &mut app.extra_panel_state);
-    }
+            } else if app.search_criteria == SearchCriteria::OrderBy && !app.order_by.is_empty() {
+                let current_idx = app.middle_panel_state.selected().unwrap_or(0);
+                if current_idx < app.order_by.len() {
+                    // Panel 2 (Right): Field / Direction
+                    let right_items = vec![
+                        ListItem::new("Field"),
+                        ListItem::new("Direction"),
+                    ];
+                    let right_list = List::new(right_items)
+                        .block(Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .padding(Padding::new(1, 1, 1, 1))
+                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
+                        .highlight_style(Style::default().fg(active_color))
+                        .highlight_symbol("> ");
+                    f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
+
+                    // Panel 3 (Extra): Options
+                    let extra_items = match app.right_panel_state.selected() {
+                         Some(0) => app.available_fields.iter().map(|f| ListItem::new(f.as_str())).collect(),
+                         Some(1) => vec![ListItem::new("Asc"), ListItem::new("Desc")],
+                         _ => vec![],
+                    };
+                    let extra_list = List::new(extra_items)
+                        .block(Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .padding(Padding::new(1, 1, 1, 1))
+                            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
+                        .highlight_style(Style::default().fg(active_color))
+                        .highlight_symbol("> ");
+                    f.render_stateful_widget(extra_list, panel_layout[3], &mut app.extra_panel_state);
+                }
+            }
 
     // Instrucciones minimalistas con descripciones claras
-    let desc_style = Style::default().fg(purple);
+    let desc_style = Style::default().fg(colors::INSTRUCTION_COLOR);
     let separator = "  •  ";
 
     let help_text = match app.focus_panel {
@@ -672,18 +696,24 @@ fn draw_loaded_data_widget(f: &mut Frame, data: &[String], area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_input_widget(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str, purple: Color, purple_muted: Color) {
+fn draw_input_widget(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str, _color: Color, purple_muted: Color) {
+    let is_focused = if app.active_task == Some("Search") {
+        app.focus_panel == FocusPanel::Bottom
+    } else {
+        true // In Load UI, the input is usually the focus if we are in those steps
+    };
+
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(purple_muted));
+        .border_style(Style::default().fg(if is_focused { colors::SAND } else { purple_muted }));
     f.render_widget(&input_block, area);
 
     let inner = input_block.inner(area).inner(&Margin { vertical: 0, horizontal: 1 });
     let centered_area = Rect { x: inner.x, y: inner.y + (inner.height / 2), width: inner.width, height: 1 };
 
     let prompt_str = " > ";
-    let mut spans = vec![Span::styled(prompt_str, Style::default().fg(purple).add_modifier(Modifier::BOLD))];
+    let mut spans = vec![Span::styled(prompt_str, Style::default().fg(colors::SAND).add_modifier(Modifier::BOLD))];
 
     let buffer = if app.active_task == Some("Search") {
         &app.filter_value_input
@@ -719,12 +749,12 @@ fn draw_suggestions_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Col
 }
 
 fn draw_query_preview(f: &mut Frame, app: &mut App, area: Rect) {
-    let active_color = Color::Rgb(137, 180, 249);
+    let active_color = colors::ACTIVE_COLOR;
     
     // Función auxiliar para colorear las claves y valores
-    let key_style = Style::default().fg(Color::DarkGray);
-    let val_style = Style::default().fg(Color::Cyan);
-    let branch_style = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(colors::KEY_COLOR);
+    let val_style = Style::default().fg(colors::VALUE_COLOR);
+    let branch_style = Style::default().fg(colors::KEY_COLOR);
 
     let mut lines = Vec::new();
 
@@ -802,11 +832,20 @@ fn draw_query_preview(f: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled("├── ", branch_style),
         Span::styled("Order By: ", key_style),
-        Span::styled(
-            app.order_by.as_ref().map(|o| format!("{} {}", o.field, o.direction)).unwrap_or_else(|| "None".to_string()),
-            val_style
-        ),
     ]));
+    if !app.order_by.is_empty() {
+        for (i, o) in app.order_by.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(if i == app.order_by.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style),
+                Span::styled(format!("{} {}", o.field, o.direction), val_style),
+            ]));
+        }
+    } else {
+         lines.push(Line::from(vec![
+            Span::styled("│   └── ", branch_style),
+            Span::styled("(None)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
 
     // Limit
     lines.push(Line::from(vec![

@@ -15,6 +15,7 @@ use state::{App, LoadStep};
 use std::io;
 use std::time::Duration;
 use ui::ui;
+use crate::ui::colors;
 use utils::{get_path_suggestions, get_loaded_data};
 
 pub fn run_interactive() -> Result<()> {
@@ -44,10 +45,8 @@ pub fn run_interactive() -> Result<()> {
 }
 
 fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    let custom_purple = Color::Rgb(197, 137, 249);
-
     loop {
-        terminal.draw(|f| ui(f, app, custom_purple))?;
+        terminal.draw(|f| ui(f, app, colors::PRIMARY_COLOR))?;
 
         // Si estamos en estado de procesamiento, ejecutamos la tarea y luego limpiamos
         if let LoadStep::Processing = app.load_step {

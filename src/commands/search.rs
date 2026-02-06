@@ -29,7 +29,7 @@ pub fn init_search(app: &mut App) {
     app.selected_value = None;
     app.filters.clear();
     app.aggregations.clear();
-    app.order_by = None;
+    app.order_by.clear();
     app.limit = None;
     app.selected_fields.clear();
     update_middle_panel_content(app);
@@ -124,7 +124,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             app.selected_field = None;
             app.filters.clear();
             app.aggregations.clear();
-            app.order_by = None;
+            app.order_by.clear();
             app.limit = None;
             app.selected_fields.clear();
             app.filter_value_input.clear();
@@ -140,7 +140,11 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             FocusPanel::Left => app.focus_panel = FocusPanel::Middle,
             FocusPanel::Middle => {
                 if app.search_criteria == SearchCriteria::OrderBy {
-                    app.focus_panel = FocusPanel::Extra;
+                    let idx = app.middle_panel_state.selected().unwrap_or(0);
+                    if idx < app.order_by.len() {
+                        app.focus_panel = FocusPanel::Right;
+                        app.right_panel_state.select(Some(0));
+                    }
                 } else if matches!(app.search_criteria, SearchCriteria::Filters | SearchCriteria::Aggregations) {
                     let idx = app.middle_panel_state.selected().unwrap_or(0);
                     let len = if app.search_criteria == SearchCriteria::Filters { app.filters.len() } else { app.aggregations.len() };
@@ -150,7 +154,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                 }
             },
             FocusPanel::Right => {
-                if matches!(app.search_criteria, SearchCriteria::Filters | SearchCriteria::Aggregations) {
+                if matches!(app.search_criteria, SearchCriteria::Filters | SearchCriteria::Aggregations | SearchCriteria::OrderBy) {
                     app.focus_panel = FocusPanel::Extra;
                 }
             },
@@ -161,7 +165,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             FocusPanel::Right => app.focus_panel = FocusPanel::Middle,
             FocusPanel::Extra => {
                 if app.search_criteria == SearchCriteria::OrderBy {
-                    app.focus_panel = FocusPanel::Middle;
+                    app.focus_panel = FocusPanel::Right;
                 } else {
                     app.focus_panel = FocusPanel::Right;
                 }
@@ -258,7 +262,26 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     }
                 }
                 (FocusPanel::Middle, SearchCriteria::OrderBy) => {
-                    app.focus_panel = FocusPanel::Extra;
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        let add_new_idx = app.order_by.len();
+                        let delete_idx = if !app.order_by.is_empty() { Some(app.order_by.len() + 1) } else { None };
+
+                        if idx == add_new_idx {
+                            app.order_by.push(crate::repl::state::OrderBy {
+                                field: "?".to_string(), direction: "Asc".to_string()
+                            });
+                            app.middle_panel_state.select(Some(app.order_by.len() - 1));
+                            app.right_panel_state.select(Some(0));
+                        } else if delete_idx == Some(idx) {
+                            if !app.order_by.is_empty() {
+                                app.order_by.pop();
+                                app.middle_panel_state.select(Some(app.order_by.len().saturating_sub(1)));
+                            }
+                        } else {
+                            app.focus_panel = FocusPanel::Right;
+                            app.right_panel_state.select(Some(0));
+                        }
+                    }
                 }
                 (FocusPanel::Middle, SearchCriteria::Limit) => {
                     app.focus_panel = FocusPanel::Bottom;
@@ -278,6 +301,9 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     app.focus_panel = FocusPanel::Extra;
                 }
                 (FocusPanel::Right, SearchCriteria::Aggregations) => {
+                    app.focus_panel = FocusPanel::Extra;
+                }
+                (FocusPanel::Right, SearchCriteria::OrderBy) => {
                     app.focus_panel = FocusPanel::Extra;
                 }
                 (FocusPanel::Extra, SearchCriteria::Filters) => {
@@ -385,14 +411,16 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     }
                 }
                 (FocusPanel::Extra, SearchCriteria::OrderBy) => {
-                    if let Some(idx) = app.extra_panel_state.selected() {
-                        let mut current = app.order_by.take().unwrap_or(crate::repl::state::OrderBy { field: "?".to_string(), direction: "Asc".to_string() });
-                        match app.middle_panel_state.selected() {
-                            Some(0) => current.field = app.available_fields[idx].clone(),
-                            Some(1) => current.direction = if idx == 0 { "Asc".to_string() } else { "Desc".to_string() },
-                            _ => {}
+                    if let Some(f_idx) = app.middle_panel_state.selected() {
+                        if f_idx < app.order_by.len() {
+                             if let Some(idx) = app.extra_panel_state.selected() {
+                                 match app.right_panel_state.selected() {
+                                     Some(0) => app.order_by[f_idx].field = app.available_fields[idx].clone(),
+                                     Some(1) => app.order_by[f_idx].direction = if idx == 0 { "Asc".to_string() } else { "Desc".to_string() },
+                                     _ => {}
+                                 }
+                             }
                         }
-                        app.order_by = Some(current);
                     }
                 }
                 _ => {}
@@ -419,7 +447,9 @@ fn navigate_list(app: &mut App, delta: isize) {
                     app.aggregations.len() + 1 + if !app.aggregations.is_empty() { 1 } else { 0 }
                 },
                 SearchCriteria::FiltersOp => 2,
-                SearchCriteria::OrderBy => 2,
+                SearchCriteria::OrderBy => {
+                    app.order_by.len() + 1 + if !app.order_by.is_empty() { 1 } else { 0 }
+                },
                 SearchCriteria::Limit => 1,
                 SearchCriteria::Fields => app.available_fields.len(),
             };
@@ -428,6 +458,7 @@ fn navigate_list(app: &mut App, delta: isize) {
         FocusPanel::Right => {
             let len = match app.search_criteria {
                 SearchCriteria::Filters => 3,
+                SearchCriteria::OrderBy => 2,
                 SearchCriteria::Aggregations => {
                     let mut count = 1; // "Change Type"
                     let current_idx = app.middle_panel_state.selected().unwrap_or(0);
@@ -473,7 +504,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                     }
                 },
                 SearchCriteria::OrderBy => {
-                    match app.middle_panel_state.selected() {
+                    match app.right_panel_state.selected() {
                         Some(0) => app.available_fields.len(),
                         Some(1) => 2, // Asc, Desc
                         _ => 0,
@@ -560,7 +591,7 @@ fn navigate_list(app: &mut App, delta: isize) {
         },
         FocusPanel::Right => {
             state.select(Some(next));
-            if app.search_criteria == SearchCriteria::Aggregations {
+            if matches!(app.search_criteria, SearchCriteria::Aggregations | SearchCriteria::OrderBy) {
                  app.extra_panel_state.select(Some(0));
             } else if app.search_criteria == SearchCriteria::Filters {
                  app.filter_step = match next { 0 => FilterStep::Field, 1 => FilterStep::Op, _ => FilterStep::Value };
