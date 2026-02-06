@@ -30,7 +30,7 @@ pub fn init_search(app: &mut App) {
     app.filters.clear();
     app.aggregations.clear();
     app.order_by.clear();
-    app.limit = None;
+    app.limit = Some(100);
     app.selected_fields.clear();
     update_middle_panel_content(app);
 }
@@ -87,7 +87,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                             app.focus_panel = FocusPanel::Extra;
                         }
                         SearchCriteria::Limit => {
-                            app.limit = val.parse::<usize>().ok();
+                            app.limit = val.parse::<usize>().ok().map(|l| l.min(100));
                             app.focus_panel = FocusPanel::Middle;
                             app.filter_value_input.clear();
                             return;
@@ -125,7 +125,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             app.filters.clear();
             app.aggregations.clear();
             app.order_by.clear();
-            app.limit = None;
+            app.limit = Some(100);
             app.selected_fields.clear();
             app.filter_value_input.clear();
             app.search_tables.clear();

@@ -178,7 +178,7 @@ impl App {
             // Order By
             order_by: Vec::new(),
             // Limit
-            limit: None,
+            limit: Some(100),
             // Fields
             selected_fields: Vec::new(),
         }
