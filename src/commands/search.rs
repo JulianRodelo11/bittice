@@ -2,7 +2,7 @@ use crossterm::event::{self, KeyCode};
 use std::path::Path;
 
 use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel};
-use crate::repl::utils::{get_indexed_fields, get_field_values, get_order_by_fields};
+use crate::repl::utils::{get_indexed_fields, get_field_values, get_order_by_fields, get_filtered_fields};
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
@@ -310,7 +310,8 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     match app.filter_step {
                         FilterStep::Field => {
                             if let Some(idx) = app.extra_panel_state.selected() {
-                                if let Some(field) = app.available_fields.get(idx) {
+                                let fields = get_filtered_fields(&app.available_fields);
+                                if let Some(field) = fields.get(idx) {
                                     if let Some(f_idx) = app.middle_panel_state.selected() {
                                         if f_idx < app.filters.len() {
                                             app.filters[f_idx].field = field.clone();
@@ -381,7 +382,8 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                     if let Some(idx) = app.extra_panel_state.selected() {
                                         match key.as_str() {
                                             "field" | "key_field" | "bucket_field" | "value_field" => {
-                                                if let Some(field) = app.available_fields.get(idx) {
+                                                let fields = get_filtered_fields(&app.available_fields);
+                                                if let Some(field) = fields.get(idx) {
                                                     inner.insert(key.clone(), serde_json::json!(field));
                                                 }
                                             }
@@ -488,7 +490,7 @@ fn navigate_list(app: &mut App, delta: isize) {
             let len = match app.search_criteria {
                 SearchCriteria::Filters => {
                     match app.filter_step {
-                        FilterStep::Field => app.available_fields.len(),
+                        FilterStep::Field => get_filtered_fields(&app.available_fields).len(),
                         FilterStep::Value => app.filter_value_options.len(),
                         FilterStep::Op => 4, // Eq, In, Gte, Lt
                         _ => 0,
@@ -505,7 +507,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                                 let keys: Vec<&String> = inner.keys().collect();
                                 if let Some(key) = keys.get(selected_step_idx - 1) {
                                     match key.as_str() {
-                                        "field" | "key_field" | "bucket_field" | "value_field" => app.available_fields.len(),
+                                        "field" | "key_field" | "bucket_field" | "value_field" => get_filtered_fields(&app.available_fields).len(),
                                         "operation" => app.agg_op_options.len(),
                                         _ => 1, // "Write value"
                                     }

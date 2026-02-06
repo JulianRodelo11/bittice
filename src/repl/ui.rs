@@ -1,5 +1,5 @@
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
-use crate::repl::utils::{get_loaded_data, get_order_by_fields};
+use crate::repl::utils::{get_loaded_data, get_order_by_fields, get_filtered_fields};
 use crate::ui::colors;
 use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
@@ -354,9 +354,9 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
 
                     let extra_items: Vec<ListItem> = match app.filter_step {
 
-                        FilterStep::Field => app.available_fields.iter().map(|s| {
+                        FilterStep::Field => get_filtered_fields(&app.available_fields).into_iter().map(|s| {
 
-                            let is_selected = app.filters[current_idx].field == *s;
+                            let is_selected = app.filters[current_idx].field == s;
 
                             let circle = if is_selected { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
 
@@ -502,9 +502,9 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
 
                                     "field" | "key_field" | "bucket_field" | "value_field" => {
 
-                                        extra_items = app.available_fields.iter().map(|s| {
+                                        extra_items = get_filtered_fields(&app.available_fields).into_iter().map(|s| {
 
-                                            let is_selected = inner.get(*key).and_then(|v| v.as_str()) == Some(s);
+                                            let is_selected = inner.get(*key).and_then(|v| v.as_str()) == Some(&s);
 
                                             ListItem::new(Line::from(vec![
 

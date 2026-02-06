@@ -195,16 +195,38 @@ pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str
 
 pub fn get_order_by_fields(all_fields: &[String]) -> Vec<String> {
     let mut filtered = Vec::new();
+    let fields_set: std::collections::HashSet<_> = all_fields.iter().collect();
+
     for f in all_fields {
-        // Ignorar sufijos específicos que no sean _date si son derivados de fecha
+        // Ocultar sufijos derivados que no queremos para Order By
         if f.ends_with("_day") || f.ends_with("_month") || f.ends_with("_hour_bucket") {
             continue;
         }
         
-        // Si no termina en _date, verificar si existe una versión _date
+        // Si es un campo base (sin sufijo _date) pero existe su versión _date, lo ocultamos.
         if !f.ends_with("_date") {
             let date_version = format!("{}_date", f);
-            if all_fields.contains(&date_version) {
+            if fields_set.contains(&date_version) {
+                continue;
+            }
+        }
+        
+        filtered.push(f.clone());
+    }
+    filtered.sort();
+    filtered
+}
+
+pub fn get_filtered_fields(all_fields: &[String]) -> Vec<String> {
+    let mut filtered = Vec::new();
+    let fields_set: std::collections::HashSet<_> = all_fields.iter().collect();
+
+    for f in all_fields {
+        // Para filtros generales, queremos ver los derivados (_day, _month, etc)
+        // pero queremos ocultar el campo base "solo" si existen versiones de fecha.
+        if !f.contains('_') || (!f.ends_with("_date") && !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket")) {
+            let date_version = format!("{}_date", f);
+            if fields_set.contains(&date_version) {
                 continue;
             }
         }
