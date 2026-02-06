@@ -1,5 +1,7 @@
 use serde::Deserialize;
 use std::path::Path;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 pub fn get_path_suggestions(input: &str) -> Vec<String> {
     // Si está vacío, empezamos en la raíz del sistema
@@ -129,22 +131,88 @@ struct IndexedField {
 }
 
 pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
+    let mut fields = std::collections::HashSet::new();
+
+    // 1. Intentar desde config.json (para asegurar campos base)
     let config_path = data_path.join(entity).join(table).join("config.json");
-
-    let mut fields = Vec::new();
-
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<Config>(&content) {
             for item in config.indexed_fields {
                 if item.indexed {
-                    fields.push(item.field_name);
+                    fields.insert(item.field_name);
                 }
             }
         }
     }
 
-    fields.sort();
-    fields
+    // 2. Intentar desde el directorio index/ (para campos derivados como _date, _month)
+    let index_dir = data_path.join(entity).join(table).join("index");
+    if let Ok(entries) = std::fs::read_dir(index_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".idx") {
+                    let field_name = &name[..name.len() - 4];
+                    fields.insert(field_name.to_string());
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<String> = fields.into_iter().collect();
+    result.sort();
+    result
+}
+
+pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str) -> Vec<String> {
+    let idx_path = data_path.join(entity).join(table).join("index").join(format!("{}.idx", field));
+    
+    let mut values = std::collections::HashSet::new();
+    
+    if let Ok(file) = File::open(idx_path) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten() {
+            // Formato: {field_name}__{val}\t{id}
+            if let Some(pos) = line.find("__") {
+                let rest = &line[pos + 2..];
+                if let Some(tab_pos) = rest.find('\t') {
+                    let val = &rest[..tab_pos];
+                    if !val.is_empty() {
+                        values.insert(val.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    let mut result: Vec<String> = values.into_iter().collect();
+    result.sort();
+    
+    // Insertar opción "Write value" al inicio
+    let mut final_res = vec!["Write value".to_string()];
+    final_res.extend(result);
+    final_res
+}
+
+pub fn get_order_by_fields(all_fields: &[String]) -> Vec<String> {
+    let mut filtered = Vec::new();
+    for f in all_fields {
+        // Ignorar sufijos específicos que no sean _date si son derivados de fecha
+        if f.ends_with("_day") || f.ends_with("_month") || f.ends_with("_hour_bucket") {
+            continue;
+        }
+        
+        // Si no termina en _date, verificar si existe una versión _date
+        if !f.ends_with("_date") {
+            let date_version = format!("{}_date", f);
+            if all_fields.contains(&date_version) {
+                continue;
+            }
+        }
+        
+        filtered.push(f.clone());
+    }
+    filtered.sort();
+    filtered
 }
 
 

@@ -2,7 +2,7 @@ use crossterm::event::{self, KeyCode};
 use std::path::Path;
 
 use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel};
-use crate::repl::utils::get_indexed_fields;
+use crate::repl::utils::{get_indexed_fields, get_field_values, get_order_by_fields};
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
@@ -314,6 +314,12 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                     if let Some(f_idx) = app.middle_panel_state.selected() {
                                         if f_idx < app.filters.len() {
                                             app.filters[f_idx].field = field.clone();
+                                            // ACTUALIZAR VALORES EXISTENTES
+                                            if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                                                let values = get_field_values(Path::new("data"), e, t, field);
+                                                app.filters[f_idx].value_options = values.clone();
+                                                app.filter_value_options = values;
+                                            }
                                         }
                                     }
                                 }
@@ -415,7 +421,12 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         if f_idx < app.order_by.len() {
                              if let Some(idx) = app.extra_panel_state.selected() {
                                  match app.right_panel_state.selected() {
-                                     Some(0) => app.order_by[f_idx].field = app.available_fields[idx].clone(),
+                                     Some(0) => {
+                                         let fields = get_order_by_fields(&app.available_fields);
+                                         if let Some(field) = fields.get(idx) {
+                                             app.order_by[f_idx].field = field.clone();
+                                         }
+                                     },
                                      Some(1) => app.order_by[f_idx].direction = if idx == 0 { "Asc".to_string() } else { "Desc".to_string() },
                                      _ => {}
                                  }
@@ -505,7 +516,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                 },
                 SearchCriteria::OrderBy => {
                     match app.right_panel_state.selected() {
-                        Some(0) => app.available_fields.len(),
+                        Some(0) => get_order_by_fields(&app.available_fields).len(),
                         Some(1) => 2, // Asc, Desc
                         _ => 0,
                     }

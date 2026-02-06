@@ -1,5 +1,5 @@
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
-use crate::repl::utils::get_loaded_data;
+use crate::repl::utils::{get_loaded_data, get_order_by_fields};
 use crate::ui::colors;
 use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
@@ -605,8 +605,8 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
 
                     // Panel 3 (Extra): Options
-                    let extra_items = match app.right_panel_state.selected() {
-                         Some(0) => app.available_fields.iter().map(|f| ListItem::new(f.as_str())).collect(),
+                    let extra_items: Vec<ListItem> = match app.right_panel_state.selected() {
+                         Some(0) => get_order_by_fields(&app.available_fields).into_iter().map(ListItem::new).collect(),
                          Some(1) => vec![ListItem::new("Asc"), ListItem::new("Desc")],
                          _ => vec![],
                     };
