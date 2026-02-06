@@ -94,7 +94,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
     let active_color = colors::ACTIVE_COLOR;
     let inactive_color = colors::INACTIVE_COLOR;
 
-    let content_height = 10; // Altura fija reducida para mayor simetría y compacidad
+    let content_height = if app.filters.len() > 1 { 12 } else { 11 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -102,9 +102,9 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(7), // Menú
             Constraint::Length(content_height), // Paneles
             Constraint::Length(1), // Instrucciones justo debajo
-            Constraint::Length(15), // Preview de Query (Aumentado de 10 a 15)
+            Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior (MOVIDO AQUÍ)
             Constraint::Length(1), // Espacio de separación
-            Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
+            Constraint::Length(15), // Preview de Query
             Constraint::Min(0),    // Resto del espacio al final
         ])
         .split(area);
@@ -644,13 +644,13 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         instructions_layout[0]
     );
 
-    // Query Preview
-    draw_query_preview(f, app, chunks[3]);
-
-    // Input Inferior
+    // Input Inferior (Ahora en chunks[3])
     if app.focus_panel == FocusPanel::Bottom {
-        draw_input_widget(f, app, chunks[5], "Type filter value...", active_color, inactive_color);
+        draw_input_widget(f, app, chunks[3], "Type filter value...", active_color, inactive_color);
     }
+
+    // Query Preview (Ahora en chunks[5])
+    draw_query_preview(f, app, chunks[5]);
 }
 
 fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
