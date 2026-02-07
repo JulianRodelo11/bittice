@@ -3,6 +3,7 @@ pub mod core {
     pub mod date_utils;
     pub mod schema;
     pub mod writer;
+    pub mod query;
 }
 
 pub mod commands {

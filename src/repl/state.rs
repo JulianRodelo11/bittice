@@ -117,6 +117,10 @@ pub struct App {
 
     // --- Sub-tarea: Fields ---
     pub selected_fields: Vec<String>,
+
+    // --- Query Results ---
+    pub search_results: Option<crate::core::query::QueryResult>,
+    pub is_loading: bool,
 }
 
 impl App {
@@ -181,6 +185,9 @@ impl App {
             limit: Some(100),
             // Fields
             selected_fields: Vec::new(),
+            // Results
+            search_results: None,
+            is_loading: false,
         }
     }
 

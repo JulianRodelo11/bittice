@@ -2,7 +2,7 @@ use crossterm::event::{self, KeyCode};
 use std::path::Path;
 
 use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel};
-use crate::repl::utils::{get_indexed_fields, get_field_values, get_order_by_fields, get_filtered_fields};
+use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields};
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
@@ -116,7 +116,50 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
     }
 
     match key.code {
+        KeyCode::Char('s') => {
+             // Execute Query with Spinner
+             if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                 let filters = app.filters.clone();
+                 let filters_op = app.filters_op.clone();
+                 let limit = app.limit.unwrap_or(100);
+                 let fields = if app.selected_fields.is_empty() {
+                     // Filter out derived fields (_date, _day, _month, _hour_bucket)
+                     app.available_fields.iter()
+                         .filter(|f| !f.ends_with("_date") && !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"))
+                         .cloned()
+                         .collect()
+                 } else {
+                     app.selected_fields.clone()
+                 };
+
+                 let entity = e.clone();
+                 let table = t.clone();
+
+                 // Position for spinner (below menu)
+                 let start_x = 4;
+                 let start_y = 9; // Menu(7) + padding
+
+                 let _ = crate::ui::spinner::run_with_spinner(
+                     "Executing query and fetching results...",
+                     start_y,
+                     start_x,
+                     |_, _| {
+                         match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, limit) {
+                             Ok(result) => {
+                                 app.search_results = Some(result);
+                                 Ok(())
+                             }
+                             Err(err) => Err(err)
+                         }
+                     }
+                 );
+             }
+        },
         KeyCode::Esc => {
+            if app.search_results.is_some() {
+                app.search_results = None;
+                return;
+            }
             app.active_task = None;
             // Limpiar todo el estado de búsqueda
             app.selected_entity = None;
@@ -316,11 +359,9 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                         if f_idx < app.filters.len() {
                                             app.filters[f_idx].field = field.clone();
                                             // ACTUALIZAR VALORES EXISTENTES
-                                            if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                                                let values = get_field_values(Path::new("data"), e, t, field);
-                                                app.filters[f_idx].value_options = values.clone();
-                                                app.filter_value_options = values;
-                                            }
+                                            let values = vec!["Write value".to_string()];
+                                            app.filters[f_idx].value_options = values.clone();
+                                            app.filter_value_options = values;
                                         }
                                     }
                                 }
