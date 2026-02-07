@@ -141,7 +141,6 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         draw_query_preview(f, app, results_layout[4]);
 
         let grid_color = Color::Rgb(100, 100, 100);
-        let text_color = Color::White;
         
         // ... (col widths calculation same as before)
         let mut col_widths = Vec::new();
@@ -174,7 +173,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                 let w = col_widths[i];
                 let truncated = if h.len() > w - 2 { &h[..w - 2] } else { h };
                 let cell = format!(" {:<width$} ", truncated, width = w - 2);
-                header_line.push(Span::styled(cell, Style::default().fg(text_color)));
+                header_line.push(Span::styled(cell, Style::default().fg(colors::ACTIVE_COLOR)));
                 header_line.push(Span::styled("│", Style::default().fg(grid_color)));
             }
             lines.push(Line::from(header_line));
@@ -194,7 +193,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     let w = col_widths[i];
                     let truncated = if cell_val.len() > w - 2 { &cell_val[..w - 2] } else { cell_val };
                     let cell = format!(" {:<width$} ", truncated, width = w - 2);
-                    row_line.push(Span::styled(cell, Style::default().fg(text_color)));
+                    row_line.push(Span::styled(cell, Style::default().fg(colors::VALUE_COLOR)));
                     row_line.push(Span::styled("│", Style::default().fg(grid_color)));
                 }
                 lines.push(Line::from(row_line));
