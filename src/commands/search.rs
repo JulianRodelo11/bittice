@@ -369,7 +369,8 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                     *agg = match new_type.as_str() {
                                         "GroupBy" => serde_json::json!({"GroupBy": {"field": "?", "operation": "Count"}}),
                                         "TopN" => serde_json::json!({"TopN": {"field": "?", "n": 10}}),
-                                        "Sum" | "Avg" | "Min" | "Max" => serde_json::json!({new_type: {"field": "?"}}),
+                                        "Sum" => serde_json::json!({"Sum": {"field": "?", "expression": "?"}}),
+                                        "Avg" | "Min" | "Max" => serde_json::json!({new_type: {"field": "?"}}),
                                         "ConsecutiveBuckets" => serde_json::json!({"ConsecutiveBuckets": {"key_field": "?", "bucket_field": "?"}}),
                                         "RetentionByBucket" => serde_json::json!({"RetentionByBucket": {"key_field": "?", "bucket_field": "?"}}),
                                         "InactiveSinceBucket" => serde_json::json!({"InactiveSinceBucket": {"key_field": "?", "bucket_field": "?"}}),
