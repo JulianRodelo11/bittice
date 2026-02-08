@@ -94,6 +94,130 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
     let active_color = colors::ACTIVE_COLOR;
     let inactive_color = colors::INACTIVE_COLOR;
 
+    // --- QUERY RESULTS MODE (GLOBAL SCROLL) ---
+    if let Some(results) = app.search_results.clone() {
+        let results_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),    // Main Scrollable Area (Menu + Query + Table)
+                Constraint::Length(1), // Fixed Footer (Single line)
+            ])
+            .split(area);
+
+        // 1. Build All Scrollable Content
+        let mut all_lines = Vec::new();
+        
+        // Menu
+        all_lines.extend(get_menu_lines(app, purple, purple_muted));
+        all_lines.push(Line::from(""));
+
+        // Exit Instructions (Normal text above Query)
+        all_lines.push(Line::from(vec![
+            Span::styled("+ ", Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)),
+            Span::styled("Press Esc to exit results", Style::default().fg(Color::White)),
+        ]));
+        all_lines.push(Line::from(""));
+        
+        // Query Preview
+        all_lines.extend(get_query_preview_lines(app));
+        all_lines.push(Line::from(""));
+
+        // Table Header & Rows
+        if results.rows.is_empty() {
+             all_lines.push(Line::from(Span::styled("  No results found", Style::default().fg(Color::Red))));
+        } else {
+            let grid_color = Color::Rgb(100, 100, 100);
+            let mut col_widths = Vec::new();
+            for (i, header) in results.headers.iter().enumerate() {
+                let mut max_w = header.len();
+                for row in &results.rows {
+                    if let Some(val) = row.get(i) {
+                        if val.len() > max_w { max_w = val.len(); }
+                    }
+                }
+                max_w = max_w.min(40);
+                col_widths.push(max_w + 2);
+            }
+
+            let num_cols = results.headers.len();
+            if num_cols > 0 {
+                let mut top = String::from("┌");
+                for (i, &w) in col_widths.iter().enumerate() {
+                    top.push_str(&"─".repeat(w));
+                    if i < num_cols - 1 { top.push('┬'); }
+                }
+                top.push('┐');
+                all_lines.push(Line::from(Span::styled(top, Style::default().fg(grid_color))));
+
+                let mut header_line = Vec::new();
+                header_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                for (i, h) in results.headers.iter().enumerate() {
+                    let w = col_widths[i];
+                    let truncated = if h.len() > w - 2 { &h[..w - 2] } else { h };
+                    let cell = format!(" {:<width$} ", truncated, width = w - 2);
+                    header_line.push(Span::styled(cell, Style::default().fg(colors::ACTIVE_COLOR)));
+                    header_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                }
+                all_lines.push(Line::from(header_line));
+
+                let mut middle = String::from("├");
+                for (i, &w) in col_widths.iter().enumerate() {
+                    middle.push_str(&"─".repeat(w));
+                    if i < num_cols - 1 { middle.push('┼'); }
+                }
+                middle.push('┤');
+                all_lines.push(Line::from(Span::styled(middle.clone(), Style::default().fg(grid_color))));
+
+                for (r_idx, row) in results.rows.iter().enumerate() {
+                    let mut row_line = Vec::new();
+                    row_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                    for (i, cell_val) in row.iter().enumerate() {
+                        let w = col_widths[i];
+                        let truncated = if cell_val.len() > w - 2 { &cell_val[..w - 2] } else { cell_val };
+                        let cell = format!(" {:<width$} ", truncated, width = w - 2);
+                        row_line.push(Span::styled(cell, Style::default().fg(colors::VALUE_COLOR)));
+                        row_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                    }
+                    all_lines.push(Line::from(row_line));
+
+                    if r_idx < results.rows.len() - 1 {
+                        all_lines.push(Line::from(Span::styled(middle.clone(), Style::default().fg(grid_color))));
+                    } else {
+                        let mut bottom = String::from("└");
+                        for (i, &w) in col_widths.iter().enumerate() {
+                            bottom.push_str(&"─".repeat(w));
+                            if i < num_cols - 1 { bottom.push('┴'); }
+                        }
+                        bottom.push('┘');
+                        all_lines.push(Line::from(Span::styled(bottom, Style::default().fg(grid_color))));
+                    }
+                }
+            }
+        }
+        
+        // Render scrollable content
+        let content_height = all_lines.len() as u16;
+        let viewport_height = results_layout[0].height;
+        f.render_widget(Paragraph::new(all_lines).scroll((app.results_scroll, 0)), results_layout[0]);
+        app.last_rendered_content_height = content_height;
+        app.results_viewport_height = viewport_height;
+
+        // 2. Build Fixed Footer (Aligned to start/left)
+        let limit = app.limit.unwrap_or(100);
+        let total_pages = (results.total_found + limit - 1) / limit;
+        
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ← A ", Style::default().fg(if app.results_page > 1 { Color::White } else { Color::DarkGray }).bg(Color::Rgb(30, 30, 30))),
+                Span::styled(format!(" Page {}/{} ", app.results_page, total_pages.max(1)), Style::default().fg(Color::White)),
+                Span::styled(" D → ", Style::default().fg(if app.results_page < total_pages { Color::White } else { Color::DarkGray }).bg(Color::Rgb(30, 30, 30))),
+                Span::styled(format!("  (Total found: {})", results.total_found), Style::default().fg(Color::DarkGray)),
+            ])).alignment(Alignment::Left),
+            results_layout[1]
+        );
+        return;
+    }
+
     let content_height = if app.filters.len() > 1 { 12 } else { 11 };
 
     let chunks = Layout::default()
@@ -104,117 +228,14 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(1), // Instrucciones justo debajo
             Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
             Constraint::Length(1), // Espacio de separación
+            Constraint::Length(1), // Nueva instrucción: Para hacer una consulta...
+            Constraint::Length(1), // Espacio extra solicitado
             Constraint::Length(15), // Preview de Query
             Constraint::Min(0),    // Resto del espacio al final
         ])
         .split(area);
     
     draw_menu_widget(f, app, chunks[0], purple, purple_muted);
-
-    // --- QUERY RESULTS MODE ---
-    if let Some(results) = app.search_results.clone() {
-        let query_h = 10;
-        let table_h = (results.rows.len() as u16 * 2 + 3).min(area.height.saturating_sub(7 + 1 + 1 + 1 + query_h + 1 + 2));
-
-        let results_layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(7),       // Menú [0]
-                Constraint::Length(1),       // Spacer 0 [1]
-                Constraint::Length(1),       // Instruction [2]
-                Constraint::Length(1),       // Spacer 1 [3]
-                Constraint::Length(query_h), // Query Details [4]
-                Constraint::Length(1),       // Spacer 2 [5]
-                Constraint::Length(table_h), // Results Table [6]
-                Constraint::Min(0),          // Remaining
-            ])
-            .split(area);
-
-        draw_menu_widget(f, app, results_layout[0], purple, purple_muted);
-        
-        // New instruction at the top
-        f.render_widget(
-            Paragraph::new("+ Press Esc to exit search results").style(Style::default().fg(Color::White)),
-            results_layout[2]
-        );
-
-        draw_query_preview(f, app, results_layout[4]);
-
-        let grid_color = Color::Rgb(100, 100, 100);
-        
-        // ... (col widths calculation same as before)
-        let mut col_widths = Vec::new();
-        for (i, header) in results.headers.iter().enumerate() {
-            let mut max_w = header.len();
-            for row in &results.rows {
-                if let Some(val) = row.get(i) {
-                    if val.len() > max_w { max_w = val.len(); }
-                }
-            }
-            max_w = max_w.min(40);
-            col_widths.push(max_w + 2);
-        }
-
-        let mut lines = Vec::new();
-        let num_cols = results.headers.len();
-
-        if num_cols > 0 {
-            let mut top = String::from("┌");
-            for (i, &w) in col_widths.iter().enumerate() {
-                top.push_str(&"─".repeat(w));
-                if i < num_cols - 1 { top.push('┬'); }
-            }
-            top.push('┐');
-            lines.push(Line::from(Span::styled(top, Style::default().fg(grid_color))));
-
-            let mut header_line = Vec::new();
-            header_line.push(Span::styled("│", Style::default().fg(grid_color)));
-            for (i, h) in results.headers.iter().enumerate() {
-                let w = col_widths[i];
-                let truncated = if h.len() > w - 2 { &h[..w - 2] } else { h };
-                let cell = format!(" {:<width$} ", truncated, width = w - 2);
-                header_line.push(Span::styled(cell, Style::default().fg(colors::ACTIVE_COLOR)));
-                header_line.push(Span::styled("│", Style::default().fg(grid_color)));
-            }
-            lines.push(Line::from(header_line));
-
-            let mut middle = String::from("├");
-            for (i, &w) in col_widths.iter().enumerate() {
-                middle.push_str(&"─".repeat(w));
-                if i < num_cols - 1 { middle.push('┼'); }
-            }
-            middle.push('┤');
-            lines.push(Line::from(Span::styled(middle.clone(), Style::default().fg(grid_color))));
-
-            for (r_idx, row) in results.rows.iter().enumerate() {
-                let mut row_line = Vec::new();
-                row_line.push(Span::styled("│", Style::default().fg(grid_color)));
-                for (i, cell_val) in row.iter().enumerate() {
-                    let w = col_widths[i];
-                    let truncated = if cell_val.len() > w - 2 { &cell_val[..w - 2] } else { cell_val };
-                    let cell = format!(" {:<width$} ", truncated, width = w - 2);
-                    row_line.push(Span::styled(cell, Style::default().fg(colors::VALUE_COLOR)));
-                    row_line.push(Span::styled("│", Style::default().fg(grid_color)));
-                }
-                lines.push(Line::from(row_line));
-
-                if r_idx < results.rows.len() - 1 {
-                    lines.push(Line::from(Span::styled(middle.clone(), Style::default().fg(grid_color))));
-                } else {
-                    let mut bottom = String::from("└");
-                    for (i, &w) in col_widths.iter().enumerate() {
-                        bottom.push_str(&"─".repeat(w));
-                        if i < num_cols - 1 { bottom.push('┴'); }
-                    }
-                    bottom.push('┘');
-                    lines.push(Line::from(Span::styled(bottom, Style::default().fg(grid_color))));
-                }
-            }
-        }
-
-        f.render_widget(Paragraph::new(lines), results_layout[6]);
-        return;
-    }
 
     let panel_layout = if app.search_criteria == SearchCriteria::Filters {
         if app.filters.is_empty() {
@@ -292,6 +313,9 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
     f.render_stateful_widget(left_list, panel_layout[0], &mut app.left_panel_state);
 
+    // (continuing rendering components)
+
+
     let middle_items: Vec<ListItem> = match app.search_criteria {
         SearchCriteria::Entity => app.search_entities.iter().map(|s| {
             let circle = if Some(s.clone()) == app.selected_entity { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
@@ -303,7 +327,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         }).collect(),
         SearchCriteria::Filters => {
             let mut items: Vec<ListItem> = app.filters.iter().map(|f| {
-                ListItem::new(Span::styled(format!("{} {} {}", f.field, f.op, f.value), Style::default().fg(active_color)))
+                ListItem::new(Span::styled(format!("{} {} {}", f.field, f.op.as_str(), f.value), Style::default().fg(active_color)))
             }).collect();
             items.push(ListItem::new(Span::styled("+ Add Next Filter", Style::default().fg(colors::ADD_COLOR))));
             if !app.filters.is_empty() { items.push(ListItem::new(Span::styled("- Delete Filter", Style::default().fg(colors::DELETE_COLOR)))); }
@@ -320,7 +344,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         },
         SearchCriteria::OrderBy => {
             let mut items: Vec<ListItem> = app.order_by.iter().enumerate().map(|(i, o)| {
-                ListItem::new(format!("{}: {} {}", i + 1, o.field, o.direction))
+                ListItem::new(format!("{}: {} {}", i + 1, o.field, o.direction.as_str()))
             }).collect();
             items.push(ListItem::new(Span::styled("+ Add Next OrderBy", Style::default().fg(colors::ADD_COLOR))));
             if !app.order_by.is_empty() { items.push(ListItem::new(Span::styled("- Delete OrderBy", Style::default().fg(colors::DELETE_COLOR)))); }
@@ -332,8 +356,8 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", f))]))
         }).collect(),
         SearchCriteria::FiltersOp => vec![
-            ListItem::new(Line::from(vec![if app.filters_op == "And" { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" And")])),
-            ListItem::new(Line::from(vec![if app.filters_op == "Or" { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Or")])),
+            ListItem::new(Line::from(vec![if app.filters_op == crate::repl::state::LogicalOp::And { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" And")])),
+            ListItem::new(Line::from(vec![if app.filters_op == crate::repl::state::LogicalOp::Or { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Or")])),
         ],
     };
 
@@ -362,8 +386,8 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     let circle = if app.filters[current_idx].field == s { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
                     ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
                 }).collect(),
-                FilterStep::Op => vec!["Eq", "In", "Gte", "Lt"].iter().map(|s| {
-                    let circle = if app.filters[current_idx].op == *s { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
+                FilterStep::Op => vec!["Eq", "Ne", "In", "Like", "Gt", "Gte", "Lt", "Lte"].iter().map(|s| {
+                    let circle = if app.filters[current_idx].op.as_str() == *s { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
                     ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
                 }).collect(),
                 FilterStep::Value => app.filter_value_options.iter().map(|s| {
@@ -452,7 +476,14 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
     if app.focus_panel == FocusPanel::Bottom {
         draw_input_widget(f, app, chunks[3], "Type filter value...", active_color, inactive_color);
     }
-    draw_query_preview(f, app, chunks[5]);
+
+    // New instruction aligned with Query
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("+ ", Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)),
+        Span::styled("To perform a query press the s key", Style::default().fg(Color::White)),
+    ])), chunks[5]);
+
+    draw_query_preview(f, app, chunks[7]);
 }
 
 fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
@@ -507,25 +538,56 @@ fn draw_suggestions_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Col
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_query_preview(f: &mut Frame, app: &mut App, area: Rect) {
-    let active_color = colors::ACTIVE_COLOR;
+fn get_menu_lines(app: &App, purple: Color, purple_muted: Color) -> Vec<Line<'_>> {
+    let mut lines = Vec::new();
+    let width = 40; // Ancho total del contenedor
+    
+    // Borde superior
+    lines.push(Line::from(Span::styled(format!("┌{}┐", "─".repeat(width - 2)), Style::default().fg(purple_muted))));
+    
+    for (i, item) in app.menu_items.iter().enumerate() {
+        let is_selected = app.menu_state.selected() == Some(i);
+        let bullet = if is_selected { "◉ " } else { "  " };
+        let text = format!("{}. {}", i + 1, item);
+        
+        // Cálculo de padding:
+        // │ (1) + espacio (1) + bullet (2 visual) + texto (N) + padding (P) + espacio (1) + │ (1) = width
+        // 1 + 1 + 2 + text.len() + P + 1 + 1 = width
+        // 6 + text.len() + P = width  =>  P = width - 6 - text.len()
+        let padding_len = width.saturating_sub(6 + text.len());
+        let padding = " ".repeat(padding_len);
+        
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(purple_muted)),
+            Span::styled(bullet, if is_selected { Style::default().fg(purple) } else { Style::default() }),
+            Span::styled(text, if is_selected { Style::default().fg(purple) } else { Style::default() }),
+            Span::styled(padding, Style::default()),
+            Span::styled(" │", Style::default().fg(purple_muted)),
+        ]));
+    }
+    
+    // Borde inferior
+    lines.push(Line::from(Span::styled(format!("└{}┘", "─".repeat(width - 2)), Style::default().fg(purple_muted))));
+    lines
+}
+
+pub fn get_query_preview_lines(app: &App) -> Vec<Line<'_>> {
     let key_style = Style::default().fg(colors::KEY_COLOR);
     let val_style = Style::default().fg(colors::VALUE_COLOR);
     let branch_style = Style::default().fg(colors::KEY_COLOR);
     let mut lines = Vec::new();
 
-    // Root
     let title = if app.search_results.is_some() { "Query" } else { "Query Preview" };
-    lines.push(Line::from(Span::styled(title, Style::default().fg(active_color))));
+    lines.push(Line::from(Span::styled(title, Style::default().fg(colors::ACTIVE_COLOR))));
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Entity: ", key_style), Span::styled(app.selected_entity.as_deref().unwrap_or("?"), val_style)]));
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Table: ", key_style), Span::styled(app.selected_table.as_deref().unwrap_or("?"), val_style)]));
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Filters: ", key_style)]));
     if !app.filters.is_empty() {
         for (i, f) in app.filters.iter().enumerate() {
-             lines.push(Line::from(vec![Span::styled(if i == app.filters.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style), Span::styled(format!("{} {} {}", f.field, f.op, f.value), val_style)]));
+             lines.push(Line::from(vec![Span::styled(if i == app.filters.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style), Span::styled(format!("{} {} {}", f.field, f.op.as_str(), f.value), val_style)]));
         }
     } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(Color::DarkGray))])); }
-    if app.filters.len() > 1 { lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Filters Op: ", key_style), Span::styled(&app.filters_op, val_style)])); }
+    if app.filters.len() > 1 { lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Filters Op: ", key_style), Span::styled(app.filters_op.to_string(), val_style)])); }
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Aggregations: ", key_style)]));
     if !app.aggregations.is_empty() {
         for (i, agg) in app.aggregations.iter().enumerate() {
@@ -536,10 +598,15 @@ fn draw_query_preview(f: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Order By: ", key_style)]));
     if !app.order_by.is_empty() {
         for (i, o) in app.order_by.iter().enumerate() {
-            lines.push(Line::from(vec![Span::styled(if i == app.order_by.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style), Span::styled(format!("{} {}", o.field, o.direction), val_style)]));
+             lines.push(Line::from(vec![Span::styled(if i == app.order_by.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style), Span::styled(format!("{} {}", o.field, o.direction.as_str()), val_style)]));
         }
     } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(Color::DarkGray))])); }
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Limit: ", key_style), Span::styled(app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string()), val_style)]));
     lines.push(Line::from(vec![Span::styled("└── ", branch_style), Span::styled("Fields: ", key_style), Span::styled(if app.selected_fields.is_empty() { "All".to_string() } else { format!("{:?}", app.selected_fields) }, val_style)]));
+    lines
+}
+
+fn draw_query_preview(f: &mut Frame, app: &mut App, area: Rect) {
+    let lines = get_query_preview_lines(app);
     f.render_widget(Paragraph::new(lines), area);
 }

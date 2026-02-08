@@ -194,25 +194,10 @@ pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str
 }
 
 pub fn get_order_by_fields(all_fields: &[String]) -> Vec<String> {
-    let mut filtered = Vec::new();
-    let fields_set: std::collections::HashSet<_> = all_fields.iter().collect();
-
-    for f in all_fields {
-        // Ocultar sufijos derivados que no queremos para Order By
-        if f.ends_with("_day") || f.ends_with("_month") || f.ends_with("_hour_bucket") {
-            continue;
-        }
-        
-        // Si es un campo base (sin sufijo _date) pero existe su versión _date, lo ocultamos.
-        if !f.ends_with("_date") {
-            let date_version = format!("{}_date", f);
-            if fields_set.contains(&date_version) {
-                continue;
-            }
-        }
-        
-        filtered.push(f.clone());
-    }
+    let mut filtered: Vec<String> = all_fields.iter()
+        .filter(|f| f.ends_with("_date"))
+        .cloned()
+        .collect();
     filtered.sort();
     filtered
 }

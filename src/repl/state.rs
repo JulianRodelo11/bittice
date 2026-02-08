@@ -24,12 +24,69 @@ pub enum SearchCriteria {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum ComparisonOp {
+    Eq,
+    Ne,
+    In,
+    Like,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+impl ComparisonOp {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "Eq" => ComparisonOp::Eq,
+            "Ne" => ComparisonOp::Ne,
+            "In" => ComparisonOp::In,
+            "Like" => ComparisonOp::Like,
+            "Gt" => ComparisonOp::Gt,
+            "Gte" => ComparisonOp::Gte,
+            "Lt" => ComparisonOp::Lt,
+            "Lte" => ComparisonOp::Lte,
+            _ => ComparisonOp::Eq,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            ComparisonOp::Eq => "Eq",
+            ComparisonOp::Ne => "Ne",
+            ComparisonOp::In => "In",
+            ComparisonOp::Like => "Like",
+            ComparisonOp::Gt => "Gt",
+            ComparisonOp::Gte => "Gte",
+            ComparisonOp::Lt => "Lt",
+            ComparisonOp::Lte => "Lte",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Filter {
     pub field: String,
-    pub op: String,
+    pub op: ComparisonOp,
     pub value: String,
     pub value_options: Vec<String>,
 }
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum LogicalOp {
+    And,
+    Or,
+}
+
+impl std::fmt::Display for LogicalOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogicalOp::And => write!(f, "And"),
+            LogicalOp::Or => write!(f, "Or"),
+        }
+    }
+}
+
 
 // Sub-paneles o pasos dentro de la sección de Filtros
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -45,9 +102,24 @@ pub enum AggregationStep {
     Main,
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    pub fn as_str(&self) -> &str {
+        match self {
+            SortDirection::Asc => "Asc",
+            SortDirection::Desc => "Desc",
+        }
+    }
+}
+
 pub struct OrderBy {
     pub field: String,
-    pub direction: String, // "Asc" | "Desc"
+    pub direction: SortDirection,
 }
 
 // Para manejar el foco en la UI de búsqueda
@@ -93,11 +165,11 @@ pub struct App {
 
     // --- Sub-tarea: Filters ---
     pub filters: Vec<Filter>,
-    pub filters_op: String, // "And" | "Or"
+    pub filters_op: LogicalOp,
     pub filter_step: FilterStep,
     pub available_fields: Vec<String>,
     pub selected_field: Option<String>,
-    pub selected_op: String,
+    pub selected_op: ComparisonOp,
     pub filter_value_input: String,
     pub filter_value_options: Vec<String>,
     pub selected_value: Option<String>,
@@ -120,7 +192,11 @@ pub struct App {
 
     // --- Query Results ---
     pub search_results: Option<crate::core::query::QueryResult>,
+    pub results_scroll: u16,
+    pub results_page: usize,
     pub is_loading: bool,
+    pub last_rendered_content_height: u16,
+    pub results_viewport_height: u16,
 }
 
 impl App {
@@ -157,11 +233,11 @@ impl App {
             extra_panel_state: ListState::default(),
             // Filters
             filters: Vec::new(),
-            filters_op: "And".to_string(),
+            filters_op: LogicalOp::And,
             filter_step: FilterStep::List,
             available_fields: Vec::new(),
             selected_field: None,
-            selected_op: "Eq".to_string(),
+            selected_op: ComparisonOp::Eq,
             filter_value_input: String::new(),
             filter_value_options: vec!["Write value".to_string()],
             selected_value: None,
@@ -187,7 +263,11 @@ impl App {
             selected_fields: Vec::new(),
             // Results
             search_results: None,
+            results_scroll: 0,
+            results_page: 1,
             is_loading: false,
+            last_rendered_content_height: 0,
+            results_viewport_height: 0,
         }
     }
 

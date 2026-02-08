@@ -116,16 +116,35 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
     }
 
     match key.code {
+        KeyCode::Up if app.search_results.is_some() => {
+            app.results_scroll = app.results_scroll.saturating_sub(1);
+            return;
+        }
+        KeyCode::Down if app.search_results.is_some() => {
+            let max_scroll = app.last_rendered_content_height.saturating_sub(app.results_viewport_height);
+            if app.results_scroll < max_scroll {
+                 app.results_scroll = app.results_scroll.saturating_add(1);
+            }
+            return;
+        }
         KeyCode::Char('s') => {
              // Execute Query with Spinner
              if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                 app.results_scroll = 0;
+                 app.results_page = 1;
                  let filters = app.filters.clone();
                  let filters_op = app.filters_op.clone();
                  let limit = app.limit.unwrap_or(100);
+                 let aggregations = app.aggregations.clone();
+                 let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
+                 
                  let fields = if app.selected_fields.is_empty() {
                      // Filter out derived fields (_date, _day, _month, _hour_bucket)
                      app.available_fields.iter()
-                         .filter(|f| !f.ends_with("_date") && !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"))
+                         .filter(|f| {
+                             let s = f.trim();
+                             !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+                         })
                          .cloned()
                          .collect()
                  } else {
@@ -144,7 +163,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                      start_y,
                      start_x,
                      |_, _| {
-                         match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, limit) {
+                         match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
                              Ok(result) => {
                                  app.search_results = Some(result);
                                  Ok(())
@@ -155,9 +174,27 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                  );
              }
         },
+        KeyCode::Char('d') if app.search_results.is_some() => {
+            if let Some(results) = &app.search_results {
+                let limit = app.limit.unwrap_or(100);
+                if app.results_page * limit < results.total_found {
+                    app.results_page += 1;
+                    app.results_scroll = 0;
+                    execute_paged_query(app);
+                }
+            }
+        }
+        KeyCode::Char('a') if app.search_results.is_some() => {
+            if app.results_page > 1 {
+                app.results_page -= 1;
+                app.results_scroll = 0;
+                execute_paged_query(app);
+            }
+        }
         KeyCode::Esc => {
             if app.search_results.is_some() {
                 app.search_results = None;
+                app.results_scroll = 0;
                 return;
             }
             app.active_task = None;
@@ -249,8 +286,8 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                 (FocusPanel::Middle, SearchCriteria::FiltersOp) => {
                     if let Some(idx) = app.middle_panel_state.selected() {
                         match idx {
-                            0 => app.filters_op = "And".to_string(),
-                            1 => app.filters_op = "Or".to_string(),
+                            0 => app.filters_op = crate::repl::state::LogicalOp::And,
+                            1 => app.filters_op = crate::repl::state::LogicalOp::Or,
                             _ => {}
                         }
                     }
@@ -262,7 +299,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
 
                         if idx == add_new_idx {
                             app.filters.push(crate::repl::state::Filter {
-                                field: "?".to_string(), op: "Eq".to_string(), value: "?".to_string(),
+                                field: "?".to_string(), op: crate::repl::state::ComparisonOp::Eq, value: "?".to_string(),
                                 value_options: vec!["Write value".to_string()],
                             });
                             app.middle_panel_state.select(Some(app.filters.len() - 1));
@@ -311,7 +348,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
 
                         if idx == add_new_idx {
                             app.order_by.push(crate::repl::state::OrderBy {
-                                field: "?".to_string(), direction: "Asc".to_string()
+                                field: "?".to_string(), direction: crate::repl::state::SortDirection::Asc
                             });
                             app.middle_panel_state.select(Some(app.order_by.len() - 1));
                             app.right_panel_state.select(Some(0));
@@ -369,11 +406,20 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         },
                         FilterStep::Op => {
                             if let Some(idx) = app.extra_panel_state.selected() {
-                                let ops = vec!["Eq", "In", "Gte", "Lt"];
+                                let ops = vec![
+                                    crate::repl::state::ComparisonOp::Eq,
+                                    crate::repl::state::ComparisonOp::Ne,
+                                    crate::repl::state::ComparisonOp::In,
+                                    crate::repl::state::ComparisonOp::Like,
+                                    crate::repl::state::ComparisonOp::Gt,
+                                    crate::repl::state::ComparisonOp::Gte,
+                                    crate::repl::state::ComparisonOp::Lt,
+                                    crate::repl::state::ComparisonOp::Lte,
+                                ];
                                 if let Some(op) = ops.get(idx) {
                                     if let Some(f_idx) = app.middle_panel_state.selected() {
                                         if f_idx < app.filters.len() {
-                                            app.filters[f_idx].op = op.to_string();
+                                            app.filters[f_idx].op = op.clone();
                                         }
                                     }
                                 }
@@ -471,7 +517,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                              app.order_by[f_idx].field = field.clone();
                                          }
                                      },
-                                     Some(1) => app.order_by[f_idx].direction = if idx == 0 { "Asc".to_string() } else { "Desc".to_string() },
+                                     Some(1) => app.order_by[f_idx].direction = if idx == 0 { crate::repl::state::SortDirection::Asc } else { crate::repl::state::SortDirection::Desc },
                                      _ => {}
                                  }
                              }
@@ -534,7 +580,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                     match app.filter_step {
                         FilterStep::Field => get_filtered_fields(&app.available_fields).len(),
                         FilterStep::Value => app.filter_value_options.len(),
-                        FilterStep::Op => 4, // Eq, In, Gte, Lt
+                        FilterStep::Op => 8, // Eq, Ne, In, Like, Gt, Gte, Lt, Lte
                         _ => 0,
                     }
                 },
@@ -656,6 +702,51 @@ fn navigate_list(app: &mut App, delta: isize) {
         _ => {
             state.select(Some(next));
         }
+    }
+}
+
+fn execute_paged_query(app: &mut App) {
+    if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+        let filters = app.filters.clone();
+        let filters_op = app.filters_op.clone();
+        let limit = app.limit.unwrap_or(100);
+        let aggregations = app.aggregations.clone();
+        let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
+        let offset = (app.results_page - 1) * limit;
+
+        let fields = if app.selected_fields.is_empty() {
+            app.available_fields.iter()
+                .filter(|f| {
+                    let s = f.trim();
+                    !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+                })
+                .cloned()
+                .collect()
+        } else {
+            app.selected_fields.clone()
+        };
+
+        let entity = e.clone();
+        let table = t.clone();
+
+        // Calculate dynamic Y position for spinner:
+        // Top margin (2) + Menu (5) + Spacer (1) + Instructions (1) + Spacer (1) + QueryPreview Length + Spacer (1)
+        let query_lines = crate::repl::ui::get_query_preview_lines(app).len();
+        let spinner_y = (2 + 5 + 1 + 1 + 1 + query_lines) as u16;
+
+        let _ = crate::ui::spinner::run_with_spinner(
+            "Fetching next page...",
+            spinner_y, 4,
+            |_, _| {
+                match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, offset) {
+                    Ok(result) => {
+                        app.search_results = Some(result);
+                        Ok(())
+                    }
+                    Err(err) => Err(err)
+                }
+            }
+        );
     }
 }
 

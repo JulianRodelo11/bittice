@@ -88,18 +88,34 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press { continue; }
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press { continue; }
 
-                if let Some(task) = app.active_task {
-                    match task {
-                        "Search" => search::handle_search_input(app, key),
-                        "Load" => handle_load_input(app, key),
-                        _ => {}
+                    if let Some(task) = app.active_task {
+                        match task {
+                            "Search" => search::handle_search_input(app, key),
+                            "Load" => handle_load_input(app, key),
+                            _ => {}
+                        }
+                    } else {
+                        handle_main_menu_input(app, key)?;
                     }
-                } else {
-                    handle_main_menu_input(app, key)?;
-                }
+                },
+                Event::Mouse(mouse) => {
+                    if app.active_task == Some("Search") && app.search_results.is_some() {
+                        match mouse.kind {
+                            event::MouseEventKind::ScrollUp => {
+                                app.results_scroll = app.results_scroll.saturating_sub(1);
+                            },
+                            event::MouseEventKind::ScrollDown => {
+                                app.results_scroll = app.results_scroll.saturating_add(1);
+                            },
+                            _ => {}
+                        }
+                    }
+                },
+                _ => {}
             }
         }
     }

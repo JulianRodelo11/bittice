@@ -24,7 +24,7 @@ use crossterm::event::{self, Event, KeyCode};
 /// - `task`: A closure that takes `&ProgressBar` (to update message) and `&Arc<AtomicBool>` (to check cancellation).
 pub fn run_with_spinner<F, T>(
     initial_msg: &str,
-    start_y: u16,
+    _start_y: u16,
     indent: u16,
     task: F,
 ) -> Result<T>
@@ -52,10 +52,14 @@ where
         }
     });
 
+    // Obtener tamaño de terminal para ir a la última línea
+    let (_, height) = terminal::size().unwrap_or((80, 24));
+    let target_y = height.saturating_sub(1);
+
     // Posicionar cursor y limpiar línea
     let _ = execute!(
         std::io::stdout(),
-        cursor::MoveTo(0, start_y),
+        cursor::MoveTo(0, target_y),
         terminal::Clear(terminal::ClearType::UntilNewLine)
     );
 
