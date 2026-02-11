@@ -105,15 +105,41 @@ pub fn execute_query(
         (all, total)
     } else {
         let mut fallback_ids = RoaringBitmap::new();
-        let sample_field = fields.get(0).or_else(|| None);
         
-        let path = if let Some(f) = sample_field {
-            stores_dir.join(format!("{}.store", f))
-        } else if let Ok(mut entries) = std::fs::read_dir(&stores_dir) {
-             entries.find_map(|e| e.ok().map(|entry| entry.path())).unwrap_or_default()
+        // Extract field from first aggregation if present
+        let agg_field = if !aggregations.is_empty() {
+             aggregations.get(0)
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.values().next())
+                .and_then(|v| v.get("field"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
         } else {
-            Path::new("").to_path_buf()
+            None
         };
+
+        // Dynamically find a suitable field for ID scanning
+        let all_fields = crate::repl::utils::get_indexed_fields(Path::new("data"), entity, table);
+        
+        let dense_candidates = vec!["PK", "id", "_id"];
+        let dense_field = dense_candidates.iter()
+            .find(|&&candidate| all_fields.contains(&candidate.to_string()))
+            .map(|s| s.to_string());
+
+        let candidate_fields = vec![
+            agg_field,
+            dense_field,
+            fields.get(0).cloned(),
+        ];
+        
+        let path = candidate_fields.into_iter().flatten().find_map(|f| {
+            let p = stores_dir.join(format!("{}.store", f));
+            if p.exists() { Some(p) } else { None }
+        }).or_else(|| {
+             if let Ok(mut entries) = std::fs::read_dir(&stores_dir) {
+                 entries.find_map(|e| e.ok().map(|entry| entry.path()))
+             } else { None }
+        }).unwrap_or_default();
 
         let mut total = 0;
         if let Ok(file) = File::open(&path) {
@@ -238,7 +264,7 @@ fn handle_aggregations(base_path: &Path, ids: &[u32], aggregations: &[serde_json
                         for line in BufReader::new(file).lines().flatten() {
                             if let Some((id_s, val)) = line.split_once('\t') {
                                 if let Ok(id) = id_s.parse::<u32>() {
-                                    if ids.contains(&id) {
+                                    if ids.binary_search(&id).is_ok() {
                                         *counts.entry(val.to_string()).or_insert(0) += 1;
                                     }
                                 }

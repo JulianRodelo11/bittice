@@ -1,5 +1,5 @@
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
-use crate::repl::utils::{get_loaded_data, get_order_by_fields, get_filtered_fields};
+use crate::repl::utils::{get_loaded_data, get_order_by_fields, get_filtered_fields, get_base_fields};
 use crate::ui::colors;
 use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
@@ -198,7 +198,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         // Render scrollable content
         let content_height = all_lines.len() as u16;
         let viewport_height = results_layout[0].height;
-        f.render_widget(Paragraph::new(all_lines).scroll((app.results_scroll, 0)), results_layout[0]);
+        f.render_widget(Paragraph::new(all_lines).scroll((app.results_scroll, app.results_scroll_x)), results_layout[0]);
         app.last_rendered_content_height = content_height;
         app.results_viewport_height = viewport_height;
 
@@ -298,7 +298,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
     }
     left_items.extend(vec![
         ListItem::new(Span::styled("Aggregations", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
-        ListItem::new(Span::styled("Order By", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
+        ListItem::new(Span::styled("Order By (Strict)", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
         ListItem::new(Span::styled("Limit", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
         ListItem::new(Span::styled("Fields", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
     ]);
@@ -351,7 +351,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             items
         },
         SearchCriteria::Limit => vec![ListItem::new(format!("Value: {}", app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string())))],
-        SearchCriteria::Fields => app.available_fields.iter().map(|f| {
+        SearchCriteria::Fields => get_base_fields(&app.available_fields).iter().map(|f| {
             let circle = if app.selected_fields.contains(f) { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
             ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", f))]))
         }).collect(),
@@ -454,7 +454,9 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             let right_list = List::new(right_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { colors::SELECTED_BORDER_COLOR } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
             f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
             let extra_items: Vec<ListItem> = match app.right_panel_state.selected() {
-                 Some(0) => get_order_by_fields(&app.available_fields).into_iter().map(ListItem::new).collect(),
+                 Some(0) => get_order_by_fields(&app.available_fields).into_iter().map(|f| {
+                     ListItem::new(f.clone())
+                 }).collect(),
                  Some(1) => vec![ListItem::new("Asc"), ListItem::new("Desc")],
                  _ => vec![],
             };

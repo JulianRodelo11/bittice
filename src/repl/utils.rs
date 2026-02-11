@@ -195,7 +195,19 @@ pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str
 
 pub fn get_order_by_fields(all_fields: &[String]) -> Vec<String> {
     let mut filtered: Vec<String> = all_fields.iter()
-        .filter(|f| f.ends_with("_date"))
+        .filter(|f| f.trim().ends_with("_date"))
+        .cloned()
+        .collect();
+    filtered.sort();
+    filtered
+}
+
+pub fn get_base_fields(all_fields: &[String]) -> Vec<String> {
+    let mut filtered: Vec<String> = all_fields.iter()
+        .filter(|f| {
+            let s = f.trim();
+            !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_hour_bucket")
+        })
         .cloned()
         .collect();
     filtered.sort();

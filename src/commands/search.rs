@@ -2,7 +2,7 @@ use crossterm::event::{self, KeyCode};
 use std::path::Path;
 
 use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel};
-use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields};
+use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields, get_base_fields};
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
@@ -127,10 +127,19 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             }
             return;
         }
+        KeyCode::Right if app.search_results.is_some() => {
+            app.results_scroll_x = app.results_scroll_x.saturating_add(5);
+            return;
+        }
+        KeyCode::Left if app.search_results.is_some() => {
+            app.results_scroll_x = app.results_scroll_x.saturating_sub(5);
+            return;
+        }
         KeyCode::Char('s') => {
              // Execute Query with Spinner
              if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
                  app.results_scroll = 0;
+                 app.results_scroll_x = 0;
                  app.results_page = 1;
                  let filters = app.filters.clone();
                  let filters_op = app.filters_op.clone();
@@ -180,6 +189,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                 if app.results_page * limit < results.total_found {
                     app.results_page += 1;
                     app.results_scroll = 0;
+                    app.results_scroll_x = 0;
                     execute_paged_query(app);
                 }
             }
@@ -188,6 +198,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             if app.results_page > 1 {
                 app.results_page -= 1;
                 app.results_scroll = 0;
+                app.results_scroll_x = 0;
                 execute_paged_query(app);
             }
         }
@@ -195,6 +206,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             if app.search_results.is_some() {
                 app.search_results = None;
                 app.results_scroll = 0;
+                app.results_scroll_x = 0;
                 return;
             }
             app.active_task = None;
@@ -368,7 +380,8 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                 }
                 (FocusPanel::Middle, SearchCriteria::Fields) => {
                     if let Some(idx) = app.middle_panel_state.selected() {
-                        if let Some(field) = app.available_fields.get(idx).cloned() {
+                        let fields = get_base_fields(&app.available_fields);
+                        if let Some(field) = fields.get(idx).cloned() {
                             if app.selected_fields.contains(&field) {
                                 app.selected_fields.retain(|f| f != &field);
                             } else {
@@ -552,7 +565,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                     app.order_by.len() + 1 + if !app.order_by.is_empty() { 1 } else { 0 }
                 },
                 SearchCriteria::Limit => 1,
-                SearchCriteria::Fields => app.available_fields.len(),
+                SearchCriteria::Fields => get_base_fields(&app.available_fields).len(),
             };
             (&mut app.middle_panel_state, len)
         },

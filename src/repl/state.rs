@@ -193,6 +193,7 @@ pub struct App {
     // --- Query Results ---
     pub search_results: Option<crate::core::query::QueryResult>,
     pub results_scroll: u16,
+    pub results_scroll_x: u16,
     pub results_page: usize,
     pub is_loading: bool,
     pub last_rendered_content_height: u16,
@@ -264,6 +265,7 @@ impl App {
             // Results
             search_results: None,
             results_scroll: 0,
+            results_scroll_x: 0,
             results_page: 1,
             is_loading: false,
             last_rendered_content_height: 0,

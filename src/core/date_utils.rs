@@ -2,7 +2,15 @@ pub fn is_date_format(s: &str) -> bool {
     // Formato básico YYYY-MM-DD
     if s.len() >= 10 {
         let b = s.as_bytes();
-        return b[4] == b'-' && b[7] == b'-';
+        // Verificamos que b[4] y b[7] sean '-'
+        if b[4] != b'-' || b[7] != b'-' {
+            return false;
+        }
+        // Verificamos que el resto sean dígitos (YYYY-MM-DD)
+        let is_digit = |idx: usize| b[idx].is_ascii_digit();
+        return is_digit(0) && is_digit(1) && is_digit(2) && is_digit(3) // YYYY
+            && is_digit(5) && is_digit(6)                               // MM
+            && is_digit(8) && is_digit(9);                              // DD
     }
     false
 }

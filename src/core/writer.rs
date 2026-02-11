@@ -110,11 +110,13 @@ pub fn process_and_write(
                 continue;
             }
 
-            // CORRECCIÓN: Manejo correcto de Value::String
+            // CORRECCIÓN: Manejo correcto de Value::String y otros tipos usando Cow
             let val_str = match val_raw.unwrap() {
-                Value::String(s) => s.as_str(),
-                Value::Null => "",
-                _ => "0",
+                Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                Value::Number(n) => std::borrow::Cow::Owned(n.to_string()),
+                Value::Bool(b) => std::borrow::Cow::Owned(b.to_string()),
+                Value::Null => std::borrow::Cow::Borrowed(""),
+                o => std::borrow::Cow::Owned(o.to_string()),
             };
             if val_str.is_empty() {
                 continue;
@@ -125,11 +127,11 @@ pub fn process_and_write(
                 let final_value: Option<String> = if target_name == base_field {
                     Some(val_str.to_string())
                 } else if target_name.ends_with("_date") || target_name.ends_with("_day") {
-                    extract_day(val_str)
+                    extract_day(&val_str)
                 } else if target_name.ends_with("_month") {
-                    extract_month(val_str)
+                    extract_month(&val_str)
                 } else if target_name.ends_with("_hour_bucket") {
-                    extract_hour_bucket(val_str)
+                    extract_hour_bucket(&val_str)
                 } else {
                     None
                 };

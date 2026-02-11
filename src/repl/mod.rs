@@ -106,10 +106,24 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                     if app.active_task == Some("Search") && app.search_results.is_some() {
                         match mouse.kind {
                             event::MouseEventKind::ScrollUp => {
-                                app.results_scroll = app.results_scroll.saturating_sub(1);
+                                if mouse.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    app.results_scroll_x = app.results_scroll_x.saturating_sub(5);
+                                } else {
+                                    app.results_scroll = app.results_scroll.saturating_sub(1);
+                                }
                             },
                             event::MouseEventKind::ScrollDown => {
-                                app.results_scroll = app.results_scroll.saturating_add(1);
+                                if mouse.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    app.results_scroll_x = app.results_scroll_x.saturating_add(5);
+                                } else {
+                                    app.results_scroll = app.results_scroll.saturating_add(1);
+                                }
+                            },
+                            event::MouseEventKind::ScrollLeft => {
+                                app.results_scroll_x = app.results_scroll_x.saturating_sub(5);
+                            },
+                            event::MouseEventKind::ScrollRight => {
+                                app.results_scroll_x = app.results_scroll_x.saturating_add(5);
                             },
                             _ => {}
                         }
