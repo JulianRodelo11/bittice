@@ -57,3 +57,27 @@ pub fn execute_load_tui(
         },
     )
 }
+
+/// Función para ser llamada desde la línea de comandos (sin TUI compleja)
+pub fn execute_load_cli(input_path: &str, entity: &str, table: &str) -> Result<()> {
+    let output_dir = Path::new("data").join(entity).join(table);
+    if output_dir.exists() {
+        std::fs::remove_dir_all(&output_dir)?;
+    }
+
+    let should_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    
+    // Spinner simple de consola
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(indicatif::ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    pb.set_message("Pass 1: Analyzing schema...");
+    let detected_fields = analyze_schema(input_path, &pb, &should_cancel)?;
+
+    pb.set_message("Pass 2: Writing binary data and indices...");
+    process_and_write(input_path, &output_dir, &detected_fields, &pb, &should_cancel)?;
+
+    pb.finish_with_message("✅ Data loaded successfully!");
+    Ok(())
+}

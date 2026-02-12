@@ -1,4 +1,6 @@
 use ratatui::widgets::ListState;
+use std::collections::HashMap;
+use roaring::RoaringBitmap;
 
 // Pasos para el proceso de carga
 #[derive(PartialEq)]
@@ -198,6 +200,12 @@ pub struct App {
     pub is_loading: bool,
     pub last_rendered_content_height: u16,
     pub results_viewport_height: u16,
+
+    // Cache para queries: Field -> {Value -> Bitmap}
+    pub query_cache: HashMap<String, HashMap<String, RoaringBitmap>>,
+
+    // --- Notificaciones ---
+    pub status_message: Option<(String, bool)>, // (Mensaje, EsÉxito)
 }
 
 impl App {
@@ -270,6 +278,8 @@ impl App {
             is_loading: false,
             last_rendered_content_height: 0,
             results_viewport_height: 0,
+            query_cache: HashMap::new(),
+            status_message: None,
         }
     }
 

@@ -73,6 +73,9 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                 spinner_y
             );
 
+            // LIMPIEZA POST-CARGA: Forzar a Ratatui a redibujar todo
+            let _ = terminal.clear(); 
+
             // Finalizamos la tarea y volvemos al menú principal
             app.active_task = None;
             app.load_step = LoadStep::InputPath;
@@ -143,6 +146,7 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
         KeyCode::Enter => match app.menu_state.selected() {
             Some(0) => {
                 app.active_task = Some("Load");
+                app.status_message = None; // Limpiar mensajes previos
                 // Iniciar sugerencias desde ROOT inmediatamente al entrar
                 app.suggestions = get_path_suggestions("");
                 app.suggestion_index = if app.suggestions.is_empty() {

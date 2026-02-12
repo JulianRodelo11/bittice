@@ -12,7 +12,9 @@ fn main() -> Result<()> {
     if std::env::args().len() > 1 {
         let cli = Cli::parse();
         match cli.command {
-            Commands::Load => {}
+            Commands::Load { input, entity, table } => {
+                bittice::commands::load::execute_load_cli(&input, &entity, &table)?;
+            }
         }
     } else {
         repl::run_interactive()?;

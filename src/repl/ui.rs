@@ -95,7 +95,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
     let inactive_color = colors::INACTIVE_COLOR;
 
     // --- QUERY RESULTS MODE (GLOBAL SCROLL) ---
-    if let Some(results) = app.search_results.clone() {
+    if let Some(results) = &app.search_results {
         let results_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -120,6 +120,21 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         
         // Query Preview
         all_lines.extend(get_query_preview_lines(app));
+        all_lines.push(Line::from(""));
+
+        // Execution Time
+        let time_str = if results.execution_time_micros < 1000 {
+            format!("{} µs", results.execution_time_micros)
+        } else if results.execution_time_micros < 1_000_000 {
+            format!("{:.2} ms", results.execution_time_micros as f64 / 1000.0)
+        } else {
+            format!("{:.2} s", results.execution_time_micros as f64 / 1_000_000.0)
+        };
+
+        all_lines.push(Line::from(vec![
+            Span::styled("Time: ", Style::default().fg(colors::KEY_COLOR)),
+            Span::styled(time_str, Style::default().fg(colors::VALUE_COLOR)),
+        ]));
         all_lines.push(Line::from(""));
 
         // Table Header & Rows
@@ -203,7 +218,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         app.results_viewport_height = viewport_height;
 
         // 2. Build Fixed Footer (Aligned to start/left)
-        let limit = app.limit.unwrap_or(100);
+        let limit = app.limit.unwrap_or(100).max(1);
         let total_pages = (results.total_found + limit - 1) / limit;
         
         f.render_widget(

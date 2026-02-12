@@ -7,6 +7,7 @@ use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_f
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
     app.active_task = Some("Search");
+    app.status_message = None; // Limpiar mensajes de carga
     app.focus_panel = FocusPanel::Left;
     app.search_entities.clear();
     
@@ -138,12 +139,13 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
         KeyCode::Char('s') => {
              // Execute Query with Spinner
              if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                 app.status_message = None; // LIMPIAR MENSAJE DE CARGA AQUÍ
                  app.results_scroll = 0;
                  app.results_scroll_x = 0;
                  app.results_page = 1;
                  let filters = app.filters.clone();
                  let filters_op = app.filters_op.clone();
-                 let limit = app.limit.unwrap_or(100);
+                 let limit = app.limit.unwrap_or(100).max(1);
                  let aggregations = app.aggregations.clone();
                  let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
                  
@@ -172,7 +174,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                      start_y,
                      start_x,
                      |_, _| {
-                         match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
+                         match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0, &mut app.query_cache) {
                              Ok(result) => {
                                  app.search_results = Some(result);
                                  Ok(())
@@ -722,7 +724,7 @@ fn execute_paged_query(app: &mut App) {
     if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
         let filters = app.filters.clone();
         let filters_op = app.filters_op.clone();
-        let limit = app.limit.unwrap_or(100);
+        let limit = app.limit.unwrap_or(100).max(1);
         let aggregations = app.aggregations.clone();
         let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
         let offset = (app.results_page - 1) * limit;
@@ -751,7 +753,7 @@ fn execute_paged_query(app: &mut App) {
             "Fetching next page...",
             spinner_y, 4,
             |_, _| {
-                match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, offset) {
+                match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, offset, &mut app.query_cache) {
                     Ok(result) => {
                         app.search_results = Some(result);
                         Ok(())

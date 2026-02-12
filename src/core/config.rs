@@ -1,6 +1,6 @@
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct FieldConfig {
     pub field_name: String,
     pub indexed: bool,
@@ -8,13 +8,13 @@ pub struct FieldConfig {
     pub extract_date_day: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Config {
     pub indexed_fields: Vec<FieldConfig>,
     pub columnar_fields: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct FieldMetadata {
     pub name: String,
     pub count: u64,

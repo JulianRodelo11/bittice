@@ -12,13 +12,13 @@ use crate::core::config::{Config, FieldConfig, FieldMetadata, FieldStats};
 use crate::core::date_utils::{extract_day, extract_hour_bucket, extract_month};
 
 struct FieldWriters {
-    idx: File,
-    store: File,
     dat: File,
+    offsets: File,
     bitmap_file: File,
     meta_file: File,
-    bitmap: RoaringBitmap,
+    value_bitmaps: HashMap<String, RoaringBitmap>,
     count: u64,
+    current_offset: u64,
 }
 
 pub fn process_and_write(
@@ -88,7 +88,9 @@ pub fn process_and_write(
     let file = File::open(input_path)?;
     let reader = BufReader::new(file);
 
-    for (i, line) in reader.lines().enumerate() {
+    let mut records_processed = 0u32;
+
+    for line in reader.lines() {
         if cancel_flag.load(Ordering::Relaxed) {
              return Err(anyhow!("Operation cancelled by user"));
         }
@@ -98,56 +100,49 @@ pub fn process_and_write(
             continue;
         }
 
-        // La barra de progreso se actualiza automáticamente por tiempo (steady_tick),
-        // no necesitamos incrementar manualmente la posición si no la mostramos.
-
         let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        let internal_id = i as u32;
+        let internal_id = records_processed;
 
         for (base_field, derived_names) in &fields_to_process {
             let val_raw = v.get(base_field);
-            if val_raw.is_none() {
-                continue;
-            }
-
-            // CORRECCIÓN: Manejo correcto de Value::String y otros tipos usando Cow
-            let val_str = match val_raw.unwrap() {
-                Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                Value::Number(n) => std::borrow::Cow::Owned(n.to_string()),
-                Value::Bool(b) => std::borrow::Cow::Owned(b.to_string()),
-                Value::Null => std::borrow::Cow::Borrowed(""),
-                o => std::borrow::Cow::Owned(o.to_string()),
+            
+            // Si el campo no existe, escribimos una entrada vacía para mantener el alineamiento de IDs
+            let val_str = match val_raw {
+                Some(Value::String(s)) => std::borrow::Cow::Borrowed(s.as_str()),
+                Some(Value::Number(n)) => std::borrow::Cow::Owned(n.to_string()),
+                Some(Value::Bool(b)) => std::borrow::Cow::Owned(b.to_string()),
+                Some(Value::Null) => std::borrow::Cow::Borrowed(""),
+                Some(o) => std::borrow::Cow::Owned(o.to_string()),
+                None => std::borrow::Cow::Borrowed(""),
             };
-            if val_str.is_empty() {
-                continue;
-            }
 
             for target_name in derived_names {
-                // CORRECCIÓN: Tipado explícito para evitar confusión del compilador
-                let final_value: Option<String> = if target_name == base_field {
-                    Some(val_str.to_string())
+                let final_value: String = if target_name == base_field {
+                    val_str.to_string()
                 } else if target_name.ends_with("_date") || target_name.ends_with("_day") {
-                    extract_day(&val_str)
+                    extract_day(&val_str).unwrap_or_default()
                 } else if target_name.ends_with("_month") {
-                    extract_month(&val_str)
+                    extract_month(&val_str).unwrap_or_default()
                 } else if target_name.ends_with("_hour_bucket") {
-                    extract_hour_bucket(&val_str)
+                    extract_hour_bucket(&val_str).unwrap_or_default()
                 } else {
-                    None
+                    String::new()
                 };
 
-                if let Some(val) = final_value {
-                    if let Some(writer) = writers.get_mut(target_name) {
-                        write_record(writer, target_name, internal_id, &val)?;
-                    }
+                if let Some(writer) = writers.get_mut(target_name) {
+                    write_record(writer, target_name, internal_id, &final_value)?;
                 }
             }
         }
+        records_processed += 1;
     }
 
     // 5. Cerrar y serializar metadatos finales
     for (name, mut w) in writers {
-        w.bitmap.serialize_into(&mut w.bitmap_file)?;
+        // Serializar el HashMap de bitmaps por valor
+        let encoded = bincode::serialize(&w.value_bitmaps)?;
+        w.bitmap_file.write_all(&encoded)?;
+
         let meta = FieldMetadata {
             name: name.clone(),
             count: w.count,
@@ -161,24 +156,30 @@ pub fn process_and_write(
 
 fn create_writers(base: &Path, field: &str) -> Result<FieldWriters> {
     Ok(FieldWriters {
-        idx: File::create(base.join(format!("index/{}.idx", field)))?,
-        store: File::create(base.join(format!("stores/{}.store", field)))?,
         dat: File::create(base.join(format!("stores/{}.dat", field)))?,
+        offsets: File::create(base.join(format!("stores/{}.offsets", field)))?,
         bitmap_file: File::create(base.join(format!("index/bitmaps_{}.dat", field)))?,
         meta_file: File::create(base.join(format!("index/metadata_{}.dat", field)))?,
-        bitmap: RoaringBitmap::new(),
+        value_bitmaps: HashMap::new(),
         count: 0,
+        current_offset: 0,
     })
 }
 
-fn write_record(w: &mut FieldWriters, field_name: &str, id: u32, val: &str) -> Result<()> {
-    writeln!(w.idx, "{}__{}\t{}", field_name, val, id)?;
-    writeln!(w.store, "{}\t{}", id, val)?;
+fn write_record(w: &mut FieldWriters, _field_name: &str, id: u32, val: &str) -> Result<()> {
+    // Guardar offset actual
+    w.offsets.write_all(&w.current_offset.to_le_bytes())?;
 
+    // Guardar dato binario
     let binary_val = bincode::serialize(val)?;
+    let len = binary_val.len() as u64;
     w.dat.write_all(&binary_val)?;
+    
+    w.current_offset += len;
 
-    w.bitmap.insert(id);
+    if !val.is_empty() {
+        w.value_bitmaps.entry(val.to_string()).or_default().insert(id);
+    }
     w.count += 1;
     Ok(())
 }

@@ -12,5 +12,15 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Carga datos desde un NDJSON al formato Bittice
-    Load,
+    Load {
+        /// Ruta al archivo .ndjson
+        #[arg(short, long)]
+        input: String,
+        /// Nombre de la entidad
+        #[arg(short, long)]
+        entity: String,
+        /// Nombre de la tabla
+        #[arg(short, long)]
+        table: String,
+    },
 }
