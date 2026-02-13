@@ -2,7 +2,7 @@ use crossterm::event::{self, KeyCode};
 use std::path::Path;
 
 use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel};
-use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields, get_base_fields};
+use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields, get_base_fields, get_field_values};
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
@@ -411,7 +411,11 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                         if f_idx < app.filters.len() {
                                             app.filters[f_idx].field = field.clone();
                                             // ACTUALIZAR VALORES EXISTENTES
-                                            let values = vec!["Write value".to_string()];
+                                            let values = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                                                get_field_values(Path::new("data"), e, t, field)
+                                            } else {
+                                                vec!["Write value".to_string()]
+                                            };
                                             app.filters[f_idx].value_options = values.clone();
                                             app.filter_value_options = values;
                                         }

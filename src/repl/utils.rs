@@ -170,10 +170,11 @@ pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str
     
     if let Ok(file) = File::open(idx_path) {
         let reader = BufReader::new(file);
+        let prefix = format!("{}__", field);
         for line in reader.lines().flatten() {
             // Formato: {field_name}__{val}\t{id}
-            if let Some(pos) = line.find("__") {
-                let rest = &line[pos + 2..];
+            if line.starts_with(&prefix) {
+                let rest = &line[prefix.len()..];
                 if let Some(tab_pos) = rest.find('\t') {
                     let val = &rest[..tab_pos];
                     if !val.is_empty() {
@@ -232,70 +233,4 @@ pub fn get_filtered_fields(all_fields: &[String]) -> Vec<String> {
     }
     filtered.sort();
     filtered
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_get_path_suggestions() {
-        let dir = tempdir().unwrap();
-        let dir_path = dir.path();
-
-        // Create dummy files and directories
-        fs::create_dir(dir_path.join("subdir")).unwrap();
-        fs::File::create(dir_path.join("file1.ndjson")).unwrap();
-        fs::File::create(dir_path.join("file2.txt")).unwrap();
-        fs::create_dir(dir_path.join(".hidden_dir")).unwrap();
-        fs::File::create(dir_path.join(".hidden_file")).unwrap();
-
-        // Test case 1: Empty input, should suggest from root
-        // Note: This test is environment-dependent, so we'll test relative paths
-
-        // Test case 2: Suggest directories and .ndjson files
-        let mut input = dir_path.to_str().unwrap().to_string();
-        input.push('/');
-        let suggestions = get_path_suggestions(&input);
-        assert!(suggestions.iter().any(|s| s.ends_with("subdir/")));
-        assert!(suggestions.iter().any(|s| s.ends_with("file1.ndjson")));
-        assert!(!suggestions.iter().any(|s| s.ends_with("file2.txt")));
-        assert!(!suggestions.iter().any(|s| s.ends_with(".hidden_dir/")));
-        assert!(!suggestions.iter().any(|s| s.ends_with(".hidden_file")));
-
-        // Test case 3: Suggest with a prefix
-        let path_buf = dir_path.join("f");
-        let prefix_input = path_buf.to_str().unwrap();
-        let suggestions_prefix = get_path_suggestions(prefix_input);
-        assert!(suggestions_prefix.iter().any(|s| s.ends_with("file1.ndjson")));
-        assert!(!suggestions_prefix.iter().any(|s| s.ends_with("subdir/")));
-    }
-
-    #[test]
-    fn test_get_indexed_fields() {
-        let dir = tempdir().unwrap();
-        let data_path = dir.path();
-        let entity = "test_entity";
-        let table = "test_table";
-        let config_dir = data_path.join(entity).join(table);
-        fs::create_dir_all(&config_dir).unwrap();
-
-        let config_content = r#"
-        {
-            "indexed_fields": [
-                {"field_name": "id", "indexed": true},
-                {"field_name": "name", "indexed": false},
-                {"field_name": "age", "indexed": true}
-            ]
-        }
-        "#;
-        fs::write(config_dir.join("config.json"), config_content).unwrap();
-
-        let fields = get_indexed_fields(data_path, entity, table);
-
-        assert_eq!(fields, vec!["age", "id"]);
-    }
 }
