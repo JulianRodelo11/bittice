@@ -206,6 +206,13 @@ pub struct App {
 
     // --- Notificaciones ---
     pub status_message: Option<(String, bool)>, // (Mensaje, EsÉxito)
+
+    // --- Saved Queries ---
+    pub is_saving_query: bool,
+    pub show_saved_queries: bool,
+    pub save_query_name_input: String,
+    pub saved_queries: Vec<crate::core::saved_queries::SavedQuery>,
+    pub saved_queries_state: ListState,
 }
 
 impl App {
@@ -215,6 +222,9 @@ impl App {
 
         let mut left_panel_state = ListState::default();
         left_panel_state.select(Some(0));
+
+        // Load saved queries
+        let saved_queries = crate::core::saved_queries::load_queries().unwrap_or_default();
 
         App {
             // General
@@ -280,6 +290,13 @@ impl App {
             results_viewport_height: 0,
             query_cache: HashMap::new(),
             status_message: None,
+
+            // Saved Queries
+            is_saving_query: false,
+            show_saved_queries: false,
+            save_query_name_input: String::new(),
+            saved_queries,
+            saved_queries_state: ListState::default(),
         }
     }
 

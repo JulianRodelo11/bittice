@@ -4,6 +4,7 @@ pub mod core {
     pub mod schema;
     pub mod writer;
     pub mod query;
+    pub mod saved_queries;
 }
 
 pub mod commands {

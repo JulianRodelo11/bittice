@@ -4,8 +4,8 @@ use crate::ui::colors;
 use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
 
-pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
-    let purple_muted = colors::MUTED_COLOR;
+pub fn ui(f: &mut Frame, app: &mut App, _purple: Color) {
+    let _purple_muted = colors::MUTED_COLOR;
     let size = f.size();
 
     // 🔹 Layout raíz con simetría vertical
@@ -32,16 +32,32 @@ pub fn ui(f: &mut Frame, app: &mut App, purple: Color) {
 
     let central_area = main_layout[1];
 
+    let is_overlay_active = app.is_saving_query || app.show_saved_queries;
+
     if app.active_task == Some("Search") {
-        draw_search_ui(f, app, central_area);
+        draw_search_ui(f, app, central_area, is_overlay_active);
+        draw_overlays(f, app, size);
     } else if app.active_task == Some("Load") {
-        draw_load_ui(f, app, central_area, purple, purple_muted);
+        draw_load_ui(f, app, central_area, is_overlay_active);
     } else {
-        draw_main_menu(f, app, central_area, purple, purple_muted);
+        draw_main_menu(f, app, central_area, is_overlay_active);
     }
 }
 
-fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
+fn draw_overlays(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.is_saving_query {
+        draw_save_query_overlay(f, app, area);
+    }
+    if app.show_saved_queries {
+        draw_saved_queries_overlay(f, app, area);
+    }
+}
+
+fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
+    let purple = if dimmed { Color::Indexed(237) } else { colors::PRIMARY_COLOR };
+    let purple_muted = if dimmed { Color::Indexed(235) } else { colors::MUTED_COLOR };
+    let text_color = if dimmed { Color::Indexed(237) } else { Color::White };
+
     let loaded_data = get_loaded_data();
     let loaded_height = if loaded_data.is_empty() {
         0
@@ -61,7 +77,7 @@ fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_
         .split(area);
 
     // 1. Menú (Se dibuja SIEMPRE)
-    draw_menu_widget(f, app, chunks[0], purple, purple_muted);
+    draw_menu_widget(f, app, chunks[0], purple, purple_muted, text_color);
 
     // 2. Datos Cargados (Se dibujan SIEMPRE)
     if !loaded_data.is_empty() {
@@ -88,11 +104,16 @@ fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_
     }
 }
 
-fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
-    let purple = colors::PRIMARY_COLOR;
-    let purple_muted = colors::MUTED_COLOR;
-    let active_color = colors::ACTIVE_COLOR;
-    let inactive_color = colors::INACTIVE_COLOR;
+fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
+    let purple = if dimmed { Color::Indexed(240) } else { colors::PRIMARY_COLOR };
+    let purple_muted = if dimmed { Color::Indexed(238) } else { colors::MUTED_COLOR };
+    let active_color = if dimmed { Color::Indexed(243) } else { colors::ACTIVE_COLOR };
+    let inactive_color = if dimmed { Color::Indexed(238) } else { colors::INACTIVE_COLOR };
+    let value_color = if dimmed { Color::Indexed(240) } else { colors::VALUE_COLOR };
+    let key_color = if dimmed { Color::Indexed(240) } else { colors::KEY_COLOR };
+    let instruction_color = if dimmed { Color::Indexed(240) } else { colors::INSTRUCTION_COLOR };
+    let text_color = if dimmed { Color::Indexed(240) } else { Color::White };
+    let grid_color = if dimmed { Color::Indexed(237) } else { Color::Rgb(100, 100, 100) };
 
     // --- QUERY RESULTS MODE (GLOBAL SCROLL) ---
     if let Some(results) = &app.search_results {
@@ -108,18 +129,22 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         let mut all_lines = Vec::new();
         
         // Menu
-        all_lines.extend(get_menu_lines(app, purple, purple_muted));
+        all_lines.extend(get_menu_lines(app, purple, purple_muted, text_color));
         all_lines.push(Line::from(""));
 
         // Exit Instructions (Normal text above Query)
         all_lines.push(Line::from(vec![
-            Span::styled("+ ", Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)),
-            Span::styled("Press Esc to exit results", Style::default().fg(Color::White)),
+            Span::styled("+ ", Style::default().fg(active_color).add_modifier(Modifier::BOLD)),
+            Span::styled("Press Esc to exit results", Style::default().fg(text_color)),
+        ]));
+        all_lines.push(Line::from(vec![
+            Span::styled("+ ", Style::default().fg(active_color).add_modifier(Modifier::BOLD)),
+            Span::styled("Press 'g' to save query", Style::default().fg(text_color)),
         ]));
         all_lines.push(Line::from(""));
         
         // Query Preview
-        all_lines.extend(get_query_preview_lines(app));
+        all_lines.extend(get_query_preview_lines_styled(app, key_color, value_color, active_color));
         all_lines.push(Line::from(""));
 
         // Execution Time
@@ -132,16 +157,15 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         all_lines.push(Line::from(vec![
-            Span::styled("Time: ", Style::default().fg(colors::KEY_COLOR)),
-            Span::styled(time_str, Style::default().fg(colors::VALUE_COLOR)),
+            Span::styled("Time: ", Style::default().fg(key_color)),
+            Span::styled(time_str, Style::default().fg(value_color)),
         ]));
         all_lines.push(Line::from(""));
 
         // Table Header & Rows
         if results.rows.is_empty() {
-             all_lines.push(Line::from(Span::styled("  No results found", Style::default().fg(Color::Red))));
+             all_lines.push(Line::from(Span::styled("  No results found", Style::default().fg(if dimmed { Color::Indexed(235) } else { Color::Red }))));
         } else {
-            let grid_color = Color::Rgb(100, 100, 100);
             let mut col_widths = Vec::new();
             for (i, header) in results.headers.iter().enumerate() {
                 let mut max_w = header.len();
@@ -170,7 +194,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     let w = col_widths[i];
                     let truncated = if h.len() > w - 2 { &h[..w - 2] } else { h };
                     let cell = format!(" {:<width$} ", truncated, width = w - 2);
-                    header_line.push(Span::styled(cell, Style::default().fg(colors::ACTIVE_COLOR)));
+                    header_line.push(Span::styled(cell, Style::default().fg(active_color)));
                     header_line.push(Span::styled("│", Style::default().fg(grid_color)));
                 }
                 all_lines.push(Line::from(header_line));
@@ -190,7 +214,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                         let w = col_widths[i];
                         let truncated = if cell_val.len() > w - 2 { &cell_val[..w - 2] } else { cell_val };
                         let cell = format!(" {:<width$} ", truncated, width = w - 2);
-                        row_line.push(Span::styled(cell, Style::default().fg(colors::VALUE_COLOR)));
+                        row_line.push(Span::styled(cell, Style::default().fg(value_color)));
                         row_line.push(Span::styled("│", Style::default().fg(grid_color)));
                     }
                     all_lines.push(Line::from(row_line));
@@ -221,12 +245,16 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         let limit = app.limit.unwrap_or(100).max(1);
         let total_pages = (results.total_found + limit - 1) / limit;
         
+        let footer_color = if dimmed { Color::Indexed(240) } else { Color::White };
+        let footer_bg = if dimmed { Color::Indexed(235) } else { Color::Rgb(30, 30, 30) };
+        let footer_muted = if dimmed { Color::Indexed(238) } else { Color::DarkGray };
+
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" ← A ", Style::default().fg(if app.results_page > 1 { Color::White } else { Color::DarkGray }).bg(Color::Rgb(30, 30, 30))),
-                Span::styled(format!(" Page {}/{} ", app.results_page, total_pages.max(1)), Style::default().fg(Color::White)),
-                Span::styled(" D → ", Style::default().fg(if app.results_page < total_pages { Color::White } else { Color::DarkGray }).bg(Color::Rgb(30, 30, 30))),
-                Span::styled(format!("  (Total found: {})", results.total_found), Style::default().fg(Color::DarkGray)),
+                Span::styled(" ← A ", Style::default().fg(if app.results_page > 1 { footer_color } else { footer_muted }).bg(footer_bg)),
+                Span::styled(format!(" Page {}/{} ", app.results_page, total_pages.max(1)), Style::default().fg(footer_color)),
+                Span::styled(" D → ", Style::default().fg(if app.results_page < total_pages { footer_color } else { footer_muted }).bg(footer_bg)),
+                Span::styled(format!("  (Total found: {})", results.total_found), Style::default().fg(footer_muted)),
             ])).alignment(Alignment::Left),
             results_layout[1]
         );
@@ -243,14 +271,14 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(1), // Instrucciones justo debajo
             Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
             Constraint::Length(1), // Espacio de separación
-            Constraint::Length(1), // Nueva instrucción: Para hacer una consulta...
+            Constraint::Length(3), // Nueva instrucción: Para hacer una consulta... (Aumentado a 3)
             Constraint::Length(1), // Espacio extra solicitado
             Constraint::Length(15), // Preview de Query
             Constraint::Min(0),    // Resto del espacio al final
         ])
         .split(area);
     
-    draw_menu_widget(f, app, chunks[0], purple, purple_muted);
+    draw_menu_widget(f, app, chunks[0], purple, purple_muted, text_color);
 
     let panel_layout = if app.search_criteria == SearchCriteria::Filters {
         if app.filters.is_empty() {
@@ -304,18 +332,18 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let mut left_items = vec![
-        ListItem::new("Entity"),
-        ListItem::new(Span::styled("Table", if app.selected_entity.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
-        ListItem::new(Span::styled("Filters", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
+        ListItem::new(Span::styled("Entity", Style::default().fg(text_color))),
+        ListItem::new(Span::styled("Table", if app.selected_entity.is_some() { Style::default().fg(text_color) } else { Style::default().fg(inactive_color) })),
+        ListItem::new(Span::styled("Filters", if app.selected_table.is_some() { Style::default().fg(text_color) } else { Style::default().fg(inactive_color) })),
     ];
     if app.filters.len() > 1 {
-        left_items.push(ListItem::new(Span::styled("Filters Op", Style::default())));
+        left_items.push(ListItem::new(Span::styled("Filters Op", Style::default().fg(text_color))));
     }
     left_items.extend(vec![
-        ListItem::new(Span::styled("Aggregations", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
-        ListItem::new(Span::styled("Order By (Strict)", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
-        ListItem::new(Span::styled("Limit", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
-        ListItem::new(Span::styled("Fields", if app.selected_table.is_some() { Style::default() } else { Style::default().fg(Color::DarkGray) })),
+        ListItem::new(Span::styled("Aggregations", if app.selected_table.is_some() { Style::default().fg(text_color) } else { Style::default().fg(inactive_color) })),
+        ListItem::new(Span::styled("Order By (Strict)", if app.selected_table.is_some() { Style::default().fg(text_color) } else { Style::default().fg(inactive_color) })),
+        ListItem::new(Span::styled("Limit", if app.selected_table.is_some() { Style::default().fg(text_color) } else { Style::default().fg(inactive_color) })),
+        ListItem::new(Span::styled("Fields", if app.selected_table.is_some() { Style::default().fg(text_color) } else { Style::default().fg(inactive_color) })),
     ]);
 
     let left_list = List::new(left_items)
@@ -323,13 +351,10 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .padding(Padding::new(1, 1, 1, 1))
-            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Left { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
+            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Left { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color })))
         .highlight_style(Style::default().fg(active_color))
         .highlight_symbol("> ");
     f.render_stateful_widget(left_list, panel_layout[0], &mut app.left_panel_state);
-
-    // (continuing rendering components)
-
 
     let middle_items: Vec<ListItem> = match app.search_criteria {
         SearchCriteria::Entity => app.search_entities.iter().map(|s| {
@@ -344,8 +369,10 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             let mut items: Vec<ListItem> = app.filters.iter().map(|f| {
                 ListItem::new(Span::styled(format!("{} {} {}", f.field, f.op.as_str(), f.value), Style::default().fg(active_color)))
             }).collect();
-            items.push(ListItem::new(Span::styled("+ Add Next Filter", Style::default().fg(colors::ADD_COLOR))));
-            if !app.filters.is_empty() { items.push(ListItem::new(Span::styled("- Delete Filter", Style::default().fg(colors::DELETE_COLOR)))); }
+            let add_color = if dimmed { Color::Indexed(235) } else { colors::ADD_COLOR };
+            let del_color = if dimmed { Color::Indexed(235) } else { colors::DELETE_COLOR };
+            items.push(ListItem::new(Span::styled("+ Add Next Filter", Style::default().fg(add_color))));
+            if !app.filters.is_empty() { items.push(ListItem::new(Span::styled("- Delete Filter", Style::default().fg(del_color)))); }
             items
         },
         SearchCriteria::Aggregations => {
@@ -353,16 +380,20 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                 let agg_type = agg.as_object().and_then(|o| o.keys().next()).map(|s| s.as_str()).unwrap_or("Unknown");
                 ListItem::new(format!("Agg {}: {}", i + 1, agg_type))
             }).collect();
-            items.push(ListItem::new(Span::styled("+ Add Next Aggregation", Style::default().fg(colors::ADD_COLOR))));
-            if !app.aggregations.is_empty() { items.push(ListItem::new(Span::styled("- Delete Aggregation", Style::default().fg(colors::DELETE_COLOR)))); }
+            let add_color = if dimmed { Color::Indexed(235) } else { colors::ADD_COLOR };
+            let del_color = if dimmed { Color::Indexed(235) } else { colors::DELETE_COLOR };
+            items.push(ListItem::new(Span::styled("+ Add Next Aggregation", Style::default().fg(add_color))));
+            if !app.aggregations.is_empty() { items.push(ListItem::new(Span::styled("- Delete Aggregation", Style::default().fg(del_color)))); }
             items
         },
         SearchCriteria::OrderBy => {
             let mut items: Vec<ListItem> = app.order_by.iter().enumerate().map(|(i, o)| {
                 ListItem::new(format!("{}: {} {}", i + 1, o.field, o.direction.as_str()))
             }).collect();
-            items.push(ListItem::new(Span::styled("+ Add Next OrderBy", Style::default().fg(colors::ADD_COLOR))));
-            if !app.order_by.is_empty() { items.push(ListItem::new(Span::styled("- Delete OrderBy", Style::default().fg(colors::DELETE_COLOR)))); }
+            let add_color = if dimmed { Color::Indexed(235) } else { colors::ADD_COLOR };
+            let del_color = if dimmed { Color::Indexed(235) } else { colors::DELETE_COLOR };
+            items.push(ListItem::new(Span::styled("+ Add Next OrderBy", Style::default().fg(add_color))));
+            if !app.order_by.is_empty() { items.push(ListItem::new(Span::styled("- Delete OrderBy", Style::default().fg(del_color)))); }
             items
         },
         SearchCriteria::Limit => vec![ListItem::new(format!("Value: {}", app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string())))],
@@ -381,7 +412,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .padding(Padding::new(1, 1, 1, 1))
-            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Middle { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
+            .border_style(Style::default().fg(if app.focus_panel == FocusPanel::Middle { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color })))
         .highlight_style(Style::default().fg(active_color))
         .highlight_symbol("> ");
     f.render_stateful_widget(middle_list, panel_layout[1], &mut app.middle_panel_state);
@@ -391,7 +422,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
         if current_idx < app.filters.len() {
             let right_items = vec![ListItem::new("Field"), ListItem::new("Op"), ListItem::new("Value")];
             let right_list = List::new(right_items)
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color })))
                 .highlight_style(Style::default().fg(active_color))
                 .highlight_symbol("> ");
             f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
@@ -412,7 +443,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                 _ => vec![],
             };
             let extra_list = List::new(extra_items)
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { colors::SELECTED_BORDER_COLOR } else { inactive_color })))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color })))
                 .highlight_style(Style::default().fg(active_color))
                 .highlight_symbol("> ");
             f.render_stateful_widget(extra_list, panel_layout[3], &mut app.extra_panel_state);
@@ -424,7 +455,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
             if let Some(inner) = app.aggregations[current_idx].as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
                 for key in inner.keys() { right_items.push(ListItem::new(key.as_str())); }
             }
-            let right_list = List::new(right_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { colors::SELECTED_BORDER_COLOR } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
+            let right_list = List::new(right_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
             f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
 
             let mut extra_items: Vec<ListItem> = Vec::new();
@@ -459,14 +490,14 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
             }
-            let extra_list = List::new(extra_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { colors::SELECTED_BORDER_COLOR } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
+            let extra_list = List::new(extra_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
             f.render_stateful_widget(extra_list, panel_layout[3], &mut app.extra_panel_state);
         }
     } else if app.search_criteria == SearchCriteria::OrderBy && !app.order_by.is_empty() {
         let current_idx = app.middle_panel_state.selected().unwrap_or(0);
         if current_idx < app.order_by.len() {
             let right_items = vec![ListItem::new("Field"), ListItem::new("Direction")];
-            let right_list = List::new(right_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { colors::SELECTED_BORDER_COLOR } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
+            let right_list = List::new(right_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
             f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
             let extra_items: Vec<ListItem> = match app.right_panel_state.selected() {
                  Some(0) => get_order_by_fields(&app.available_fields).into_iter().map(|f| {
@@ -475,12 +506,12 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
                  Some(1) => vec![ListItem::new("Asc"), ListItem::new("Desc")],
                  _ => vec![],
             };
-            let extra_list = List::new(extra_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { colors::SELECTED_BORDER_COLOR } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
+            let extra_list = List::new(extra_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
             f.render_stateful_widget(extra_list, panel_layout[3], &mut app.extra_panel_state);
         }
     }
 
-    let desc_style = Style::default().fg(colors::INSTRUCTION_COLOR);
+    let desc_style = Style::default().fg(instruction_color);
     let help_text = match app.focus_panel {
         FocusPanel::Left => format!("↑↓ Navigate  •  → Next Panel  •  esq Quit"),
         FocusPanel::Middle => format!("↑↓ Navigate  •  ↵ Toggle Selection  •  ←→ Switch Panel  •  esq Quit"),
@@ -495,27 +526,39 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // New instruction aligned with Query
-    f.render_widget(Paragraph::new(Line::from(vec![
-        Span::styled("+ ", Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)),
-        Span::styled("To perform a query press the s key", Style::default().fg(Color::White)),
-    ])), chunks[5]);
+    f.render_widget(Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("+ ", Style::default().fg(active_color).add_modifier(Modifier::BOLD)),
+            Span::styled("To perform a query press the s key", Style::default().fg(text_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("+ ", Style::default().fg(active_color).add_modifier(Modifier::BOLD)),
+            Span::styled("Press 'L' (Shift+l) to load a saved query", Style::default().fg(text_color)),
+        ])
+    ]), chunks[5]);
 
-    draw_query_preview(f, app, chunks[7]);
+    draw_query_preview_styled(f, app, chunks[7], key_color, value_color, active_color);
 }
 
-fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
+fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
+    let purple = if dimmed { Color::Indexed(237) } else { colors::PRIMARY_COLOR };
+    let purple_muted = if dimmed { Color::Indexed(235) } else { colors::MUTED_COLOR };
+    let text_color = if dimmed { Color::Indexed(237) } else { Color::White };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(7), Constraint::Min(0)])
         .split(area);
-    draw_menu_widget(f, app, chunks[0], purple, purple_muted);
+    draw_menu_widget(f, app, chunks[0], purple, purple_muted, text_color);
     let loaded_data = get_loaded_data();
     if !loaded_data.is_empty() { draw_loaded_data_widget(f, &loaded_data, chunks[1]); }
 }
 
-fn draw_menu_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color) {
+fn draw_menu_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Color, purple_muted: Color, text_color: Color) {
     let menu_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(purple_muted)).padding(Padding::new(2, 2, 1, 1));
-    let items: Vec<ListItem> = app.menu_items.iter().enumerate().map(|(i, m)| ListItem::new(format!("{}. {}", i + 1, m))).collect();
+    let items: Vec<ListItem> = app.menu_items.iter().enumerate().map(|(i, m)| {
+        ListItem::new(Span::styled(format!("{}. {}", i + 1, m), Style::default().fg(text_color)))
+    }).collect();
     let list = List::new(items).block(menu_block).highlight_style(Style::default().fg(purple)).highlight_symbol("◉ ");
     f.render_stateful_widget(list, area, &mut app.menu_state);
 }
@@ -555,7 +598,7 @@ fn draw_suggestions_widget(f: &mut Frame, app: &mut App, area: Rect, purple: Col
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn get_menu_lines(app: &App, purple: Color, purple_muted: Color) -> Vec<Line<'_>> {
+fn get_menu_lines(app: &App, purple: Color, purple_muted: Color, text_color: Color) -> Vec<Line<'_>> {
     let mut lines = Vec::new();
     let width = 40; // Ancho total del contenedor
     
@@ -576,8 +619,8 @@ fn get_menu_lines(app: &App, purple: Color, purple_muted: Color) -> Vec<Line<'_>
         
         lines.push(Line::from(vec![
             Span::styled("│ ", Style::default().fg(purple_muted)),
-            Span::styled(bullet, if is_selected { Style::default().fg(purple) } else { Style::default() }),
-            Span::styled(text, if is_selected { Style::default().fg(purple) } else { Style::default() }),
+            Span::styled(bullet, if is_selected { Style::default().fg(purple) } else { Style::default().fg(text_color) }),
+            Span::styled(text, if is_selected { Style::default().fg(purple) } else { Style::default().fg(text_color) }),
             Span::styled(padding, Style::default()),
             Span::styled(" │", Style::default().fg(purple_muted)),
         ]));
@@ -588,14 +631,23 @@ fn get_menu_lines(app: &App, purple: Color, purple_muted: Color) -> Vec<Line<'_>
     lines
 }
 
+fn draw_query_preview_styled(f: &mut Frame, app: &mut App, area: Rect, key_style: Color, val_style: Color, active_style: Color) {
+    let lines = get_query_preview_lines_styled(app, key_style, val_style, active_style);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 pub fn get_query_preview_lines(app: &App) -> Vec<Line<'_>> {
-    let key_style = Style::default().fg(colors::KEY_COLOR);
-    let val_style = Style::default().fg(colors::VALUE_COLOR);
-    let branch_style = Style::default().fg(colors::KEY_COLOR);
+    get_query_preview_lines_styled(app, colors::KEY_COLOR, colors::VALUE_COLOR, colors::ACTIVE_COLOR)
+}
+
+pub fn get_query_preview_lines_styled(app: &App, key_c: Color, val_c: Color, active_c: Color) -> Vec<Line<'_>> {
+    let key_style = Style::default().fg(key_c);
+    let val_style = Style::default().fg(val_c);
+    let branch_style = Style::default().fg(key_c);
     let mut lines = Vec::new();
 
     let title = if app.search_results.is_some() { "Query" } else { "Query Preview" };
-    lines.push(Line::from(Span::styled(title, Style::default().fg(colors::ACTIVE_COLOR))));
+    lines.push(Line::from(Span::styled(title, Style::default().fg(active_c))));
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Entity: ", key_style), Span::styled(app.selected_entity.as_deref().unwrap_or("?"), val_style)]));
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Table: ", key_style), Span::styled(app.selected_table.as_deref().unwrap_or("?"), val_style)]));
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Filters: ", key_style)]));
@@ -603,7 +655,7 @@ pub fn get_query_preview_lines(app: &App) -> Vec<Line<'_>> {
         for (i, f) in app.filters.iter().enumerate() {
              lines.push(Line::from(vec![Span::styled(if i == app.filters.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style), Span::styled(format!("{} {} {}", f.field, f.op.as_str(), f.value), val_style)]));
         }
-    } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(Color::DarkGray))])); }
+    } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(if key_c == colors::KEY_COLOR { Color::DarkGray } else { key_c }))])); }
     if app.filters.len() > 1 { lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Filters Op: ", key_style), Span::styled(app.filters_op.to_string(), val_style)])); }
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Aggregations: ", key_style)]));
     if !app.aggregations.is_empty() {
@@ -611,19 +663,81 @@ pub fn get_query_preview_lines(app: &App) -> Vec<Line<'_>> {
             let agg_str = serde_json::to_string(agg).unwrap_or_default();
             lines.push(Line::from(vec![Span::styled(if i == app.aggregations.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style), Span::styled(agg_str, val_style)]));
         }
-    } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(Color::DarkGray))])); }
+    } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(if key_c == colors::KEY_COLOR { Color::DarkGray } else { key_c }))])); }
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Order By: ", key_style)]));
     if !app.order_by.is_empty() {
         for (i, o) in app.order_by.iter().enumerate() {
              lines.push(Line::from(vec![Span::styled(if i == app.order_by.len() - 1 { "│   └── " } else { "│   ├── " }, branch_style), Span::styled(format!("{} {}", o.field, o.direction.as_str()), val_style)]));
         }
-    } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(Color::DarkGray))])); }
+    } else { lines.push(Line::from(vec![Span::styled("│   └── ", branch_style), Span::styled("(None)", Style::default().fg(if key_c == colors::KEY_COLOR { Color::DarkGray } else { key_c }))])); }
     lines.push(Line::from(vec![Span::styled("├── ", branch_style), Span::styled("Limit: ", key_style), Span::styled(app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string()), val_style)]));
     lines.push(Line::from(vec![Span::styled("└── ", branch_style), Span::styled("Fields: ", key_style), Span::styled(if app.selected_fields.is_empty() { "All".to_string() } else { format!("{:?}", app.selected_fields) }, val_style)]));
     lines
 }
 
-fn draw_query_preview(f: &mut Frame, app: &mut App, area: Rect) {
-    let lines = get_query_preview_lines(app);
-    f.render_widget(Paragraph::new(lines), area);
+fn draw_save_query_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default().title(" Save Query ").borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    let area = centered_rect(60, 20, area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+    
+    let input = Paragraph::new(app.save_query_name_input.as_str())
+        .block(Block::default().borders(Borders::ALL).title(" Query Name "));
+    f.render_widget(input, chunks[0]);
+    
+    let msg = Paragraph::new("Press Enter to Save, Esc to Cancel")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(msg, chunks[1]);
+}
+
+fn draw_saved_queries_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default().title(" Saved Queries ").borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    let area = centered_rect(60, 60, area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+
+    let items: Vec<ListItem> = app.saved_queries.iter().map(|q| {
+        ListItem::new(format!("{} ({} - {})", q.name, q.entity, q.table))
+    }).collect();
+    
+    let list = List::new(items)
+        .highlight_style(Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, chunks[0], &mut app.saved_queries_state);
+
+    let msg = Paragraph::new("Enter: Load & Run • d: Delete • Esc: Close")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(msg, chunks[1]);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }

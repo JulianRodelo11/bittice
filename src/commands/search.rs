@@ -1,8 +1,9 @@
 use crossterm::event::{self, KeyCode};
 use std::path::Path;
 
-use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel};
+use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel, Filter, ComparisonOp, OrderBy, SortDirection, LogicalOp};
 use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields, get_base_fields, get_field_values};
+use crate::core::saved_queries::{SavedQuery, save_queries, SavedFilter, SavedOrderBy};
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
@@ -37,6 +38,100 @@ pub fn init_search(app: &mut App) {
 }
 
 pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
+    // 1. Handle Saving Query Input Overlay
+    if app.is_saving_query {
+        match key.code {
+            KeyCode::Enter => {
+                if !app.save_query_name_input.is_empty() {
+                    let name = app.save_query_name_input.clone();
+                    // Create SavedQuery object
+                    let query = SavedQuery {
+                        name: name.clone(),
+                        entity: app.selected_entity.clone().unwrap_or_default(),
+                        table: app.selected_table.clone().unwrap_or_default(),
+                        filters: app.filters.iter().map(SavedFilter::from).collect(),
+                        filters_op: app.filters_op.to_string(),
+                        aggregations: app.aggregations.clone(),
+                        order_by: app.order_by.iter().map(SavedOrderBy::from).collect(),
+                        limit: app.limit,
+                        selected_fields: app.selected_fields.clone(),
+                    };
+                    
+                    app.saved_queries.push(query);
+                    if let Err(e) = save_queries(&app.saved_queries) {
+                        app.status_message = Some((format!("Error saving: {}", e), false));
+                    } else {
+                        app.status_message = Some((format!("Query '{}' saved!", name), true));
+                    }
+                    
+                    app.is_saving_query = false;
+                    app.save_query_name_input.clear();
+                }
+            },
+            KeyCode::Esc => {
+                app.is_saving_query = false;
+                app.save_query_name_input.clear();
+            },
+            KeyCode::Char(c) => {
+                app.save_query_name_input.push(c);
+            },
+            KeyCode::Backspace => {
+                app.save_query_name_input.pop();
+            },
+            _ => {}
+        }
+        return;
+    }
+
+    // 2. Handle Saved Queries List Overlay
+    if app.show_saved_queries {
+        match key.code {
+            KeyCode::Esc => {
+                app.show_saved_queries = false;
+            },
+            KeyCode::Up => {
+                 let i = match app.saved_queries_state.selected() {
+                    Some(i) => if i == 0 { app.saved_queries.len().saturating_sub(1) } else { i - 1 },
+                    None => 0,
+                };
+                app.saved_queries_state.select(Some(i));
+            },
+            KeyCode::Down => {
+                let i = match app.saved_queries_state.selected() {
+                    Some(i) => if i >= app.saved_queries.len().saturating_sub(1) { 0 } else { i + 1 },
+                    None => 0,
+                };
+                app.saved_queries_state.select(Some(i));
+            },
+            KeyCode::Enter => {
+                if let Some(idx) = app.saved_queries_state.selected() {
+                    if idx < app.saved_queries.len() {
+                        let query = app.saved_queries[idx].clone();
+                        load_saved_query_into_app(app, &query);
+                        app.show_saved_queries = false;
+                        execute_search_action(app);
+                    }
+                }
+            },
+            KeyCode::Char('d') => {
+                 // Delete saved query
+                 if let Some(idx) = app.saved_queries_state.selected() {
+                    if idx < app.saved_queries.len() {
+                        app.saved_queries.remove(idx);
+                        let _ = save_queries(&app.saved_queries);
+                        if app.saved_queries.is_empty() {
+                            app.saved_queries_state.select(None);
+                        } else if idx >= app.saved_queries.len() {
+                            app.saved_queries_state.select(Some(app.saved_queries.len() - 1));
+                        }
+                    }
+                 }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if app.focus_panel == FocusPanel::Bottom {
         match key.code {
             KeyCode::Enter => {
@@ -136,54 +231,18 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             app.results_scroll_x = app.results_scroll_x.saturating_sub(5);
             return;
         }
+        KeyCode::Char('g') if app.search_results.is_some() => {
+            app.is_saving_query = true;
+            app.save_query_name_input.clear();
+        },
+        KeyCode::Char('L') if app.search_results.is_none() => {
+            app.show_saved_queries = true;
+            if !app.saved_queries.is_empty() {
+                app.saved_queries_state.select(Some(0));
+            }
+        },
         KeyCode::Char('s') => {
-             // Execute Query with Spinner
-             if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                 app.status_message = None; // LIMPIAR MENSAJE DE CARGA AQUÍ
-                 app.results_scroll = 0;
-                 app.results_scroll_x = 0;
-                 app.results_page = 1;
-                 let filters = app.filters.clone();
-                 let filters_op = app.filters_op.clone();
-                 let limit = app.limit.unwrap_or(100).max(1);
-                 let aggregations = app.aggregations.clone();
-                 let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
-                 
-                 let fields = if app.selected_fields.is_empty() {
-                     // Filter out derived fields (_date, _day, _month, _hour_bucket)
-                     app.available_fields.iter()
-                         .filter(|f| {
-                             let s = f.trim();
-                             !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
-                         })
-                         .cloned()
-                         .collect()
-                 } else {
-                     app.selected_fields.clone()
-                 };
-
-                 let entity = e.clone();
-                 let table = t.clone();
-
-                 // Position for spinner (below menu)
-                 let start_x = 4;
-                 let start_y = 9; // Menu(7) + padding
-
-                 let _ = crate::ui::spinner::run_with_spinner(
-                     "Executing query and fetching results...",
-                     start_y,
-                     start_x,
-                     |_, _| {
-                         match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0, &mut app.query_cache) {
-                             Ok(result) => {
-                                 app.search_results = Some(result);
-                                 Ok(())
-                             }
-                             Err(err) => Err(err)
-                         }
-                     }
-                 );
-             }
+             execute_search_action(app);
         },
         KeyCode::Char('d') if app.search_results.is_some() => {
             if let Some(results) = &app.search_results {
@@ -548,6 +607,90 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
         },
         _ => {}
     }
+}
+
+fn execute_search_action(app: &mut App) {
+    if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+         app.status_message = None; // LIMPIAR MENSAJE DE CARGA AQUÍ
+         app.results_scroll = 0;
+         app.results_scroll_x = 0;
+         app.results_page = 1;
+         let filters = app.filters.clone();
+         let filters_op = app.filters_op.clone();
+         let limit = app.limit.unwrap_or(100).max(1);
+         let aggregations = app.aggregations.clone();
+         let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
+         
+         let fields = if app.selected_fields.is_empty() {
+             // Filter out derived fields (_date, _day, _month, _hour_bucket)
+             app.available_fields.iter()
+                 .filter(|f| {
+                     let s = f.trim();
+                     !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+                 })
+                 .cloned()
+                 .collect()
+         } else {
+             app.selected_fields.clone()
+         };
+
+         let entity = e.clone();
+         let table = t.clone();
+
+         // Position for spinner (below menu)
+         let start_x = 4;
+         let start_y = 9; // Menu(7) + padding
+
+         let _ = crate::ui::spinner::run_with_spinner(
+             "Executing query and fetching results...",
+             start_y,
+             start_x,
+             |_, _| {
+                 match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0, &mut app.query_cache) {
+                     Ok(result) => {
+                         app.search_results = Some(result);
+                         Ok(())
+                     }
+                     Err(err) => Err(err)
+                 }
+             }
+         );
+    }
+}
+
+fn load_saved_query_into_app(app: &mut App, query: &SavedQuery) {
+    app.selected_entity = Some(query.entity.clone());
+    app.selected_table = Some(query.table.clone());
+    
+    // Explicitly load available fields regardless of search_criteria
+    if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+        app.available_fields = get_indexed_fields(Path::new("data"), e, t);
+    }
+    
+    // Update other panel content (like table list if we are in Entity view)
+    update_middle_panel_content(app);
+
+    app.filters = query.filters.iter().map(|sf| Filter {
+        field: sf.field.clone(),
+        op: ComparisonOp::from_str(&sf.op),
+        value: sf.value.clone(),
+        value_options: vec!["Write value".to_string()], // We could reload these if needed
+    }).collect();
+    
+    app.filters_op = match query.filters_op.as_str() {
+        "Or" => LogicalOp::Or,
+        _ => LogicalOp::And,
+    };
+    
+    app.aggregations = query.aggregations.clone();
+    
+    app.order_by = query.order_by.iter().map(|so| OrderBy {
+        field: so.field.clone(),
+        direction: if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc },
+    }).collect();
+    
+    app.limit = query.limit;
+    app.selected_fields = query.selected_fields.clone();
 }
 
 fn navigate_list(app: &mut App, delta: isize) {
