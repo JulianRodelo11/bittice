@@ -31,7 +31,7 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = "0.0.0.0:3000";
+    let addr = "127.0.0.1:3000";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let _ = log_sender.send(format!("Server started on http://{}", addr)).await;
     

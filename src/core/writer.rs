@@ -39,7 +39,6 @@ pub fn process_and_write(
     for (name, stats) in detected_fields {
         let mut subfields = vec![name.clone()];
         if stats.is_date {
-            subfields.push(format!("{}_date", name));
             subfields.push(format!("{}_day", name));
             subfields.push(format!("{}_month", name));
             if stats.has_time {
@@ -119,7 +118,7 @@ pub fn process_and_write(
             for target_name in derived_names {
                 let final_value: String = if target_name == base_field {
                     val_str.to_string()
-                } else if target_name.ends_with("_date") || target_name.ends_with("_day") {
+                } else if target_name.ends_with("_day") {
                     extract_day(&val_str).unwrap_or_default()
                 } else if target_name.ends_with("_month") {
                     extract_month(&val_str).unwrap_or_default()

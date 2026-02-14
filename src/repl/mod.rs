@@ -263,7 +263,7 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
                     let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
                     if let Some(i) = app.endpoint_state.selected() {
                         if let Some(q) = queries.get(i) {
-                            let text = format!("http://0.0.0.0:3000/{}", q.name);
+                            let text = format!("http://127.0.0.1:3000/{}", q.name);
                             let _ = clipboard.set_text(text);
                             app.status_message = Some(("Endpoint copied to clipboard!".to_string(), true));
                         }

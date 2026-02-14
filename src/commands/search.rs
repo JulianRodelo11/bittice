@@ -718,11 +718,11 @@ fn execute_search_action(app: &mut App) {
          let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
          
          let fields = if app.selected_fields.is_empty() {
-             // Filter out derived fields (_date, _day, _month, _hour_bucket)
+             // Filter out derived fields (_day, _month, _hour_bucket)
              app.available_fields.iter()
                  .filter(|f| {
                      let s = f.trim();
-                     !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+                     !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
                  })
                  .cloned()
                  .collect()
@@ -1004,7 +1004,7 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
              app.available_fields.iter()
                  .filter(|f| {
                      let s = f.trim();
-                     !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+                     !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
                  })
                  .cloned()
                  .collect()
@@ -1071,7 +1071,7 @@ fn execute_paged_query(app: &mut App) {
             app.available_fields.iter()
                 .filter(|f| {
                     let s = f.trim();
-                    !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+                    !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
                 })
                 .cloned()
                 .collect()

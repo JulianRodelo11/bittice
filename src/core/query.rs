@@ -95,27 +95,32 @@ pub fn execute_query(
     let mut final_ids = ids_to_fetch_all;
     if !order_by.is_empty() {
         let (sort_field, direction) = &order_by[0];
-        if let Ok((dat, off)) = mmap_field(&stores_dir, sort_field) {
-            // Ordenamos los IDs directamente usando los bytes del mmap para comparar
-            final_ids.sort_unstable_by(|&a, &b| {
-                let val_a = get_raw_bytes(&dat, &off, a).unwrap_or(&[]);
-                let val_b = get_raw_bytes(&dat, &off, b).unwrap_or(&[]);
-                
-                // Intentar orden numérico si parece número (optimización de velocidad)
-                let cmp = if !val_a.is_empty() && val_a[0].is_ascii_digit() {
-                    let s_a = std::str::from_utf8(val_a).unwrap_or("");
-                    let s_b = std::str::from_utf8(val_b).unwrap_or("");
-                    match (s_a.parse::<f64>(), s_b.parse::<f64>()) {
-                        (Ok(n_a), Ok(n_b)) => n_a.partial_cmp(&n_b).unwrap_or(std::cmp::Ordering::Equal),
-                        _ => val_a.cmp(val_b),
-                    }
-                } else {
-                    val_a.cmp(val_b)
-                };
+        let (dat, off) = mmap_field(&stores_dir, sort_field)
+            .map_err(|e| anyhow::anyhow!("Failed to load sort field '{}': {}", sort_field, e))?;
 
-                if *direction == SortDirection::Desc { cmp.reverse() } else { cmp }
-            });
-        }
+        // Ordenamos los IDs directamente usando los bytes del mmap para comparar
+        final_ids.sort_unstable_by(|&a, &b| {
+            let val_a = get_raw_bytes(&dat, &off, a).unwrap_or(&[]);
+            let val_b = get_raw_bytes(&dat, &off, b).unwrap_or(&[]);
+            
+            // Intentar orden numérico si parece número (optimización de velocidad)
+            let cmp = if !val_a.is_empty() && val_a[0].is_ascii_digit() {
+                let s_a = std::str::from_utf8(val_a).unwrap_or("");
+                let s_b = std::str::from_utf8(val_b).unwrap_or("");
+                match (s_a.parse::<f64>(), s_b.parse::<f64>()) {
+                    (Ok(n_a), Ok(n_b)) => n_a.partial_cmp(&n_b).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => val_a.cmp(val_b),
+                }
+            } else {
+                val_a.cmp(val_b)
+            };
+
+            if *direction == SortDirection::Desc {
+                cmp.reverse()
+            } else {
+                cmp
+            }
+        });
     }
 
     // 4. Paginación

@@ -68,7 +68,7 @@ fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
 
     // 2. Status Header
     let status_text = if app.is_server_running {
-        Span::styled(" ● Server Running on http://0.0.0.0:3000 ", Style::default().fg(colors::GREEN).add_modifier(Modifier::BOLD))
+        Span::styled(" ● Server Running on http://127.0.0.1:3000 ", Style::default().fg(colors::GREEN).add_modifier(Modifier::BOLD))
     } else {
         Span::styled(" ● Server Stopped ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
     };

@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use std::path::Path;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 
 pub fn get_path_suggestions(input: &str) -> Vec<String> {
     // Si está vacío, empezamos en la raíz del sistema
@@ -143,12 +142,13 @@ pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<St
         }
     }
 
-    // 2. Intentar desde el directorio index/ (para campos derivados como _date, _month)
+    // 2. Intentar desde el directorio index/ (para campos derivados como _day, _month)
     let index_dir = data_path.join(entity).join(table).join("index");
     if let Ok(entries) = std::fs::read_dir(index_dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if let Some(field_name) = name.strip_suffix(".idx") {
+                if name.starts_with("bitmaps_") && name.ends_with(".dat") {
+                    let field_name = &name[8..name.len() - 4];
                     fields.insert(field_name.to_string());
                 }
             }
@@ -160,74 +160,24 @@ pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<St
     result
 }
 
-pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str) -> Vec<String> {
-    let idx_path = data_path.join(entity).join(table).join("index").join(format!("{}.idx", field));
-    
-    let mut values = std::collections::HashSet::new();
-    
-    if let Ok(file) = File::open(idx_path) {
-        let reader = BufReader::new(file);
-        let prefix = format!("{}__", field);
-        for line in reader.lines().flatten() {
-            // Formato: {field_name}__{val}\t{id}
-            if line.starts_with(&prefix) {
-                let rest = &line[prefix.len()..];
-                if let Some(tab_pos) = rest.find('\t') {
-                    let val = &rest[..tab_pos];
-                    if !val.is_empty() {
-                        values.insert(val.to_string());
-                    }
-                }
-            }
-        }
-    }
-    
-    let mut result: Vec<String> = values.into_iter().collect();
-    result.sort();
-    
-    // Insertar opción "Write value" al inicio
-    let mut final_res = vec!["Write value".to_string()];
-    final_res.extend(result);
-    final_res
+pub fn get_field_values(_data_path: &Path, _entity: &str, _table: &str, _field: &str) -> Vec<String> {
+    vec!["Write value".to_string(), "Variable (ask later)".to_string()]
 }
 
 pub fn get_order_by_fields(all_fields: &[String]) -> Vec<String> {
-    let mut filtered: Vec<String> = all_fields.iter()
-        .filter(|f| f.trim().ends_with("_date"))
-        .cloned()
-        .collect();
+    let mut filtered = all_fields.to_vec();
     filtered.sort();
     filtered
 }
 
 pub fn get_base_fields(all_fields: &[String]) -> Vec<String> {
-    let mut filtered: Vec<String> = all_fields.iter()
-        .filter(|f| {
-            let s = f.trim();
-            !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_hour_bucket")
-        })
-        .cloned()
-        .collect();
+    let mut filtered = all_fields.to_vec();
     filtered.sort();
     filtered
 }
 
 pub fn get_filtered_fields(all_fields: &[String]) -> Vec<String> {
-    let mut filtered = Vec::new();
-    let fields_set: std::collections::HashSet<_> = all_fields.iter().collect();
-
-    for f in all_fields {
-        // Para filtros generales, queremos ver los derivados (_day, _month, etc)
-        // pero queremos ocultar el campo base "solo" si existen versiones de fecha.
-        if !f.contains('_') || (!f.ends_with("_date") && !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket")) {
-            let date_version = format!("{}_date", f);
-            if fields_set.contains(&date_version) {
-                continue;
-            }
-        }
-        
-        filtered.push(f.clone());
-    }
+    let mut filtered = all_fields.to_vec();
     filtered.sort();
     filtered
 }
