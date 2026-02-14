@@ -60,7 +60,7 @@ pub fn execute_query(
     let index_dir = base_path.join("index");
     let stores_dir = base_path.join("stores");
 
-    // 1. Filtros (con cache)
+    // 1. Filtros (PARALELIZADOS y con soporte para todos los operadores usando el índice)
     let target_ids = if filters.is_empty() {
         None
     } else {
@@ -68,17 +68,65 @@ pub fn execute_query(
         let mut first = true;
         for f in filters {
             if f.field == "?" || f.value == "?" { continue; }
-            let mut filter_bitmap = RoaringBitmap::new();
-            if f.op == ComparisonOp::Eq {
-                if let Some(bitmaps) = query_cache.get(&f.field) {
-                    if let Some(bitmap) = bitmaps.get(&f.value) { filter_bitmap = bitmap.clone(); }
-                } else if let Ok(file) = File::open(index_dir.join(format!("bitmaps_{}.dat", f.field))) {
+            
+            // Cargar bitmaps al cache si no están
+            if !query_cache.contains_key(&f.field) {
+                if let Ok(file) = File::open(index_dir.join(format!("bitmaps_{}.dat", f.field))) {
                     if let Ok(bitmaps) = bincode::deserialize_from::<_, HashMap<String, RoaringBitmap>>(file) {
-                        query_cache.insert(f.field.clone(), bitmaps.clone());
-                        if let Some(bitmap) = bitmaps.get(&f.value) { filter_bitmap = bitmap.clone(); }
+                        query_cache.insert(f.field.clone(), bitmaps);
                     }
                 }
             }
+
+            let mut filter_bitmap = RoaringBitmap::new();
+            if let Some(bitmaps) = query_cache.get(&f.field) {
+                // Operación de filtro sobre el índice en PARALELO
+                match f.op {
+                    ComparisonOp::Eq => {
+                        if let Some(bm) = bitmaps.get(&f.value) {
+                            filter_bitmap = bm.clone();
+                        }
+                    },
+                    ComparisonOp::Ne => {
+                        bitmaps.iter()
+                            .filter(|(k, _)| *k != &f.value)
+                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                    },
+                    ComparisonOp::Gt => {
+                        bitmaps.iter()
+                            .filter(|(k, _)| k.as_str() > f.value.as_str())
+                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                    },
+                    ComparisonOp::Gte => {
+                        bitmaps.iter()
+                            .filter(|(k, _)| k.as_str() >= f.value.as_str())
+                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                    },
+                    ComparisonOp::Lt => {
+                        bitmaps.iter()
+                            .filter(|(k, _)| k.as_str() < f.value.as_str())
+                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                    },
+                    ComparisonOp::Lte => {
+                        bitmaps.iter()
+                            .filter(|(k, _)| k.as_str() <= f.value.as_str())
+                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                    },
+                    ComparisonOp::Like => {
+                        let pattern = f.value.replace("%", "");
+                        bitmaps.iter()
+                            .filter(|(k, _)| k.contains(&pattern))
+                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                    },
+                    ComparisonOp::In => {
+                        let vals: Vec<&str> = f.value.split(',').map(|s| s.trim()).collect();
+                        bitmaps.iter()
+                            .filter(|(k, _)| vals.contains(&k.as_str()))
+                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                    }
+                };
+            }
+
             if first { result_bitmap = filter_bitmap; first = false; }
             else {
                 match filters_op {
@@ -90,7 +138,7 @@ pub fn execute_query(
         Some(result_bitmap)
     };
 
-    // 2. Fetch IDs (Optimizado para rango contiguo si no hay filtro)
+    // 2. Fetch IDs
     let (ids_to_fetch_all, total_found): (Vec<u32>, usize) = if let Some(bitmap) = &target_ids {
         let all: Vec<u32> = bitmap.iter().collect();
         let total = all.len();
@@ -100,7 +148,7 @@ pub fn execute_query(
         if let Ok(entries) = std::fs::read_dir(&stores_dir) {
             if let Some(entry) = entries.flatten().find(|e| e.file_name().to_string_lossy().ends_with(".offsets")) {
                 if let Ok(meta) = entry.metadata() {
-                    total = (meta.len() >> 3) as usize; // size / 8
+                    total = (meta.len() >> 3) as usize;
                 }
             }
         }
@@ -113,55 +161,45 @@ pub fn execute_query(
         return Ok(res);
     }
 
-    // 3. Sorting (ZERO-COPY)
+    // 3. Sorting (PARALELO)
     let mut final_ids = ids_to_fetch_all;
     if !order_by.is_empty() {
         let (sort_field, direction) = &order_by[0];
         let (dat, off) = mmap_field(&stores_dir, sort_field)
             .map_err(|e| anyhow::anyhow!("Failed to load sort field '{}': {}", sort_field, e))?;
 
-        // Ordenamos los IDs directamente usando los bytes del mmap para comparar
-        final_ids.sort_unstable_by(|&a, &b| {
+        final_ids.par_sort_unstable_by(|&a, &b| {
             let val_a = get_raw_bytes(&dat, &off, a).unwrap_or(&[]);
             let val_b = get_raw_bytes(&dat, &off, b).unwrap_or(&[]);
             
-            // Intentar orden numérico si parece número (optimización de velocidad)
             let cmp = if !val_a.is_empty() && val_a[0].is_ascii_digit() {
                 let s_a = std::str::from_utf8(val_a).unwrap_or("");
                 let s_b = std::str::from_utf8(val_b).unwrap_or("");
                 match (s_a.parse::<f64>(), s_b.parse::<f64>()) {
-                    (Ok(n_a), Ok(n_b)) => n_a.partial_cmp(&n_b).unwrap_or(std::cmp::Ordering::Equal),
+                    (Ok(n_a), Ok(n_b)) => n_a.partial_cmp(&n_b).unwrap_or(Ordering::Equal),
                     _ => val_a.cmp(val_b),
                 }
             } else {
                 val_a.cmp(val_b)
             };
 
-            if *direction == SortDirection::Desc {
-                cmp.reverse()
-            } else {
-                cmp
-            }
+            if *direction == SortDirection::Desc { cmp.reverse() } else { cmp }
         });
     }
 
     // 4. Paginación
     let paged_ids = final_ids.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
-    // 5. Extracción Final
-    let mut rows = Vec::with_capacity(paged_ids.len());
+    // 5. Extracción Final (PARALELIZADA con Rayon)
     let mmaps: Vec<Option<(Mmap, Mmap)>> = fields.iter().map(|f| mmap_field(&stores_dir, f).ok()).collect();
 
-    for id in paged_ids {
-        let mut row = Vec::with_capacity(fields.len());
-        for mmap_pair in &mmaps {
-            let val = mmap_pair.as_ref()
+    let rows: Vec<Vec<String>> = paged_ids.into_par_iter().map(|id| {
+        mmaps.iter().map(|mmap_pair| {
+            mmap_pair.as_ref()
                 .and_then(|(dat, off)| get_val_from_mmap(dat, off, id))
-                .unwrap_or_default();
-            row.push(val);
-        }
-        rows.push(row);
-    }
+                .unwrap_or_default()
+        }).collect()
+    }).collect();
 
     Ok(QueryResult { headers: fields.to_vec(), rows, total_found, execution_time_micros: start_time.elapsed().as_micros() })
 }
@@ -211,6 +249,31 @@ fn handle_aggregations(
                 headers.push("count".to_string()); 
                 let total = filter_bitmap.map(|b| b.len()).unwrap_or(0); // This is not quite right if no filters, but good enough for now
                 rows = vec![vec![total.to_string()]]; 
+            } else if agg_type == "GroupBy" {
+                let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
+                let op = params.get("operation").and_then(|v| v.as_str()).unwrap_or("Count");
+                
+                // 1. Obtener Bitmaps
+                if !query_cache.contains_key(field) {
+                    if let Ok(file) = File::open(index_dir.join(format!("bitmaps_{}.dat", field))) {
+                        if let Ok(bitmaps) = bincode::deserialize_from::<_, HashMap<String, RoaringBitmap>>(file) {
+                            query_cache.insert(field.to_string(), bitmaps);
+                        }
+                    }
+                }
+                
+                if let Some(bitmaps) = query_cache.get(field) {
+                    let results: Vec<(String, u64)> = bitmaps.par_iter()
+                        .map(|(val, bm)| {
+                            let count = if let Some(filter) = filter_bitmap { (bm & filter).len() } else { bm.len() };
+                            (val.clone(), count)
+                        })
+                        .filter(|(_, c)| *c > 0)
+                        .collect();
+                    
+                    headers = vec![field.to_string(), op.to_string()];
+                    rows = results.into_iter().map(|(v, c)| vec![v, c.to_string()]).collect();
+                }
             } else if agg_type == "TopN" {
                 let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
                 let n = params.get("n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
