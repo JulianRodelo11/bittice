@@ -39,9 +39,98 @@ pub fn ui(f: &mut Frame, app: &mut App, _purple: Color) {
         draw_overlays(f, app, size);
     } else if app.active_task == Some("Load") {
         draw_load_ui(f, app, central_area, is_overlay_active);
+    } else if app.active_task == Some("Server") {
+        draw_server_ui(f, app, central_area, is_overlay_active);
     } else {
         draw_main_menu(f, app, central_area, is_overlay_active);
     }
+}
+
+fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
+    let purple = if dimmed { Color::Indexed(237) } else { colors::PRIMARY_COLOR };
+    let purple_muted = if dimmed { Color::Indexed(235) } else { colors::MUTED_COLOR };
+    let text_color = if dimmed { Color::Indexed(237) } else { Color::White };
+    let log_color = if dimmed { Color::Indexed(240) } else { colors::GREEN };
+    let active_color = if dimmed { Color::Indexed(243) } else { colors::ACTIVE_COLOR };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8), // Menu
+            Constraint::Length(3), // Status Header
+            Constraint::Min(0),    // Main Content (Split)
+            Constraint::Length(1), // Footer
+        ])
+        .split(area);
+
+    // 1. Menu
+    draw_menu_widget(f, app, chunks[0], purple, purple_muted, text_color);
+
+    // 2. Status Header
+    let status_text = if app.is_server_running {
+        Span::styled(" ● Server Running on http://0.0.0.0:3000 ", Style::default().fg(colors::GREEN).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" ● Server Stopped ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
+    
+    let status_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(purple_muted));
+    
+    f.render_widget(Paragraph::new(status_text).block(status_block).alignment(Alignment::Center), chunks[1]);
+
+    // 3. Main Content
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40), // Available Endpoints
+            Constraint::Percentage(60), // Logs
+        ])
+        .split(chunks[2]);
+
+    // Left: Available Endpoints
+    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
+    let items: Vec<ListItem> = queries.iter().map(|q| {
+        let path = format!("/{}", q.name);
+        ListItem::new(Line::from(vec![
+            Span::styled("GET ", Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)),
+            Span::styled(path, Style::default().fg(text_color)),
+        ]))
+    }).collect();
+
+    let endpoints_focus = app.server_focus == crate::repl::state::ServerFocus::Endpoints;
+    let endpoints_list = List::new(items)
+        .block(Block::default()
+            .title(" Available Endpoints ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .padding(Padding::uniform(1))
+            .border_style(Style::default().fg(if endpoints_focus { active_color } else { purple_muted })))
+        .highlight_style(Style::default().fg(active_color))
+        .highlight_symbol(if endpoints_focus { "> " } else { "  " });
+    f.render_stateful_widget(endpoints_list, main_chunks[0], &mut app.endpoint_state);
+
+    // Right: Logs
+    let log_items: Vec<ListItem> = app.server_logs.iter().rev().map(|log| {
+        ListItem::new(Span::styled(log, Style::default().fg(log_color)))
+    }).collect();
+
+    let logs_focus = app.server_focus == crate::repl::state::ServerFocus::Logs;
+    let logs_list = List::new(log_items)
+        .block(Block::default()
+            .title(" Server Logs ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .padding(Padding::uniform(1))
+            .border_style(Style::default().fg(if logs_focus { active_color } else { purple_muted })))
+        .highlight_style(Style::default().fg(active_color))
+        .highlight_symbol(if logs_focus { "> " } else { "  " });
+    f.render_stateful_widget(logs_list, main_chunks[1], &mut app.log_state);
+
+    // 4. Footer
+    let footer_text = "Esc: Back • Tab: Switch Panel • ↑↓: Navigate • c: Copy to Clipboard";
+    f.render_widget(Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray)).alignment(Alignment::Center), chunks[3]);
 }
 
 fn draw_overlays(f: &mut Frame, app: &mut App, area: Rect) {
@@ -50,6 +139,9 @@ fn draw_overlays(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if app.show_saved_queries {
         draw_saved_queries_overlay(f, app, area);
+    }
+    if app.is_prompting_variable {
+        draw_variable_prompt_overlay(f, app, area);
     }
 }
 
@@ -68,7 +160,7 @@ fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Menú
+            Constraint::Length(8), // Menú
             Constraint::Length(loaded_height), // Datos cargados
             Constraint::Length(1), // Separador
             Constraint::Length(3), // Input
@@ -243,7 +335,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
 
         // 2. Build Fixed Footer (Aligned to start/left)
         let limit = app.limit.unwrap_or(100).max(1);
-        let total_pages = (results.total_found + limit - 1) / limit;
+        let total_pages = results.total_found.div_ceil(limit);
         
         let footer_color = if dimmed { Color::Indexed(240) } else { Color::White };
         let footer_bg = if dimmed { Color::Indexed(235) } else { Color::Rgb(30, 30, 30) };
@@ -266,7 +358,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Menú
+            Constraint::Length(8), // Menú
             Constraint::Length(content_height), // Paneles
             Constraint::Length(1), // Instrucciones justo debajo
             Constraint::Length(if app.focus_panel == FocusPanel::Bottom { 3 } else { 0 }), // Input inferior
@@ -432,7 +524,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
                     let circle = if app.filters[current_idx].field == s { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
                     ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
                 }).collect(),
-                FilterStep::Op => vec!["Eq", "Ne", "In", "Like", "Gt", "Gte", "Lt", "Lte"].iter().map(|s| {
+                FilterStep::Op => ["Eq", "Ne", "In", "Like", "Gt", "Gte", "Lt", "Lte"].iter().map(|s| {
                     let circle = if app.filters[current_idx].op.as_str() == *s { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
                     ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", s))]))
                 }).collect(),
@@ -513,11 +605,11 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
 
     let desc_style = Style::default().fg(instruction_color);
     let help_text = match app.focus_panel {
-        FocusPanel::Left => format!("↑↓ Navigate  •  → Next Panel  •  esq Quit"),
-        FocusPanel::Middle => format!("↑↓ Navigate  •  ↵ Toggle Selection  •  ←→ Switch Panel  •  esq Quit"),
-        FocusPanel::Right => format!("↑↓ Navigate  •  ↵ Toggle Selection  •  ←→ Switch Panel  •  esq Quit"),
-        FocusPanel::Extra => format!("↑↓ Navigate  •  ↵ Toggle Selection  •  ← Prev Panel  •  esq Quit"),
-        FocusPanel::Bottom => format!("↵ Accept  •  esq Cancel"),
+        FocusPanel::Left => "↑↓ Navigate  •  → Next Panel  •  esq Quit".to_string(),
+        FocusPanel::Middle => "↑↓ Navigate  •  ↵ Toggle Selection  •  ←→ Switch Panel  •  esq Quit".to_string(),
+        FocusPanel::Right => "↑↓ Navigate  •  ↵ Toggle Selection  •  ←→ Switch Panel  •  esq Quit".to_string(),
+        FocusPanel::Extra => "↑↓ Navigate  •  ↵ Toggle Selection  •  ← Prev Panel  •  esq Quit".to_string(),
+        FocusPanel::Bottom => "↵ Accept  •  esq Cancel".to_string(),
     };
     f.render_widget(Paragraph::new(help_text).style(desc_style).alignment(Alignment::Right), chunks[2]);
 
@@ -534,6 +626,10 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
         Line::from(vec![
             Span::styled("+ ", Style::default().fg(active_color).add_modifier(Modifier::BOLD)),
             Span::styled("Press 'L' (Shift+l) to load a saved query", Style::default().fg(text_color)),
+        ]),
+        Line::from(vec![
+            Span::styled("+ ", Style::default().fg(active_color).add_modifier(Modifier::BOLD)),
+            Span::styled("Press 'E' (Shift+e) to edit a saved query", Style::default().fg(text_color)),
         ])
     ]), chunks[5]);
 
@@ -547,7 +643,7 @@ fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints([Constraint::Length(8), Constraint::Min(0)])
         .split(area);
     draw_menu_widget(f, app, chunks[0], purple, purple_muted, text_color);
     let loaded_data = get_loaded_data();
@@ -718,6 +814,34 @@ fn draw_saved_queries_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, chunks[0], &mut app.saved_queries_state);
 
     let msg = Paragraph::new("Enter: Load & Run • d: Delete • Esc: Close")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(msg, chunks[1]);
+}
+
+fn draw_variable_prompt_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default()
+        .title(" Variable Required ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    
+    let popup_area = centered_rect(50, 20, area);
+    f.render_widget(Clear, popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(popup_area);
+    
+    let input = Paragraph::new(app.variable_input.as_str())
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Enter value for {} ", app.current_variable)));
+    f.render_widget(input, chunks[0]);
+    
+    let msg = Paragraph::new("Press Enter to continue, Esc to cancel")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(msg, chunks[1]);
 }

@@ -1,12 +1,12 @@
 use ratatui::style::Color;
 
-pub const BLUE: Color = Color::Rgb(137, 180, 249);
-pub const PURPLE: Color = Color::Rgb(197, 137, 249);
-pub const MUTED_PURPLE: Color = Color::Rgb(115, 115, 130);
-pub const GREEN: Color = Color::Rgb(149, 213, 178);
-pub const PINK: Color = Color::Rgb(255, 179, 193);
-pub const SAND: Color = Color::Rgb(248, 225, 175);
-pub const PURPLE_SECONDARY: Color = Color::Rgb(184, 184, 255);
+pub const BLUE: Color = Color::Rgb(136, 190, 245);
+pub const PURPLE: Color = Color::Rgb(200, 136, 221);
+pub const MUTED_PURPLE: Color = Color::Rgb(204, 204, 221);
+pub const GREEN: Color = Color::Rgb(203, 239, 176);
+pub const PINK: Color = Color::Rgb(252, 165, 165);
+pub const SAND: Color = Color::Rgb(222, 185, 133);
+pub const PURPLE_SECONDARY: Color = Color::Rgb(219, 192, 254);
 
 // Semantic aliases
 pub const PRIMARY_COLOR: Color = PURPLE_SECONDARY;

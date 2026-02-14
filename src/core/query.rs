@@ -5,9 +5,10 @@ use std::path::Path;
 use std::time::Instant;
 use roaring::RoaringBitmap;
 use memmap2::Mmap;
+use serde::Serialize;
 use crate::repl::state::{Filter, ComparisonOp, LogicalOp, SortDirection};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
@@ -15,6 +16,7 @@ pub struct QueryResult {
     pub execution_time_micros: u128,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_query(
     entity: &str,
     table: &str,

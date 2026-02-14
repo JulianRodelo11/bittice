@@ -23,15 +23,13 @@ pub fn get_path_suggestions(input: &str) -> Vec<String> {
     // Determinamos directorio de búsqueda y prefijo
     let (search_dir, prefix) = if query.ends_with(std::path::MAIN_SEPARATOR) {
         (path, "")
+    } else if path.parent().is_none() {
+        (Path::new("/"), path.to_str().unwrap_or(""))
     } else {
-        if path.parent().is_none() {
-            (Path::new("/"), path.to_str().unwrap_or(""))
-        } else {
-            (
-                path.parent().unwrap(),
-                path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
-            )
-        }
+        (
+            path.parent().unwrap(),
+            path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+        )
     };
 
     let search_dir = if search_dir.as_os_str().is_empty() {
@@ -150,8 +148,7 @@ pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<St
     if let Ok(entries) = std::fs::read_dir(index_dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".idx") {
-                    let field_name = &name[..name.len() - 4];
+                if let Some(field_name) = name.strip_suffix(".idx") {
                     fields.insert(field_name.to_string());
                 }
             }

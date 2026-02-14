@@ -1,0 +1,202 @@
+use axum::{
+    debug_handler,
+    extract::{Path, State, Query},
+    response::Json,
+    routing::get,
+    Router,
+};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
+use tower_http::trace::TraceLayer;
+use crate::core::saved_queries::{load_queries};
+use crate::core::query::{execute_query};
+use crate::repl::state::{Filter, LogicalOp, ComparisonOp, SortDirection};
+use std::collections::HashMap;
+
+// Estructura para compartir estado con los handlers de Axum
+struct ServerState {
+    query_cache: Arc<Mutex<HashMap<String, HashMap<String, roaring::RoaringBitmap>>>>,
+    log_sender: mpsc::Sender<String>,
+}
+
+pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot::Receiver<()>) {
+    let state = Arc::new(ServerState {
+        query_cache: Arc::new(Mutex::new(HashMap::new())),
+        log_sender: log_sender.clone(),
+    });
+
+    // Definir rutas
+    let app = Router::new()
+        .route("/*path", get(handle_query))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    let addr = "0.0.0.0:3000";
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let _ = log_sender.send(format!("Server started on http://{}", addr)).await;
+    
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            shutdown_rx.await.ok();
+        })
+        .await
+        .unwrap();
+}
+
+#[debug_handler]
+async fn handle_query(
+    Path(path): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<ServerState>>,
+) -> Json<serde_json::Value> {
+    let _ = state.log_sender.send(format!("GET /{}", path)).await;
+    
+    // Cargar queries (en cada petición para hot-reload simple)
+    let queries = load_queries().unwrap_or_default();
+    
+    // Buscar la query por nombre (path)
+    // Normalizamos el path para quitar posibles slash iniciales extra si el framework los deja
+    let query_name = path.trim_start_matches('/');
+    
+    if let Some(query) = queries.iter().find(|q| q.name == query_name || q.name == path) {
+        // Ejecutar query
+        
+        let mut missing_params = Vec::new();
+
+        // Convertir SavedQuery a argumentos para execute_query
+        let filters: Vec<Filter> = query.filters.iter().map(|sf| {
+            let mut val = sf.value.clone();
+            if val.starts_with('$') {
+                // Remove $ for the parameter key
+                let key = &val[1..];
+                if let Some(param_val) = params.get(key) {
+                    val = param_val.clone();
+                } else {
+                    missing_params.push(key.to_string());
+                }
+            }
+            Filter {
+                field: sf.field.clone(),
+                op: ComparisonOp::from_str(&sf.op),
+                value: val,
+                value_options: vec![], // No necesario para ejecución
+            }
+        }).collect();
+        
+        let mut aggregations = query.aggregations.clone();
+        for agg in &mut aggregations {
+            if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
+                for val in obj.values_mut() {
+                    if let Some(s) = val.as_str() {
+                        if let Some(key) = s.strip_prefix('$') {
+                            if let Some(param_val) = params.get(key) {
+                                *val = serde_json::json!(param_val);
+                            } else {
+                                missing_params.push(key.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !missing_params.is_empty() {
+             missing_params.sort();
+             missing_params.dedup();
+             let _ = state.log_sender.send(format!("  -> 400 Bad Request (Missing params: {:?})", missing_params)).await;
+             return Json(serde_json::json!({
+                 "status": 400,
+                 "error": "Missing required query parameters",
+                 "missing_parameters": missing_params
+             }));
+        }
+
+        let filters_op = match query.filters_op.as_str() {
+            "Or" => LogicalOp::Or,
+            _ => LogicalOp::And,
+        };
+        
+        let order_by: Vec<(String, SortDirection)> = query.order_by.iter().map(|so| {
+            (so.field.clone(), if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc })
+        }).collect();
+        
+        // Determine Limit and Offset
+        // STRICT: Limit comes ONLY from the saved query definition.
+        let limit = query.limit.unwrap_or(100).max(1);
+        let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
+        let offset = (page - 1) * limit;
+
+         let fields = if query.selected_fields.is_empty() {
+             crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &query.entity, &query.table)
+         } else {
+             query.selected_fields.clone()
+         };
+
+        let result = {
+            let mut cache = state.query_cache.lock().unwrap();
+            execute_query(
+                &query.entity,
+                &query.table,
+                &fields,
+                &filters,
+                &filters_op,
+                &query.aggregations,
+                &order_by,
+                limit,
+                offset,
+                &mut cache
+            )
+        };
+
+        match result {
+            Ok(result) => {
+                let _ = state.log_sender.send(format!("  -> 200 OK (Found {})", result.total_found)).await;
+                
+                // Transform rows into standard JSON objects
+                let data: Vec<serde_json::Map<String, serde_json::Value>> = result.rows.into_iter().map(|row| {
+                    let mut map = serde_json::Map::new();
+                    for (i, header) in result.headers.iter().enumerate() {
+                        if let Some(val) = row.get(i) {
+                            // Try to parse numbers if possible, otherwise string
+                            // For now, keep as string to match CLI behavior, or simple heuristic?
+                            // Let's keep as String to be safe and consistent with CLI output.
+                            map.insert(header.clone(), serde_json::Value::String(val.clone()));
+                        }
+                    }
+                    map
+                }).collect();
+
+                // Construct enhanced JSON response
+                let total_pages = result.total_found.div_ceil(limit);
+                let response = serde_json::json!({
+                    "status": 200,
+                    "data": data,
+                    "meta": {
+                        "execution_time_ms": result.execution_time_micros as f64 / 1000.0
+                    },
+                    "pagination": {
+                        "page": page,
+                        "per_page": limit,
+                        "total_pages": total_pages.max(1),
+                        "total_items": result.total_found
+                    }
+                });
+
+                Json(response)
+            },
+            Err(e) => {
+                let _ = state.log_sender.send(format!("  -> 500 Error: {}", e)).await;
+                Json(serde_json::json!({
+                    "status": 500,
+                    "error": e.to_string()
+                }))
+            }
+        }
+    } else {
+        let _ = state.log_sender.send(format!("  -> 404 Not Found (Query '{}' not found)", query_name)).await;
+        Json(serde_json::json!({
+            "status": 404,
+            "error": "Query not found. Make sure to save a query with this name first."
+        }))
+    }
+}

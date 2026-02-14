@@ -17,6 +17,7 @@ use std::time::Duration;
 use ui::ui;
 use crate::ui::colors;
 use utils::{get_path_suggestions, get_loaded_data};
+use tokio::sync::{mpsc, oneshot};
 
 pub fn run_interactive() -> Result<()> {
     enable_raw_mode()?;
@@ -90,6 +91,13 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
             continue;
         }
 
+        // Poll Server Logs
+        if let Some(rx) = &mut app.server_log_receiver {
+             while let Ok(msg) = rx.try_recv() {
+                 app.server_logs.push(msg);
+             }
+        }
+
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
@@ -99,6 +107,7 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                         match task {
                             "Search" => search::handle_search_input(app, key),
                             "Load" => handle_load_input(app, key),
+                            "Server" => handle_server_input(app, key),
                             _ => {}
                         }
                     } else {
@@ -158,12 +167,122 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
             Some(1) => {
                 search::init_search(app);
             }
-            Some(2) => return Err(anyhow::anyhow!("Quit")),
+            Some(2) => {
+                // Start Local Server
+                app.active_task = Some("Server");
+                let (log_tx, log_rx) = mpsc::channel(100);
+                app.server_log_receiver = Some(log_rx);
+                app.server_logs.clear();
+                
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                app.server_shutdown_tx = Some(shutdown_tx);
+                app.is_server_running = true;
+                app.server_focus = crate::repl::state::ServerFocus::Endpoints;
+                app.endpoint_state.select(Some(0));
+                app.log_state.select(Some(0));
+
+                // Spawn server thread
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(crate::server::start_server(log_tx, shutdown_rx));
+                });
+            }
+            Some(3) => return Err(anyhow::anyhow!("Quit")),
             _ => {}
         },
         _ => {}
     }
     Ok(())
+}
+
+fn handle_server_input(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(tx) = app.server_shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            app.is_server_running = false;
+            app.active_task = None;
+        }
+        KeyCode::Tab => {
+            app.server_focus = match app.server_focus {
+                crate::repl::state::ServerFocus::Endpoints => crate::repl::state::ServerFocus::Logs,
+                crate::repl::state::ServerFocus::Logs => crate::repl::state::ServerFocus::Endpoints,
+            };
+        }
+        KeyCode::Down => {
+            match app.server_focus {
+                crate::repl::state::ServerFocus::Endpoints => {
+                    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
+                    if !queries.is_empty() {
+                        let i = match app.endpoint_state.selected() {
+                            Some(i) => if i >= queries.len() - 1 { 0 } else { i + 1 },
+                            None => 0,
+                        };
+                        app.endpoint_state.select(Some(i));
+                    }
+                }
+                crate::repl::state::ServerFocus::Logs => {
+                    if !app.server_logs.is_empty() {
+                        let i = match app.log_state.selected() {
+                            Some(i) => if i >= app.server_logs.len() - 1 { 0 } else { i + 1 },
+                            None => 0,
+                        };
+                        app.log_state.select(Some(i));
+                    }
+                }
+            }
+        }
+        KeyCode::Up => {
+            match app.server_focus {
+                crate::repl::state::ServerFocus::Endpoints => {
+                    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
+                    if !queries.is_empty() {
+                        let i = match app.endpoint_state.selected() {
+                            Some(i) => if i == 0 { queries.len() - 1 } else { i - 1 },
+                            None => 0,
+                        };
+                        app.endpoint_state.select(Some(i));
+                    }
+                }
+                crate::repl::state::ServerFocus::Logs => {
+                    if !app.server_logs.is_empty() {
+                        let i = match app.log_state.selected() {
+                            Some(i) => if i == 0 { app.server_logs.len() - 1 } else { i - 1 },
+                            None => 0,
+                        };
+                        app.log_state.select(Some(i));
+                    }
+                }
+            }
+        }
+        KeyCode::Char('c') => {
+            let mut clipboard = arboard::Clipboard::new().unwrap();
+            match app.server_focus {
+                crate::repl::state::ServerFocus::Endpoints => {
+                    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
+                    if let Some(i) = app.endpoint_state.selected() {
+                        if let Some(q) = queries.get(i) {
+                            let text = format!("http://0.0.0.0:3000/{}", q.name);
+                            let _ = clipboard.set_text(text);
+                            app.status_message = Some(("Endpoint copied to clipboard!".to_string(), true));
+                        }
+                    }
+                }
+                crate::repl::state::ServerFocus::Logs => {
+                    if let Some(i) = app.log_state.selected() {
+                        // Logs are rev() in UI, so we need to match that
+                        let logs: Vec<_> = app.server_logs.iter().rev().collect();
+                        if let Some(log) = logs.get(i) {
+                            let _ = clipboard.set_text((*log).clone());
+                            app.status_message = Some(("Log line copied to clipboard!".to_string(), true));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_load_input(app: &mut App, key: event::KeyEvent) {

@@ -38,6 +38,7 @@ pub enum ComparisonOp {
 }
 
 impl ComparisonOp {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "Eq" => ComparisonOp::Eq,
@@ -134,6 +135,13 @@ pub enum FocusPanel {
     Bottom, // Input para el valor
 }
 
+// Foco para la UI del servidor
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum ServerFocus {
+    Endpoints,
+    Logs,
+}
+
 pub struct App {
     // --- Estado General ---
     pub menu_items: Vec<&'static str>,
@@ -210,9 +218,33 @@ pub struct App {
     // --- Saved Queries ---
     pub is_saving_query: bool,
     pub show_saved_queries: bool,
+    pub is_loading_to_edit: bool,
+    pub loaded_query_name: Option<String>,
     pub save_query_name_input: String,
     pub saved_queries: Vec<crate::core::saved_queries::SavedQuery>,
     pub saved_queries_state: ListState,
+
+    // --- Server ---
+    pub is_server_running: bool,
+    pub server_logs: Vec<String>,
+    pub server_log_receiver: Option<tokio::sync::mpsc::Receiver<String>>,
+    pub server_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub server_focus: ServerFocus,
+    pub endpoint_state: ListState,
+    pub log_state: ListState,
+
+    // --- Parameterized Queries ---
+    pub variable_prompt_queue: Vec<String>,
+    pub variable_values: std::collections::HashMap<String, String>,
+    pub is_prompting_variable: bool,
+    pub current_variable: String,
+    pub variable_input: String,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl App {
@@ -228,7 +260,7 @@ impl App {
 
         App {
             // General
-            menu_items: vec!["Load Data", "Search Data", "Exit"],
+            menu_items: vec!["Load Data", "Search Data", "Local Server", "Exit"],
             menu_state,
             active_task: None,
             // Load
@@ -258,7 +290,7 @@ impl App {
             selected_field: None,
             selected_op: ComparisonOp::Eq,
             filter_value_input: String::new(),
-            filter_value_options: vec!["Write value".to_string()],
+            filter_value_options: vec!["Write value".to_string(), "Variable (ask later)".to_string()],
             selected_value: None,
             // Aggregations
             aggregations: Vec::new(),
@@ -273,7 +305,7 @@ impl App {
                 "Sum".to_string(), "Count".to_string(), "Avg".to_string(), 
                 "Min".to_string(), "Max".to_string()
             ],
-            agg_value_options: vec!["Write value".to_string()],
+            agg_value_options: vec!["Write value".to_string(), "Variable (ask later)".to_string()],
             // Order By
             order_by: Vec::new(),
             // Limit
@@ -294,9 +326,27 @@ impl App {
             // Saved Queries
             is_saving_query: false,
             show_saved_queries: false,
+            is_loading_to_edit: false,
+            loaded_query_name: None,
             save_query_name_input: String::new(),
             saved_queries,
             saved_queries_state: ListState::default(),
+
+            // Server
+            is_server_running: false,
+            server_logs: Vec::new(),
+            server_log_receiver: None,
+            server_shutdown_tx: None,
+            server_focus: ServerFocus::Endpoints,
+            endpoint_state: ListState::default(),
+            log_state: ListState::default(),
+
+            // Parameterized Queries
+            variable_prompt_queue: Vec::new(),
+            variable_values: std::collections::HashMap::new(),
+            is_prompting_variable: false,
+            current_variable: String::new(),
+            variable_input: String::new(),
         }
     }
 

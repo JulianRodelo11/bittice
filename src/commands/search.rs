@@ -27,17 +27,49 @@ pub fn init_search(app: &mut App) {
     
     // Inicializar estados
     app.search_criteria = SearchCriteria::Entity;
-    app.filter_value_options = vec!["Write value".to_string()];
+    app.filter_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
     app.selected_value = None;
     app.filters.clear();
     app.aggregations.clear();
     app.order_by.clear();
+    app.variable_values.clear();
+    app.loaded_query_name = None;
     app.limit = Some(100);
     app.selected_fields.clear();
     update_middle_panel_content(app);
 }
 
 pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
+    // 0. Handle Variable Prompting
+    if app.is_prompting_variable {
+        match key.code {
+            KeyCode::Enter => {
+                if !app.variable_input.is_empty() {
+                    app.variable_values.insert(app.current_variable.clone(), app.variable_input.clone());
+                    if let Some(next_var) = app.variable_prompt_queue.pop() {
+                        app.current_variable = next_var;
+                        app.variable_input.clear();
+                    } else {
+                        app.is_prompting_variable = false;
+                        app.current_variable.clear();
+                        app.variable_input.clear();
+                        execute_search_action_with_resolved_vars(app);
+                    }
+                }
+            },
+            KeyCode::Esc => {
+                app.is_prompting_variable = false;
+                app.variable_prompt_queue.clear();
+                app.current_variable.clear();
+                app.variable_input.clear();
+            },
+            KeyCode::Char(c) => app.variable_input.push(c),
+            KeyCode::Backspace => { app.variable_input.pop(); },
+            _ => {}
+        }
+        return;
+    }
+
     // 1. Handle Saving Query Input Overlay
     if app.is_saving_query {
         match key.code {
@@ -57,11 +89,22 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         selected_fields: app.selected_fields.clone(),
                     };
                     
-                    app.saved_queries.push(query);
-                    if let Err(e) = save_queries(&app.saved_queries) {
-                        app.status_message = Some((format!("Error saving: {}", e), false));
+                    if let Some(pos) = app.saved_queries.iter().position(|q| q.name == name) {
+                        app.saved_queries[pos] = query;
+                        if let Err(e) = save_queries(&app.saved_queries) {
+                            app.status_message = Some((format!("Error updating: {}", e), false));
+                        } else {
+                            app.status_message = Some((format!("Query '{}' updated!", name), true));
+                            app.loaded_query_name = Some(name.clone());
+                        }
                     } else {
-                        app.status_message = Some((format!("Query '{}' saved!", name), true));
+                        app.saved_queries.push(query);
+                        if let Err(e) = save_queries(&app.saved_queries) {
+                            app.status_message = Some((format!("Error saving: {}", e), false));
+                        } else {
+                            app.status_message = Some((format!("Query '{}' saved!", name), true));
+                            app.loaded_query_name = Some(name.clone());
+                        }
                     }
                     
                     app.is_saving_query = false;
@@ -108,8 +151,12 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     if idx < app.saved_queries.len() {
                         let query = app.saved_queries[idx].clone();
                         load_saved_query_into_app(app, &query);
+                        let run_immediately = !app.is_loading_to_edit;
                         app.show_saved_queries = false;
-                        execute_search_action(app);
+                        app.is_loading_to_edit = false;
+                        if run_immediately {
+                            execute_search_action(app);
+                        }
                     }
                 }
             },
@@ -159,7 +206,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                         if let Some(inner) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
                                             let keys: Vec<String> = inner.keys().cloned().collect();
                                             if let Some(key) = keys.get(selected_step_idx - 1) {
-                                                let num_keys = vec!["n", "top_n", "limit", "page", "min_streak"];
+                                                let num_keys = ["n", "top_n", "limit", "page", "min_streak"];
                                                 if num_keys.contains(&key.as_str()) {
                                                     if let Ok(num) = val.parse::<u64>() {
                                                         inner.insert(key.clone(), serde_json::json!(num));
@@ -214,29 +261,33 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
     match key.code {
         KeyCode::Up if app.search_results.is_some() => {
             app.results_scroll = app.results_scroll.saturating_sub(1);
-            return;
         }
         KeyCode::Down if app.search_results.is_some() => {
             let max_scroll = app.last_rendered_content_height.saturating_sub(app.results_viewport_height);
             if app.results_scroll < max_scroll {
                  app.results_scroll = app.results_scroll.saturating_add(1);
             }
-            return;
         }
         KeyCode::Right if app.search_results.is_some() => {
             app.results_scroll_x = app.results_scroll_x.saturating_add(5);
-            return;
         }
         KeyCode::Left if app.search_results.is_some() => {
             app.results_scroll_x = app.results_scroll_x.saturating_sub(5);
-            return;
         }
         KeyCode::Char('S') if app.search_results.is_some() => {
             app.is_saving_query = true;
-            app.save_query_name_input.clear();
+            app.save_query_name_input = app.loaded_query_name.clone().unwrap_or_default();
         },
         KeyCode::Char('L') if app.search_results.is_none() => {
             app.show_saved_queries = true;
+            app.is_loading_to_edit = false;
+            if !app.saved_queries.is_empty() {
+                app.saved_queries_state.select(Some(0));
+            }
+        },
+        KeyCode::Char('E') if app.search_results.is_none() => {
+            app.show_saved_queries = true;
+            app.is_loading_to_edit = true;
             if !app.saved_queries.is_empty() {
                 app.saved_queries_state.select(Some(0));
             }
@@ -278,6 +329,8 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             app.filters.clear();
             app.aggregations.clear();
             app.order_by.clear();
+            app.variable_values.clear();
+            app.loaded_query_name = None;
             app.limit = Some(100);
             app.selected_fields.clear();
             app.filter_value_input.clear();
@@ -317,11 +370,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             FocusPanel::Middle => app.focus_panel = FocusPanel::Left,
             FocusPanel::Right => app.focus_panel = FocusPanel::Middle,
             FocusPanel::Extra => {
-                if app.search_criteria == SearchCriteria::OrderBy {
-                    app.focus_panel = FocusPanel::Right;
-                } else {
-                    app.focus_panel = FocusPanel::Right;
-                }
+                app.focus_panel = FocusPanel::Right;
             },
             _ => {}
         },
@@ -373,10 +422,10 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         if idx == add_new_idx {
                             app.filters.push(crate::repl::state::Filter {
                                 field: "?".to_string(), op: crate::repl::state::ComparisonOp::Eq, value: "?".to_string(),
-                                value_options: vec!["Write value".to_string()],
+                                value_options: vec!["Write value".to_string(), "Variable (ask later)".to_string()],
                             });
                             app.middle_panel_state.select(Some(app.filters.len() - 1));
-                            app.filter_value_options = vec!["Write value".to_string()];
+                            app.filter_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
                         } else if delete_idx == Some(idx) {
                             if !app.filters.is_empty() {
                                 app.filters.pop();
@@ -385,7 +434,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                 if let Some(f) = app.filters.get(new_idx) {
                                     app.filter_value_options = f.value_options.clone();
                                 } else {
-                                    app.filter_value_options = vec!["Write value".to_string()];
+                                    app.filter_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
                                 }
                             }
                         } else {
@@ -470,11 +519,14 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                         if f_idx < app.filters.len() {
                                             app.filters[f_idx].field = field.clone();
                                             // ACTUALIZAR VALORES EXISTENTES
-                                            let values = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                                            let mut values = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
                                                 get_field_values(Path::new("data"), e, t, field)
                                             } else {
-                                                vec!["Write value".to_string()]
+                                                vec!["Write value".to_string(), "Variable (ask later)".to_string()]
                                             };
+                                            if !values.contains(&"Variable (ask later)".to_string()) {
+                                                values.push("Variable (ask later)".to_string());
+                                            }
                                             app.filters[f_idx].value_options = values.clone();
                                             app.filter_value_options = values;
                                         }
@@ -484,16 +536,14 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         },
                         FilterStep::Op => {
                             if let Some(idx) = app.extra_panel_state.selected() {
-                                let ops = vec![
-                                    crate::repl::state::ComparisonOp::Eq,
+                                let ops = [crate::repl::state::ComparisonOp::Eq,
                                     crate::repl::state::ComparisonOp::Ne,
                                     crate::repl::state::ComparisonOp::In,
                                     crate::repl::state::ComparisonOp::Like,
                                     crate::repl::state::ComparisonOp::Gt,
                                     crate::repl::state::ComparisonOp::Gte,
                                     crate::repl::state::ComparisonOp::Lt,
-                                    crate::repl::state::ComparisonOp::Lte,
-                                ];
+                                    crate::repl::state::ComparisonOp::Lte];
                                 if let Some(op) = ops.get(idx) {
                                     if let Some(f_idx) = app.middle_panel_state.selected() {
                                         if f_idx < app.filters.len() {
@@ -508,11 +558,18 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                 if let Some(val) = app.filter_value_options.get(idx) {
                                     if val == "Write value" {
                                         app.focus_panel = FocusPanel::Bottom;
-                                    } else {
+                                    } else if val == "Variable (ask later)" {
                                         if let Some(f_idx) = app.middle_panel_state.selected() {
                                             if f_idx < app.filters.len() {
-                                                app.filters[f_idx].value = val.clone();
+                                                let var_name = format!("${}", app.filters[f_idx].field);
+                                                app.filters[f_idx].value = var_name.clone();
+                                                app.focus_panel = FocusPanel::Bottom;
+                                                app.filter_value_input = var_name;
                                             }
+                                        }
+                                    } else if let Some(f_idx) = app.middle_panel_state.selected() {
+                                        if f_idx < app.filters.len() {
+                                            app.filters[f_idx].value = val.clone();
                                         }
                                     }
                                 }
@@ -524,6 +581,11 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                 (FocusPanel::Extra, SearchCriteria::Aggregations) => {
                     if let Some(f_idx) = app.middle_panel_state.selected() {
                         if f_idx < app.aggregations.len() {
+                            let agg_type_str = app.aggregations[f_idx].as_object()
+                                .and_then(|o| o.keys().next())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "var".to_string());
+
                             let agg = &mut app.aggregations[f_idx];
                             let selected_step_idx = app.right_panel_state.selected().unwrap_or(0);
 
@@ -563,8 +625,15 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                                 if let Some(val) = app.agg_value_options.get(idx) {
                                                     if val == "Write value" {
                                                         app.focus_panel = FocusPanel::Bottom;
+                                                    } else if val == "Variable (ask later)" {
+                                                        // Use Aggregation Type as variable name base (e.g. $TopN, $Sum)
+                                                        let var_name = format!("${}", agg_type_str);
+
+                                                        inner.insert(key.clone(), serde_json::json!(var_name));
+                                                        app.focus_panel = FocusPanel::Bottom;
+                                                        app.filter_value_input = var_name;
                                                     } else {
-                                                        let num_keys = vec!["n", "top_n", "limit", "page", "min_streak"];
+                                                        let num_keys = ["n", "top_n", "limit", "page", "min_streak"];
                                                         if num_keys.contains(&key.as_str()) {
                                                             if let Ok(num) = val.parse::<u64>() {
                                                                 inner.insert(key.clone(), serde_json::json!(num));
@@ -611,12 +680,39 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
 
 fn execute_search_action(app: &mut App) {
     if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+         // Detect variables
+         let mut variables = Vec::new();
+         for f in &app.filters {
+             if f.value.starts_with('$') { variables.push(f.value.clone()); }
+         }
+         for agg in &app.aggregations {
+             if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                 for val in obj.values() {
+                     if let Some(s) = val.as_str() {
+                         if s.starts_with('$') { variables.push(s.to_string()); }
+                     }
+                 }
+             }
+         }
+         variables.sort();
+         variables.dedup();
+
+         if !variables.is_empty() {
+             app.variable_prompt_queue = variables;
+             app.is_prompting_variable = true;
+             app.variable_input.clear();
+             if let Some(var) = app.variable_prompt_queue.pop() {
+                 app.current_variable = var;
+             }
+             return;
+         }
+
          app.status_message = None; // LIMPIAR MENSAJE DE CARGA AQUÍ
          app.results_scroll = 0;
          app.results_scroll_x = 0;
          app.results_page = 1;
          let filters = app.filters.clone();
-         let filters_op = app.filters_op.clone();
+         let filters_op = app.filters_op;
          let limit = app.limit.unwrap_or(100).max(1);
          let aggregations = app.aggregations.clone();
          let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
@@ -661,6 +757,7 @@ fn execute_search_action(app: &mut App) {
 fn load_saved_query_into_app(app: &mut App, query: &SavedQuery) {
     app.selected_entity = Some(query.entity.clone());
     app.selected_table = Some(query.table.clone());
+    app.loaded_query_name = Some(query.name.clone());
     
     // Explicitly load available fields regardless of search_criteria
     if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
@@ -674,7 +771,7 @@ fn load_saved_query_into_app(app: &mut App, query: &SavedQuery) {
         field: sf.field.clone(),
         op: ComparisonOp::from_str(&sf.op),
         value: sf.value.clone(),
-        value_options: vec!["Write value".to_string()], // We could reload these if needed
+        value_options: vec!["Write value".to_string(), "Variable (ask later)".to_string()], // We could reload these if needed
     }).collect();
     
     app.filters_op = match query.filters_op.as_str() {
@@ -759,7 +856,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                                     match key.as_str() {
                                         "field" | "key_field" | "bucket_field" | "value_field" => get_filtered_fields(&app.available_fields).len(),
                                         "operation" => app.agg_op_options.len(),
-                                        _ => 1, // "Write value"
+                                        _ => app.agg_value_options.len(),
                                     }
                                 } else { 0 }
                             } else { 0 }
@@ -780,7 +877,7 @@ fn navigate_list(app: &mut App, delta: isize) {
         _ => return,
     };
 
-    if len == 0 { if delta != 0 { return; } }
+    if len == 0 && delta != 0 { return; }
     let current = state.selected().unwrap_or(0);
     let next = if len > 0 { (current as isize + delta + len as isize) as usize % len } else { 0 };
 
@@ -818,7 +915,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                     app.filter_step = FilterStep::Field;
                 }
                 SearchCriteria::Aggregations => {
-                    app.agg_value_options = vec!["Write value".to_string()];
+                    app.agg_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
                     app.agg_step = AggregationStep::Main;
                 }
                 _ => {}
@@ -840,7 +937,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                 SearchCriteria::Aggregations => {
                     app.right_panel_state.select(Some(0));
                     app.agg_step = AggregationStep::Main;
-                    app.agg_value_options = vec!["Write value".to_string()];
+                    app.agg_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
                     // Sincronizar extra panel si es un agg existente
                     if next < app.aggregations.len() {
                         app.extra_panel_state.select(Some(0));
@@ -867,12 +964,106 @@ fn navigate_list(app: &mut App, delta: isize) {
     }
 }
 
+fn execute_search_action_with_resolved_vars(app: &mut App) {
+    if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+         app.status_message = None;
+         app.results_scroll = 0;
+         app.results_scroll_x = 0;
+         app.results_page = 1;
+         
+         let mut filters = app.filters.clone();
+         for f in &mut filters {
+             if f.value.starts_with('$') {
+                 if let Some(resolved) = app.variable_values.get(&f.value) {
+                     f.value = resolved.clone();
+                 }
+             }
+         }
+
+         let filters_op = app.filters_op;
+         let limit = app.limit.unwrap_or(100).max(1);
+         
+         let mut aggregations = app.aggregations.clone();
+         for agg in &mut aggregations {
+             if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
+                 for val in obj.values_mut() {
+                     if let Some(s) = val.as_str() {
+                         if s.starts_with('$') {
+                             if let Some(resolved) = app.variable_values.get(s) {
+                                 *val = serde_json::json!(resolved);
+                             }
+                         }
+                     }
+                 }
+             }
+         }
+
+         let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
+         
+         let fields = if app.selected_fields.is_empty() {
+             app.available_fields.iter()
+                 .filter(|f| {
+                     let s = f.trim();
+                     !s.ends_with("_date") && !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+                 })
+                 .cloned()
+                 .collect()
+         } else {
+             app.selected_fields.clone()
+         };
+
+         let entity = e.clone();
+         let table = t.clone();
+
+         let start_x = 4;
+         let start_y = 9;
+
+         let _ = crate::ui::spinner::run_with_spinner(
+             "Executing query and fetching results...",
+             start_y,
+             start_x,
+             |_, _| {
+                 match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0, &mut app.query_cache) {
+                     Ok(result) => {
+                         app.search_results = Some(result);
+                         Ok(())
+                     }
+                     Err(err) => Err(err)
+                 }
+             }
+         );
+    }
+}
+
 fn execute_paged_query(app: &mut App) {
     if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-        let filters = app.filters.clone();
-        let filters_op = app.filters_op.clone();
+        let mut filters = app.filters.clone();
+        for f in &mut filters {
+            if f.value.starts_with('$') {
+                if let Some(resolved) = app.variable_values.get(&f.value) {
+                    f.value = resolved.clone();
+                }
+            }
+        }
+
+        let filters_op = app.filters_op;
         let limit = app.limit.unwrap_or(100).max(1);
-        let aggregations = app.aggregations.clone();
+        
+        let mut aggregations = app.aggregations.clone();
+        for agg in &mut aggregations {
+            if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
+                for val in obj.values_mut() {
+                    if let Some(s) = val.as_str() {
+                        if s.starts_with('$') {
+                            if let Some(resolved) = app.variable_values.get(s) {
+                                *val = serde_json::json!(resolved);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
         let offset = (app.results_page - 1) * limit;
 
@@ -891,8 +1082,6 @@ fn execute_paged_query(app: &mut App) {
         let entity = e.clone();
         let table = t.clone();
 
-        // Calculate dynamic Y position for spinner:
-        // Top margin (2) + Menu (5) + Spacer (1) + Instructions (1) + Spacer (1) + QueryPreview Length + Spacer (1)
         let query_lines = crate::repl::ui::get_query_preview_lines(app).len();
         let spinner_y = (2 + 5 + 1 + 1 + 1 + query_lines) as u16;
 
