@@ -156,6 +156,12 @@ async fn handle_query(
                     let mut map = serde_json::Map::new();
                     for (i, header) in result.headers.iter().enumerate() {
                         if let Some(val) = row.get(i) {
+                            // If value is empty, return null
+                            if val.is_empty() {
+                                map.insert(header.clone(), serde_json::Value::Null);
+                                continue;
+                            }
+
                             // Try to parse numbers if possible, otherwise string
                             let json_val = if let Ok(n) = val.parse::<i64>() {
                                 serde_json::Value::Number(n.into())

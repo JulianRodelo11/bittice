@@ -263,8 +263,39 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
                     let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
                     if let Some(i) = app.endpoint_state.selected() {
                         if let Some(q) = queries.get(i) {
-                            let text = format!("http://127.0.0.1:3000/{}", q.name);
-                            let _ = clipboard.set_text(text);
+                            let mut params = Vec::new();
+                            
+                            // Extract params from filters
+                            for f in &q.filters {
+                                if f.value.starts_with('$') {
+                                    params.push(f.value[1..].to_string());
+                                }
+                            }
+                            
+                            // Extract params from aggregations
+                            for agg in &q.aggregations {
+                                if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                                    for val in obj.values() {
+                                        if let Some(s) = val.as_str() {
+                                            if s.starts_with('$') {
+                                                params.push(s[1..].to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            params.sort();
+                            params.dedup();
+                            
+                            let mut url = format!("http://127.0.0.1:3000/{}", q.name);
+                            if !params.is_empty() {
+                                let query_string = params.iter().map(|p| format!("{}=?", p)).collect::<Vec<_>>().join("&");
+                                url.push('?');
+                                url.push_str(&query_string);
+                            }
+
+                            let _ = clipboard.set_text(url);
                             app.status_message = Some(("Endpoint copied to clipboard!".to_string(), true));
                         }
                     }

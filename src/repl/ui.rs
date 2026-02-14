@@ -92,7 +92,38 @@ fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
     // Left: Available Endpoints
     let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
     let items: Vec<ListItem> = queries.iter().map(|q| {
-        let path = format!("/{}", q.name);
+        let mut params = Vec::new();
+        
+        // Extract params from filters
+        for f in &q.filters {
+            if f.value.starts_with('$') {
+                params.push(f.value[1..].to_string());
+            }
+        }
+        
+        // Extract params from aggregations
+        for agg in &q.aggregations {
+            if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                for val in obj.values() {
+                    if let Some(s) = val.as_str() {
+                        if s.starts_with('$') {
+                            params.push(s[1..].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        params.sort();
+        params.dedup();
+        
+        let mut path = format!("/{}", q.name);
+        if !params.is_empty() {
+            let query_string = params.iter().map(|p| format!("{}=?", p)).collect::<Vec<_>>().join("&");
+            path.push('?');
+            path.push_str(&query_string);
+        }
+
         ListItem::new(Line::from(vec![
             Span::styled("GET ", Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)),
             Span::styled(path, Style::default().fg(text_color)),
