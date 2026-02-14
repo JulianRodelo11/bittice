@@ -105,7 +105,6 @@ async fn handle_query(
              missing_params.dedup();
              let _ = state.log_sender.send(format!("  -> 400 Bad Request (Missing params: {:?})", missing_params)).await;
              return Json(serde_json::json!({
-                 "status": 400,
                  "error": "Missing required query parameters",
                  "missing_parameters": missing_params
              }));
@@ -158,27 +157,40 @@ async fn handle_query(
                     for (i, header) in result.headers.iter().enumerate() {
                         if let Some(val) = row.get(i) {
                             // Try to parse numbers if possible, otherwise string
-                            // For now, keep as string to match CLI behavior, or simple heuristic?
-                            // Let's keep as String to be safe and consistent with CLI output.
-                            map.insert(header.clone(), serde_json::Value::String(val.clone()));
+                            let json_val = if let Ok(n) = val.parse::<i64>() {
+                                serde_json::Value::Number(n.into())
+                            } else if let Ok(f) = val.parse::<f64>() {
+                                serde_json::Number::from_f64(f)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::String(val.clone()))
+                            } else {
+                                serde_json::Value::String(val.clone())
+                            };
+                            map.insert(header.clone(), json_val);
                         }
                     }
                     map
                 }).collect();
 
+                // If it's an aggregation (like TopN), the "total_found" is effectively the number of rows returned
+                let is_aggregation = !query.aggregations.is_empty();
+                let actual_total = if is_aggregation { data.len() } else { result.total_found };
+                let actual_limit = if is_aggregation { data.len() } else { limit };
+
                 // Construct enhanced JSON response
-                let total_pages = result.total_found.div_ceil(limit);
+                let total_pages = if actual_limit > 0 { (actual_total + actual_limit - 1) / actual_limit } else { 1 };
                 let response = serde_json::json!({
-                    "status": 200,
                     "data": data,
                     "meta": {
-                        "execution_time_ms": result.execution_time_micros as f64 / 1000.0
+                        "execution_time_ms": result.execution_time_micros as f64 / 1000.0,
+                        "query": query_name,
+                        "limit": actual_limit
                     },
                     "pagination": {
                         "page": page,
-                        "per_page": limit,
+                        "per_page": actual_limit,
                         "total_pages": total_pages.max(1),
-                        "total_items": result.total_found
+                        "total_items": actual_total
                     }
                 });
 
@@ -187,7 +199,6 @@ async fn handle_query(
             Err(e) => {
                 let _ = state.log_sender.send(format!("  -> 500 Error: {}", e)).await;
                 Json(serde_json::json!({
-                    "status": 500,
                     "error": e.to_string()
                 }))
             }
@@ -195,7 +206,6 @@ async fn handle_query(
     } else {
         let _ = state.log_sender.send(format!("  -> 404 Not Found (Query '{}' not found)", query_name)).await;
         Json(serde_json::json!({
-            "status": 404,
             "error": "Query not found. Make sure to save a query with this name first."
         }))
     }

@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use std::path::Path;
-use std::fs::File;
 
 pub fn get_path_suggestions(input: &str) -> Vec<String> {
     // Si está vacío, empezamos en la raíz del sistema

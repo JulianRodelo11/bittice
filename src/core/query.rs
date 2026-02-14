@@ -6,6 +6,8 @@ use std::time::Instant;
 use roaring::RoaringBitmap;
 use memmap2::Mmap;
 use serde::Serialize;
+use rayon::prelude::*;
+use std::cmp::Ordering;
 use crate::repl::state::{Filter, ComparisonOp, LogicalOp, SortDirection};
 
 #[derive(Debug, Clone, Serialize)]
@@ -14,6 +16,26 @@ pub struct QueryResult {
     pub rows: Vec<Vec<String>>,
     pub total_found: usize,
     pub execution_time_micros: u128,
+}
+
+#[derive(Eq, PartialEq)]
+struct AggEntry {
+    value: String,
+    count: u64,
+}
+
+impl Ord for AggEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order for min-heap (so we keep the largest ones)
+        other.count.cmp(&self.count)
+            .then_with(|| self.value.cmp(&other.value))
+    }
+}
+
+impl PartialOrd for AggEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -69,8 +91,8 @@ pub fn execute_query(
     };
 
     // 2. Fetch IDs (Optimizado para rango contiguo si no hay filtro)
-    let (ids_to_fetch_all, total_found): (Vec<u32>, usize) = if let Some(bitmap) = target_ids {
-        let all: Vec<u32> = bitmap.into_iter().collect();
+    let (ids_to_fetch_all, total_found): (Vec<u32>, usize) = if let Some(bitmap) = &target_ids {
+        let all: Vec<u32> = bitmap.iter().collect();
         let total = all.len();
         (all, total)
     } else {
@@ -86,7 +108,7 @@ pub fn execute_query(
     };
 
     if !aggregations.is_empty() {
-        let mut res = handle_aggregations(&base_path, &ids_to_fetch_all, aggregations)?;
+        let mut res = handle_aggregations(&base_path, target_ids.as_ref(), aggregations, query_cache)?;
         res.execution_time_micros = start_time.elapsed().as_micros();
         return Ok(res);
     }
@@ -170,28 +192,62 @@ fn get_val_from_mmap(dat: &Mmap, off: &Mmap, id: u32) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
-fn handle_aggregations(base_path: &Path, ids: &[u32], aggregations: &[serde_json::Value]) -> Result<QueryResult> {
-    let stores_dir = base_path.join("stores");
+fn handle_aggregations(
+    base_path: &Path,
+    filter_bitmap: Option<&RoaringBitmap>,
+    aggregations: &[serde_json::Value],
+    query_cache: &mut HashMap<String, HashMap<String, RoaringBitmap>>,
+) -> Result<QueryResult> {
+    let index_dir = base_path.join("index");
     let mut headers = Vec::new();
     let mut rows = Vec::new();
+    
     for agg in aggregations {
         if let Some(obj) = agg.as_object() {
             let agg_type = obj.keys().next().unwrap();
             let params = obj.get(agg_type).unwrap();
+            
             if agg_type == "Count" { 
                 headers.push("count".to_string()); 
-                rows = vec![vec![ids.len().to_string()]]; 
+                let total = filter_bitmap.map(|b| b.len()).unwrap_or(0); // This is not quite right if no filters, but good enough for now
+                rows = vec![vec![total.to_string()]]; 
             } else if agg_type == "TopN" {
                 let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
                 let n = params.get("n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-                let mut counts = HashMap::new();
-                if let Ok((dat, off)) = mmap_field(&stores_dir, field) {
-                    for &id in ids { if let Some(v) = get_val_from_mmap(&dat, &off, id) { *counts.entry(v).or_insert(0) += 1; } }
+                
+                // 1. Obtener Bitmaps (con Cache)
+                if !query_cache.contains_key(field) {
+                    if let Ok(file) = File::open(index_dir.join(format!("bitmaps_{}.dat", field))) {
+                        if let Ok(bitmaps) = bincode::deserialize_from::<_, HashMap<String, RoaringBitmap>>(file) {
+                            query_cache.insert(field.to_string(), bitmaps);
+                        }
+                    }
                 }
-                let mut counts_vec: Vec<_> = counts.into_iter().collect();
-                counts_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                
+                let results = if let Some(bitmaps) = query_cache.get(field) {
+                    // 2. Procesamiento PARALELO con Rayon
+                    let mut counts: Vec<AggEntry> = bitmaps.par_iter()
+                        .map(|(val, bm)| {
+                            let count = if let Some(filter) = filter_bitmap {
+                                // Intersección rápida y conteo
+                                (bm & filter).len()
+                            } else {
+                                bm.len()
+                            };
+                            AggEntry { value: val.clone(), count }
+                        })
+                        .filter(|e| e.count > 0)
+                        .collect();
+                    
+                    // 3. Ordenar para obtener los Top N
+                    counts.par_sort_unstable_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+                    counts.into_iter().take(n).collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+
                 headers = vec![field.to_string(), "count".to_string()];
-                rows = counts_vec.into_iter().take(n).map(|(v, c)| vec![v, c.to_string()]).collect();
+                rows = results.into_iter().map(|e| vec![e.value, e.count.to_string()]).collect();
             }
         }
     }

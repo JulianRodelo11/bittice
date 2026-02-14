@@ -74,13 +74,6 @@ pub fn process_and_write(
     let mut writers: HashMap<String, FieldWriters> = HashMap::new();
     for field_name in &all_target_fields {
         writers.insert(field_name.clone(), create_writers(output_dir, field_name)?);
-
-        // Archivos extra de Bittice
-        File::create(output_dir.join(format!("stores/{}_threads.dat", field_name)))?;
-        File::create(output_dir.join(format!("stores/{}_metadata.dat", field_name)))?;
-        File::create(
-            output_dir.join(format!("stores/{}_columnar_{}.dat", field_name, field_name)),
-        )?;
     }
 
     // 4. Leer y Escribir (Pasada 2)
