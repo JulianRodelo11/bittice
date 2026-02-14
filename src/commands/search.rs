@@ -231,7 +231,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             app.results_scroll_x = app.results_scroll_x.saturating_sub(5);
             return;
         }
-        KeyCode::Char('g') if app.search_results.is_some() => {
+        KeyCode::Char('S') if app.search_results.is_some() => {
             app.is_saving_query = true;
             app.save_query_name_input.clear();
         },

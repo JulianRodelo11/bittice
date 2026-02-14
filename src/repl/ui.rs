@@ -139,7 +139,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
         ]));
         all_lines.push(Line::from(vec![
             Span::styled("+ ", Style::default().fg(active_color).add_modifier(Modifier::BOLD)),
-            Span::styled("Press 'g' to save query", Style::default().fg(text_color)),
+            Span::styled("Press 'S' (Shift+s) to save query", Style::default().fg(text_color)),
         ]));
         all_lines.push(Line::from(""));
         
