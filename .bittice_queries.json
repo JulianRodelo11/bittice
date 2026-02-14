@@ -1,1 +1,24 @@
-[]
+[
+  {
+    "name": "services/orderBy-desc",
+    "entity": "ruedaz",
+    "table": "parking_request",
+    "filters": [],
+    "filters_op": "And",
+    "aggregations": [],
+    "order_by": [
+      {
+        "field": "SK_date",
+        "direction": "Desc"
+      }
+    ],
+    "limit": 100,
+    "selected_fields": [
+      "ACCOUNT_CUSTOMER_DOCUMENTNUMBER",
+      "ACCOUNT_CUSTOMER_NAME",
+      "ACCOUNT_VEHICLE_PLATE",
+      "FACILITY_NAME",
+      "SK"
+    ]
+  }
+]

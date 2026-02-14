@@ -2,5 +2,6 @@
 /data/
 
 input.ndjson
+.bittice_queries.json
 resultado_limpio.ndjson
 PROMPT_QUERY_BUILDER.md
