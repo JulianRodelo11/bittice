@@ -452,7 +452,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         let delete_idx = if !app.aggregations.is_empty() { Some(app.aggregations.len() + 1) } else { None };
 
                         if idx == add_new_idx {
-                            app.aggregations.push(serde_json::json!({"TopN": {"field": "?", "n": 0}}));
+                            app.aggregations.push(serde_json::json!({"TopN": {"field": "?", "n": 10}}));
                             app.middle_panel_state.select(Some(app.aggregations.len() - 1));
                         } else if delete_idx == Some(idx) {
                             if !app.aggregations.is_empty() {
@@ -681,12 +681,22 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
 
 fn execute_search_action(app: &mut App) {
     if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-         // Detect variables
          let mut variables = Vec::new();
          for f in &app.filters {
              if f.value.starts_with('$') { variables.push(f.value.clone()); }
          }
-         // Ignoramos agregaciones por ahora en variables ya que no soportamos agregaciones
+         
+         // Detect variables in aggregations
+         for agg in &app.aggregations {
+             if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                 for val in obj.values() {
+                     if let Some(s) = val.as_str() {
+                         if s.starts_with('$') { variables.push(s.to_string()); }
+                     }
+                 }
+             }
+         }
+         
          variables.sort();
          variables.dedup();
 
@@ -735,16 +745,11 @@ fn execute_search_action(app: &mut App) {
              start_y,
              start_x,
              |_, _| {
-                 // CHECK: Aggregations
-                 if !aggregations.is_empty() {
-                     return Err(anyhow::anyhow!("Aggregations are not yet supported in the new storage engine."));
-                 }
-
                  let base_path = Path::new("data").join(&entity);
                  let mut table = Table::open(&base_path, &table_name)?;
                  
                  // Execute Search on Table
-                 match table.search(&fields, &filters, &filters_op, &order_by, limit, 0) {
+                 match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
                      Ok(result) => {
                          app.search_results = Some(result);
                          Ok(())
@@ -992,7 +997,12 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
                      if let Some(s) = val.as_str() {
                          if s.starts_with('$') {
                              if let Some(resolved) = app.variable_values.get(s) {
-                                 *val = serde_json::json!(resolved);
+                                 // Try to parse as number if it's for n/limit/etc
+                                 if let Ok(num) = resolved.parse::<u64>() {
+                                     *val = serde_json::json!(num);
+                                 } else {
+                                     *val = serde_json::json!(resolved);
+                                 }
                              }
                          }
                      }
@@ -1025,15 +1035,10 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
              start_y,
              start_x,
              |_, _| {
-                 // CHECK: Aggregations
-                 if !aggregations.is_empty() {
-                     return Err(anyhow::anyhow!("Aggregations are not yet supported in the new storage engine."));
-                 }
-
                  let base_path = Path::new("data").join(&entity);
                  let mut table = Table::open(&base_path, &table_name)?;
                  
-                 match table.search(&fields, &filters, &filters_op, &order_by, limit, 0) {
+                 match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
                      Ok(result) => {
                          app.search_results = Some(result);
                          Ok(())
@@ -1066,7 +1071,11 @@ fn execute_paged_query(app: &mut App) {
                     if let Some(s) = val.as_str() {
                         if s.starts_with('$') {
                             if let Some(resolved) = app.variable_values.get(s) {
-                                *val = serde_json::json!(resolved);
+                                if let Ok(num) = resolved.parse::<u64>() {
+                                    *val = serde_json::json!(num);
+                                } else {
+                                    *val = serde_json::json!(resolved);
+                                }
                             }
                         }
                     }
@@ -1099,16 +1108,11 @@ fn execute_paged_query(app: &mut App) {
             "Fetching next page...",
             spinner_y, 4,
             |_, _| {
-                                 // CHECK: Aggregations
-                                 if !aggregations.is_empty() {
-                                     return Err(anyhow::anyhow!("Aggregations are not yet supported in the new storage engine."));
-                                 }
-                
-                                 let base_path = Path::new("data").join(&entity);
-                                 let mut table = Table::open(&base_path, &table_name)?;
-                                 
-                                 match table.search(&fields, &filters, &filters_op, &order_by, limit, offset) {
-                                    Ok(result) => {
+                                                  let base_path = Path::new("data").join(&entity);
+                                                  let mut table = Table::open(&base_path, &table_name)?;
+                                                  
+                                                  match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset) {
+                    Ok(result) => {
                                         app.search_results = Some(result);
                                         Ok(())
                                     }

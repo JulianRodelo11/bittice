@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::fs;
 use anyhow::{Result, Context};
+use roaring::RoaringBitmap;
 use crate::core::storage::manifest::Manifest;
 use crate::core::storage::segment::{Segment, SegmentWriter};
 use crate::core::storage::wal::{Wal, WalOperation};
@@ -171,70 +172,120 @@ impl Table {
         fields: &[String],
         filters: &[Filter],
         filters_op: &LogicalOp,
-        order_by: &[OrderBy],
+        aggregations: &[serde_json::Value],
+        _order_by: &[OrderBy],
         limit: usize,
         offset: usize
     ) -> Result<QueryResult> {
         let start_time = std::time::Instant::now();
-        let mut final_results: Vec<(u64, u32)> = Vec::new();
+        
+        // 1. Filtrado (Obtener bitmaps por segmento)
+        let mut segment_matches: Vec<(u64, RoaringBitmap)> = Vec::new();
         let mut total_found = 0;
-        
-        // Cache for immutable segments
         let mut cache = HashMap::new(); 
-        
-        // 1. Search Immutable Segments
+
         for segment in &self.immutable_segments {
              let bitmap = segment.search(filters, filters_op, &mut cache)?;
              if !bitmap.is_empty() {
                  total_found += bitmap.len();
-                 for id in bitmap {
-                     final_results.push((segment.id, id));
-                 }
+                 segment_matches.push((segment.id, bitmap));
              }
         }
         
-        // 2. Search Active Segment
         if let Some(writer) = &mut self.active_segment {
-             // Flush to ensure data consistency for reading
              writer.flush()?;
              let bitmap = writer.search(filters, filters_op)?;
              if !bitmap.is_empty() {
                  total_found += bitmap.len();
-                 for id in bitmap {
-                     final_results.push((writer.segment.id, id));
-                 }
+                 segment_matches.push((writer.segment.id, bitmap));
              }
         }
-        
-        // 3. Sorting (TODO: Global Sorting)
-        // For now, results are roughly ordered by segment ID then local ID.
-        if !order_by.is_empty() {
-            // Placeholder: sorting not yet implemented
+
+        // 2. Manejo de Agregaciones (si existen)
+        if !aggregations.is_empty() {
+            let mut final_headers = Vec::new();
+            let mut final_rows = Vec::new();
+
+            for agg in aggregations {
+                if let Some(obj) = agg.as_object() {
+                    let agg_type = obj.keys().next().unwrap();
+                    let params = obj.get(agg_type).unwrap();
+
+                    if agg_type == "Count" {
+                        final_headers = vec!["count".to_string()];
+                        final_rows = vec![vec![total_found.to_string()]];
+                    } else if agg_type == "GroupBy" || agg_type == "TopN" {
+                        let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
+                        
+                        let mut global_counts: HashMap<String, u64> = HashMap::new();
+                        for (seg_id, bitmap) in &segment_matches {
+                            let seg_counts = if let Some(writer) = &self.active_segment {
+                                if writer.segment.id == *seg_id {
+                                    writer.get_counts(field, bitmap)?
+                                } else {
+                                    self.immutable_segments.iter().find(|s| s.id == *seg_id)
+                                        .ok_or_else(|| anyhow::anyhow!("Segment {} not found", seg_id))?
+                                        .get_counts(field, bitmap, &mut cache)?
+                                }
+                            } else {
+                                self.immutable_segments.iter().find(|s| s.id == *seg_id)
+                                    .ok_or_else(|| anyhow::anyhow!("Segment {} not found", seg_id))?
+                                    .get_counts(field, bitmap, &mut cache)?
+                            };
+
+                            for (val, count) in seg_counts {
+                                *global_counts.entry(val).or_insert(0) += count;
+                            }
+                        }
+
+                        let mut results: Vec<(String, u64)> = global_counts.into_iter().collect();
+                        
+                        if agg_type == "TopN" {
+                            let n = params.get("n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                            results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                            results.truncate(n);
+                        } else {
+                            results.sort_by(|a, b| a.0.cmp(&b.0));
+                        }
+
+                        final_headers = vec![field.to_string(), "count".to_string()];
+                        final_rows = results.into_iter().map(|(v, c)| vec![v, c.to_string()]).collect();
+                    }
+                }
+            }
+
+            return Ok(QueryResult {
+                headers: final_headers,
+                rows: final_rows,
+                total_found: total_found as usize,
+                execution_time_micros: start_time.elapsed().as_micros(),
+            });
         }
-        
-        // 4. Pagination
-        let paged_results: Vec<(u64, u32)> = final_results.into_iter().skip(offset).take(limit).collect();
-        
-        // 5. Materialization
+
+        // 3. Materialización de Filas (Scatter-Gather)
+        let mut final_ids: Vec<(u64, u32)> = Vec::new();
+        for (seg_id, bitmap) in segment_matches {
+            for id in bitmap {
+                final_ids.push((seg_id, id));
+            }
+        }
+
+        // Pagination
+        let paged_results: Vec<(u64, u32)> = final_ids.into_iter().skip(offset).take(limit).collect();
         let mut rows = Vec::new();
         
         for (seg_id, local_id) in paged_results {
             let mut row_map = None;
-            
-            // Check active segment first
             if let Some(writer) = &self.active_segment {
                 if writer.segment.id == seg_id {
                     row_map = Some(writer.segment.get_row(local_id, fields)?);
                 }
             }
-            
-            // Check immutable segments
             if row_map.is_none() {
                 if let Some(segment) = self.immutable_segments.iter().find(|s| s.id == seg_id) {
                     row_map = Some(segment.get_row(local_id, fields)?);
                 }
             }
-            
             if let Some(map) = row_map {
                 let row_vec: Vec<String> = fields.iter().map(|f| map.get(f).cloned().unwrap_or_default()).collect();
                 rows.push(row_vec);

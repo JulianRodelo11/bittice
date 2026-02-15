@@ -82,19 +82,18 @@ async fn handle_query(
         }).collect();
         
         let mut aggregations = query.aggregations.clone();
-        if !aggregations.is_empty() {
-             let _ = state.log_sender.send(format!("  -> 400 Bad Request (Aggregations not supported)")).await;
-             return Json(serde_json::json!({
-                 "error": "Aggregations are not yet supported in the new storage engine."
-             }));
-        }
         for agg in &mut aggregations {
             if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
                 for val in obj.values_mut() {
                     if let Some(s) = val.as_str() {
                         if let Some(key) = s.strip_prefix('$') {
                             if let Some(param_val) = params.get(key) {
-                                *val = serde_json::json!(param_val);
+                                // Try to parse as number for parameters like 'n' or 'limit'
+                                if let Ok(num) = param_val.parse::<u64>() {
+                                    *val = serde_json::json!(num);
+                                } else {
+                                    *val = serde_json::json!(param_val);
+                                }
                             } else {
                                 missing_params.push(key.to_string());
                             }
@@ -141,7 +140,7 @@ async fn handle_query(
         let result = {
             let base_path = std::path::Path::new("data").join(&query.entity);
             match Table::open(&base_path, &query.table) {
-                Ok(mut table) => table.search(&fields, &filters, &filters_op, &order_by, limit, offset),
+                Ok(mut table) => table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset),
                 Err(e) => Err(e)
             }
         };

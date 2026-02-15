@@ -288,6 +288,35 @@ impl Segment {
         }
         Ok(row)
     }
+
+    pub fn get_counts(
+        &self,
+        field: &str,
+        filter_bitmap: &RoaringBitmap,
+        cache: &mut HashMap<(u64, String), HashMap<String, RoaringBitmap>>
+    ) -> Result<HashMap<String, u64>> {
+        let cache_key = (self.id, field.to_string());
+        if !cache.contains_key(&cache_key) {
+            let bitmap_path = self.path.join(format!("bitmaps_{}.dat", field));
+            if bitmap_path.exists() {
+                let file = File::open(bitmap_path)?;
+                let bitmaps: HashMap<String, RoaringBitmap> = bincode::deserialize_from(file)?;
+                cache.insert(cache_key.clone(), bitmaps);
+            } else {
+                cache.insert(cache_key.clone(), HashMap::new());
+            }
+        }
+
+        let bitmaps = cache.get(&cache_key).unwrap();
+        let mut counts = HashMap::new();
+        for (val, bm) in bitmaps {
+            let count = (bm & filter_bitmap).len();
+            if count > 0 {
+                counts.insert(val.clone(), count);
+            }
+        }
+        Ok(counts)
+    }
 }
 
 pub struct SegmentWriter {
@@ -377,9 +406,19 @@ impl SegmentWriter {
     }
 
     pub fn search(&self, filters: &[Filter], filters_op: &LogicalOp) -> Result<RoaringBitmap> {
+        let valid_filters: Vec<&Filter> = filters.iter().filter(|f| f.field != "?" && f.value != "?").collect();
+
+        if valid_filters.is_empty() {
+             let mut all = RoaringBitmap::new();
+             all.insert_range(0..self.segment.record_count as u32);
+             if !self.segment.deleted_bitmap.is_empty() {
+                 all -= &self.segment.deleted_bitmap;
+             }
+             return Ok(all);
+        }
+
         // 1. Pruning
-        for f in filters {
-            if f.field == "?" || f.value == "?" { continue; }
+        for f in &valid_filters {
             if let Some((min, max)) = self.segment.min_max.get(&f.field) {
                 let val = &f.value;
                 let skip = match f.op {
@@ -400,9 +439,7 @@ impl SegmentWriter {
         let mut result_bitmap = RoaringBitmap::new();
         let mut first = true;
 
-        for f in filters {
-            if f.field == "?" || f.value == "?" { continue; }
-
+        for f in &valid_filters {
             // Use in-memory bitmaps
             let empty_map = HashMap::new();
             let bitmaps = self.bitmaps.get(&f.field).unwrap_or(&empty_map);
@@ -484,5 +521,18 @@ impl SegmentWriter {
         }
 
         Ok(result_bitmap)
+    }
+
+    pub fn get_counts(&self, field: &str, filter_bitmap: &RoaringBitmap) -> Result<HashMap<String, u64>> {
+        let empty_map = HashMap::new();
+        let bitmaps = self.bitmaps.get(field).unwrap_or(&empty_map);
+        let mut counts = HashMap::new();
+        for (val, bm) in bitmaps {
+            let count = (bm & filter_bitmap).len();
+            if count > 0 {
+                counts.insert(val.clone(), count);
+            }
+        }
+        Ok(counts)
     }
 }
