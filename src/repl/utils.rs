@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use std::path::Path;
 
 pub fn get_path_suggestions(input: &str) -> Vec<String> {
@@ -115,48 +114,59 @@ pub fn get_loaded_data() -> Vec<String> {
     tree_lines
 }
 
-#[derive(Deserialize)]
-struct Config {
-    indexed_fields: Vec<IndexedField>,
-}
 
-#[derive(Deserialize)]
-struct IndexedField {
-    field_name: String,
-    indexed: bool,
-}
 
 pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
     let mut fields = std::collections::HashSet::new();
-
-    // 1. Intentar desde config.json (para asegurar campos base)
-    let config_path = data_path.join(entity).join(table).join("config.json");
-    if let Ok(content) = std::fs::read_to_string(config_path) {
-        if let Ok(config) = serde_json::from_str::<Config>(&content) {
-            for item in config.indexed_fields {
-                if item.indexed {
-                    fields.insert(item.field_name);
-                }
-            }
-        }
-    }
-
-    // 2. Intentar desde el directorio index/ (para campos derivados como _day, _month)
-    let index_dir = data_path.join(entity).join(table).join("index");
-    if let Ok(entries) = std::fs::read_dir(index_dir) {
+    let table_path = data_path.join(entity).join(table);
+    
+    // 1. Try manifest.json? No, it doesn't store schema.
+    
+    // 2. Scan segments
+    let segments_dir = table_path.join("segments");
+    if let Ok(entries) = std::fs::read_dir(segments_dir) {
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("bitmaps_") && name.ends_with(".dat") {
-                    let field_name = &name[8..name.len() - 4];
-                    fields.insert(field_name.to_string());
+            if entry.path().is_dir() {
+                // Inside segment dir (e.g. seg_0000)
+                if let Ok(seg_files) = std::fs::read_dir(entry.path()) {
+                    for f in seg_files.flatten() {
+                        if let Some(name) = f.file_name().to_str() {
+                            if name.starts_with("bitmaps_") && name.ends_with(".dat") {
+                                let field_name = &name[8..name.len() - 4];
+                                fields.insert(field_name.to_string());
+                            }
+                        }
+                    }
+                }
+                // Scanning one segment is usually enough if schema is consistent.
+                if !fields.is_empty() {
+                    break;
                 }
             }
         }
     }
+
+    // Fallback to old method just in case mixed data?
+    // ... No, let's stick to new engine structure.
 
     let mut result: Vec<String> = fields.into_iter().collect();
     result.sort();
     result
+}
+
+pub fn get_entities(data_path: &Path) -> Vec<String> {
+    let mut entities = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(data_path) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    entities.push(entry.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    entities.sort();
+    entities
 }
 
 pub fn get_field_values(_data_path: &Path, _entity: &str, _table: &str, _field: &str) -> Vec<String> {

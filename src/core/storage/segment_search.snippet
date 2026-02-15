@@ -1,0 +1,129 @@
+    pub fn search(
+        &self,
+        filters: &[Filter],
+        filters_op: &LogicalOp,
+        cache: &mut HashMap<(u64, String), HashMap<String, RoaringBitmap>>
+    ) -> Result<RoaringBitmap> {
+        // 1. Pruning (Data Skipping)
+        for f in filters {
+            if f.field == "?" || f.value == "?" { continue; }
+            if let Some((min, max)) = self.min_max.get(&f.field) {
+                let val = &f.value;
+                let skip = match f.op {
+                    ComparisonOp::Eq => val < min || val > max,
+                    ComparisonOp::Gt => val >= max, // If looking for > MAX, nothing can be found (assuming strict >)
+                    ComparisonOp::Gte => val > max,
+                    ComparisonOp::Lt => val <= min,
+                    ComparisonOp::Lte => val < min,
+                    _ => false,
+                };
+                if skip {
+                    return Ok(RoaringBitmap::new()); // Pruned!
+                }
+            }
+        }
+
+        // 2. Filter Execution
+        let mut result_bitmap = RoaringBitmap::new();
+        let mut first = true;
+
+        for f in filters {
+            if f.field == "?" || f.value == "?" { continue; }
+
+            // Load Bitmaps if not in cache
+            let cache_key = (self.id, f.field.clone());
+            if !cache.contains_key(&cache_key) {
+                let bitmap_path = self.path.join(format!("bitmaps_{}.dat", f.field));
+                if bitmap_path.exists() {
+                    let file = File::open(bitmap_path)?;
+                    let bitmaps: HashMap<String, RoaringBitmap> = bincode::deserialize_from(file)?;
+                    cache.insert(cache_key.clone(), bitmaps);
+                } else {
+                    // If no bitmap file, maybe column doesn't exist or no index. Treat as empty.
+                    cache.insert(cache_key.clone(), HashMap::new());
+                }
+            }
+
+            let bitmaps = cache.get(&cache_key).unwrap();
+            let mut filter_bitmap = RoaringBitmap::new();
+
+            match f.op {
+                ComparisonOp::Eq => {
+                    if let Some(bm) = bitmaps.get(&f.value) {
+                        filter_bitmap = bm.clone();
+                    }
+                },
+                ComparisonOp::Ne => {
+                    // NE is tricky with bitmaps. Usually: All - Eq.
+                    // Or union of all others.
+                    // Here we iterate all keys != value.
+                    for (k, bm) in bitmaps {
+                        if k != &f.value {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Gt => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() > f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Gte => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() >= f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Lt => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() < f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Lte => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() <= f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Like => {
+                    let pattern = f.value.replace("%", "");
+                    for (k, bm) in bitmaps {
+                        if k.contains(&pattern) {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::In => {
+                    let vals: Vec<&str> = f.value.split(',').map(|s| s.trim()).collect();
+                    for (k, bm) in bitmaps {
+                        if vals.contains(&k.as_str()) {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                }
+            }
+
+            if first {
+                result_bitmap = filter_bitmap;
+                first = false;
+            } else {
+                match filters_op {
+                    LogicalOp::And => result_bitmap &= filter_bitmap,
+                    LogicalOp::Or => result_bitmap |= filter_bitmap,
+                }
+            }
+        }
+        
+        // Remove deleted records
+        if !self.deleted_bitmap.is_empty() {
+            result_bitmap -= &self.deleted_bitmap;
+        }
+
+        Ok(result_bitmap)
+    }

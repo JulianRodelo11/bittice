@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel, Filter, ComparisonOp, OrderBy, SortDirection, LogicalOp};
 use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields, get_base_fields, get_field_values};
 use crate::core::saved_queries::{SavedQuery, save_queries, SavedFilter, SavedOrderBy};
+use crate::core::storage::table::Table;
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
@@ -685,15 +686,7 @@ fn execute_search_action(app: &mut App) {
          for f in &app.filters {
              if f.value.starts_with('$') { variables.push(f.value.clone()); }
          }
-         for agg in &app.aggregations {
-             if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
-                 for val in obj.values() {
-                     if let Some(s) = val.as_str() {
-                         if s.starts_with('$') { variables.push(s.to_string()); }
-                     }
-                 }
-             }
-         }
+         // Ignoramos agregaciones por ahora en variables ya que no soportamos agregaciones
          variables.sort();
          variables.dedup();
 
@@ -715,7 +708,7 @@ fn execute_search_action(app: &mut App) {
          let filters_op = app.filters_op;
          let limit = app.limit.unwrap_or(100).max(1);
          let aggregations = app.aggregations.clone();
-         let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
+         let order_by = app.order_by.clone();
          
          let fields = if app.selected_fields.is_empty() {
              // Filter out derived fields (_day, _month, _hour_bucket)
@@ -731,7 +724,7 @@ fn execute_search_action(app: &mut App) {
          };
 
          let entity = e.clone();
-         let table = t.clone();
+         let table_name = t.clone();
 
          // Position for spinner (below menu)
          let start_x = 4;
@@ -742,7 +735,16 @@ fn execute_search_action(app: &mut App) {
              start_y,
              start_x,
              |_, _| {
-                 match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0, &mut app.query_cache) {
+                 // CHECK: Aggregations
+                 if !aggregations.is_empty() {
+                     return Err(anyhow::anyhow!("Aggregations are not yet supported in the new storage engine."));
+                 }
+
+                 let base_path = Path::new("data").join(&entity);
+                 let mut table = Table::open(&base_path, &table_name)?;
+                 
+                 // Execute Search on Table
+                 match table.search(&fields, &filters, &filters_op, &order_by, limit, 0) {
                      Ok(result) => {
                          app.search_results = Some(result);
                          Ok(())
@@ -998,7 +1000,7 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
              }
          }
 
-         let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
+         let order_by = app.order_by.clone();
          
          let fields = if app.selected_fields.is_empty() {
              app.available_fields.iter()
@@ -1013,7 +1015,7 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
          };
 
          let entity = e.clone();
-         let table = t.clone();
+         let table_name = t.clone();
 
          let start_x = 4;
          let start_y = 9;
@@ -1023,7 +1025,15 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
              start_y,
              start_x,
              |_, _| {
-                 match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, 0, &mut app.query_cache) {
+                 // CHECK: Aggregations
+                 if !aggregations.is_empty() {
+                     return Err(anyhow::anyhow!("Aggregations are not yet supported in the new storage engine."));
+                 }
+
+                 let base_path = Path::new("data").join(&entity);
+                 let mut table = Table::open(&base_path, &table_name)?;
+                 
+                 match table.search(&fields, &filters, &filters_op, &order_by, limit, 0) {
                      Ok(result) => {
                          app.search_results = Some(result);
                          Ok(())
@@ -1064,7 +1074,7 @@ fn execute_paged_query(app: &mut App) {
             }
         }
 
-        let order_by = app.order_by.iter().map(|o| (o.field.clone(), o.direction)).collect::<Vec<_>>();
+        let order_by = app.order_by.clone();
         let offset = (app.results_page - 1) * limit;
 
         let fields = if app.selected_fields.is_empty() {
@@ -1080,7 +1090,7 @@ fn execute_paged_query(app: &mut App) {
         };
 
         let entity = e.clone();
-        let table = t.clone();
+        let table_name = t.clone();
 
         let query_lines = crate::repl::ui::get_query_preview_lines(app).len();
         let spinner_y = (2 + 5 + 1 + 1 + 1 + query_lines) as u16;
@@ -1089,14 +1099,21 @@ fn execute_paged_query(app: &mut App) {
             "Fetching next page...",
             spinner_y, 4,
             |_, _| {
-                match crate::core::query::execute_query(&entity, &table, &fields, &filters, &filters_op, &aggregations, &order_by, limit, offset, &mut app.query_cache) {
-                    Ok(result) => {
-                        app.search_results = Some(result);
-                        Ok(())
-                    }
-                    Err(err) => Err(err)
-                }
-            }
+                                 // CHECK: Aggregations
+                                 if !aggregations.is_empty() {
+                                     return Err(anyhow::anyhow!("Aggregations are not yet supported in the new storage engine."));
+                                 }
+                
+                                 let base_path = Path::new("data").join(&entity);
+                                 let mut table = Table::open(&base_path, &table_name)?;
+                                 
+                                 match table.search(&fields, &filters, &filters_op, &order_by, limit, offset) {
+                                    Ok(result) => {
+                                        app.search_results = Some(result);
+                                        Ok(())
+                                    }
+                                    Err(err) => Err(err)
+                                }            }
         );
     }
 }

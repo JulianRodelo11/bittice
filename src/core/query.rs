@@ -5,18 +5,10 @@ use std::path::Path;
 use std::time::Instant;
 use roaring::RoaringBitmap;
 use memmap2::Mmap;
-use serde::Serialize;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use crate::repl::state::{Filter, ComparisonOp, LogicalOp, SortDirection};
-
-#[derive(Debug, Clone, Serialize)]
-pub struct QueryResult {
-    pub headers: Vec<String>,
-    pub rows: Vec<Vec<String>>,
-    pub total_found: usize,
-    pub execution_time_micros: u128,
-}
+use crate::core::types::{Filter, ComparisonOp, LogicalOp, SortDirection};
+pub use crate::core::types::QueryResult;
 
 #[derive(Eq, PartialEq)]
 struct AggEntry {

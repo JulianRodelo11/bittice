@@ -5,23 +5,21 @@ use axum::{
     routing::get,
     Router,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use tokio::sync::{mpsc, oneshot};
 use tower_http::trace::TraceLayer;
 use crate::core::saved_queries::{load_queries};
-use crate::core::query::{execute_query};
-use crate::repl::state::{Filter, LogicalOp, ComparisonOp, SortDirection};
+use crate::core::storage::table::Table;
+use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy};
 use std::collections::HashMap;
 
 // Estructura para compartir estado con los handlers de Axum
 struct ServerState {
-    query_cache: Arc<Mutex<HashMap<String, HashMap<String, roaring::RoaringBitmap>>>>,
     log_sender: mpsc::Sender<String>,
 }
 
 pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot::Receiver<()>) {
     let state = Arc::new(ServerState {
-        query_cache: Arc::new(Mutex::new(HashMap::new())),
         log_sender: log_sender.clone(),
     });
 
@@ -84,6 +82,12 @@ async fn handle_query(
         }).collect();
         
         let mut aggregations = query.aggregations.clone();
+        if !aggregations.is_empty() {
+             let _ = state.log_sender.send(format!("  -> 400 Bad Request (Aggregations not supported)")).await;
+             return Json(serde_json::json!({
+                 "error": "Aggregations are not yet supported in the new storage engine."
+             }));
+        }
         for agg in &mut aggregations {
             if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
                 for val in obj.values_mut() {
@@ -115,8 +119,11 @@ async fn handle_query(
             _ => LogicalOp::And,
         };
         
-        let order_by: Vec<(String, SortDirection)> = query.order_by.iter().map(|so| {
-            (so.field.clone(), if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc })
+        let order_by: Vec<OrderBy> = query.order_by.iter().map(|so| {
+            OrderBy {
+                field: so.field.clone(),
+                direction: if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc }
+            }
         }).collect();
         
         // Determine Limit and Offset
@@ -132,19 +139,11 @@ async fn handle_query(
          };
 
         let result = {
-            let mut cache = state.query_cache.lock().unwrap();
-            execute_query(
-                &query.entity,
-                &query.table,
-                &fields,
-                &filters,
-                &filters_op,
-                &query.aggregations,
-                &order_by,
-                limit,
-                offset,
-                &mut cache
-            )
+            let base_path = std::path::Path::new("data").join(&query.entity);
+            match Table::open(&base_path, &query.table) {
+                Ok(mut table) => table.search(&fields, &filters, &filters_op, &order_by, limit, offset),
+                Err(e) => Err(e)
+            }
         };
 
         match result {
@@ -178,10 +177,8 @@ async fn handle_query(
                     map
                 }).collect();
 
-                // If it's an aggregation (like TopN), the "total_found" is effectively the number of rows returned
-                let is_aggregation = !query.aggregations.is_empty();
-                let actual_total = if is_aggregation { data.len() } else { result.total_found };
-                let actual_limit = if is_aggregation { data.len() } else { limit };
+                let actual_total = result.total_found;
+                let actual_limit = limit;
 
                 // Construct enhanced JSON response
                 let total_pages = if actual_limit > 0 { (actual_total + actual_limit - 1) / actual_limit } else { 1 };

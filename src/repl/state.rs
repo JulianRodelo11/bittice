@@ -25,73 +25,8 @@ pub enum SearchCriteria {
     Fields,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ComparisonOp {
-    Eq,
-    Ne,
-    In,
-    Like,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-}
+pub use crate::core::types::{ComparisonOp, Filter, LogicalOp, SortDirection, OrderBy, QueryResult};
 
-impl ComparisonOp {
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "Eq" => ComparisonOp::Eq,
-            "Ne" => ComparisonOp::Ne,
-            "In" => ComparisonOp::In,
-            "Like" => ComparisonOp::Like,
-            "Gt" => ComparisonOp::Gt,
-            "Gte" => ComparisonOp::Gte,
-            "Lt" => ComparisonOp::Lt,
-            "Lte" => ComparisonOp::Lte,
-            _ => ComparisonOp::Eq,
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            ComparisonOp::Eq => "Eq",
-            ComparisonOp::Ne => "Ne",
-            ComparisonOp::In => "In",
-            ComparisonOp::Like => "Like",
-            ComparisonOp::Gt => "Gt",
-            ComparisonOp::Gte => "Gte",
-            ComparisonOp::Lt => "Lt",
-            ComparisonOp::Lte => "Lte",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Filter {
-    pub field: String,
-    pub op: ComparisonOp,
-    pub value: String,
-    pub value_options: Vec<String>,
-}
-
-#[derive(PartialEq, Clone, Copy, Debug)]
-pub enum LogicalOp {
-    And,
-    Or,
-}
-
-impl std::fmt::Display for LogicalOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogicalOp::And => write!(f, "And"),
-            LogicalOp::Or => write!(f, "Or"),
-        }
-    }
-}
-
-
-// Sub-paneles o pasos dentro de la sección de Filtros
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum FilterStep {
     List, 
@@ -103,26 +38,6 @@ pub enum FilterStep {
 #[derive(PartialEq, Clone, Debug)]
 pub enum AggregationStep {
     Main,
-}
-
-#[derive(PartialEq, Clone, Copy, Debug)]
-pub enum SortDirection {
-    Asc,
-    Desc,
-}
-
-impl SortDirection {
-    pub fn as_str(&self) -> &str {
-        match self {
-            SortDirection::Asc => "Asc",
-            SortDirection::Desc => "Desc",
-        }
-    }
-}
-
-pub struct OrderBy {
-    pub field: String,
-    pub direction: SortDirection,
 }
 
 // Para manejar el foco en la UI de búsqueda
@@ -201,7 +116,7 @@ pub struct App {
     pub selected_fields: Vec<String>,
 
     // --- Query Results ---
-    pub search_results: Option<crate::core::query::QueryResult>,
+    pub search_results: Option<QueryResult>,
     pub results_scroll: u16,
     pub results_scroll_x: u16,
     pub results_page: usize,

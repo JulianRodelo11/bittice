@@ -5,6 +5,7 @@ use anyhow::{Result, Context};
 use crate::core::storage::manifest::Manifest;
 use crate::core::storage::segment::{Segment, SegmentWriter};
 use crate::core::storage::wal::{Wal, WalOperation};
+use crate::core::types::{Filter, LogicalOp, OrderBy, QueryResult};
 
 pub struct Table {
     pub name: String,
@@ -163,5 +164,88 @@ impl Table {
         // Prepare new active segment
         self.ensure_active_segment()?;
         Ok(())
+    }
+
+    pub fn search(
+        &mut self,
+        fields: &[String],
+        filters: &[Filter],
+        filters_op: &LogicalOp,
+        order_by: &[OrderBy],
+        limit: usize,
+        offset: usize
+    ) -> Result<QueryResult> {
+        let start_time = std::time::Instant::now();
+        let mut final_results: Vec<(u64, u32)> = Vec::new();
+        let mut total_found = 0;
+        
+        // Cache for immutable segments
+        let mut cache = HashMap::new(); 
+        
+        // 1. Search Immutable Segments
+        for segment in &self.immutable_segments {
+             let bitmap = segment.search(filters, filters_op, &mut cache)?;
+             if !bitmap.is_empty() {
+                 total_found += bitmap.len();
+                 for id in bitmap {
+                     final_results.push((segment.id, id));
+                 }
+             }
+        }
+        
+        // 2. Search Active Segment
+        if let Some(writer) = &mut self.active_segment {
+             // Flush to ensure data consistency for reading
+             writer.flush()?;
+             let bitmap = writer.search(filters, filters_op)?;
+             if !bitmap.is_empty() {
+                 total_found += bitmap.len();
+                 for id in bitmap {
+                     final_results.push((writer.segment.id, id));
+                 }
+             }
+        }
+        
+        // 3. Sorting (TODO: Global Sorting)
+        // For now, results are roughly ordered by segment ID then local ID.
+        if !order_by.is_empty() {
+            // Placeholder: sorting not yet implemented
+        }
+        
+        // 4. Pagination
+        let paged_results: Vec<(u64, u32)> = final_results.into_iter().skip(offset).take(limit).collect();
+        
+        // 5. Materialization
+        let mut rows = Vec::new();
+        
+        for (seg_id, local_id) in paged_results {
+            let mut row_map = None;
+            
+            // Check active segment first
+            if let Some(writer) = &self.active_segment {
+                if writer.segment.id == seg_id {
+                    row_map = Some(writer.segment.get_row(local_id, fields)?);
+                }
+            }
+            
+            // Check immutable segments
+            if row_map.is_none() {
+                if let Some(segment) = self.immutable_segments.iter().find(|s| s.id == seg_id) {
+                    row_map = Some(segment.get_row(local_id, fields)?);
+                }
+            }
+            
+            if let Some(map) = row_map {
+                let row_vec: Vec<String> = fields.iter().map(|f| map.get(f).cloned().unwrap_or_default()).collect();
+                rows.push(row_vec);
+            }
+        }
+        
+        Ok(QueryResult {
+            headers: fields.to_vec(),
+            rows,
+            total_found: total_found as usize,
+            execution_time_micros: start_time.elapsed().as_micros(),
+        })
     }
 }

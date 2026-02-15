@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use crate::repl::state::{OrderBy, Filter};
+use crate::core::types::{OrderBy, Filter};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SavedQuery {

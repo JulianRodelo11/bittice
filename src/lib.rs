@@ -6,6 +6,7 @@ pub mod core {
     pub mod query;
     pub mod saved_queries;
     pub mod storage;
+    pub mod types;
 }
 
 pub mod commands {

@@ -5,6 +5,7 @@ use anyhow::{Result, Context};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use crate::core::storage::manifest::SegmentMeta;
+use crate::core::types::{Filter, ComparisonOp, LogicalOp};
 
 #[derive(Debug)]
 pub struct Segment {
@@ -72,13 +73,27 @@ impl Segment {
             HashMap::new()
         };
 
+        let mut record_count = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".offsets") {
+                        if let Ok(meta) = entry.metadata() {
+                            record_count = meta.len() / 8;
+                            break; 
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Segment {
             id,
             path: path.to_path_buf(),
-            is_immutable: true, // Assuming loaded segments are immutable by default unless opened for write
+            is_immutable: true, 
             min_max,
             deleted_bitmap,
-            record_count: 0, // Should load from metadata
+            record_count, 
         })
     }
 
@@ -107,6 +122,171 @@ impl Segment {
         let writer = BufWriter::new(file);
         serde_json::to_writer(writer, &self.min_max)?;
         Ok(())
+    }
+
+    pub fn search(
+        &self,
+        filters: &[Filter],
+        filters_op: &LogicalOp,
+        cache: &mut HashMap<(u64, String), HashMap<String, RoaringBitmap>>
+    ) -> Result<RoaringBitmap> {
+        
+        let valid_filters: Vec<&Filter> = filters.iter().filter(|f| f.field != "?" && f.value != "?").collect();
+
+        if valid_filters.is_empty() {
+             let mut all = RoaringBitmap::new();
+             all.insert_range(0..self.record_count as u32);
+             if !self.deleted_bitmap.is_empty() {
+                 all -= &self.deleted_bitmap;
+             }
+             return Ok(all);
+        }
+
+        // 1. Pruning (Data Skipping)
+        for f in &valid_filters {
+            if let Some((min, max)) = self.min_max.get(&f.field) {
+                let val = &f.value;
+                let skip = match f.op {
+                    ComparisonOp::Eq => val < min || val > max,
+                    ComparisonOp::Gt => val >= max, 
+                    ComparisonOp::Gte => val > max,
+                    ComparisonOp::Lt => val <= min,
+                    ComparisonOp::Lte => val < min,
+                    _ => false,
+                };
+                if skip {
+                    return Ok(RoaringBitmap::new()); // Pruned!
+                }
+            }
+        }
+
+        // 2. Filter Execution
+        let mut result_bitmap = RoaringBitmap::new();
+        let mut first = true;
+
+        for f in &valid_filters {
+            // Load Bitmaps if not in cache
+            let cache_key = (self.id, f.field.clone());
+            if !cache.contains_key(&cache_key) {
+                let bitmap_path = self.path.join(format!("bitmaps_{}.dat", f.field));
+                if bitmap_path.exists() {
+                    let file = File::open(bitmap_path)?;
+                    let bitmaps: HashMap<String, RoaringBitmap> = bincode::deserialize_from(file)?;
+                    cache.insert(cache_key.clone(), bitmaps);
+                } else {
+                    cache.insert(cache_key.clone(), HashMap::new());
+                }
+            }
+
+            let bitmaps = cache.get(&cache_key).unwrap();
+            let mut filter_bitmap = RoaringBitmap::new();
+
+            match f.op {
+                ComparisonOp::Eq => {
+                    if let Some(bm) = bitmaps.get(&f.value) {
+                        filter_bitmap = bm.clone();
+                    }
+                },
+                ComparisonOp::Ne => {
+                    for (k, bm) in bitmaps {
+                        if k != &f.value {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Gt => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() > f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Gte => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() >= f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Lt => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() < f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Lte => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() <= f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Like => {
+                    let pattern = f.value.replace("%", "");
+                    for (k, bm) in bitmaps {
+                        if k.contains(&pattern) {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::In => {
+                    let vals: Vec<&str> = f.value.split(',').map(|s| s.trim()).collect();
+                    for (k, bm) in bitmaps {
+                        if vals.contains(&k.as_str()) {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                }
+            }
+            
+            if first {
+                result_bitmap = filter_bitmap;
+                first = false;
+            } else {
+                match filters_op {
+                    LogicalOp::And => result_bitmap &= filter_bitmap,
+                    LogicalOp::Or => result_bitmap |= filter_bitmap,
+                }
+            }
+        }
+        
+        // Remove deleted records
+        if !self.deleted_bitmap.is_empty() {
+            result_bitmap -= &self.deleted_bitmap;
+        }
+        
+        Ok(result_bitmap)
+    }
+
+    pub fn get_row(&self, local_id: u32, fields: &[String]) -> Result<HashMap<String, String>> {
+        let mut row = HashMap::new();
+        for field in fields {
+            let dat_path = self.path.join(format!("{}.dat", field));
+            let off_path = self.path.join(format!("{}.offsets", field));
+
+            if !dat_path.exists() || !off_path.exists() {
+                continue; // Field not found, treat as null/empty
+            }
+
+            let mut off_file = File::open(&off_path)?;
+            let mut dat_file = File::open(&dat_path)?;
+
+            // Read offset
+            use std::io::{Seek, Read};
+            off_file.seek(std::io::SeekFrom::Start((local_id as u64) * 8))?;
+            let mut start_buf = [0u8; 8];
+            off_file.read_exact(&mut start_buf)?;
+            let start_pos = u64::from_le_bytes(start_buf);
+
+            // Read Data
+            dat_file.seek(std::io::SeekFrom::Start(start_pos))?;
+            
+            // We assume bincode format: [len (8 bytes)][utf8 bytes]
+            let val: String = bincode::deserialize_from(&dat_file)?;
+            row.insert(field.clone(), val);
+        }
+        Ok(row)
     }
 }
 
@@ -194,5 +374,115 @@ impl SegmentWriter {
             bincode::serialize_into(file, map)?;
         }
         Ok(())
+    }
+
+    pub fn search(&self, filters: &[Filter], filters_op: &LogicalOp) -> Result<RoaringBitmap> {
+        // 1. Pruning
+        for f in filters {
+            if f.field == "?" || f.value == "?" { continue; }
+            if let Some((min, max)) = self.segment.min_max.get(&f.field) {
+                let val = &f.value;
+                let skip = match f.op {
+                    ComparisonOp::Eq => val < min || val > max,
+                    ComparisonOp::Gt => val >= max,
+                    ComparisonOp::Gte => val > max,
+                    ComparisonOp::Lt => val <= min,
+                    ComparisonOp::Lte => val < min,
+                    _ => false,
+                };
+                if skip {
+                    return Ok(RoaringBitmap::new());
+                }
+            }
+        }
+
+        // 2. Filter Execution
+        let mut result_bitmap = RoaringBitmap::new();
+        let mut first = true;
+
+        for f in filters {
+            if f.field == "?" || f.value == "?" { continue; }
+
+            // Use in-memory bitmaps
+            let empty_map = HashMap::new();
+            let bitmaps = self.bitmaps.get(&f.field).unwrap_or(&empty_map);
+            let mut filter_bitmap = RoaringBitmap::new();
+
+            match f.op {
+                ComparisonOp::Eq => {
+                    if let Some(bm) = bitmaps.get(&f.value) {
+                        filter_bitmap = bm.clone();
+                    }
+                },
+                ComparisonOp::Ne => {
+                    for (k, bm) in bitmaps {
+                        if k != &f.value {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Gt => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() > f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Gte => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() >= f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Lt => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() < f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Lte => {
+                    for (k, bm) in bitmaps {
+                        if k.as_str() <= f.value.as_str() {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::Like => {
+                    let pattern = f.value.replace("%", "");
+                    for (k, bm) in bitmaps {
+                        if k.contains(&pattern) {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                },
+                ComparisonOp::In => {
+                    let vals: Vec<&str> = f.value.split(',').map(|s| s.trim()).collect();
+                    for (k, bm) in bitmaps {
+                        if vals.contains(&k.as_str()) {
+                            filter_bitmap |= bm;
+                        }
+                    }
+                }
+            }
+
+            if first {
+                result_bitmap = filter_bitmap;
+                first = false;
+            } else {
+                match filters_op {
+                    LogicalOp::And => result_bitmap &= filter_bitmap,
+                    LogicalOp::Or => result_bitmap |= filter_bitmap,
+                }
+            }
+        }
+
+        // Remove deleted records
+        if !self.segment.deleted_bitmap.is_empty() {
+            result_bitmap -= &self.segment.deleted_bitmap;
+        }
+
+        Ok(result_bitmap)
     }
 }
