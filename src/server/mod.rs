@@ -5,7 +5,7 @@ use axum::{
     routing::get,
     Router,
 };
-use std::sync::{Arc};
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tower_http::trace::TraceLayer;
 use crate::core::saved_queries::{load_queries};
@@ -13,14 +13,48 @@ use crate::core::storage::table::Table;
 use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy};
 use std::collections::HashMap;
 
+// Manejador de tablas para mantenerlas abiertas en memoria
+struct TableManager {
+    tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
+}
+
+impl TableManager {
+    fn new() -> Self {
+        Self {
+            tables: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_table(&self, entity: &str, table_name: &str) -> anyhow::Result<Arc<RwLock<Table>>> {
+        let key = format!("{}/{}", entity, table_name);
+        {
+            let cache = self.tables.read().unwrap();
+            if let Some(table) = cache.get(&key) {
+                return Ok(table.clone());
+            }
+        }
+        let mut cache = self.tables.write().unwrap();
+        if let Some(table) = cache.get(&key) {
+            return Ok(table.clone());
+        }
+        let base_path = std::path::Path::new("data").join(entity);
+        let table = Table::open(&base_path, table_name)?;
+        let table_arc = Arc::new(RwLock::new(table));
+        cache.insert(key, table_arc.clone());
+        Ok(table_arc)
+    }
+}
+
 // Estructura para compartir estado con los handlers de Axum
 struct ServerState {
     log_sender: mpsc::Sender<String>,
+    table_manager: TableManager,
 }
 
 pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot::Receiver<()>) {
     let state = Arc::new(ServerState {
         log_sender: log_sender.clone(),
+        table_manager: TableManager::new(),
     });
 
     // Definir rutas
@@ -137,12 +171,12 @@ async fn handle_query(
              query.selected_fields.clone()
          };
 
-        let result = {
-            let base_path = std::path::Path::new("data").join(&query.entity);
-            match Table::open(&base_path, &query.table) {
-                Ok(mut table) => table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset),
-                Err(e) => Err(e)
-            }
+        let result = match state.table_manager.get_table(&query.entity, &query.table) {
+            Ok(table_lock) => {
+                let mut table = table_lock.write().unwrap();
+                table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
+            },
+            Err(e) => Err(e)
         };
 
         match result {

@@ -6,8 +6,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use crate::core::storage::manifest::SegmentMeta;
 use crate::core::types::{Filter, ComparisonOp, LogicalOp};
+use memmap2::Mmap;
+use std::sync::{Arc, RwLock};
 
-#[derive(Debug)]
 pub struct Segment {
     pub id: u64,
     pub path: PathBuf,
@@ -15,6 +16,18 @@ pub struct Segment {
     pub min_max: HashMap<String, (String, String)>,
     pub deleted_bitmap: RoaringBitmap,
     pub record_count: u64,
+    /// Cache of memory-mapped files: Field -> (Data, Offsets)
+    pub mmap_cache: RwLock<HashMap<String, Arc<(Mmap, Mmap)>>>,
+}
+
+impl std::fmt::Debug for Segment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Segment")
+            .field("id", &self.id)
+            .field("path", &self.path)
+            .field("record_count", &self.record_count)
+            .finish()
+    }
 }
 
 impl Segment {
@@ -27,6 +40,7 @@ impl Segment {
             min_max: HashMap::new(),
             deleted_bitmap: RoaringBitmap::new(),
             record_count: 0,
+            mmap_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -93,7 +107,8 @@ impl Segment {
             is_immutable: true, 
             min_max,
             deleted_bitmap,
-            record_count, 
+            record_count,
+            mmap_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -262,28 +277,51 @@ impl Segment {
     pub fn get_row(&self, local_id: u32, fields: &[String]) -> Result<HashMap<String, String>> {
         let mut row = HashMap::new();
         for field in fields {
-            let dat_path = self.path.join(format!("{}.dat", field));
-            let off_path = self.path.join(format!("{}.offsets", field));
+            // 1. Get from cache or map on demand
+            let mmap_pair = {
+                let cache = self.mmap_cache.read().unwrap();
+                cache.get(field).cloned()
+            };
 
-            if !dat_path.exists() || !off_path.exists() {
-                continue; // Field not found, treat as null/empty
-            }
+            let mmap_pair = if let Some(p) = mmap_pair {
+                p
+            } else {
+                let dat_path = self.path.join(format!("{}.dat", field));
+                let off_path = self.path.join(format!("{}.offsets", field));
 
-            let mut off_file = File::open(&off_path)?;
-            let mut dat_file = File::open(&dat_path)?;
+                if !dat_path.exists() || !off_path.exists() {
+                    continue; 
+                }
 
-            // Read offset
-            use std::io::{Seek, Read};
-            off_file.seek(std::io::SeekFrom::Start((local_id as u64) * 8))?;
-            let mut start_buf = [0u8; 8];
-            off_file.read_exact(&mut start_buf)?;
-            let start_pos = u64::from_le_bytes(start_buf);
+                let dat_file = File::open(&dat_path)?;
+                let off_file = File::open(&off_path)?;
+                
+                let pair = Arc::new((
+                    unsafe { Mmap::map(&dat_file)? },
+                    unsafe { Mmap::map(&off_file)? }
+                ));
 
-            // Read Data
-            dat_file.seek(std::io::SeekFrom::Start(start_pos))?;
+                let mut cache = self.mmap_cache.write().unwrap();
+                cache.insert(field.clone(), pair.clone());
+                pair
+            };
+
+            let (dat, off) = &*mmap_pair;
+
+            // 2. Read Offset from memory
+            let start_idx = (local_id as usize) * 8;
+            if start_idx + 8 > off.len() { continue; }
             
-            // We assume bincode format: [len (8 bytes)][utf8 bytes]
-            let val: String = bincode::deserialize_from(&dat_file)?;
+            let start_pos = u64::from_le_bytes(off[start_idx..start_idx+8].try_into().unwrap()) as usize;
+            
+            // 3. Read Data from memory
+            // We use bincode format: [8 bytes length][data]
+            if start_pos + 8 > dat.len() { continue; }
+            let len = u64::from_le_bytes(dat[start_pos..start_pos+8].try_into().unwrap()) as usize;
+            
+            if start_pos + 8 + len > dat.len() { continue; }
+            let val = String::from_utf8_lossy(&dat[start_pos + 8..start_pos + 8 + len]).into_owned();
+            
             row.insert(field.clone(), val);
         }
         Ok(row)
@@ -318,6 +356,7 @@ impl Segment {
         Ok(counts)
     }
 }
+
 
 pub struct SegmentWriter {
     pub segment: Segment,

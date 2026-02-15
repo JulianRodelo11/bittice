@@ -17,6 +17,8 @@ pub struct Table {
     // For now, let's keep track of them.
     immutable_segments: Vec<Segment>,
     wal: Wal,
+    /// Cache for deserialized bitmaps: (segment_id, field_name) -> { value -> bitmap }
+    index_cache: HashMap<(u64, String), HashMap<String, RoaringBitmap>>,
 }
 
 impl Table {
@@ -55,6 +57,7 @@ impl Table {
             active_segment: None,
             immutable_segments: Vec::new(),
             wal,
+            index_cache: HashMap::new(),
         };
 
         table.load_segments()?;
@@ -182,10 +185,9 @@ impl Table {
         // 1. Filtrado (Obtener bitmaps por segmento)
         let mut segment_matches: Vec<(u64, RoaringBitmap)> = Vec::new();
         let mut total_found = 0;
-        let mut cache = HashMap::new(); 
 
         for segment in &self.immutable_segments {
-             let bitmap = segment.search(filters, filters_op, &mut cache)?;
+             let bitmap = segment.search(filters, filters_op, &mut self.index_cache)?;
              if !bitmap.is_empty() {
                  total_found += bitmap.len();
                  segment_matches.push((segment.id, bitmap));
@@ -225,12 +227,12 @@ impl Table {
                                 } else {
                                     self.immutable_segments.iter().find(|s| s.id == *seg_id)
                                         .ok_or_else(|| anyhow::anyhow!("Segment {} not found", seg_id))?
-                                        .get_counts(field, bitmap, &mut cache)?
+                                        .get_counts(field, bitmap, &mut self.index_cache)?
                                 }
                             } else {
                                 self.immutable_segments.iter().find(|s| s.id == *seg_id)
                                     .ok_or_else(|| anyhow::anyhow!("Segment {} not found", seg_id))?
-                                    .get_counts(field, bitmap, &mut cache)?
+                                    .get_counts(field, bitmap, &mut self.index_cache)?
                             };
 
                             for (val, count) in seg_counts {
