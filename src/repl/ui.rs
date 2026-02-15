@@ -1,5 +1,6 @@
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
 use crate::repl::utils::{get_loaded_data, get_order_by_fields, get_filtered_fields, get_base_fields};
+use crate::core::saved_queries::SavedOperation;
 use crate::ui::colors;
 use ratatui::layout::Margin;
 use ratatui::{prelude::*, widgets::*};
@@ -90,42 +91,48 @@ fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
         .split(chunks[2]);
 
     // Left: Available Endpoints
-    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
-    let items: Vec<ListItem> = queries.iter().map(|q| {
-        let mut params = Vec::new();
-        
-        // Extract params from filters
-        for f in &q.filters {
-            if f.value.starts_with('$') {
-                params.push(f.value[1..].to_string());
-            }
-        }
-        
-        // Extract params from aggregations
-        for agg in &q.aggregations {
-            if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
-                for val in obj.values() {
-                    if let Some(s) = val.as_str() {
-                        if s.starts_with('$') {
-                            params.push(s[1..].to_string());
+    let items: Vec<ListItem> = app.saved_queries.iter().map(|op| {
+        let (method, name, params) = match op {
+            SavedOperation::Read(q) => {
+                let mut p = Vec::new();
+                for f in &q.filters {
+                    if f.value.starts_with('$') { p.push(f.value[1..].to_string()); }
+                }
+                for agg in &q.aggregations {
+                    if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                        for val in obj.values() {
+                            if let Some(s) = val.as_str() {
+                                if s.starts_with('$') { p.push(s[1..].to_string()); }
+                            }
                         }
                     }
                 }
-            }
-        }
-        
-        params.sort();
-        params.dedup();
-        
-        let mut path = format!("/{}", q.name);
+                p.sort();
+                p.dedup();
+                ("GET ", q.name.clone(), p)
+            },
+            SavedOperation::Insert(i) => ("POST", i.name.clone(), vec![]),
+            SavedOperation::Update(u) => ("PUT ", u.name.clone(), vec![]),
+            SavedOperation::Delete(d) => ("DEL ", d.name.clone(), vec![]),
+        };
+
+        let mut path = format!("/{}", name);
         if !params.is_empty() {
             let query_string = params.iter().map(|p| format!("{}=?", p)).collect::<Vec<_>>().join("&");
             path.push('?');
             path.push_str(&query_string);
         }
 
+        let method_color = match method {
+            "GET " => colors::ACTIVE_COLOR,
+            "POST" => colors::GREEN,
+            "PUT " => Color::Yellow,
+            "DEL " => Color::Red,
+            _ => colors::ACTIVE_COLOR,
+        };
+
         ListItem::new(Line::from(vec![
-            Span::styled("GET ", Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} ", method), Style::default().fg(method_color).add_modifier(Modifier::BOLD)),
             Span::styled(path, Style::default().fg(text_color)),
         ]))
     }).collect();
@@ -835,8 +842,14 @@ fn draw_saved_queries_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
-    let items: Vec<ListItem> = app.saved_queries.iter().map(|q| {
-        ListItem::new(format!("{} ({} - {})", q.name, q.entity, q.table))
+    let items: Vec<ListItem> = app.saved_queries.iter().map(|op| {
+        let (name, details) = match op {
+            SavedOperation::Read(q) => (q.name.clone(), format!("Search: {}/{}", q.entity, q.table)),
+            SavedOperation::Insert(i) => (i.name.clone(), format!("Insert: {}/{}", i.entity, i.table)),
+            SavedOperation::Update(u) => (u.name.clone(), format!("Update: {}/{}", u.entity, u.table)),
+            SavedOperation::Delete(d) => (d.name.clone(), format!("Delete: {}/{}", d.entity, d.table)),
+        };
+        ListItem::new(format!("{} ({})", name, details))
     }).collect();
     
     let list = List::new(items)

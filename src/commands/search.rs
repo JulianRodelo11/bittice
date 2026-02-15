@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::repl::state::{App, SearchCriteria, FilterStep, AggregationStep, FocusPanel, Filter, ComparisonOp, OrderBy, SortDirection, LogicalOp};
 use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_fields, get_base_fields, get_field_values};
-use crate::core::saved_queries::{SavedQuery, save_queries, SavedFilter, SavedOrderBy};
+use crate::core::saved_queries::{SavedOperation, SavedQuery, save_operations, SavedFilter, SavedOrderBy};
 use crate::core::storage::table::Table;
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
@@ -90,17 +90,19 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         selected_fields: app.selected_fields.clone(),
                     };
                     
-                    if let Some(pos) = app.saved_queries.iter().position(|q| q.name == name) {
-                        app.saved_queries[pos] = query;
-                        if let Err(e) = save_queries(&app.saved_queries) {
+                    let operation = SavedOperation::Read(query);
+                    
+                    if let Some(pos) = app.saved_queries.iter().position(|op| op.name() == name) {
+                        app.saved_queries[pos] = operation;
+                        if let Err(e) = save_operations(&app.saved_queries) {
                             app.status_message = Some((format!("Error updating: {}", e), false));
                         } else {
                             app.status_message = Some((format!("Query '{}' updated!", name), true));
                             app.loaded_query_name = Some(name.clone());
                         }
                     } else {
-                        app.saved_queries.push(query);
-                        if let Err(e) = save_queries(&app.saved_queries) {
+                        app.saved_queries.push(operation);
+                        if let Err(e) = save_operations(&app.saved_queries) {
                             app.status_message = Some((format!("Error saving: {}", e), false));
                         } else {
                             app.status_message = Some((format!("Query '{}' saved!", name), true));
@@ -150,13 +152,17 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             KeyCode::Enter => {
                 if let Some(idx) = app.saved_queries_state.selected() {
                     if idx < app.saved_queries.len() {
-                        let query = app.saved_queries[idx].clone();
-                        load_saved_query_into_app(app, &query);
-                        let run_immediately = !app.is_loading_to_edit;
-                        app.show_saved_queries = false;
-                        app.is_loading_to_edit = false;
-                        if run_immediately {
-                            execute_search_action(app);
+                        if let SavedOperation::Read(query) = &app.saved_queries[idx] {
+                            let query_clone = query.clone();
+                            load_saved_query_into_app(app, &query_clone);
+                            let run_immediately = !app.is_loading_to_edit;
+                            app.show_saved_queries = false;
+                            app.is_loading_to_edit = false;
+                            if run_immediately {
+                                execute_search_action(app);
+                            }
+                        } else {
+                            app.status_message = Some(("This operation is not a Search query".to_string(), false));
                         }
                     }
                 }
@@ -166,7 +172,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                  if let Some(idx) = app.saved_queries_state.selected() {
                     if idx < app.saved_queries.len() {
                         app.saved_queries.remove(idx);
-                        let _ = save_queries(&app.saved_queries);
+                        let _ = save_operations(&app.saved_queries);
                         if app.saved_queries.is_empty() {
                             app.saved_queries_state.select(None);
                         } else if idx >= app.saved_queries.len() {

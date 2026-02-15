@@ -136,7 +136,7 @@ pub struct App {
     pub is_loading_to_edit: bool,
     pub loaded_query_name: Option<String>,
     pub save_query_name_input: String,
-    pub saved_queries: Vec<crate::core::saved_queries::SavedQuery>,
+    pub saved_queries: Vec<crate::core::saved_queries::SavedOperation>,
     pub saved_queries_state: ListState,
 
     // --- Server ---
@@ -171,7 +171,7 @@ impl App {
         left_panel_state.select(Some(0));
 
         // Load saved queries
-        let saved_queries = crate::core::saved_queries::load_queries().unwrap_or_default();
+        let saved_queries = crate::core::saved_queries::load_operations().unwrap_or_default();
 
         App {
             // General

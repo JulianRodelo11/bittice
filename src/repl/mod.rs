@@ -213,10 +213,10 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
         KeyCode::Down => {
             match app.server_focus {
                 crate::repl::state::ServerFocus::Endpoints => {
-                    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
-                    if !queries.is_empty() {
+                    let ops = crate::core::saved_queries::load_operations().unwrap_or_default();
+                    if !ops.is_empty() {
                         let i = match app.endpoint_state.selected() {
-                            Some(i) => if i >= queries.len() - 1 { 0 } else { i + 1 },
+                            Some(i) => if i >= ops.len() - 1 { 0 } else { i + 1 },
                             None => 0,
                         };
                         app.endpoint_state.select(Some(i));
@@ -236,10 +236,10 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
         KeyCode::Up => {
             match app.server_focus {
                 crate::repl::state::ServerFocus::Endpoints => {
-                    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
-                    if !queries.is_empty() {
+                    let ops = crate::core::saved_queries::load_operations().unwrap_or_default();
+                    if !ops.is_empty() {
                         let i = match app.endpoint_state.selected() {
-                            Some(i) => if i == 0 { queries.len() - 1 } else { i - 1 },
+                            Some(i) => if i == 0 { ops.len() - 1 } else { i - 1 },
                             None => 0,
                         };
                         app.endpoint_state.select(Some(i));
@@ -260,43 +260,49 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
             let mut clipboard = arboard::Clipboard::new().unwrap();
             match app.server_focus {
                 crate::repl::state::ServerFocus::Endpoints => {
-                    let queries = crate::core::saved_queries::load_queries().unwrap_or_default();
+                    let ops = crate::core::saved_queries::load_operations().unwrap_or_default();
                     if let Some(i) = app.endpoint_state.selected() {
-                        if let Some(q) = queries.get(i) {
+                        if let Some(op) = ops.get(i) {
                             let mut params = Vec::new();
-                            
-                            // Extract params from filters
-                            for f in &q.filters {
-                                if f.value.starts_with('$') {
-                                    params.push(f.value[1..].to_string());
-                                }
-                            }
-                            
-                            // Extract params from aggregations
-                            for agg in &q.aggregations {
-                                if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
-                                    for val in obj.values() {
-                                        if let Some(s) = val.as_str() {
-                                            if s.starts_with('$') {
-                                                params.push(s[1..].to_string());
+                            let name = op.name().to_string();
+
+                            let method = match op {
+                                crate::core::saved_queries::SavedOperation::Read(q) => {
+                                    for f in &q.filters {
+                                        if f.value.starts_with('$') {
+                                            params.push(f.value[1..].to_string());
+                                        }
+                                    }
+                                    for agg in &q.aggregations {
+                                        if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                                            for val in obj.values() {
+                                                if let Some(s) = val.as_str() {
+                                                    if s.starts_with('$') {
+                                                        params.push(s[1..].to_string());
+                                                    }
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            }
+                                    "GET"
+                                },
+                                crate::core::saved_queries::SavedOperation::Insert(_) => "POST",
+                                crate::core::saved_queries::SavedOperation::Update(_) => "PUT",
+                                crate::core::saved_queries::SavedOperation::Delete(_) => "DELETE",
+                            };
                             
                             params.sort();
                             params.dedup();
                             
-                            let mut url = format!("http://127.0.0.1:3000/{}", q.name);
-                            if !params.is_empty() {
+                            let mut url = format!("http://127.0.0.1:3000/{}", name);
+                            if method == "GET" && !params.is_empty() {
                                 let query_string = params.iter().map(|p| format!("{}=?", p)).collect::<Vec<_>>().join("&");
                                 url.push('?');
                                 url.push_str(&query_string);
                             }
 
                             let _ = clipboard.set_text(url);
-                            app.status_message = Some(("Endpoint copied to clipboard!".to_string(), true));
+                            app.status_message = Some((format!("{} endpoint copied to clipboard!", method), true));
                         }
                     }
                 }
