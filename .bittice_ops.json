@@ -14,15 +14,8 @@
           "direction": "Desc"
         }
       ],
-      "limit": 100,
-      "selected_fields": [
-        "ACCOUNT_CUSTOMER_DOCUMENTNUMBER",
-        "ACCOUNT_CUSTOMER_NAME",
-        "ACCOUNT_VEHICLE_PLATE",
-        "FACILITY_NAME",
-        "PAYMENTS_PARKING_TOTALTIME",
-        "SK"
-      ]
+      "limit": 50,
+      "selected_fields": []
     }
   },
   {
@@ -46,14 +39,25 @@
           "direction": "Desc"
         }
       ],
-      "limit": 100,
+      "limit": 50,
       "selected_fields": [
-        "SK",
-        "PAYMENTS_PARKING_TOTALTIME",
-        "FACILITY_NAME",
-        "ACCOUNT_VEHICLE_PLATE",
         "ACCOUNT_CUSTOMER_DOCUMENTNUMBER",
-        "ACCOUNT_CUSTOMER_NAME"
+        "ACCOUNT_CUSTOMER_EMAIL",
+        "ACCOUNT_CUSTOMER_NAME",
+        "ACCOUNT_VEHICLE_PLATE",
+        "FACILITY_NAME",
+        "FACILITY_ISAUTOMATIC",
+        "PAYMENTS_PARKING_ENDTDATETIME",
+        "PAYMENTS_PARKING_GENERATEPAY",
+        "PAYMENTS_PARKING_IVA",
+        "PAYMENTS_PARKING_PAYMINUTES",
+        "PAYMENTS_PARKING_ST",
+        "PAYMENTS_PARKING_STARTDATETIME",
+        "PAYMENTS_PARKING_STATUS_PAY",
+        "PAYMENTS_PARKING_TOTALTIME",
+        "PAYMENTS_PARKING_TYPE_REQUEST",
+        "SAP_ISFACTURED",
+        "SK"
       ]
     }
   },

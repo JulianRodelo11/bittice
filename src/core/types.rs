@@ -86,6 +86,7 @@ pub struct QueryResult {
     pub rows: Vec<Vec<String>>,
     pub total_found: usize,
     pub execution_time_micros: u128,
+    pub debug_info: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

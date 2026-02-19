@@ -13,6 +13,7 @@ use crate::core::saved_queries::{load_operations, SavedOperation};
 use crate::core::storage::table::Table;
 use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy};
 use std::collections::HashMap;
+use rayon::prelude::*;
 
 // Manejador de tablas para mantenerlas abiertas en memoria
 struct TableManager {
@@ -198,51 +199,85 @@ async fn handle_read(
         }
     }).collect();
     
+    // Check for 'fields' override in params
+    let param_fields: Vec<String> = params.get("fields")
+        .map(|s| s.split(',').map(|f| f.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+
     let limit = query.limit.unwrap_or(100).max(1);
     let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
 
-    let fields = if query.selected_fields.is_empty() {
+    let fields = if !param_fields.is_empty() {
+        param_fields
+    } else if query.selected_fields.is_empty() {
         crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &query.entity, &query.table)
+            .into_iter()
+            .filter(|f| {
+                let s = f.trim();
+                !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
+            })
+            .collect()
     } else {
         query.selected_fields.clone()
     };
 
-    let result = match state.table_manager.get_table(&query.entity, &query.table) {
-        Ok(table_lock) => {
-            let mut table = table_lock.write().unwrap();
-            table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
-        },
-        Err(e) => Err(e)
-    };
+    let query_entity = query.entity.clone();
+    let query_table = query.table.clone();
+    let state_clone = state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        match state_clone.table_manager.get_table(&query_entity, &query_table) {
+            Ok(table_lock) => {
+                let mut table = table_lock.write().unwrap();
+                table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
+            },
+            Err(e) => Err(e)
+        }
+    }).await.unwrap();
 
     match result {
         Ok(result) => {
-            let data: Vec<serde_json::Map<String, serde_json::Value>> = result.rows.into_iter().map(|row| {
+            let headers = &result.headers;
+            let rows = result.rows;
+            let data: Vec<serde_json::Map<String, serde_json::Value>> = rows.into_par_iter().map(|row| {
                 let mut map = serde_json::Map::new();
-                for (i, header) in result.headers.iter().enumerate() {
+                for (i, header) in headers.iter().enumerate() {
                     if let Some(val) = row.get(i) {
                         if val.is_empty() {
                             map.insert(header.clone(), serde_json::Value::Null);
-                            continue;
-                        }
-                        let json_val = if let Ok(n) = val.parse::<i64>() {
-                            serde_json::Value::Number(n.into())
-                        } else if let Ok(f) = val.parse::<f64>() {
-                            serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::String(val.clone()))
                         } else {
-                            serde_json::Value::String(val.clone())
-                        };
-                        map.insert(header.clone(), json_val);
+                            // Only try to parse as number if it looks like a number
+                            let first_char = val.as_bytes()[0];
+                            let json_val = if first_char.is_ascii_digit() || first_char == b'-' {
+                                if let Ok(n) = val.parse::<i64>() {
+                                    serde_json::Value::Number(n.into())
+                                } else if let Ok(f) = val.parse::<f64>() {
+                                    serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::String(val.clone()))
+                                } else {
+                                    serde_json::Value::String(val.clone())
+                                }
+                            } else {
+                                serde_json::Value::String(val.clone())
+                            };
+                            map.insert(header.clone(), json_val);
+                        }
                     }
                 }
                 map
             }).collect();
 
             let total_pages = if limit > 0 { (result.total_found + limit - 1) / limit } else { 1 };
+            let engine_time_ms = result.execution_time_micros as f64 / 1000.0;
+            
             (StatusCode::OK, Json(serde_json::json!({
                 "data": data,
-                "meta": { "execution_time_ms": result.execution_time_micros as f64 / 1000.0 },
+                "meta": { 
+                    "engine_time_ms": engine_time_ms,
+                    "total_found": result.total_found,
+                    "fields_count": headers.len(),
+                    "debug_info": result.debug_info
+                },
                 "pagination": { "page": page, "per_page": limit, "total_pages": total_pages.max(1), "total_items": result.total_found }
             })))
         },

@@ -631,9 +631,13 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
             f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
             let extra_items: Vec<ListItem> = match app.right_panel_state.selected() {
                  Some(0) => get_order_by_fields(&app.available_fields).into_iter().map(|f| {
-                     ListItem::new(f.clone())
+                     let circle = if app.order_by[current_idx].field == f { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
+                     ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", f))]))
                  }).collect(),
-                 Some(1) => vec![ListItem::new("Asc"), ListItem::new("Desc")],
+                 Some(1) => vec![
+                     ListItem::new(Line::from(vec![if app.order_by[current_idx].direction == crate::repl::state::SortDirection::Asc { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Asc")])),
+                     ListItem::new(Line::from(vec![if app.order_by[current_idx].direction == crate::repl::state::SortDirection::Desc { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Desc")])),
+                 ],
                  _ => vec![],
             };
             let extra_list = List::new(extra_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Extra { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
@@ -857,7 +861,7 @@ fn draw_saved_queries_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[0], &mut app.saved_queries_state);
 
-    let msg = Paragraph::new("Enter: Load & Run • d: Delete • Esc: Close")
+    let msg = Paragraph::new("Enter: Load & Run • d/D: Delete • Esc: Close")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(msg, chunks[1]);
 }

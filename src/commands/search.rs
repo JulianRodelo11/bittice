@@ -167,7 +167,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     }
                 }
             },
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') | KeyCode::Char('D') => {
                  // Delete saved query
                  if let Some(idx) = app.saved_queries_state.selected() {
                     if idx < app.saved_queries.len() {

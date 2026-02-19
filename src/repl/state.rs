@@ -175,7 +175,7 @@ impl App {
 
         App {
             // General
-            menu_items: vec!["Load Data", "Search Data", "Local Server", "Exit"],
+            menu_items: vec!["Load", "Read", "Local Server", "Exit"],
             menu_state,
             active_task: None,
             // Load
