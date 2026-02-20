@@ -259,8 +259,10 @@ impl Table {
         let filter_elapsed = filter_start.elapsed().as_micros();
 
         let mut aggregation_results = Vec::new();
+        let agg_start = std::time::Instant::now();
         if !aggregations.is_empty() {
             for agg in aggregations {
+                // ... existing aggregation logic ...
                 let mut agg_headers = Vec::new();
                 let mut agg_rows = Vec::new();
                 if let Some(obj) = agg.as_object() {
@@ -285,6 +287,7 @@ impl Table {
                             };
                             for (val, count) in seg_counts { *global_counts.entry(val).or_insert(0) += count; }
                         }
+                        
                         let mut results: Vec<(String, u64)> = global_counts.into_iter().collect();
                         if agg_type == "TopN" {
                             let n = params.get("n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -297,8 +300,19 @@ impl Table {
                                 if direction == SortDirection::Desc { cmp.reverse() } else { cmp }
                             });
                         }
+
+                        // Calcular el summary: suma de los conteos que REALMENTE se van a devolver
+                        let total_count: u64 = results.iter().map(|(_, c)| c).sum();
+                        
                         agg_headers = vec![field.to_string(), "count".to_string()];
                         agg_rows = results.into_iter().map(|(v, c)| vec![v, c.to_string()]).collect();
+                        
+                        aggregation_results.push(crate::core::types::AggregationResult { 
+                            headers: agg_headers, 
+                            rows: agg_rows, 
+                            summary: Some(total_count as f64) 
+                        });
+                        continue;
                     } else if agg_type == "Sum" {
                         let field_name_opt = params.get("field").and_then(|v| v.as_str()).filter(|&s| s != "?");
                         let expression_str = params.get("expression").and_then(|v| v.as_str()).unwrap_or("0");
@@ -373,12 +387,17 @@ impl Table {
             }
             
             if fields.is_empty() {
+                let total_elapsed = start_time.elapsed().as_micros();
+                let agg_elapsed = agg_start.elapsed().as_micros();
+                let debug = format!("Filter: {}ms, Agg: {}ms, Segments: {}", 
+                    filter_elapsed / 1000, agg_elapsed / 1000, segment_tasks.len());
+
                 return Ok(QueryResult { 
                     headers: vec![], 
                     rows: vec![], 
                     total_found: total_found as usize, 
-                    execution_time_micros: start_time.elapsed().as_micros(), 
-                    debug_info: None,
+                    execution_time_micros: total_elapsed, 
+                    debug_info: Some(debug),
                     aggregations: Some(aggregation_results)
                 });
             }
