@@ -726,7 +726,7 @@ fn execute_search_action(app: &mut App) {
          let aggregations = app.aggregations.clone();
          let order_by = app.order_by.clone();
          
-         let fields = if app.selected_fields.is_empty() {
+         let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
              // Filter out derived fields (_day, _month, _hour_bucket)
              app.available_fields.iter()
                  .filter(|f| {
@@ -1018,7 +1018,7 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
 
          let order_by = app.order_by.clone();
          
-         let fields = if app.selected_fields.is_empty() {
+         let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
              app.available_fields.iter()
                  .filter(|f| {
                      let s = f.trim();
@@ -1092,7 +1092,7 @@ fn execute_paged_query(app: &mut App) {
         let order_by = app.order_by.clone();
         let offset = (app.results_page - 1) * limit;
 
-        let fields = if app.selected_fields.is_empty() {
+        let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
             app.available_fields.iter()
                 .filter(|f| {
                     let s = f.trim();

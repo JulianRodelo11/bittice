@@ -363,6 +363,95 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
                 }
             }
         }
+
+        // --- Aggregations Section ---
+        if let Some(aggs) = &results.aggregations {
+            for (agg_idx, agg) in aggs.iter().enumerate() {
+                all_lines.push(Line::from(""));
+                all_lines.push(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(active_color)),
+                    Span::styled(format!("Aggregation #{}", agg_idx + 1), Style::default().fg(text_color).add_modifier(Modifier::BOLD)),
+                ]));
+
+                if let Some(summary) = agg.summary {
+                    all_lines.push(Line::from(vec![
+                        Span::styled("  Total Sum: ", Style::default().fg(key_color)),
+                        Span::styled(format!("{:.2}", summary), Style::default().fg(value_color).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+
+                if agg.rows.is_empty() {
+                    all_lines.push(Line::from(Span::styled("  No results for this aggregation", Style::default().fg(Color::DarkGray))));
+                } else {
+                    let mut col_widths = Vec::new();
+                    for (i, header) in agg.headers.iter().enumerate() {
+                        let mut max_w = header.len();
+                        for row in &agg.rows {
+                            if let Some(val) = row.get(i) {
+                                if val.len() > max_w { max_w = val.len(); }
+                            }
+                        }
+                        max_w = max_w.min(40);
+                        col_widths.push(max_w + 2);
+                    }
+
+                    let num_cols = agg.headers.len();
+                    if num_cols > 0 {
+                        let mut top = String::from("┌");
+                        for (i, &w) in col_widths.iter().enumerate() {
+                            top.push_str(&"─".repeat(w));
+                            if i < num_cols - 1 { top.push('┬'); }
+                        }
+                        top.push('┐');
+                        all_lines.push(Line::from(Span::styled(top, Style::default().fg(grid_color))));
+
+                        let mut header_line = Vec::new();
+                        header_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                        for (i, h) in agg.headers.iter().enumerate() {
+                            let w = col_widths[i];
+                            let truncated = if h.len() > w - 2 { &h[..w - 2] } else { h };
+                            let cell = format!(" {:<width$} ", truncated, width = w - 2);
+                            header_line.push(Span::styled(cell, Style::default().fg(active_color)));
+                            header_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                        }
+                        all_lines.push(Line::from(header_line));
+
+                        let mut middle = String::from("├");
+                        for (i, &w) in col_widths.iter().enumerate() {
+                            middle.push_str(&"─".repeat(w));
+                            if i < num_cols - 1 { middle.push('┼'); }
+                        }
+                        middle.push('┤');
+                        all_lines.push(Line::from(Span::styled(middle.clone(), Style::default().fg(grid_color))));
+
+                        for (r_idx, row) in agg.rows.iter().enumerate() {
+                            let mut row_line = Vec::new();
+                            row_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                            for (i, cell_val) in row.iter().enumerate() {
+                                let w = col_widths[i];
+                                let truncated = if cell_val.len() > w - 2 { &cell_val[..w - 2] } else { cell_val };
+                                let cell = format!(" {:<width$} ", truncated, width = w - 2);
+                                row_line.push(Span::styled(cell, Style::default().fg(value_color)));
+                                row_line.push(Span::styled("│", Style::default().fg(grid_color)));
+                            }
+                            all_lines.push(Line::from(row_line));
+
+                            if r_idx < agg.rows.len() - 1 {
+                                all_lines.push(Line::from(Span::styled(middle.clone(), Style::default().fg(grid_color))));
+                            } else {
+                                let mut bottom = String::from("└");
+                                for (i, &w) in col_widths.iter().enumerate() {
+                                    bottom.push_str(&"─".repeat(w));
+                                    if i < num_cols - 1 { bottom.push('┴'); }
+                                }
+                                bottom.push('┘');
+                                all_lines.push(Line::from(Span::styled(bottom, Style::default().fg(grid_color))));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         
         // Render scrollable content
         let content_height = all_lines.len() as u16;

@@ -81,12 +81,20 @@ pub struct Filter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationResult {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub summary: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub total_found: usize,
     pub execution_time_micros: u128,
     pub debug_info: Option<String>,
+    pub aggregations: Option<Vec<AggregationResult>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

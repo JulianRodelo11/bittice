@@ -248,16 +248,17 @@ impl Table {
         }
         let filter_elapsed = filter_start.elapsed().as_micros();
 
+        let mut aggregation_results = Vec::new();
         if !aggregations.is_empty() {
-            let mut final_headers = Vec::new();
-            let mut final_rows = Vec::new();
             for agg in aggregations {
+                let mut agg_headers = Vec::new();
+                let mut agg_rows = Vec::new();
                 if let Some(obj) = agg.as_object() {
                     let agg_type = obj.keys().next().unwrap();
                     let params = obj.get(agg_type).unwrap();
                     if agg_type == "Count" {
-                        final_headers = vec!["count".to_string()];
-                        final_rows = vec![vec![total_found.to_string()]];
+                        agg_headers = vec!["count".to_string()];
+                        agg_rows = vec![vec![total_found.to_string()]];
                     } else if agg_type == "GroupBy" || agg_type == "TopN" {
                         let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
                         let mut global_counts: HashMap<String, u64> = HashMap::new();
@@ -286,13 +287,93 @@ impl Table {
                                 if direction == SortDirection::Desc { cmp.reverse() } else { cmp }
                             });
                         }
-                        final_headers = vec![field.to_string(), "count".to_string()];
-                        final_rows = results.into_iter().map(|(v, c)| vec![v, c.to_string()]).collect();
+                        agg_headers = vec![field.to_string(), "count".to_string()];
+                        agg_rows = results.into_iter().map(|(v, c)| vec![v, c.to_string()]).collect();
+                    } else if agg_type == "Sum" {
+                        let field_name_opt = params.get("field").and_then(|v| v.as_str()).filter(|&s| s != "?");
+                        let expression_str = params.get("expression").and_then(|v| v.as_str()).unwrap_or("0");
+                        
+                        if let Ok(expr) = crate::core::expression::parse_expression(expression_str) {
+                            let required_fields = crate::core::expression::extract_fields(&expr);
+                            
+                            if let Some(field_name) = field_name_opt {
+                                // --- Grouped Sum ---
+                                // Parallel processing only if we have enough rows
+                                let use_par = total_found > 500;
+                                
+                                let segment_group_results: Vec<HashMap<String, f64>> = if use_par {
+                                    segment_matches.par_iter()
+                                        .map(|(seg_id, bitmap)| self.process_seg_sum_grouped(*seg_id, bitmap, field_name, &required_fields, &expr))
+                                        .collect()
+                                } else {
+                                    segment_matches.iter()
+                                        .map(|(seg_id, bitmap)| self.process_seg_sum_grouped(*seg_id, bitmap, field_name, &required_fields, &expr))
+                                        .collect()
+                                };
+
+                                let mut global_group_sums = HashMap::new();
+                                let mut total_sum = 0.0;
+                                for seg_map in segment_group_results {
+                                    for (k, v) in seg_map {
+                                        total_sum += v;
+                                        *global_group_sums.entry(k).or_insert(0.0) += v;
+                                    }
+                                }
+
+                                let mut results: Vec<(String, f64)> = global_group_sums.into_iter().collect();
+                                results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                                
+                                agg_headers = vec![field_name.to_string(), "sum".to_string()];
+                                agg_rows = results.into_iter().map(|(v, s)| vec![v, format!("{:.2}", s)]).collect();
+                                aggregation_results.push(crate::core::types::AggregationResult { 
+                                    headers: agg_headers, 
+                                    rows: agg_rows, 
+                                    summary: Some(total_sum) 
+                                });
+                                continue; 
+                            } else {
+                                // --- Global Sum ---
+                                let use_par = total_found > 500;
+                                let total_sum: f64 = if use_par {
+                                    segment_matches.par_iter()
+                                        .map(|(seg_id, bitmap)| self.process_seg_sum_global(*seg_id, bitmap, &required_fields, &expr))
+                                        .sum()
+                                } else {
+                                    segment_matches.iter()
+                                        .map(|(seg_id, bitmap)| self.process_seg_sum_global(*seg_id, bitmap, &required_fields, &expr))
+                                        .sum()
+                                };
+                                
+                                agg_headers = vec!["sum".to_string()];
+                                agg_rows = vec![vec![format!("{:.2}", total_sum)]];
+                                aggregation_results.push(crate::core::types::AggregationResult { 
+                                    headers: agg_headers, 
+                                    rows: agg_rows, 
+                                    summary: Some(total_sum) 
+                                });
+                                continue;
+                            }
+                        } else {
+                             agg_headers = vec!["error".to_string()];
+                             agg_rows = vec![vec!["Invalid expression".to_string()]];
+                        }
                     }
                 }
+                aggregation_results.push(crate::core::types::AggregationResult { headers: agg_headers, rows: agg_rows, summary: None });
             }
-            return Ok(QueryResult { headers: final_headers, rows: final_rows, total_found: total_found as usize, execution_time_micros: start_time.elapsed().as_micros(), debug_info: None });
+            
+            if fields.is_empty() {
+                return Ok(QueryResult { 
+                    headers: vec![], 
+                    rows: vec![], 
+                    total_found: total_found as usize, 
+                    execution_time_micros: start_time.elapsed().as_micros(), 
+                    debug_info: None,
+                    aggregations: Some(aggregation_results)
+                });
+            }
         }
+
 
         // --- ORDENAMIENTO ---
         let sort_start = std::time::Instant::now();
@@ -459,6 +540,89 @@ impl Table {
         let debug = format!("Filter: {}ms, Sort: {}ms, Fetch: {}ms, Segments: {}", 
             filter_elapsed / 1000, sort_elapsed / 1000, fetch_elapsed / 1000, segment_tasks.len());
         
-        Ok(QueryResult { headers: fields.to_vec(), rows, total_found: total_found as usize, execution_time_micros: total_elapsed, debug_info: Some(debug) })
+        Ok(QueryResult { 
+            headers: fields.to_vec(), 
+            rows, 
+            total_found: total_found as usize, 
+            execution_time_micros: total_elapsed, 
+            debug_info: Some(debug),
+            aggregations: if aggregation_results.is_empty() { None } else { Some(aggregation_results) }
+        })
+    }
+
+    fn process_seg_sum_grouped(
+        &self, 
+        seg_id: u64, 
+        bitmap: &RoaringBitmap, 
+        field_name: &str, 
+        required_fields: &[String], 
+        expr: &crate::core::expression::Expr
+    ) -> HashMap<String, f64> {
+        let mut seg_group_sums = HashMap::new();
+        let segment = if let Some(writer) = &self.active_segment {
+            if writer.segment.id == seg_id { Some(&writer.segment) }
+            else { self.immutable_segments.iter().find(|s| s.id == seg_id) }
+        } else {
+            self.immutable_segments.iter().find(|s| s.id == seg_id)
+        };
+
+        if let Some(s) = segment {
+            let group_mmap = s.get_mmap_pair(field_name).ok();
+            let mmaps: Vec<Option<Arc<(Mmap, Mmap)>>> = required_fields.iter()
+                .map(|f| s.get_mmap_pair(f).ok())
+                .collect();
+            
+            let mut context = HashMap::with_capacity(required_fields.len());
+            
+            for id in bitmap {
+                let group_val = if let Some(m) = &group_mmap {
+                    s.get_row_values_from_mmaps(id, &[Some(m.clone())]).pop().unwrap_or_default()
+                } else { "Unknown".to_string() };
+
+                let row_nums = s.get_row_numbers_from_mmaps(id, &mmaps);
+                
+                context.clear();
+                for (i, val) in row_nums.into_iter().enumerate() {
+                    context.insert(required_fields[i].clone(), val);
+                }
+                
+                let val = crate::core::expression::evaluate(expr, &context);
+                *seg_group_sums.entry(group_val).or_insert(0.0) += val;
+            }
+        }
+        seg_group_sums
+    }
+
+    fn process_seg_sum_global(
+        &self, 
+        seg_id: u64, 
+        bitmap: &RoaringBitmap, 
+        required_fields: &[String], 
+        expr: &crate::core::expression::Expr
+    ) -> f64 {
+        let segment = if let Some(writer) = &self.active_segment {
+            if writer.segment.id == seg_id { Some(&writer.segment) }
+            else { self.immutable_segments.iter().find(|s| s.id == seg_id) }
+        } else {
+            self.immutable_segments.iter().find(|s| s.id == seg_id)
+        };
+
+        let mut seg_sum = 0.0;
+        if let Some(s) = segment {
+            let mmaps: Vec<Option<Arc<(Mmap, Mmap)>>> = required_fields.iter()
+                .map(|f| s.get_mmap_pair(f).ok())
+                .collect();
+            
+            let mut context = HashMap::with_capacity(required_fields.len());
+            for id in bitmap {
+                let row_nums = s.get_row_numbers_from_mmaps(id, &mmaps);
+                context.clear();
+                for (i, val) in row_nums.into_iter().enumerate() {
+                    context.insert(required_fields[i].clone(), val);
+                }
+                seg_sum += crate::core::expression::evaluate(expr, &context);
+            }
+        }
+        seg_sum
     }
 }

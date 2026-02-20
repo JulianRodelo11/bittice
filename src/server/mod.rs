@@ -210,7 +210,7 @@ async fn handle_read(
 
     let fields = if !param_fields.is_empty() {
         param_fields
-    } else if query.selected_fields.is_empty() {
+    } else if query.selected_fields.is_empty() && query.aggregations.is_empty() {
         crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &query.entity, &query.table)
             .into_iter()
             .filter(|f| {
@@ -240,14 +240,14 @@ async fn handle_read(
         Ok(result) => {
             let headers = &result.headers;
             let rows = result.rows;
-            let data: Vec<serde_json::Map<String, serde_json::Value>> = rows.into_par_iter().map(|row| {
+            
+            let row_to_json = |headers: &[String], row: &[String]| {
                 let mut map = serde_json::Map::new();
                 for (i, header) in headers.iter().enumerate() {
                     if let Some(val) = row.get(i) {
                         if val.is_empty() {
                             map.insert(header.clone(), serde_json::Value::Null);
                         } else {
-                            // Only try to parse as number if it looks like a number
                             let first_char = val.as_bytes()[0];
                             let json_val = if first_char.is_ascii_digit() || first_char == b'-' {
                                 if let Ok(n) = val.parse::<i64>() {
@@ -265,21 +265,54 @@ async fn handle_read(
                     }
                 }
                 map
+            };
+
+            let data: Vec<serde_json::Map<String, serde_json::Value>> = rows.into_par_iter().map(|row| {
+                row_to_json(headers, &row)
             }).collect();
+
+            let aggregations_data: Option<Vec<serde_json::Value>> = result.aggregations.map(|aggs| {
+                aggs.into_iter().map(|agg| {
+                    let agg_headers = agg.headers;
+                    let rows_json: Vec<serde_json::Map<String, serde_json::Value>> = agg.rows.into_iter().map(|row| {
+                        row_to_json(&agg_headers, &row)
+                    }).collect();
+                    
+                    serde_json::json!({
+                        "data": rows_json,
+                        "summary": agg.summary
+                    })
+                }).collect()
+            });
 
             let total_pages = if limit > 0 { (result.total_found + limit - 1) / limit } else { 1 };
             let engine_time_ms = result.execution_time_micros as f64 / 1000.0;
             
-            (StatusCode::OK, Json(serde_json::json!({
-                "data": data,
-                "meta": { 
-                    "engine_time_ms": engine_time_ms,
-                    "total_found": result.total_found,
-                    "fields_count": headers.len(),
-                    "debug_info": result.debug_info
-                },
-                "pagination": { "page": page, "per_page": limit, "total_pages": total_pages.max(1), "total_items": result.total_found }
-            })))
+            let mut response_map = serde_json::Map::new();
+            
+            if !data.is_empty() {
+                response_map.insert("data".to_string(), serde_json::json!(data));
+            }
+            
+            if let Some(aggs) = aggregations_data {
+                response_map.insert("aggregations".to_string(), serde_json::json!(aggs));
+            }
+            
+            response_map.insert("meta".to_string(), serde_json::json!({
+                "engine_time_ms": engine_time_ms,
+                "total_found": result.total_found,
+                "fields_count": headers.len(),
+                "debug_info": result.debug_info
+            }));
+            
+            response_map.insert("pagination".to_string(), serde_json::json!({
+                "page": page,
+                "per_page": limit,
+                "total_pages": total_pages.max(1),
+                "total_items": result.total_found
+            }));
+
+            (StatusCode::OK, Json(serde_json::Value::Object(response_map)))
         },
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))

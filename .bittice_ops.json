@@ -81,5 +81,37 @@
       "limit": 100,
       "selected_fields": []
     }
+  },
+  {
+    "type": "read",
+    "details": {
+      "name": "services/saving",
+      "entity": "ruedaz",
+      "table": "parking_request",
+      "filters": [
+        {
+          "field": "SK_month",
+          "op": "Eq",
+          "value": "2025-08"
+        },
+        {
+          "field": "ACCOUNT_CUSTOMER_DOCUMENTNUMBER",
+          "op": "Eq",
+          "value": "$document"
+        }
+      ],
+      "filters_op": "And",
+      "aggregations": [
+        {
+          "Sum": {
+            "field": "FACILITY_NAME",
+            "expression": "IF(PAYMENTS_PARKING_TOTALTIME >= ACCOUNT_PLAN_TIMEMINUTESFREE, FACILITY_FEE * ACCOUNT_PLAN_TIMEMINUTESFREE, FACILITY_FEE * PAYMENTS_PARKING_TOTALTIME)"
+          }
+        }
+      ],
+      "order_by": [],
+      "limit": 100,
+      "selected_fields": []
+    }
   }
 ]

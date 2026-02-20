@@ -320,6 +320,36 @@ impl Segment {
         values
     }
 
+    /// Optimized: Get numbers directly without String allocation
+    pub fn get_row_numbers_from_mmaps(&self, local_id: u32, mmaps: &[Option<Arc<(Mmap, Mmap)>>]) -> Vec<f64> {
+        let mut values = Vec::with_capacity(mmaps.len());
+        let start_idx = (local_id as usize) << 3;
+
+        for mmap_pair_opt in mmaps {
+            let val = if let Some(mmap_pair) = mmap_pair_opt {
+                let (dat, off) = &**mmap_pair;
+                if start_idx + 8 <= off.len() {
+                    let start_pos = u64::from_le_bytes(off[start_idx..start_idx+8].try_into().unwrap()) as usize;
+                    if start_pos + 8 <= dat.len() {
+                        let len = u64::from_le_bytes(dat[start_pos..start_pos+8].try_into().unwrap()) as usize;
+                        if start_pos + 8 + len <= dat.len() {
+                            let bytes = &dat[start_pos + 8..start_pos + 8 + len];
+                            if bytes.is_empty() { 0.0 }
+                            else {
+                                // Fast parse: Try to avoid UTF8 validation if possible
+                                std::str::from_utf8(bytes).ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0)
+                            }
+                        } else { 0.0 }
+                    } else { 0.0 }
+                } else { 0.0 }
+            } else {
+                0.0
+            };
+            values.push(val);
+        }
+        values
+    }
+
     pub fn get_row_values(&self, local_id: u32, fields: &[String]) -> Result<Vec<String>> {
         let mut mmaps = Vec::with_capacity(fields.len());
         {
