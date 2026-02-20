@@ -212,7 +212,7 @@ impl App {
             agg_step: AggregationStep::Main,
             agg_type_options: vec![
                 "TopN".to_string(), "GroupBy".to_string(), "Sum".to_string(), 
-                "Avg".to_string(), "Min".to_string(), "Max".to_string(),
+                "Count".to_string(), "Avg".to_string(), "Min".to_string(), "Max".to_string(),
                 "ConsecutiveBuckets".to_string(), "RetentionByBucket".to_string(),
                 "InactiveSinceBucket".to_string()
             ],

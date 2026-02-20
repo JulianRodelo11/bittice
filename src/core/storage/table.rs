@@ -269,8 +269,13 @@ impl Table {
                     let agg_type = obj.keys().next().unwrap();
                     let params = obj.get(agg_type).unwrap();
                     if agg_type == "Count" {
-                        agg_headers = vec!["count".to_string()];
-                        agg_rows = vec![vec![total_found.to_string()]];
+                        // Global Count: Only summary
+                        aggregation_results.push(crate::core::types::AggregationResult { 
+                            headers: vec![], 
+                            rows: vec![], 
+                            summary: Some(total_found as f64) 
+                        });
+                        continue;
                     } else if agg_type == "GroupBy" || agg_type == "TopN" {
                         let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
                         let mut global_counts: HashMap<String, u64> = HashMap::new();
@@ -368,11 +373,9 @@ impl Table {
                                         .sum()
                                 };
                                 
-                                agg_headers = vec!["sum".to_string()];
-                                agg_rows = vec![vec![format!("{:.2}", total_sum)]];
                                 aggregation_results.push(crate::core::types::AggregationResult { 
-                                    headers: agg_headers, 
-                                    rows: agg_rows, 
+                                    headers: vec![], 
+                                    rows: vec![], 
                                     summary: Some(total_sum) 
                                 });
                                 continue;

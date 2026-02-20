@@ -3,8 +3,8 @@
 
 input.ndjson
 .bittice_ops.json
-.bittice_queries.json
 resultado_limpio.ndjson
+resultado_limpio_2.ndjson
 PROMPT_QUERY_BUILDER.md
 PROPOSAL_CRUD.md
 CRUD_ROADMAP.md
