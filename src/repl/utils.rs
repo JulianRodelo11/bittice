@@ -130,7 +130,7 @@ pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<St
                     
                     let mut date_fields = std::collections::HashSet::new();
                     
-                    // Escaneamos el primer segmento para ver qué campos tienen archivos _day.dat
+                    // Escaneamos el primer segmento para ver qué campos tienen archivos derivados de fecha
                     let segments_dir = table_path.join("segments");
                     if let Ok(entries) = std::fs::read_dir(segments_dir) {
                         if let Some(seg_entry) = entries.filter_map(|e| e.ok()).find(|e| e.path().is_dir()) {
@@ -138,8 +138,16 @@ pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<St
                                  for f in files.flatten() {
                                      if let Some(name) = f.file_name().to_str() {
                                          // IGNORAR archivos que empiecen por bitmaps_
-                                         if name.ends_with("_day.dat") && !name.starts_with("bitmaps_") {
-                                             date_fields.insert(name.trim_end_matches("_day.dat").to_string());
+                                         if !name.starts_with("bitmaps_") {
+                                             if name.ends_with("_day.dat") {
+                                                 date_fields.insert(name[..name.len()-8].to_string());
+                                             } else if name.ends_with("_month.dat") {
+                                                 date_fields.insert(name[..name.len()-10].to_string());
+                                             } else if name.ends_with("_year.dat") {
+                                                 date_fields.insert(name[..name.len()-9].to_string());
+                                             } else if name.ends_with("_hour_bucket.dat") {
+                                                 date_fields.insert(name[..name.len()-16].to_string());
+                                             }
                                          }
                                      }
                                  }
@@ -233,8 +241,16 @@ pub fn get_order_by_fields(data_path: &Path, entity: &str, table: &str) -> Vec<S
                  for f in files.flatten() {
                      if let Some(name) = f.file_name().to_str() {
                          // IGNORAR archivos que empiecen por bitmaps_
-                         if name.ends_with("_day.dat") && !name.starts_with("bitmaps_") {
-                             date_fields.push(name.trim_end_matches("_day.dat").to_string());
+                         if !name.starts_with("bitmaps_") {
+                             if name.ends_with("_day.dat") {
+                                 date_fields.push(name[..name.len()-8].to_string());
+                             } else if name.ends_with("_month.dat") {
+                                 date_fields.push(name[..name.len()-10].to_string());
+                             } else if name.ends_with("_year.dat") {
+                                 date_fields.push(name[..name.len()-9].to_string());
+                             } else if name.ends_with("_hour_bucket.dat") {
+                                 date_fields.push(name[..name.len()-16].to_string());
+                             }
                          }
                      }
                  }

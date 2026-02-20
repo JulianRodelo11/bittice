@@ -30,8 +30,7 @@ pub fn analyze_schema(input_path: &str, _pb: &ProgressBar, cancel_flag: &AtomicB
         if let Ok(v) = serde_json::from_str::<Value>(&line) {
             if let Some(obj) = v.as_object() {
                 for (key, val) in obj {
-                    let s_val = val.as_str().unwrap_or("");
-                    if s_val.is_empty() { continue; }
+                    if val.is_null() { continue; }
 
                     let entry = analysis.entry(key.clone()).or_insert(FieldAnalysis {
                         total_non_empty: 0,
@@ -40,10 +39,13 @@ pub fn analyze_schema(input_path: &str, _pb: &ProgressBar, cancel_flag: &AtomicB
                     });
 
                     entry.total_non_empty += 1;
-                    if is_date_format(s_val) {
-                        entry.date_matches += 1;
-                        if has_time_component(s_val) {
-                            entry.time_matches += 1;
+                    
+                    if let Some(s_val) = val.as_str() {
+                        if is_date_format(s_val) {
+                            entry.date_matches += 1;
+                            if has_time_component(s_val) {
+                                entry.time_matches += 1;
+                            }
                         }
                     }
                 }
