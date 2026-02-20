@@ -308,7 +308,8 @@ impl Segment {
                     if start_pos + 8 <= dat.len() {
                         let len = u64::from_le_bytes(dat[start_pos..start_pos+8].try_into().unwrap()) as usize;
                         if start_pos + 8 + len <= dat.len() {
-                            String::from_utf8_lossy(&dat[start_pos + 8..start_pos + 8 + len]).into_owned()
+                            let bytes = &dat[start_pos + 8..start_pos + 8 + len];
+                            String::from_utf8_lossy(bytes).into_owned()
                         } else { String::new() }
                     } else { String::new() }
                 } else { String::new() }
