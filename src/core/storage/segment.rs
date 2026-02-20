@@ -278,7 +278,7 @@ impl Segment {
                     for (k, bm) in bitmaps.as_ref() { if k.contains(&pattern) { filter_bitmap |= bm; } }
                 },
                 ComparisonOp::In => {
-                    let vals: Vec<&str> = f.value.split(',').map(|s| s.trim()).collect();
+                    let vals: Vec<&str> = f.value.split(';').map(|s| s.trim()).collect();
                     for (k, bm) in bitmaps.as_ref() { if vals.contains(&k.as_str()) { filter_bitmap |= bm; } }
                 }
             }
@@ -454,7 +454,7 @@ impl SegmentWriter {
                     for (k, bm) in bitmaps { if k.contains(&pattern) { filter_bitmap |= bm; } }
                 },
                 ComparisonOp::In => {
-                    let vals: Vec<&str> = f.value.split(',').map(|s| s.trim()).collect();
+                    let vals: Vec<&str> = f.value.split(';').map(|s| s.trim()).collect();
                     for (k, bm) in bitmaps { if vals.contains(&k.as_str()) { filter_bitmap |= bm; } }
                 }
             }

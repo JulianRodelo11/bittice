@@ -225,8 +225,33 @@ pub fn get_entities(data_path: &Path) -> Vec<String> {
     entities
 }
 
-pub fn get_field_values(_data_path: &Path, _entity: &str, _table: &str, _field: &str) -> Vec<String> {
-    vec!["Write value".to_string(), "Variable (ask later)".to_string()]
+pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str) -> Vec<String> {
+    let mut values = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
+    let table_path = data_path.join(entity).join(table);
+    let segments_dir = table_path.join("segments");
+    
+    // Intentamos leer del primer segmento disponible
+    if let Ok(entries) = std::fs::read_dir(segments_dir) {
+        if let Some(seg_entry) = entries.filter_map(|e| e.ok()).find(|e| e.path().is_dir()) {
+            let bitmap_path = seg_entry.path().join(format!("bitmaps_{}.dat", field));
+            if bitmap_path.exists() {
+                if let Ok(file) = std::fs::File::open(bitmap_path) {
+                    // Usamos un tipo genérico para los bitmaps ya que solo nos interesan las llaves
+                    if let Ok(bitmaps) = bincode::deserialize_from::<_, std::collections::HashMap<String, serde_json::Value>>(file) {
+                        let mut keys: Vec<String> = bitmaps.keys().cloned().collect();
+                        keys.sort();
+                        // Mostramos un máximo de 100 valores para no saturar la UI
+                        for k in keys.into_iter().take(100) {
+                            if !k.is_empty() {
+                                values.push(k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    values
 }
 
 pub fn get_order_by_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
