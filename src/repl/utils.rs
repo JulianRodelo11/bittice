@@ -231,7 +231,7 @@ pub fn get_field_values(_data_path: &Path, _entity: &str, _table: &str, _field: 
 
 pub fn get_order_by_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
     let table_path = data_path.join(entity).join(table);
-    let mut date_fields = Vec::new();
+    let mut date_fields_set = std::collections::HashSet::new();
 
     // Necesitamos identificar qué campos son REALMENTE fechas
     let segments_dir = table_path.join("segments");
@@ -243,13 +243,13 @@ pub fn get_order_by_fields(data_path: &Path, entity: &str, table: &str) -> Vec<S
                          // IGNORAR archivos que empiecen por bitmaps_
                          if !name.starts_with("bitmaps_") {
                              if name.ends_with("_day.dat") {
-                                 date_fields.push(name[..name.len()-8].to_string());
+                                 date_fields_set.insert(name[..name.len()-8].to_string());
                              } else if name.ends_with("_month.dat") {
-                                 date_fields.push(name[..name.len()-10].to_string());
+                                 date_fields_set.insert(name[..name.len()-10].to_string());
                              } else if name.ends_with("_year.dat") {
-                                 date_fields.push(name[..name.len()-9].to_string());
+                                 date_fields_set.insert(name[..name.len()-9].to_string());
                              } else if name.ends_with("_hour_bucket.dat") {
-                                 date_fields.push(name[..name.len()-16].to_string());
+                                 date_fields_set.insert(name[..name.len()-16].to_string());
                              }
                          }
                      }
@@ -258,6 +258,7 @@ pub fn get_order_by_fields(data_path: &Path, entity: &str, table: &str) -> Vec<S
         }
     }
     
+    let mut date_fields: Vec<String> = date_fields_set.into_iter().collect();
     date_fields.sort();
     date_fields
 }
