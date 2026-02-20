@@ -176,6 +176,23 @@ impl Table {
         Ok(())
     }
 
+    pub fn set_original_fields(&mut self, fields: Vec<String>) -> Result<()> {
+        self.manifest.original_fields = fields;
+        self.save_manifest()
+    }
+
+    fn save_manifest(&self) -> Result<()> {
+        let manifest_path = self.base_path.join("manifest.json");
+        let temp_path = self.base_path.join("manifest.tmp");
+        {
+            let file = fs::File::create(&temp_path)?;
+            serde_json::to_writer_pretty(&file, &self.manifest)?;
+            file.sync_all()?;
+        }
+        fs::rename(&temp_path, &manifest_path)?;
+        Ok(())
+    }
+
     pub fn flush_active_segment(&mut self) -> Result<()> {
         if let Some(mut writer) = self.active_segment.take() {
             writer.flush()?;
@@ -184,14 +201,7 @@ impl Table {
             self.manifest.active_segment_id += 1;
             self.manifest.last_sequence_number += 1; 
             
-            let manifest_path = self.base_path.join("manifest.json");
-            let temp_path = self.base_path.join("manifest.tmp");
-            {
-                let file = fs::File::create(&temp_path)?;
-                serde_json::to_writer_pretty(&file, &self.manifest)?;
-                file.sync_all()?;
-            }
-            fs::rename(&temp_path, &manifest_path)?;
+            self.save_manifest()?;
             self.wal.truncate()?;
             
             let mut immutable_seg = writer.segment;

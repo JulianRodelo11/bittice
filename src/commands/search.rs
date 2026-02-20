@@ -666,7 +666,11 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                              if let Some(idx) = app.extra_panel_state.selected() {
                                  match app.right_panel_state.selected() {
                                      Some(0) => {
-                                         let fields = get_order_by_fields(&app.available_fields);
+                                         let fields = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                                             get_order_by_fields(Path::new("data"), e, t)
+                                         } else {
+                                             vec![]
+                                         };
                                          if let Some(field) = fields.get(idx) {
                                              app.order_by[f_idx].field = field.clone();
                                          }
@@ -727,14 +731,7 @@ fn execute_search_action(app: &mut App) {
          let order_by = app.order_by.clone();
          
          let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
-             // Filter out derived fields (_day, _month, _hour_bucket)
-             app.available_fields.iter()
-                 .filter(|f| {
-                     let s = f.trim();
-                     !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
-                 })
-                 .cloned()
-                 .collect()
+             app.available_fields.clone()
          } else {
              app.selected_fields.clone()
          };
@@ -878,7 +875,13 @@ fn navigate_list(app: &mut App, delta: isize) {
                 },
                 SearchCriteria::OrderBy => {
                     match app.right_panel_state.selected() {
-                        Some(0) => get_order_by_fields(&app.available_fields).len(),
+                        Some(0) => {
+                            if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                                get_order_by_fields(Path::new("data"), e, t).len()
+                            } else {
+                                0
+                            }
+                        },
                         Some(1) => 2, // Asc, Desc
                         _ => 0,
                     }
@@ -1019,13 +1022,7 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
          let order_by = app.order_by.clone();
          
          let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
-             app.available_fields.iter()
-                 .filter(|f| {
-                     let s = f.trim();
-                     !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
-                 })
-                 .cloned()
-                 .collect()
+             app.available_fields.clone()
          } else {
              app.selected_fields.clone()
          };
@@ -1093,13 +1090,7 @@ fn execute_paged_query(app: &mut App) {
         let offset = (app.results_page - 1) * limit;
 
         let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
-            app.available_fields.iter()
-                .filter(|f| {
-                    let s = f.trim();
-                    !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
-                })
-                .cloned()
-                .collect()
+            app.available_fields.clone()
         } else {
             app.selected_fields.clone()
         };

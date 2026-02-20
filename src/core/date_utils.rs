@@ -8,9 +8,16 @@ pub fn is_date_format(s: &str) -> bool {
         }
         // Verificamos que el resto sean dígitos (YYYY-MM-DD)
         let is_digit = |idx: usize| b[idx].is_ascii_digit();
-        return is_digit(0) && is_digit(1) && is_digit(2) && is_digit(3) // YYYY
+        let ok = is_digit(0) && is_digit(1) && is_digit(2) && is_digit(3) // YYYY
             && is_digit(5) && is_digit(6)                               // MM
             && is_digit(8) && is_digit(9);                              // DD
+            
+        if !ok { return false; }
+
+        // Validaciones numéricas básicas para evitar falsos positivos (como IDs con guiones)
+        if let (Ok(month), Ok(day)) = (s[5..7].parse::<u8>(), s[8..10].parse::<u8>()) {
+            return (1..=12).contains(&month) && (1..=31).contains(&day);
+        }
     }
     false
 }

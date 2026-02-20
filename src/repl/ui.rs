@@ -1,3 +1,4 @@
+use std::path::Path;
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
 use crate::repl::utils::{get_loaded_data, get_order_by_fields, get_filtered_fields, get_base_fields};
 use crate::core::saved_queries::SavedOperation;
@@ -719,10 +720,17 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
             let right_list = List::new(right_items).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).padding(Padding::new(1, 1, 1, 1)).border_style(Style::default().fg(if app.focus_panel == FocusPanel::Right { if dimmed { Color::Indexed(242) } else { colors::SELECTED_BORDER_COLOR } } else { inactive_color }))).highlight_style(Style::default().fg(active_color)).highlight_symbol("> ");
             f.render_stateful_widget(right_list, panel_layout[2], &mut app.right_panel_state);
             let extra_items: Vec<ListItem> = match app.right_panel_state.selected() {
-                 Some(0) => get_order_by_fields(&app.available_fields).into_iter().map(|f| {
-                     let circle = if app.order_by[current_idx].field == f { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
-                     ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", f))]))
-                 }).collect(),
+                 Some(0) => {
+                     let fields = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                         get_order_by_fields(Path::new("data"), e, t)
+                     } else {
+                         vec![]
+                     };
+                     fields.into_iter().map(|f| {
+                         let circle = if app.order_by[current_idx].field == f { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") };
+                         ListItem::new(Line::from(vec![circle, Span::raw(format!(" {}", f))]))
+                     }).collect()
+                 },
                  Some(1) => vec![
                      ListItem::new(Line::from(vec![if app.order_by[current_idx].direction == crate::repl::state::SortDirection::Asc { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Asc")])),
                      ListItem::new(Line::from(vec![if app.order_by[current_idx].direction == crate::repl::state::SortDirection::Desc { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Desc")])),

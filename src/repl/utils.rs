@@ -117,37 +117,85 @@ pub fn get_loaded_data() -> Vec<String> {
 
 
 pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
-    let mut fields = std::collections::HashSet::new();
     let table_path = data_path.join(entity).join(table);
     
-    // 1. Try manifest.json? No, it doesn't store schema.
-    
-    // 2. Scan segments
-    let segments_dir = table_path.join("segments");
-    if let Ok(entries) = std::fs::read_dir(segments_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                // Inside segment dir (e.g. seg_0000)
-                if let Ok(seg_files) = std::fs::read_dir(entry.path()) {
-                    for f in seg_files.flatten() {
-                        if let Some(name) = f.file_name().to_str() {
-                            if name.starts_with("bitmaps_") && name.ends_with(".dat") {
-                                let field_name = &name[8..name.len() - 4];
-                                fields.insert(field_name.to_string());
+    // 1. Intentar leer desde manifest.json (campos originales)
+    let manifest_path = table_path.join("manifest.json");
+    if manifest_path.exists() {
+        if let Ok(file) = std::fs::File::open(&manifest_path) {
+            let reader = std::io::BufReader::new(file);
+            if let Ok(manifest) = serde_json::from_reader::<_, serde_json::Value>(reader) {
+                if let Some(original_fields) = manifest.get("original_fields").and_then(|f| f.as_array()) {
+                    let mut all_fields = std::collections::HashSet::new();
+                    
+                    let mut date_fields = std::collections::HashSet::new();
+                    
+                    // Escaneamos el primer segmento para ver qué campos tienen archivos _day.dat
+                    let segments_dir = table_path.join("segments");
+                    if let Ok(entries) = std::fs::read_dir(segments_dir) {
+                        if let Some(seg_entry) = entries.filter_map(|e| e.ok()).find(|e| e.path().is_dir()) {
+                             if let Ok(files) = std::fs::read_dir(seg_entry.path()) {
+                                 for f in files.flatten() {
+                                     if let Some(name) = f.file_name().to_str() {
+                                         // IGNORAR archivos que empiecen por bitmaps_
+                                         if name.ends_with("_day.dat") && !name.starts_with("bitmaps_") {
+                                             date_fields.insert(name.trim_end_matches("_day.dat").to_string());
+                                         }
+                                     }
+                                 }
+                             }
+                        }
+                    }
+
+                    for v in original_fields {
+                        if let Some(field) = v.as_str() {
+                            let field_s = field.to_string();
+                            all_fields.insert(field_s.clone());
+                            
+                            if date_fields.contains(&field_s) {
+                                all_fields.insert(format!("{}_day", field_s));
+                                all_fields.insert(format!("{}_month", field_s));
+                                all_fields.insert(format!("{}_hour_bucket", field_s));
+                                all_fields.insert(format!("{}_year", field_s));
                             }
                         }
                     }
-                }
-                // Scanning one segment is usually enough if schema is consistent.
-                if !fields.is_empty() {
-                    break;
+                    
+                    let mut result: Vec<String> = all_fields.into_iter().collect();
+                    result.sort();
+                    return result;
                 }
             }
         }
     }
 
-    // Fallback to old method just in case mixed data?
-    // ... No, let's stick to new engine structure.
+    // 2. Scan segments (Fallback si no hay manifest con original_fields)
+    let mut fields = std::collections::HashSet::new();
+    let segments_dir = table_path.join("segments");
+    if let Ok(entries) = std::fs::read_dir(segments_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Ok(seg_files) = std::fs::read_dir(entry.path()) {
+                    for f in seg_files.flatten() {
+                        if let Some(name) = f.file_name().to_str() {
+                            // Ignorar archivos de metadatos internos
+                            if name.ends_with(".dat") && !name.starts_with("bitmaps_") {
+                                let field_name = name.trim_end_matches(".dat");
+                                // También ignorar si es un derivado oficial para la lista base
+                                if !field_name.ends_with("_day") && 
+                                   !field_name.ends_with("_month") && 
+                                   !field_name.ends_with("_year") && 
+                                   !field_name.ends_with("_hour_bucket") {
+                                    fields.insert(field_name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                if !fields.is_empty() { break; }
+            }
+        }
+    }
 
     let mut result: Vec<String> = fields.into_iter().collect();
     result.sort();
@@ -173,19 +221,49 @@ pub fn get_field_values(_data_path: &Path, _entity: &str, _table: &str, _field: 
     vec!["Write value".to_string(), "Variable (ask later)".to_string()]
 }
 
-pub fn get_order_by_fields(all_fields: &[String]) -> Vec<String> {
-    let mut filtered = all_fields.to_vec();
-    filtered.sort();
-    filtered
+pub fn get_order_by_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
+    let table_path = data_path.join(entity).join(table);
+    let mut date_fields = Vec::new();
+
+    // Necesitamos identificar qué campos son REALMENTE fechas
+    let segments_dir = table_path.join("segments");
+    if let Ok(entries) = std::fs::read_dir(segments_dir) {
+        if let Some(seg_entry) = entries.filter_map(|e| e.ok()).find(|e| e.path().is_dir()) {
+             if let Ok(files) = std::fs::read_dir(seg_entry.path()) {
+                 for f in files.flatten() {
+                     if let Some(name) = f.file_name().to_str() {
+                         // IGNORAR archivos que empiecen por bitmaps_
+                         if name.ends_with("_day.dat") && !name.starts_with("bitmaps_") {
+                             date_fields.push(name.trim_end_matches("_day.dat").to_string());
+                         }
+                     }
+                 }
+             }
+        }
+    }
+    
+    date_fields.sort();
+    date_fields
 }
 
 pub fn get_base_fields(all_fields: &[String]) -> Vec<String> {
-    let mut filtered = all_fields.to_vec();
+    // IMPORTANTE: Para la opción "Fields" (columnas a mostrar), solo mostramos originales.
+    // Identificamos los originales porque NO terminan en los sufijos derivados.
+    let mut filtered: Vec<String> = all_fields.iter()
+        .filter(|f| {
+            !f.ends_with("_day") && 
+            !f.ends_with("_month") && 
+            !f.ends_with("_year") && 
+            !f.ends_with("_hour_bucket")
+        })
+        .cloned()
+        .collect();
     filtered.sort();
     filtered
 }
 
 pub fn get_filtered_fields(all_fields: &[String]) -> Vec<String> {
+    // Para filtros, permitimos TODO (originales + derivados)
     let mut filtered = all_fields.to_vec();
     filtered.sort();
     filtered

@@ -212,12 +212,6 @@ async fn handle_read(
         param_fields
     } else if query.selected_fields.is_empty() && query.aggregations.is_empty() {
         crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &query.entity, &query.table)
-            .into_iter()
-            .filter(|f| {
-                let s = f.trim();
-                !s.ends_with("_day") && !s.ends_with("_month") && !s.ends_with("_year") && !s.ends_with("_hour_bucket")
-            })
-            .collect()
     } else {
         query.selected_fields.clone()
     };

@@ -38,7 +38,6 @@ fn tokenize(input: &str) -> Vec<String> {
                 if !current.is_empty() { tokens.push(current.clone()); current.clear(); }
                 i += 1;
             }
-            
             '>' => {
                 if !current.is_empty() { tokens.push(current.clone()); current.clear(); }
                 if i+1 < chars.len() && chars[i+1] == '=' {

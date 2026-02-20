@@ -90,6 +90,10 @@ fn load_data_to_table(
     }
     let mut table = Table::open(&base_path, table_name)?;
 
+    // Guardar campos originales en el manifest
+    let original_fields_list: Vec<String> = detected_fields.keys().cloned().collect();
+    table.set_original_fields(original_fields_list)?;
+
     // 3. Preparar expansión de fechas
     let mut fields_to_process: HashMap<String, Vec<String>> = HashMap::new();
     for (name, stats) in detected_fields {

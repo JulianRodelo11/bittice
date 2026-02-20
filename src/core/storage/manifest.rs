@@ -24,6 +24,8 @@ pub struct Manifest {
     pub last_sequence_number: u64,
     /// Version of the manifest file itself
     pub version: u64,
+    /// Fields present in the original source data
+    pub original_fields: Vec<String>,
 }
 
 impl Manifest {
@@ -33,6 +35,7 @@ impl Manifest {
             active_segment_id: 0,
             last_sequence_number: 0,
             version: 1,
+            original_fields: Vec::new(),
         }
     }
 
