@@ -23,6 +23,10 @@ pub enum SearchCriteria {
     OrderBy,
     Limit,
     Fields,
+    // CRUD variants
+    Create,
+    Update,
+    Delete,
 }
 
 pub use crate::core::types::{ComparisonOp, Filter, LogicalOp, SortDirection, OrderBy, QueryResult};
@@ -48,6 +52,7 @@ pub enum FocusPanel {
     Right,  // Pasos de Filtro (Field, Op, Value) / Pasos de Agregación
     Extra,  // Opciones de Field/Op/Value
     Bottom, // Input para el valor
+    CRUD,   // Panel para Create/Update/Delete
 }
 
 // Foco para la UI del servidor
@@ -115,6 +120,11 @@ pub struct App {
     // --- Sub-tarea: Fields ---
     pub selected_fields: Vec<String>,
 
+    // --- CRUD state ---
+    pub crud_payload: HashMap<String, String>,
+    pub crud_target_id: String,
+    pub is_entering_field_name: bool,
+
     // --- Query Results ---
     pub search_results: Option<QueryResult>,
     pub results_scroll: u16,
@@ -175,7 +185,7 @@ impl App {
 
         App {
             // General
-            menu_items: vec!["Load", "Read", "Local Server", "Exit"],
+            menu_items: vec!["Load", "Create", "Read", "Update", "Delete", "Local Server", "Exit"],
             menu_state,
             active_task: None,
             // Load
@@ -227,6 +237,10 @@ impl App {
             limit: Some(100),
             // Fields
             selected_fields: Vec::new(),
+            // CRUD
+            crud_payload: HashMap::new(),
+            crud_target_id: String::new(),
+            is_entering_field_name: false,
             // Results
             search_results: None,
             results_scroll: 0,

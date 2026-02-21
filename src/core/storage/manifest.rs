@@ -10,6 +10,8 @@ pub struct SegmentMeta {
     pub min_max: HashMap<String, (String, String)>,
     pub created_at: i64,
     pub record_count: u64,
+    #[serde(default)]
+    pub deleted_count: u64,
     /// Path relative to table root where segment data is stored
     pub path: String,
 }
@@ -25,7 +27,11 @@ pub struct Manifest {
     /// Version of the manifest file itself
     pub version: u64,
     /// Fields present in the original source data
+    #[serde(default)]
     pub original_fields: Vec<String>,
+    /// Field name used as primary key
+    #[serde(default)]
+    pub primary_key: String,
 }
 
 impl Manifest {
@@ -36,6 +42,7 @@ impl Manifest {
             last_sequence_number: 0,
             version: 1,
             original_fields: Vec::new(),
+            primary_key: "PK".to_string(),
         }
     }
 

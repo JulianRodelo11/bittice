@@ -15,11 +15,13 @@ use std::cmp::Ordering;
 pub struct Table {
     pub name: String,
     pub base_path: PathBuf,
-    manifest: Manifest,
+    pub manifest: Manifest,
     active_segment: Option<SegmentWriter>,
     immutable_segments: Vec<Segment>,
     wal: Wal,
     index_cache: Arc<RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>>,
+    /// External ID -> (Segment ID, Local ID)
+    pub primary_index: HashMap<String, (u64, u32)>,
 }
 
 // Estructuras para el Heap
@@ -88,7 +90,7 @@ impl Table {
         }
 
         let manifest_path = table_path.join("manifest.json");
-        let manifest = if manifest_path.exists() {
+        let manifest: Manifest = if manifest_path.exists() {
             let file = fs::File::open(&manifest_path)?;
             let reader = std::io::BufReader::new(file);
             serde_json::from_reader(reader)?
@@ -107,12 +109,32 @@ impl Table {
             immutable_segments: Vec::new(),
             wal,
             index_cache: Arc::new(RwLock::new(HashMap::new())),
+            primary_index: HashMap::new(),
         };
 
         table.load_segments()?;
         table.ensure_active_segment()?;
+        table.load_primary_index()?;
 
         Ok(table)
+    }
+
+    fn load_primary_index(&mut self) -> Result<()> {
+        let idx_path = self.base_path.join("primary.idx");
+        if idx_path.exists() {
+            let file = fs::File::open(idx_path)?;
+            let reader = std::io::BufReader::new(file);
+            self.primary_index = bincode::deserialize_from(reader).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    fn save_primary_index(&self) -> Result<()> {
+        let idx_path = self.base_path.join("primary.idx");
+        let file = fs::File::create(idx_path)?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, &self.primary_index)?;
+        Ok(())
     }
 
     fn load_segments(&mut self) -> Result<()> {
@@ -164,15 +186,41 @@ impl Table {
 
     pub fn insert(&mut self, row_data: HashMap<String, String>) -> Result<()> {
         let row_bytes = serde_json::to_vec(&row_data)?;
-        let id = row_data.get("_id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
+        let id = row_data.get(pk_field).cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         
-        let op = WalOperation::Insert { id, data: row_bytes };
+        let op = WalOperation::Insert { id: id.clone(), data: row_bytes };
         self.wal.append(&op)?;
 
         if let Some(writer) = &mut self.active_segment {
+             let local_id = writer.segment.record_count as u32;
              writer.append_record(&row_data)?; 
+             self.primary_index.insert(id, (writer.segment.id, local_id));
         }
 
+        Ok(())
+    }
+
+    pub fn delete(&mut self, id: &str) -> Result<()> {
+        if let Some((seg_id, local_id)) = self.primary_index.remove(id) {
+            let op = WalOperation::Delete { id: id.to_string() };
+            self.wal.append(&op)?;
+
+            // Mark as deleted in segment
+            if let Some(writer) = &mut self.active_segment {
+                if writer.segment.id == seg_id {
+                    writer.segment.mark_deleted(local_id)?;
+                } else if let Some(seg) = self.immutable_segments.iter_mut().find(|s| s.id == seg_id) {
+                    seg.mark_deleted(local_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn update(&mut self, id: &str, row_data: HashMap<String, String>) -> Result<()> {
+        self.delete(id)?;
+        self.insert(row_data)?;
         Ok(())
     }
 
@@ -202,6 +250,7 @@ impl Table {
             self.manifest.last_sequence_number += 1; 
             
             self.save_manifest()?;
+            self.save_primary_index()?;
             self.wal.truncate()?;
             
             let mut immutable_seg = writer.segment;

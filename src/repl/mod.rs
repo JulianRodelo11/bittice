@@ -105,7 +105,7 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
 
                     if let Some(task) = app.active_task {
                         match task {
-                            "Search" => search::handle_search_input(app, key),
+                            "Search" | "Create" | "Update" | "Delete" => search::handle_search_input(app, key),
                             "Load" => handle_load_input(app, key),
                             "Server" => handle_server_input(app, key),
                             _ => {}
@@ -165,9 +165,18 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
                 };
             }
             Some(1) => {
-                search::init_search(app);
+                search::init_crud(app, crate::repl::state::SearchCriteria::Create);
             }
             Some(2) => {
+                search::init_search(app);
+            }
+            Some(3) => {
+                search::init_crud(app, crate::repl::state::SearchCriteria::Update);
+            }
+            Some(4) => {
+                search::init_crud(app, crate::repl::state::SearchCriteria::Delete);
+            }
+            Some(5) => {
                 // Start Local Server
                 app.active_task = Some("Server");
                 let (log_tx, log_rx) = mpsc::channel(100);
@@ -187,7 +196,7 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
                     rt.block_on(crate::server::start_server(log_tx, shutdown_rx));
                 });
             }
-            Some(3) => return Err(anyhow::anyhow!("Quit")),
+            Some(6) => return Err(anyhow::anyhow!("Quit")),
             _ => {}
         },
         _ => {}

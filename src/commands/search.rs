@@ -6,6 +6,37 @@ use crate::repl::utils::{get_indexed_fields, get_order_by_fields, get_filtered_f
 use crate::core::saved_queries::{SavedOperation, SavedQuery, save_operations, SavedFilter, SavedOrderBy};
 use crate::core::storage::table::Table;
 
+pub fn init_crud(app: &mut App, mode: SearchCriteria) {
+    app.active_task = match mode {
+        SearchCriteria::Create => Some("Create"),
+        SearchCriteria::Update => Some("Update"),
+        SearchCriteria::Delete => Some("Delete"),
+        _ => Some("CRUD"),
+    };
+    app.status_message = None;
+    app.focus_panel = FocusPanel::Left;
+    app.search_criteria = SearchCriteria::Entity;
+    
+    // Read entities
+    if let Ok(entries) = std::fs::read_dir("data") {
+        app.search_entities = entries.flatten()
+            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+    }
+    app.search_entities.sort();
+    
+    app.left_panel_state.select(Some(0));
+    app.middle_panel_state.select(Some(0));
+    
+    app.crud_payload.clear();
+    app.crud_target_id.clear();
+    app.available_fields.clear();
+    app.filter_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
+    app.selected_entity = None;
+    app.selected_table = None;
+}
+
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
 pub fn init_search(app: &mut App) {
     app.active_task = Some("Search");
@@ -54,7 +85,13 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         app.is_prompting_variable = false;
                         app.current_variable.clear();
                         app.variable_input.clear();
-                        execute_search_action_with_resolved_vars(app);
+                        
+                        // Execute based on active task
+                        match app.active_task {
+                            Some("Search") => execute_search_action_with_resolved_vars(app),
+                            Some("Create") | Some("Update") | Some("Delete") => execute_crud_action_with_resolved_vars(app),
+                            _ => {}
+                        }
                     }
                 }
             },
@@ -77,27 +114,54 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             KeyCode::Enter => {
                 if !app.save_query_name_input.is_empty() {
                     let name = app.save_query_name_input.clone();
-                    // Create SavedQuery object
-                    let query = SavedQuery {
-                        name: name.clone(),
-                        entity: app.selected_entity.clone().unwrap_or_default(),
-                        table: app.selected_table.clone().unwrap_or_default(),
-                        filters: app.filters.iter().map(SavedFilter::from).collect(),
-                        filters_op: app.filters_op.to_string(),
-                        aggregations: app.aggregations.clone(),
-                        order_by: app.order_by.iter().map(SavedOrderBy::from).collect(),
-                        limit: app.limit,
-                        selected_fields: app.selected_fields.clone(),
-                    };
                     
-                    let operation = SavedOperation::Read(query);
+                    let operation = match app.active_task {
+                        Some("Create") => {
+                            SavedOperation::Insert(crate::core::saved_queries::SavedInsert {
+                                name: name.clone(),
+                                entity: app.selected_entity.clone().unwrap_or_default(),
+                                table: app.selected_table.clone().unwrap_or_default(),
+                                expected_fields: app.crud_payload.keys().cloned().collect(),
+                            })
+                        },
+                        Some("Update") => {
+                            SavedOperation::Update(crate::core::saved_queries::SavedUpdate {
+                                name: name.clone(),
+                                entity: app.selected_entity.clone().unwrap_or_default(),
+                                table: app.selected_table.clone().unwrap_or_default(),
+                                filters: vec![], // Future: add filter support for Update templates
+                                allowed_fields: app.crud_payload.keys().cloned().collect(),
+                            })
+                        },
+                        Some("Delete") => {
+                            SavedOperation::Delete(crate::core::saved_queries::SavedDelete {
+                                name: name.clone(),
+                                entity: app.selected_entity.clone().unwrap_or_default(),
+                                table: app.selected_table.clone().unwrap_or_default(),
+                                filters: vec![],
+                            })
+                        },
+                        _ => {
+                            SavedOperation::Read(SavedQuery {
+                                name: name.clone(),
+                                entity: app.selected_entity.clone().unwrap_or_default(),
+                                table: app.selected_table.clone().unwrap_or_default(),
+                                filters: app.filters.iter().map(SavedFilter::from).collect(),
+                                filters_op: app.filters_op.to_string(),
+                                aggregations: app.aggregations.clone(),
+                                order_by: app.order_by.iter().map(SavedOrderBy::from).collect(),
+                                limit: app.limit,
+                                selected_fields: app.selected_fields.clone(),
+                            })
+                        }
+                    };
                     
                     if let Some(pos) = app.saved_queries.iter().position(|op| op.name() == name) {
                         app.saved_queries[pos] = operation;
                         if let Err(e) = save_operations(&app.saved_queries) {
                             app.status_message = Some((format!("Error updating: {}", e), false));
                         } else {
-                            app.status_message = Some((format!("Query '{}' updated!", name), true));
+                            app.status_message = Some((format!("Operation '{}' updated!", name), true));
                             app.loaded_query_name = Some(name.clone());
                         }
                     } else {
@@ -105,7 +169,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                         if let Err(e) = save_operations(&app.saved_queries) {
                             app.status_message = Some((format!("Error saving: {}", e), false));
                         } else {
-                            app.status_message = Some((format!("Query '{}' saved!", name), true));
+                            app.status_message = Some((format!("Operation '{}' saved!", name), true));
                             app.loaded_query_name = Some(name.clone());
                         }
                     }
@@ -126,6 +190,11 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             },
             _ => {}
         }
+        return;
+    }
+
+    if matches!(app.active_task, Some("Create") | Some("Update") | Some("Delete")) {
+        handle_crud_input(app, key);
         return;
     }
 
@@ -151,18 +220,60 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
             },
             KeyCode::Enter => {
                 if let Some(idx) = app.saved_queries_state.selected() {
-                    if idx < app.saved_queries.len() {
-                        if let SavedOperation::Read(query) = &app.saved_queries[idx] {
-                            let query_clone = query.clone();
-                            load_saved_query_into_app(app, &query_clone);
-                            let run_immediately = !app.is_loading_to_edit;
-                            app.show_saved_queries = false;
-                            app.is_loading_to_edit = false;
-                            if run_immediately {
-                                execute_search_action(app);
+                    // Get only the operations relevant to the current task
+                    let filtered_ops: Vec<_> = app.saved_queries.iter().filter(|op| {
+                        match app.active_task {
+                            Some("Search") => matches!(op, SavedOperation::Read(_)),
+                            Some("Create") => matches!(op, SavedOperation::Insert(_)),
+                            Some("Update") => matches!(op, SavedOperation::Update(_)),
+                            Some("Delete") => matches!(op, SavedOperation::Delete(_)),
+                            _ => true,
+                        }
+                    }).collect();
+
+                    if idx < filtered_ops.len() {
+                        let op = filtered_ops[idx];
+                        match op {
+                            SavedOperation::Read(query) => {
+                                let query_clone = query.clone();
+                                load_saved_query_into_app(app, &query_clone);
+                                let run_immediately = !app.is_loading_to_edit;
+                                app.show_saved_queries = false;
+                                app.is_loading_to_edit = false;
+                                if run_immediately {
+                                    execute_search_action(app);
+                                }
                             }
-                        } else {
-                            app.status_message = Some(("This operation is not a Search query".to_string(), false));
+                            SavedOperation::Insert(ins) => {
+                                app.selected_entity = Some(ins.entity.clone());
+                                app.selected_table = Some(ins.table.clone());
+                                app.loaded_query_name = Some(ins.name.clone());
+                                app.crud_payload.clear();
+                                for f in &ins.expected_fields {
+                                    app.crud_payload.insert(f.clone(), format!("${}", f));
+                                }
+                                app.show_saved_queries = false;
+                                if !app.is_loading_to_edit { execute_crud_action(app); }
+                            }
+                            SavedOperation::Update(upd) => {
+                                app.selected_entity = Some(upd.entity.clone());
+                                app.selected_table = Some(upd.table.clone());
+                                app.loaded_query_name = Some(upd.name.clone());
+                                app.crud_payload.clear();
+                                for f in &upd.allowed_fields {
+                                    app.crud_payload.insert(f.clone(), format!("${}", f));
+                                }
+                                app.show_saved_queries = false;
+                                if !app.is_loading_to_edit { execute_crud_action(app); }
+                            }
+                            SavedOperation::Delete(del) => {
+                                app.selected_entity = Some(del.entity.clone());
+                                app.selected_table = Some(del.table.clone());
+                                app.loaded_query_name = Some(del.name.clone());
+                                app.crud_target_id = "$id".to_string();
+                                app.show_saved_queries = false;
+                                if !app.is_loading_to_edit { execute_crud_action(app); }
+                            }
                         }
                     }
                 }
@@ -803,7 +914,11 @@ fn load_saved_query_into_app(app: &mut App, query: &SavedQuery) {
 fn navigate_list(app: &mut App, delta: isize) {
     let (state, len) = match app.focus_panel {
         FocusPanel::Left => {
-            let len = 7 + if app.filters.len() > 1 { 1 } else { 0 };
+            let len = match app.active_task {
+                Some("Search") => 7 + if app.filters.len() > 1 { 1 } else { 0 },
+                Some("Create") | Some("Update") | Some("Delete") => 3,
+                _ => 7,
+            };
             (&mut app.left_panel_state, len)
         },
         FocusPanel::Middle => {
@@ -822,6 +937,12 @@ fn navigate_list(app: &mut App, delta: isize) {
                 },
                 SearchCriteria::Limit => 1,
                 SearchCriteria::Fields => get_base_fields(&app.available_fields).len(),
+                SearchCriteria::Create => {
+                    let fields_count = app.crud_payload.len();
+                    fields_count + 1 + if fields_count > 0 { 1 } else { 0 }
+                },
+                SearchCriteria::Update => get_base_fields(&app.available_fields).len() + 1,
+                SearchCriteria::Delete => 1,
             };
             (&mut app.middle_panel_state, len)
         },
@@ -839,6 +960,18 @@ fn navigate_list(app: &mut App, delta: isize) {
                     }
                     count
                 },
+                SearchCriteria::Create => {
+                    let current_fields: Vec<_> = app.crud_payload.keys().cloned().collect();
+                    let idx = app.middle_panel_state.selected().unwrap_or(0);
+                    if idx >= current_fields.len() {
+                        // "+ Add Field" or "- Remove Field" selected
+                        get_base_fields(&app.available_fields).len() + 1 // +1 for "Create Custom Field"
+                    } else {
+                        // Existing field selected: Options for value
+                        1 // "Value" step
+                    }
+                },
+                SearchCriteria::Update => 1,
                 _ => 0,
             };
             (&mut app.right_panel_state, len)
@@ -886,6 +1019,16 @@ fn navigate_list(app: &mut App, delta: isize) {
                         _ => 0,
                     }
                 },
+                SearchCriteria::Create => {
+                    let current_fields: Vec<_> = app.crud_payload.keys().cloned().collect();
+                    let idx = app.middle_panel_state.selected().unwrap_or(0);
+                    if idx >= current_fields.len() {
+                        0 // Handled in Right panel for field selection
+                    } else {
+                        // Options for existing field (Write value, Variable)
+                        app.filter_value_options.len()
+                    }
+                }
                 _ => 0,
             };
             (&mut app.extra_panel_state, len)
@@ -900,27 +1043,39 @@ fn navigate_list(app: &mut App, delta: isize) {
     // Update derived state based on new selection
     match app.focus_panel {
         FocusPanel::Left => {
-            let has_filters_op = app.filters.len() > 1;
-            let next_criteria = match next { 
-                0 => SearchCriteria::Entity, 
-                1 => SearchCriteria::Table, 
-                2 => SearchCriteria::Filters,
-                3 if has_filters_op => SearchCriteria::FiltersOp,
+            let next_criteria = match next {
+                0 => SearchCriteria::Entity,
+                1 => SearchCriteria::Table,
                 idx => {
-                    let offset = if has_filters_op { 0 } else { 1 };
-                    match idx + offset {
-                        4 => SearchCriteria::Aggregations,
-                        5 => SearchCriteria::OrderBy,
-                        6 => SearchCriteria::Limit,
-                        7 => SearchCriteria::Fields,
-                        _ => SearchCriteria::Entity 
+                    match app.active_task {
+                        Some("Search") => {
+                            let has_filters_op = app.filters.len() > 1;
+                            match idx {
+                                2 => SearchCriteria::Filters,
+                                3 if has_filters_op => SearchCriteria::FiltersOp,
+                                _ => {
+                                    let offset = if has_filters_op { 0 } else { 1 };
+                                    match idx + offset {
+                                        4 => SearchCriteria::Aggregations,
+                                        5 => SearchCriteria::OrderBy,
+                                        6 => SearchCriteria::Limit,
+                                        7 => SearchCriteria::Fields,
+                                        _ => SearchCriteria::Entity
+                                    }
+                                }
+                            }
+                        }
+                        Some("Create") => SearchCriteria::Create,
+                        Some("Update") => SearchCriteria::Update,
+                        Some("Delete") => SearchCriteria::Delete,
+                        _ => SearchCriteria::Entity
                     }
                 }
             };
             
             // Requisitos para navegar:
             if next_criteria == SearchCriteria::Table && app.selected_entity.is_none() { return; }
-            if matches!(next_criteria, SearchCriteria::Filters | SearchCriteria::FiltersOp | SearchCriteria::Aggregations | SearchCriteria::OrderBy | SearchCriteria::Limit | SearchCriteria::Fields) && app.selected_table.is_none() { return; }
+            if matches!(next_criteria, SearchCriteria::Filters | SearchCriteria::FiltersOp | SearchCriteria::Aggregations | SearchCriteria::OrderBy | SearchCriteria::Limit | SearchCriteria::Fields | SearchCriteria::Create | SearchCriteria::Update | SearchCriteria::Delete) && app.selected_table.is_none() { return; }
 
             state.select(Some(next));
             app.search_criteria = next_criteria;
@@ -933,6 +1088,9 @@ fn navigate_list(app: &mut App, delta: isize) {
                 SearchCriteria::Aggregations => {
                     app.agg_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
                     app.agg_step = AggregationStep::Main;
+                }
+                SearchCriteria::Create | SearchCriteria::Update => {
+                    app.filter_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
                 }
                 _ => {}
             }
@@ -960,6 +1118,34 @@ fn navigate_list(app: &mut App, delta: isize) {
                     }
                 }
                 SearchCriteria::OrderBy => {
+                    app.extra_panel_state.select(Some(0));
+                }
+                SearchCriteria::Create | SearchCriteria::Update => {
+                    let fields = if app.search_criteria == SearchCriteria::Create {
+                        let mut f: Vec<_> = app.crud_payload.keys().cloned().collect();
+                        f.sort();
+                        f
+                    } else {
+                        get_base_fields(&app.available_fields)
+                    };
+
+                    if let Some(field) = fields.get(next) {
+                        let mut values = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                            get_field_values(Path::new("data"), e, t, field)
+                        } else {
+                            vec![]
+                        };
+                        
+                        let mut final_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
+                        for v in values.drain(..) {
+                            if !final_options.contains(&v) {
+                                final_options.push(v);
+                            }
+                        }
+                        app.filter_value_options = final_options;
+                    } else {
+                        app.filter_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
+                    }
                     app.extra_panel_state.select(Some(0));
                 }
                 _ => {}
@@ -1122,8 +1308,9 @@ fn execute_paged_query(app: &mut App) {
 pub fn update_middle_panel_content(app: &mut App) {
     match app.search_criteria {
         SearchCriteria::Entity => {
-            // No auto-select entity here.
-            // Just ensure tables are loaded for the CURRENTLY selected entity if any.
+            // Entities are already loaded in init_search / init_crud
+        },
+        SearchCriteria::Table => {
             app.search_tables.clear();
             if let Some(entity) = &app.selected_entity {
                 let path = format!("data/{}", entity);
@@ -1135,10 +1322,7 @@ pub fn update_middle_panel_content(app: &mut App) {
                 }
             }
             app.search_tables.sort();
-        },
-        SearchCriteria::Table => {
-             // No auto-select table here.
-             // Just ensure fields are loaded for the CURRENTLY selected entity and table.
+
             if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
                 app.available_fields = get_indexed_fields(Path::new("data"), e, t);
             } else {
@@ -1153,6 +1337,383 @@ pub fn update_middle_panel_content(app: &mut App) {
         },
         _ => {
             // Placeholder for other criteria
+        }
+    }
+}
+
+pub fn handle_crud_input(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            if app.focus_panel == FocusPanel::Bottom {
+                app.focus_panel = FocusPanel::Extra;
+                app.filter_value_input.clear();
+            } else {
+                app.active_task = None;
+                app.status_message = None;
+                app.focus_panel = FocusPanel::Left;
+            }
+        }
+        KeyCode::Up => navigate_list(app, -1),
+        KeyCode::Down => navigate_list(app, 1),
+        KeyCode::Left => {
+            if app.focus_panel == FocusPanel::Middle {
+                app.focus_panel = FocusPanel::Left;
+            } else if app.focus_panel == FocusPanel::Right {
+                app.focus_panel = FocusPanel::Middle;
+            } else if app.focus_panel == FocusPanel::Extra {
+                app.focus_panel = FocusPanel::Middle;
+            } else if app.focus_panel == FocusPanel::Bottom {
+                app.focus_panel = FocusPanel::Middle;
+            }
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            if app.focus_panel == FocusPanel::Left {
+                app.focus_panel = FocusPanel::Middle;
+            } else if app.focus_panel == FocusPanel::Middle {
+                if app.search_criteria == SearchCriteria::Create {
+                    let current_fields_len = app.crud_payload.len();
+                    let idx = app.middle_panel_state.selected().unwrap_or(0);
+                    if idx >= current_fields_len {
+                        app.focus_panel = FocusPanel::Right;
+                        app.right_panel_state.select(Some(0));
+                    } else {
+                        // Skip 'Right' and go to 'Extra'
+                        app.focus_panel = FocusPanel::Extra;
+                        app.extra_panel_state.select(Some(0));
+                    }
+                } else if app.search_criteria == SearchCriteria::Update {
+                    app.focus_panel = FocusPanel::Extra;
+                    app.extra_panel_state.select(Some(0));
+                } else if app.search_criteria == SearchCriteria::Delete {
+                    app.focus_panel = FocusPanel::Bottom;
+                    app.filter_value_input.clear();
+                }
+            } else if app.focus_panel == FocusPanel::Right {
+                app.focus_panel = FocusPanel::Extra;
+                app.extra_panel_state.select(Some(0));
+            }
+        }
+        KeyCode::Char('S') => {
+            app.is_saving_query = true;
+            app.save_query_name_input = app.loaded_query_name.clone().unwrap_or_default();
+        },
+        KeyCode::Char('L') => {
+            app.show_saved_queries = true;
+            app.is_loading_to_edit = false;
+            if !app.saved_queries.is_empty() {
+                app.saved_queries_state.select(Some(0));
+            }
+        },
+        KeyCode::Char('E') => {
+            app.show_saved_queries = true;
+            app.is_loading_to_edit = true;
+            if !app.saved_queries.is_empty() {
+                app.saved_queries_state.select(Some(0));
+            }
+        },
+        KeyCode::Char('s') => {
+            execute_crud_action(app);
+        }
+        KeyCode::Enter => {
+            match (app.focus_panel, app.search_criteria) {
+                (FocusPanel::Middle, SearchCriteria::Entity) => {
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        app.selected_entity = app.search_entities.get(idx).cloned();
+                        app.selected_table = None;
+                        update_middle_panel_content(app);
+                    }
+                }
+                (FocusPanel::Middle, SearchCriteria::Table) => {
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        app.selected_table = app.search_tables.get(idx).cloned();
+                        if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+                            app.available_fields = get_indexed_fields(Path::new("data"), e, t);
+                            
+                            app.crud_payload.clear();
+                            // Only auto-populate for Update, not for Create
+                            if app.active_task == Some("Update") {
+                                for f in &app.available_fields {
+                                    if !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_year") && !f.ends_with("_hour_bucket") {
+                                        app.crud_payload.insert(f.clone(), String::new());
+                                    }
+                                }
+                            }
+                        }
+                        update_middle_panel_content(app);
+                    }
+                }
+                (FocusPanel::Middle, SearchCriteria::Create) => {
+                    let mut current_fields: Vec<_> = app.crud_payload.keys().cloned().collect();
+                    current_fields.sort();
+                    let add_field_idx = current_fields.len();
+                    let remove_field_idx = if !current_fields.is_empty() { Some(current_fields.len() + 1) } else { None };
+
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        if idx == add_field_idx {
+                            // User wants to add a new field from the table
+                            app.focus_panel = FocusPanel::Right;
+                            app.right_panel_state.select(Some(0));
+                        } else if remove_field_idx == Some(idx) {
+                             // User wants to remove the last added field
+                             if !current_fields.is_empty() {
+                                 let last = current_fields.last().unwrap();
+                                 app.crud_payload.remove(last);
+                             }
+                        } else if idx < current_fields.len() {
+                            // Edit existing selected field: Go straight to Extra
+                            app.focus_panel = FocusPanel::Extra;
+                            app.extra_panel_state.select(Some(0));
+                        }
+                    }
+                }
+                (FocusPanel::Middle, SearchCriteria::Update) => {
+                    let fields = get_base_fields(&app.available_fields);
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        if idx < fields.len() {
+                            app.focus_panel = FocusPanel::Extra;
+                            app.extra_panel_state.select(Some(0));
+                        }
+                    }
+                }
+                (FocusPanel::Middle, SearchCriteria::Delete) => {
+                    app.focus_panel = FocusPanel::Bottom;
+                    app.filter_value_input = app.crud_target_id.clone();
+                }
+                (FocusPanel::Right, SearchCriteria::Create) => {
+                    let mut current_fields: Vec<_> = app.crud_payload.keys().cloned().collect();
+                    current_fields.sort();
+                    let idx = app.middle_panel_state.selected().unwrap_or(0);
+
+                    if idx >= current_fields.len() {
+                        // Selecting a field to ADD
+                        if let Some(right_idx) = app.right_panel_state.selected() {
+                            if right_idx == 0 {
+                                // Create Custom Field
+                                app.is_entering_field_name = true;
+                                app.focus_panel = FocusPanel::Bottom;
+                                app.filter_value_input.clear();
+                            } else {
+                                let available = get_base_fields(&app.available_fields);
+                                if let Some(field) = available.get(right_idx - 1) {
+                                    if !app.crud_payload.contains_key(field) {
+                                        app.crud_payload.insert(field.clone(), String::new());
+                                        
+                                        // Move focus to the newly added field and prompt for value type
+                                        let mut updated_fields: Vec<_> = app.crud_payload.keys().cloned().collect();
+                                        updated_fields.sort();
+                                        if let Some(new_pos) = updated_fields.iter().position(|f| f == field) {
+                                            app.middle_panel_state.select(Some(new_pos));
+                                            app.focus_panel = FocusPanel::Extra;
+                                            app.right_panel_state.select(Some(0));
+                                            app.extra_panel_state.select(Some(0));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Selecting "Value" step for existing field
+                        app.focus_panel = FocusPanel::Extra;
+                        app.extra_panel_state.select(Some(0));
+                    }
+                }
+                (FocusPanel::Right, _) => {
+                    app.focus_panel = FocusPanel::Extra;
+                    app.extra_panel_state.select(Some(0));
+                }
+                (FocusPanel::Extra, SearchCriteria::Create) | (FocusPanel::Extra, SearchCriteria::Update) => {
+                    if let Some(idx) = app.extra_panel_state.selected() {
+                        if let Some(val) = app.filter_value_options.get(idx).cloned() {
+                             if val == "Write value" {
+                                 app.focus_panel = FocusPanel::Bottom;
+                                 if let Some(f_idx) = app.middle_panel_state.selected() {
+                                     let fields = if app.search_criteria == SearchCriteria::Create {
+                                         let mut f: Vec<_> = app.crud_payload.keys().cloned().collect();
+                                         f.sort();
+                                         f
+                                     } else {
+                                         get_base_fields(&app.available_fields)
+                                     };
+                                     if let Some(field) = fields.get(f_idx) {
+                                         let current_val = app.crud_payload.get(field).cloned().unwrap_or_default();
+                                         // If it's currently a variable, clear it for fresh "Write value"
+                                         if current_val.starts_with('$') {
+                                             app.filter_value_input = String::new();
+                                         } else {
+                                             app.filter_value_input = current_val;
+                                         }
+                                     }
+                                 }
+                             } else if val == "Variable (ask later)" {
+                                 if let Some(f_idx) = app.middle_panel_state.selected() {
+                                     let fields = if app.search_criteria == SearchCriteria::Create {
+                                         let mut f: Vec<_> = app.crud_payload.keys().cloned().collect();
+                                         f.sort();
+                                         f
+                                     } else {
+                                         get_base_fields(&app.available_fields)
+                                     };
+                                     if let Some(field) = fields.get(f_idx) {
+                                         let var_name = format!("${}", field);
+                                         app.filter_value_input = var_name;
+                                         app.focus_panel = FocusPanel::Bottom; 
+                                     }
+                                 }
+                             } else {
+                                 if let Some(f_idx) = app.middle_panel_state.selected() {
+                                     let fields = if app.search_criteria == SearchCriteria::Create {
+                                         let mut f: Vec<_> = app.crud_payload.keys().cloned().collect();
+                                         f.sort();
+                                         f
+                                     } else {
+                                         get_base_fields(&app.available_fields)
+                                     };
+                                     if let Some(field) = fields.get(f_idx) {
+                                         app.crud_payload.insert(field.to_string(), val);
+                                     }
+                                 }
+                                 app.focus_panel = FocusPanel::Middle;
+                             }
+                        }
+                    }
+                }
+                (FocusPanel::Bottom, SearchCriteria::Delete) => {
+                    app.crud_target_id = app.filter_value_input.clone();
+                    app.focus_panel = FocusPanel::Middle;
+                }
+                (FocusPanel::Bottom, _) => {
+                    if let Some(idx) = app.middle_panel_state.selected() {
+                        let fields = if app.search_criteria == SearchCriteria::Create {
+                            let mut f: Vec<_> = app.crud_payload.keys().cloned().collect();
+                            f.sort();
+                            f
+                        } else {
+                            get_base_fields(&app.available_fields)
+                        };
+
+                        if let Some(field) = fields.get(idx) {
+                            let val = app.filter_value_input.clone();
+                            app.crud_payload.insert(field.clone(), val.clone());
+                            
+                            // Add to history of options if it's a fixed value
+                            if !val.starts_with('$') && !app.filter_value_options.contains(&val) {
+                                app.filter_value_options.push(val);
+                            }
+                        }
+                    }
+                    // Return to Extra panel like in Search/Read mode
+                    app.focus_panel = FocusPanel::Extra;
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char(c) if app.focus_panel == FocusPanel::Bottom => {
+            app.filter_value_input.push(c);
+        }
+        KeyCode::Backspace if app.focus_panel == FocusPanel::Bottom => {
+            app.filter_value_input.pop();
+        }
+        _ => {}
+    }
+}
+
+fn execute_crud_action(app: &mut App) {
+    if let (Some(_e), Some(_t)) = (&app.selected_entity, &app.selected_table) {
+        // Detect variables in CRUD payload
+        let mut variables = Vec::new();
+        for val in app.crud_payload.values() {
+            if val.starts_with('$') {
+                variables.push(val.clone());
+            }
+        }
+        if app.crud_target_id.starts_with('$') {
+            variables.push(app.crud_target_id.clone());
+        }
+
+        variables.sort();
+        variables.dedup();
+
+        if !variables.is_empty() {
+            app.variable_prompt_queue = variables;
+            app.is_prompting_variable = true;
+            app.variable_input.clear();
+            if let Some(var) = app.variable_prompt_queue.pop() {
+                app.current_variable = var;
+            }
+            return;
+        }
+
+        execute_crud_action_with_resolved_vars(app);
+    }
+}
+
+fn execute_crud_action_with_resolved_vars(app: &mut App) {
+    if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
+        let base_path = Path::new("data").join(e);
+        let mut table = match Table::open(&base_path, t) {
+            Ok(table) => table,
+            Err(err) => {
+                app.status_message = Some((format!("Error opening table: {}", err), false));
+                return;
+            }
+        };
+
+        // Resolve variables
+        let mut resolved_payload = app.crud_payload.clone();
+        for val in resolved_payload.values_mut() {
+            if val.starts_with('$') {
+                if let Some(resolved) = app.variable_values.get(val) {
+                    *val = resolved.clone();
+                }
+            }
+        }
+        let mut resolved_target_id = app.crud_target_id.clone();
+        if resolved_target_id.starts_with('$') {
+            if let Some(resolved) = app.variable_values.get(&resolved_target_id) {
+                resolved_target_id = resolved.clone();
+            }
+        }
+
+        let result = match app.active_task {
+            Some("Create") => {
+                table.insert(resolved_payload)
+            }
+            Some("Update") => {
+                let pk_field = if !table.manifest.primary_key.is_empty() { 
+                    table.manifest.primary_key.as_str() 
+                } else if resolved_payload.contains_key("id") {
+                    "id"
+                } else {
+                    "PK" 
+                };
+                
+                let id = resolved_payload.get(pk_field).cloned().unwrap_or_else(|| resolved_target_id.clone());
+                if id.is_empty() {
+                    Err(anyhow::anyhow!("Primary Key ({}) is required for Update", pk_field))
+                } else {
+                    table.update(&id, resolved_payload)
+                }
+            }
+            Some("Delete") => {
+                if resolved_target_id.is_empty() {
+                    Err(anyhow::anyhow!("ID is required for Delete"))
+                } else {
+                    table.delete(&resolved_target_id)
+                }
+            }
+            _ => Ok(()),
+        };
+
+        match result {
+            Ok(_) => {
+                app.status_message = Some((format!("{} operation successful!", app.active_task.unwrap_or("CRUD")), true));
+                if let Err(err) = table.flush_active_segment() {
+                    app.status_message = Some((format!("Error flushing: {}", err), false));
+                }
+            }
+            Err(err) => {
+                app.status_message = Some((format!("Error: {}", err), false));
+            }
         }
     }
 }
