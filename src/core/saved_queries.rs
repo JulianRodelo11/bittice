@@ -26,6 +26,9 @@ pub struct SavedQuery {
     pub aggregations: Vec<serde_json::Value>,
     pub order_by: Vec<SavedOrderBy>,
     pub limit: Option<usize>,
+    /// When set (e.g. "$limit"), limit is a variable to be asked at runtime
+    #[serde(default)]
+    pub limit_param: Option<String>,
     pub selected_fields: Vec<String>,
 }
 

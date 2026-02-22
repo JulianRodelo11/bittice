@@ -1,3 +1,6 @@
+pub mod grpc;
+pub mod table_manager;
+
 use axum::{
     debug_handler,
     extract::{State, Query, Request},
@@ -6,46 +9,14 @@ use axum::{
     Router,
     http::{Method, StatusCode},
 };
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 use tokio::sync::{mpsc, oneshot};
 use tower_http::trace::TraceLayer;
 use crate::core::saved_queries::{load_operations, SavedOperation};
-use crate::core::storage::table::Table;
 use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy};
 use std::collections::HashMap;
 use rayon::prelude::*;
-
-// Manejador de tablas para mantenerlas abiertas en memoria
-struct TableManager {
-    tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
-}
-
-impl TableManager {
-    fn new() -> Self {
-        Self {
-            tables: RwLock::new(HashMap::new()),
-        }
-    }
-
-    fn get_table(&self, entity: &str, table_name: &str) -> anyhow::Result<Arc<RwLock<Table>>> {
-        let key = format!("{}/{}", entity, table_name);
-        {
-            let cache = self.tables.read().unwrap();
-            if let Some(table) = cache.get(&key) {
-                return Ok(table.clone());
-            }
-        }
-        let mut cache = self.tables.write().unwrap();
-        if let Some(table) = cache.get(&key) {
-            return Ok(table.clone());
-        }
-        let base_path = std::path::Path::new("data").join(entity);
-        let table = Table::open(&base_path, table_name)?;
-        let table_arc = Arc::new(RwLock::new(table));
-        cache.insert(key, table_arc.clone());
-        Ok(table_arc)
-    }
-}
+use crate::server::table_manager::TableManager;
 
 // Estructura para compartir estado con los handlers de Axum
 struct ServerState {
@@ -204,7 +175,12 @@ async fn handle_read(
         .map(|s| s.split(',').map(|f| f.trim().to_string()).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
 
-    let limit = query.limit.unwrap_or(100).max(1);
+    let limit = if let Some(ref param) = query.limit_param {
+        let key = param.strip_prefix('$').unwrap_or(param);
+        params.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
+    } else {
+        query.limit
+    }.unwrap_or(100).max(1);
     let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
 
@@ -240,22 +216,22 @@ async fn handle_read(
                 for (i, header) in headers.iter().enumerate() {
                     if let Some(val) = row.get(i) {
                         if val.is_empty() {
-                            map.insert(header.clone(), serde_json::Value::Null);
-                        } else {
-                            let first_char = val.as_bytes()[0];
-                            let json_val = if first_char.is_ascii_digit() || first_char == b'-' {
-                                if let Ok(n) = val.parse::<i64>() {
-                                    serde_json::Value::Number(n.into())
-                                } else if let Ok(f) = val.parse::<f64>() {
-                                    serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::String(val.clone()))
-                                } else {
-                                    serde_json::Value::String(val.clone())
-                                }
+                            // No incluir claves con valor vacío (ahorra payload)
+                            continue;
+                        }
+                        let first_char = val.as_bytes()[0];
+                        let json_val = if first_char.is_ascii_digit() || first_char == b'-' {
+                            if let Ok(n) = val.parse::<i64>() {
+                                serde_json::Value::Number(n.into())
+                            } else if let Ok(f) = val.parse::<f64>() {
+                                serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::String(val.clone()))
                             } else {
                                 serde_json::Value::String(val.clone())
-                            };
-                            map.insert(header.clone(), json_val);
-                        }
+                            }
+                        } else {
+                            serde_json::Value::String(val.clone())
+                        };
+                        map.insert(header.clone(), json_val);
                     }
                 }
                 map

@@ -163,6 +163,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
             if idx >= flen { show_right = true; } else { show_extra = true; } 
         }
         SearchCriteria::Update => { show_extra = true; }
+        SearchCriteria::Limit => { if matches!(app.focus_panel, FocusPanel::Extra | FocusPanel::Bottom) { show_extra = true; } }
         _ => {}
     }
 
@@ -217,7 +218,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
             if !app.order_by.is_empty() { items.push(ListItem::new(Span::styled("- Delete Last", Style::default().fg(colors::DELETE_COLOR)))); }
             items
         }
-        SearchCriteria::Limit => vec![ListItem::new(format!("Value: {}", app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string())))],
+        SearchCriteria::Limit => vec![ListItem::new(if let Some(ref v) = app.limit_variable { format!("Variable: {}", v) } else { format!("Value: {}", app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string())) })],
         SearchCriteria::Fields => get_base_fields(&app.available_fields).iter().map(|f| ListItem::new(Line::from(vec![if app.selected_fields.contains(f) { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(format!(" {}", f))]))).collect(),
         SearchCriteria::Create => {
             let mut cur: Vec<_> = app.crud_payload.keys().cloned().collect(); cur.sort();
@@ -314,6 +315,12 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
                         }
                     } else { vec![] }
                 }
+                SearchCriteria::Limit => {
+                    app.limit_value_options.iter().map(|s| {
+                        let is_sel = if app.limit_variable.is_some() { s == "Variable (ask later)" } else { s == "Write value" };
+                        ListItem::new(Line::from(vec![if is_sel { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(format!(" {}", s))]))
+                    }).collect()
+                }
                 SearchCriteria::Create | SearchCriteria::Update => {
                     app.filter_value_options.iter().map(|s| {
                         let is_sel = if let Some(f) = field {
@@ -389,11 +396,40 @@ fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
     let main_chunks = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(40), Constraint::Percentage(60)]).split(chunks[2]);
     let selected_idx = app.endpoint_state.selected();
     let items: Vec<ListItem> = app.saved_queries.iter().enumerate().map(|(i, op)| {
-        let (method, name) = match op {
-            SavedOperation::Read(q) => ("GET", &q.name),
-            SavedOperation::Insert(i) => ("POST", &i.name),
-            SavedOperation::Update(u) => ("PUT", &u.name),
-            SavedOperation::Delete(d) => ("DEL", &d.name),
+        let (method, name, params_hint) = match op {
+            SavedOperation::Read(q) => {
+                let mut params: Vec<String> = Vec::new();
+                for f in &q.filters {
+                    if let Some(k) = f.value.strip_prefix('$') {
+                        params.push(k.to_string());
+                    }
+                }
+                for agg in &q.aggregations {
+                    if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                        for val in obj.values() {
+                            if let Some(s) = val.as_str().and_then(|v| v.strip_prefix('$')) {
+                                params.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some(ref p) = q.limit_param {
+                    if let Some(k) = p.strip_prefix('$') {
+                        params.push(k.to_string());
+                    }
+                }
+                params.sort();
+                params.dedup();
+                let hint = if params.is_empty() {
+                    String::new()
+                } else {
+                    format!("?{}", params.iter().map(|p| format!("{}?", p)).collect::<Vec<_>>().join("&"))
+                };
+                ("GET", q.name.as_str(), hint)
+            }
+            SavedOperation::Insert(_) => ("POST", op.name(), String::new()),
+            SavedOperation::Update(_) => ("PUT", op.name(), String::new()),
+            SavedOperation::Delete(_) => ("DEL", op.name(), String::new()),
         };
         
         let method_color = match method { 
@@ -406,7 +442,6 @@ fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
 
         let is_selected = Some(i) == selected_idx;
         
-        // If selected, entire line gets the method color. If not, only method gets color, path is white.
         let path_color = if is_selected { method_color } else { text_color };
         let method_style = if is_selected { 
             Style::default().fg(method_color).add_modifier(Modifier::BOLD | Modifier::REVERSED) 
@@ -414,11 +449,14 @@ fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
             Style::default().fg(method_color).add_modifier(Modifier::BOLD) 
         };
         
-        // Using REVERSED for selection to make it pop, with the method's color
-        let content = Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!("{} ", method), method_style),
-            Span::styled(name, Style::default().fg(path_color).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }))
-        ]);
+            Span::styled(name, Style::default().fg(path_color).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
+        ];
+        if !params_hint.is_empty() {
+            spans.push(Span::styled(params_hint, Style::default().fg(Color::DarkGray)));
+        }
+        let content = Line::from(spans);
         
         ListItem::new(content)
     }).collect();
@@ -502,7 +540,8 @@ pub fn get_query_preview_lines_styled(app: &App, key_c: Color, val_c: Color, act
             if !app.aggregations.is_empty() { for (i, agg) in app.aggregations.iter().enumerate() { lines.push(Line::from(vec![Span::styled(if i == app.aggregations.len()-1 { "│   └── " } else { "│   ├── " }, bs), Span::styled(serde_json::to_string(agg).unwrap_or_default(), vs)])); } }
             else { lines.push(Line::from(vec![Span::styled("│   └── ", bs), Span::styled("(None)", Style::default().fg(Color::DarkGray))])); }
             lines.push(Line::from(vec![Span::styled("├── ", bs), Span::styled("Order By: ", ks), Span::styled(format!("{:?}", app.order_by), vs)]));
-            lines.push(Line::from(vec![Span::styled("├── ", bs), Span::styled("Limit: ", ks), Span::styled(app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string()), vs)]));
+            let limit_display = app.limit_variable.clone().unwrap_or_else(|| app.limit.map(|l| l.to_string()).unwrap_or_else(|| "None".to_string()));
+            lines.push(Line::from(vec![Span::styled("├── ", bs), Span::styled("Limit: ", ks), Span::styled(limit_display, vs)]));
             lines.push(Line::from(vec![Span::styled("└── ", bs), Span::styled("Fields: ", ks), Span::styled(format!("{:?}", app.selected_fields), vs)]));
         }
     }

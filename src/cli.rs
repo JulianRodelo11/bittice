@@ -23,4 +23,14 @@ pub enum Commands {
         #[arg(short, long)]
         table: String,
     },
+    /// Inicia el servidor
+    Server {
+        /// Puerto para escuchar (default: 50051)
+        #[arg(short, long, default_value_t = 50051)]
+        port: u16,
+
+        /// Tipo de servidor: 'grpc' o 'http'
+        #[arg(short, long, default_value = "grpc")]
+        r#type: String,
+    },
 }

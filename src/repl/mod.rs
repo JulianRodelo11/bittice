@@ -282,6 +282,11 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
                                             params.push(f.value[1..].to_string());
                                         }
                                     }
+                                    if let Some(ref p) = q.limit_param {
+                                        if let Some(k) = p.strip_prefix('$') {
+                                            params.push(k.to_string());
+                                        }
+                                    }
                                     for agg in &q.aggregations {
                                         if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
                                             for val in obj.values() {

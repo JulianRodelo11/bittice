@@ -116,6 +116,8 @@ pub struct App {
 
     // --- Sub-tarea: Limit ---
     pub limit: Option<usize>,
+    pub limit_value_options: Vec<String>,
+    pub limit_variable: Option<String>,
 
     // --- Sub-tarea: Fields ---
     pub selected_fields: Vec<String>,
@@ -235,6 +237,8 @@ impl App {
             order_by: Vec::new(),
             // Limit
             limit: Some(100),
+            limit_value_options: vec!["Write value".to_string(), "Variable (ask later)".to_string()],
+            limit_variable: None,
             // Fields
             selected_fields: Vec::new(),
             // CRUD

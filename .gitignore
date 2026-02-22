@@ -1,6 +1,8 @@
 /target/
 /data/
+/proto/
 
+build.rs
 input.ndjson
 .bittice_ops.json
 resultado_limpio.ndjson

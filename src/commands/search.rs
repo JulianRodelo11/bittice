@@ -67,6 +67,7 @@ pub fn init_search(app: &mut App) {
     app.variable_values.clear();
     app.loaded_query_name = None;
     app.limit = Some(100);
+    app.limit_variable = None;
     app.selected_fields.clear();
     update_middle_panel_content(app);
 }
@@ -151,6 +152,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                 aggregations: app.aggregations.clone(),
                                 order_by: app.order_by.iter().map(SavedOrderBy::from).collect(),
                                 limit: app.limit,
+                                limit_param: app.limit_variable.clone(),
                                 selected_fields: app.selected_fields.clone(),
                             })
                         }
@@ -348,7 +350,13 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                             app.focus_panel = FocusPanel::Extra;
                         }
                         SearchCriteria::Limit => {
-                            app.limit = val.parse::<usize>().ok().map(|l| l.min(100));
+                            if val.starts_with('$') {
+                                app.limit_variable = Some(val);
+                                app.limit = None; // Will be resolved at execution
+                            } else {
+                                app.limit = val.parse::<usize>().ok().map(|l| l.min(1000));
+                                app.limit_variable = None;
+                            }
                             app.focus_panel = FocusPanel::Middle;
                             app.filter_value_input.clear();
                             return;
@@ -604,7 +612,8 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     }
                 }
                 (FocusPanel::Middle, SearchCriteria::Limit) => {
-                    app.focus_panel = FocusPanel::Bottom;
+                    app.focus_panel = FocusPanel::Extra;
+                    app.extra_panel_state.select(Some(0));
                 }
                 (FocusPanel::Middle, SearchCriteria::Fields) => {
                     if let Some(idx) = app.middle_panel_state.selected() {
@@ -626,6 +635,20 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                 }
                 (FocusPanel::Right, SearchCriteria::OrderBy) => {
                     app.focus_panel = FocusPanel::Extra;
+                }
+                (FocusPanel::Extra, SearchCriteria::Limit) => {
+                    if let Some(idx) = app.extra_panel_state.selected() {
+                        if let Some(val) = app.limit_value_options.get(idx) {
+                            if val == "Write value" {
+                                app.filter_value_input.clear();
+                                app.focus_panel = FocusPanel::Bottom;
+                            } else if val == "Variable (ask later)" {
+                                app.limit_variable = Some("$limit".to_string());
+                                app.filter_value_input = "$limit".to_string();
+                                app.focus_panel = FocusPanel::Bottom;
+                            }
+                        }
+                    }
                 }
                 (FocusPanel::Extra, SearchCriteria::Filters) => {
                     match app.filter_step {
@@ -806,6 +829,9 @@ fn execute_search_action(app: &mut App) {
          for f in &app.filters {
              if f.value.starts_with('$') { variables.push(f.value.clone()); }
          }
+         if let Some(ref var) = app.limit_variable {
+             if var.starts_with('$') { variables.push(var.clone()); }
+         }
          
          // Detect variables in aggregations
          for agg in &app.aggregations {
@@ -892,7 +918,7 @@ fn load_saved_query_into_app(app: &mut App, query: &SavedQuery) {
         field: sf.field.clone(),
         op: ComparisonOp::from_str(&sf.op),
         value: sf.value.clone(),
-        value_options: vec!["Write value".to_string(), "Variable (ask later)".to_string()], // We could reload these if needed
+        value_options: vec!["Write value".to_string(), "Variable (ask later)".to_string()],
     }).collect();
     
     app.filters_op = match query.filters_op.as_str() {
@@ -908,6 +934,7 @@ fn load_saved_query_into_app(app: &mut App, query: &SavedQuery) {
     }).collect();
     
     app.limit = query.limit;
+    app.limit_variable = query.limit_param.clone();
     app.selected_fields = query.selected_fields.clone();
 }
 
@@ -1029,6 +1056,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                         app.filter_value_options.len()
                     }
                 }
+                SearchCriteria::Limit => app.limit_value_options.len(),
                 _ => 0,
             };
             (&mut app.extra_panel_state, len)
@@ -1183,7 +1211,9 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
          }
 
          let filters_op = app.filters_op;
-         let limit = app.limit.unwrap_or(100).max(1);
+         let limit = app.limit
+             .or_else(|| app.limit_variable.as_ref().and_then(|v| app.variable_values.get(v)).and_then(|s| s.parse().ok()))
+             .unwrap_or(100).max(1).min(1000);
          
          let mut aggregations = app.aggregations.clone();
          for agg in &mut aggregations {
@@ -1251,7 +1281,9 @@ fn execute_paged_query(app: &mut App) {
         }
 
         let filters_op = app.filters_op;
-        let limit = app.limit.unwrap_or(100).max(1);
+        let limit = app.limit
+            .or_else(|| app.limit_variable.as_ref().and_then(|v| app.variable_values.get(v)).and_then(|s| s.parse().ok()))
+            .unwrap_or(100).max(1).min(1000);
         
         let mut aggregations = app.aggregations.clone();
         for agg in &mut aggregations {
