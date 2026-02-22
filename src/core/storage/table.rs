@@ -595,31 +595,98 @@ impl Table {
             segments_map.insert(writer.segment.id, &writer.segment);
         }
 
+        // Optimization: Identify unique segments actually needed for the result set
+        // With LIMIT 100, we likely only need 1 or 2 segments, not all of them.
+        let needed_seg_ids: std::collections::HashSet<u64> = final_ids.iter().map(|(id, _)| *id).collect();
+
         // 1. Pre-resolve all MMAPs for all involved segments and fields (PARALLEL)
         let segment_field_mmaps: HashMap<u64, Vec<Option<Arc<(Mmap, Mmap)>>>> = segments_map.par_iter()
+            .filter(|(id, _)| needed_seg_ids.contains(id))
             .map(|(id, segment)| {
-                let mmaps = fields.iter().map(|f| segment.get_mmap_pair(f).ok()).collect();
+                // Optimization: Parallelize column opening within segment to reduce cold-start latency
+                let mmaps = fields.par_iter().map(|f| segment.get_mmap_pair(f).ok()).collect();
                 (*id, mmaps)
             })
             .collect();
 
-        // 2. Optimized Parallel Fetching
-        let rows: Vec<Vec<String>> = final_ids.par_iter()
-            .map(|(seg_id, local_id)| {
-                if let Some(segment) = segments_map.get(seg_id) {
-                    let mmaps = segment_field_mmaps.get(seg_id).unwrap();
-                    segment.get_row_values_from_mmaps(*local_id, mmaps)
-                } else {
-                    vec![String::new(); fields.len()]
-                }
-            })
-            .collect();
+        // 2. Optimized Parallel Fetching (Vectorized)
+        let use_vectorized = total_found > 100 || fields.len() >= 4;
+        let fetch_mode_str = if use_vectorized { "Vectorized" } else { "Row" };
+        let mut chunks_count = 0;
+
+        let rows: Vec<Vec<String>> = if use_vectorized {
+            const CHUNK_SIZE: usize = 512;
+            chunks_count = (final_ids.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+            final_ids.par_chunks(CHUNK_SIZE)
+                .flat_map(|chunk| {
+                    // 1. Columnar Read: Read full columns into temporary buffers
+                    // This ensures strictly sequential memory access for both reads (mmap) and writes (Vec push)
+                    let mut columns_data: Vec<Vec<String>> = Vec::with_capacity(fields.len());
+                    
+                    for (field_idx, _) in fields.iter().enumerate() {
+                        let mut col_values = Vec::with_capacity(chunk.len());
+                        
+                        // Optimization: Cache last segment's mmap to avoid map lookup per row
+                        let mut last_seg_id = u64::MAX;
+                        let mut last_mmap: Option<&(Mmap, Mmap)> = None;
+
+                        for (seg_id, local_id) in chunk {
+                            if *seg_id != last_seg_id {
+                                last_seg_id = *seg_id;
+                                last_mmap = None;
+                                if let Some(mmaps) = segment_field_mmaps.get(seg_id) {
+                                    if let Some(mmap_pair) = &mmaps[field_idx] {
+                                        last_mmap = Some(&**mmap_pair);
+                                    }
+                                }
+                            }
+
+                            let val = if let Some(mmap_pair) = last_mmap {
+                                unsafe { Segment::read_value_unchecked(mmap_pair, *local_id) }
+                            } else {
+                                String::new()
+                            };
+                            col_values.push(val);
+                        }
+                        columns_data.push(col_values);
+                    }
+
+                    // 2. Transpose: Construct rows from columns
+                    // This is a fast memory-only operation
+                    let mut chunk_rows = Vec::with_capacity(chunk.len());
+                    let mut col_iters: Vec<_> = columns_data.into_iter().map(|c| c.into_iter()).collect();
+
+                    for _ in 0..chunk.len() {
+                        let mut row = Vec::with_capacity(fields.len());
+                        for iter in &mut col_iters {
+                            // Safe unwrap: all columns have exactly chunk.len() elements
+                            row.push(iter.next().unwrap());
+                        }
+                        chunk_rows.push(row);
+                    }
+                    
+                    chunk_rows
+                })
+                .collect()
+        } else {
+            final_ids.par_iter()
+                .map(|(seg_id, local_id)| {
+                    if let Some(segment) = segments_map.get(seg_id) {
+                        let mmaps = segment_field_mmaps.get(seg_id).unwrap();
+                        segment.get_row_values_from_mmaps(*local_id, mmaps)
+                    } else {
+                        vec![String::new(); fields.len()]
+                    }
+                })
+                .collect()
+        };
         
         let fetch_elapsed = fetch_start.elapsed().as_micros();
 
         let total_elapsed = start_time.elapsed().as_micros();
-        let debug = format!("Filter: {}ms, Sort: {}ms, Fetch: {}ms, Segments: {}", 
-            filter_elapsed / 1000, sort_elapsed / 1000, fetch_elapsed / 1000, segment_tasks.len());
+        let debug = format!("Filter: {}ms, Sort: {}ms, Fetch: {}ms, Segments: {}, FetchMode: {}, Chunks: {}", 
+            filter_elapsed / 1000, sort_elapsed / 1000, fetch_elapsed / 1000, segment_tasks.len(), fetch_mode_str, chunks_count);
         
         Ok(QueryResult { 
             headers: fields.to_vec(), 

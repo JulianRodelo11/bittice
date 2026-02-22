@@ -297,6 +297,23 @@ impl Segment {
         Ok(result_bitmap)
     }
 
+    /// Unsafe: Does not check bounds. Caller ensures local_id is valid.
+    pub unsafe fn read_value_unchecked(mmaps: &(Mmap, Mmap), local_id: u32) -> String {
+        let (dat, off) = mmaps;
+        
+        let off_offset = (local_id as usize) * 8;
+        let off_ptr = off.as_ptr().add(off_offset);
+        let start_pos = u64::from_le_bytes(*(off_ptr as *const [u8; 8])) as usize;
+        
+        let dat_ptr = dat.as_ptr().add(start_pos);
+        let len = u64::from_le_bytes(*(dat_ptr as *const [u8; 8])) as usize;
+        
+        let bytes_ptr = dat_ptr.add(8);
+        let bytes = std::slice::from_raw_parts(bytes_ptr, len);
+        
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
     pub fn get_row_values_from_mmaps(&self, local_id: u32, mmaps: &[Option<Arc<(Mmap, Mmap)>>]) -> Vec<String> {
         let mut values = Vec::with_capacity(mmaps.len());
         let start_idx = (local_id as usize) << 3;
