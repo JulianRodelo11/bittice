@@ -9,7 +9,7 @@ use axum::{
     Router,
     http::{Method, StatusCode},
 };
-use std::sync::{Arc};
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tower_http::trace::TraceLayer;
 use crate::core::saved_queries::{load_operations, SavedOperation};
@@ -22,24 +22,57 @@ use crate::server::table_manager::TableManager;
 struct ServerState {
     log_sender: mpsc::Sender<String>,
     table_manager: TableManager,
+    ops_cache: Arc<RwLock<Option<(std::time::Instant, Vec<SavedOperation>)>>>,
 }
 
 pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot::Receiver<()>) {
     let state = Arc::new(ServerState {
         log_sender: log_sender.clone(),
         table_manager: TableManager::new(),
+        ops_cache: Arc::new(RwLock::new(None)),
     });
 
     // Definir rutas: Catch-all para cualquier método
     let app = Router::new()
         .route("/*path", any(handle_request))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = "127.0.0.1:3000";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let _ = log_sender.send(format!("Server started on http://{}", addr)).await;
     
+    // --- SMART PRE-WARMING ---
+    // Carga en segundo plano las tablas que se usan en las operaciones guardadas.
+    let warm_state = state.clone();
+    let warm_logger = log_sender.clone();
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        if let Ok(ops) = load_operations() {
+            let mut targets = std::collections::HashSet::new();
+            for op in ops {
+                if let SavedOperation::Read(q) = op {
+                    targets.insert((q.entity, q.table));
+                }
+            }
+            
+            if !targets.is_empty() {
+                let count = targets.len();
+                // Ejecutamos la carga en un hilo blocking para no afectar el event loop
+                tokio::task::spawn_blocking(move || {
+                    for (entity, table) in targets {
+                        // Al llamar a get_table, se carga en el cache del TableManager
+                        let _ = warm_state.table_manager.get_table(&entity, &table);
+                    }
+                }).await.ok();
+                
+                let elapsed = start.elapsed().as_millis();
+                let _ = warm_logger.send(format!("  -> Pre-warmed {} unique tables in {}ms", count, elapsed)).await;
+            }
+        }
+    });
+    // -------------------------
+
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
@@ -53,6 +86,7 @@ async fn handle_request(
     State(state): State<Arc<ServerState>>,
     req: Request,
 ) -> impl IntoResponse {
+    let start_total = std::time::Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query_params: HashMap<String, String> = Query::try_from_uri(req.uri())
@@ -62,21 +96,36 @@ async fn handle_request(
     let op_name = path.trim_start_matches('/');
     let _ = state.log_sender.send(format!("{} /{}", method, op_name)).await;
 
-    // Load operations from CLI definitions
-    let ops = load_operations().unwrap_or_default();
+    // Load operations from cache or disk
+    let start_ops = std::time::Instant::now();
+    let ops: Vec<SavedOperation> = {
+        let mut cache = state.ops_cache.write().unwrap();
+        let needs_reload = match &*cache {
+            Some((ts, _)) => ts.elapsed().as_secs() > 5,
+            None => true,
+        };
+        if needs_reload {
+            let loaded = load_operations().unwrap_or_default();
+            *cache = Some((std::time::Instant::now(), loaded.clone()));
+            loaded
+        } else {
+            cache.as_ref().unwrap().1.clone()
+        }
+    };
+    let ops_load_ms = start_ops.elapsed().as_secs_f64() * 1000.0;
     
     // Find operation by name
     let operation = ops.iter().find(|o| o.name() == op_name);
 
     if let Some(op) = operation {
         match (method, op) {
-            (Method::GET, SavedOperation::Read(q)) => {
-                handle_read(q, query_params, state).await.into_response()
+            (Method::GET, SavedOperation::Read(ref q)) => {
+                handle_read(q, query_params, state, start_total, ops_load_ms).await.into_response()
             },
-            (Method::GET, SavedOperation::Batch(b)) => {
+            (Method::GET, SavedOperation::Batch(ref b)) => {
                 handle_batch(b, query_params, state).await.into_response()
             },
-            (Method::POST, SavedOperation::Insert(i)) => {
+            (Method::POST, SavedOperation::Insert(ref i)) => {
                 // Extract body as JSON
                 let body_bytes = ax_body_to_bytes(req).await;
                 let payload: HashMap<String, String> = serde_json::from_slice(&body_bytes).unwrap_or_default();
@@ -109,8 +158,10 @@ async fn handle_read(
     query: &crate::core::saved_queries::SavedQuery,
     params: HashMap<String, String>,
     state: Arc<ServerState>,
+    start_time: std::time::Instant,
+    ops_load_ms: f64,
 ) -> impl IntoResponse {
-    match execute_read_operation(query, params, state).await {
+    match execute_read_operation(query, params, state, start_time, ops_load_ms).await {
         Ok(json) => (StatusCode::OK, Json(json)),
         Err((code, json)) => (code, Json(json)),
     }
@@ -122,7 +173,22 @@ async fn handle_batch(
     state: Arc<ServerState>,
 ) -> impl IntoResponse {
     let mut results = serde_json::Map::new();
-    let ops = load_operations().unwrap_or_default();
+    
+    // Use cache
+    let ops = {
+        let mut cache = state.ops_cache.write().unwrap();
+        let needs_reload = match &*cache {
+            Some((ts, _)) => ts.elapsed().as_secs() > 5,
+            None => true,
+        };
+        if needs_reload {
+            let loaded = load_operations().unwrap_or_default();
+            *cache = Some((std::time::Instant::now(), loaded.clone()));
+            loaded
+        } else {
+            cache.as_ref().unwrap().1.clone()
+        }
+    };
     
     let mut max_pages = 0;
     let mut total_items_sum = 0;
@@ -132,7 +198,7 @@ async fn handle_batch(
     for op_name in &batch.operations {
         if let Some(op) = ops.iter().find(|o| o.name() == op_name) {
             match op {
-                SavedOperation::Read(q) => {
+                SavedOperation::Read(ref q) => {
                     // Soporte para parámetros específicos -> nombre_query:param
                     let mut targeted_params = params.clone();
                     let prefix = format!("{}:", op_name);
@@ -142,7 +208,7 @@ async fn handle_batch(
                         }
                     }
 
-                    match execute_read_operation(q, targeted_params, state.clone()).await {
+                    match execute_read_operation(q, targeted_params, state.clone(), std::time::Instant::now(), 0.0).await {
                         Ok(res) => { 
                             if let Some(obj) = res.as_object() {
                                 if let Some(pagination) = obj.get("pagination").and_then(|p| p.as_object()) {
@@ -196,6 +262,8 @@ async fn execute_read_operation(
     query: &crate::core::saved_queries::SavedQuery,
     params: HashMap<String, String>,
     state: Arc<ServerState>,
+    start_time: std::time::Instant,
+    ops_load_ms: f64,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
     let mut missing_params = Vec::new();
 
@@ -287,18 +355,41 @@ async fn execute_read_operation(
     let query_table = query.table.clone();
     let state_clone = state.clone();
 
+    let setup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let engine_start = std::time::Instant::now();
+
     let result = tokio::task::spawn_blocking(move || {
-        match state_clone.table_manager.get_table(&query_entity, &query_table) {
+        let t0 = std::time::Instant::now();
+        let table_res = state_clone.table_manager.get_table(&query_entity, &query_table);
+        let t1 = std::time::Instant::now();
+
+        match table_res {
             Ok(table_lock) => {
-                let mut table = table_lock.write().unwrap();
-                table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
+                let table = table_lock.read().unwrap();
+                let t2 = std::time::Instant::now();
+                let mut search_res = table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)?;
+                
+                // Add server-side timing diagnostics to debug_info
+                let open_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
+                let lock_ms = t2.duration_since(t1).as_secs_f64() * 1000.0;
+                let extra = format!(" | Open: {:.2}ms, Lock: {:.2}ms", open_ms, lock_ms);
+                
+                if let Some(ref mut d) = search_res.debug_info {
+                    d.push_str(&extra);
+                } else {
+                    search_res.debug_info = Some(extra);
+                }
+                Ok(search_res)
             },
             Err(e) => Err(e)
         }
     }).await.unwrap();
 
+    let engine_total_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+
     match result {
         Ok(result) => {
+            let mapping_start = std::time::Instant::now();
             let headers = &result.headers;
             let rows = result.rows;
             
@@ -346,6 +437,7 @@ async fn execute_read_operation(
                 }).collect()
             });
 
+            let mapping_ms = mapping_start.elapsed().as_secs_f64() * 1000.0;
             let engine_time_ms = result.execution_time_micros as f64 / 1000.0;
             
             let mut response_map = serde_json::Map::new();
@@ -357,8 +449,15 @@ async fn execute_read_operation(
                 response_map.insert("aggregations".to_string(), serde_json::json!(aggs));
             }
             
+            let total_server_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+
             response_map.insert("meta".to_string(), serde_json::json!({
                 "engine_time_ms": engine_time_ms,
+                "engine_total_ms": engine_total_ms,
+                "ops_load_ms": ops_load_ms,
+                "setup_ms": setup_ms,
+                "mapping_ms": mapping_ms,
+                "total_server_ms": total_server_ms,
                 "total_found": result.total_found,
                 "fields_count": headers.len(),
                 "debug_info": result.debug_info

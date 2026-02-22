@@ -262,7 +262,7 @@ impl Table {
     }
 
     pub fn search(
-        &mut self,
+        &self,
         fields: &[String],
         filters: &[Filter],
         filters_op: &LogicalOp,
@@ -279,7 +279,7 @@ impl Table {
         }
 
         let filter_start = std::time::Instant::now();
-        let cache_ref = self.index_cache.clone();
+        let cache_ref = &self.index_cache;
 
         // --- OPTIMIZATION: Primary Key Lookup ---
         let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
@@ -727,7 +727,7 @@ impl Table {
         segment_tasks: &[&Segment],
         filters: &[Filter],
         filters_op: &LogicalOp,
-        cache_ref: &Arc<RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>>
+        cache_ref: &RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>
     ) -> Result<Vec<(u64, RoaringBitmap)>> {
         let segment_results: Vec<Result<(u64, RoaringBitmap)>> = segment_tasks.par_iter()
             .map(|segment| {

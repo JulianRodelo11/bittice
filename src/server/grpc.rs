@@ -144,7 +144,7 @@ impl Database for MyDatabase {
                     let result = tokio::task::spawn_blocking(move || {
                         match table_manager.get_table(&entity, &table_name) {
                             Ok(table_lock) => {
-                                let mut table = table_lock.write().unwrap();
+                                let table = table_lock.read().unwrap();
                                 table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
                             },
                             Err(e) => Err(e)
@@ -285,7 +285,7 @@ impl Database for MyDatabase {
             let result = tokio::task::spawn_blocking(move || {
                 match table_manager.get_table(&entity, &table_name) {
                     Ok(table_lock) => {
-                        let mut table = table_lock.write().unwrap();
+                        let table = table_lock.read().unwrap();
                         table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
                     },
                     Err(e) => Err(e)
@@ -421,7 +421,7 @@ impl Database for MyDatabase {
         let result = tokio::task::spawn_blocking(move || {
             match table_manager.get_table(&entity, &table_name) {
                 Ok(table_lock) => {
-                    let mut table = table_lock.write().unwrap();
+                    let table = table_lock.read().unwrap();
                     table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
                 },
                 Err(e) => Err(e)

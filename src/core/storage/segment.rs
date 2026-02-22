@@ -181,7 +181,7 @@ impl Segment {
         &self,
         field: &str,
         filter_bitmap: &RoaringBitmap,
-        cache: &Arc<RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>>
+        cache: &RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>
     ) -> Result<HashMap<String, u64>> {
         let cache_key = (self.id, field.to_string());
         
@@ -220,7 +220,7 @@ impl Segment {
         &self,
         filters: &[Filter],
         filters_op: &LogicalOp,
-        cache: &Arc<RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>>
+        cache: &RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>
     ) -> Result<RoaringBitmap> {
         let valid_filters: Vec<&Filter> = filters.iter().filter(|f| f.field != "?" && f.value != "?").collect();
 
@@ -251,6 +251,8 @@ impl Segment {
 
         for f in &valid_filters {
             let cache_key = (self.id, f.field.clone());
+            
+            // Try with read lock first
             let bitmaps = {
                 let r = cache.read().unwrap();
                 r.get(&cache_key).cloned()
@@ -259,6 +261,7 @@ impl Segment {
             let bitmaps = if let Some(bm) = bitmaps {
                 bm
             } else {
+                // If missing, load from disk and insert with write lock
                 let bitmap_path = self.path.join(format!("bitmaps_{}.dat", f.field));
                 let bm_loaded: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
                     let file = File::open(bitmap_path)?;
@@ -268,8 +271,7 @@ impl Segment {
                 };
                 let arc_bm = Arc::new(bm_loaded);
                 let mut w = cache.write().unwrap();
-                w.insert(cache_key, arc_bm.clone());
-                arc_bm
+                w.entry(cache_key).or_insert(arc_bm.clone()).clone()
             };
 
             let mut filter_bitmap = RoaringBitmap::new();

@@ -963,7 +963,7 @@ fn execute_search_action(app: &mut App) {
              start_x,
              |_, _| {
                  let base_path = Path::new("data").join(&entity);
-                 let mut table = Table::open(&base_path, &table_name)?;
+                 let table = Table::open(&base_path, &table_name)?;
                  
                  // Execute Search on Table
                  match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
@@ -1332,9 +1332,8 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
              start_x,
              |_, _| {
                  let base_path = Path::new("data").join(&entity);
-                 let mut table = Table::open(&base_path, &table_name)?;
-                 
-                 match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
+                                                                   let table = Table::open(&base_path, &table_name)?;
+                                  match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
                      Ok(result) => {
                          app.search_results = Some(result);
                          Ok(())
@@ -1401,7 +1400,7 @@ fn execute_paged_query(app: &mut App) {
             spinner_y, 4,
             |_, _| {
                                                   let base_path = Path::new("data").join(&entity);
-                                                  let mut table = Table::open(&base_path, &table_name)?;
+                                                  let table = Table::open(&base_path, &table_name)?;
                                                   
                                                   match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset) {
                     Ok(result) => {
