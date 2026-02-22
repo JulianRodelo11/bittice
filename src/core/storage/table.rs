@@ -603,8 +603,12 @@ impl Table {
         let segment_field_mmaps: HashMap<u64, Vec<Option<Arc<(Mmap, Mmap)>>>> = segments_map.par_iter()
             .filter(|(id, _)| needed_seg_ids.contains(id))
             .map(|(id, segment)| {
-                // Optimization: Parallelize column opening within segment to reduce cold-start latency
-                let mmaps = fields.par_iter().map(|f| segment.get_mmap_pair(f).ok()).collect();
+                // Optimization: Batch open all fields to reduce lock contention
+                // This is especially critical when opening hundreds of files for a wide query (Cold Start)
+                // Ignore errors here, as individual get_mmap_pair calls will fail if needed later
+                let _ = segment.ensure_mmaps_batch(fields);
+
+                let mmaps = segment.get_mmaps_batch(fields);
                 (*id, mmaps)
             })
             .collect();
@@ -621,36 +625,37 @@ impl Table {
             final_ids.par_chunks(CHUNK_SIZE)
                 .flat_map(|chunk| {
                     // 1. Columnar Read: Read full columns into temporary buffers
-                    // This ensures strictly sequential memory access for both reads (mmap) and writes (Vec push)
-                    let mut columns_data: Vec<Vec<String>> = Vec::with_capacity(fields.len());
-                    
-                    for (field_idx, _) in fields.iter().enumerate() {
-                        let mut col_values = Vec::with_capacity(chunk.len());
-                        
-                        // Optimization: Cache last segment's mmap to avoid map lookup per row
-                        let mut last_seg_id = u64::MAX;
-                        let mut last_mmap: Option<&(Mmap, Mmap)> = None;
+                    // Use parallel iteration over fields to maximize throughput, 
+                    // especially when chunks_count is small (e.g. 1 chunk but 100+ fields)
+                    let columns_data: Vec<Vec<String>> = fields.par_iter().enumerate()
+                        .map(|(field_idx, _)| {
+                            let mut col_values = Vec::with_capacity(chunk.len());
+                            
+                            // Optimization: Cache last segment's mmap to avoid map lookup per row
+                            let mut last_seg_id = u64::MAX;
+                            let mut last_mmap: Option<&(Mmap, Mmap)> = None;
 
-                        for (seg_id, local_id) in chunk {
-                            if *seg_id != last_seg_id {
-                                last_seg_id = *seg_id;
-                                last_mmap = None;
-                                if let Some(mmaps) = segment_field_mmaps.get(seg_id) {
-                                    if let Some(mmap_pair) = &mmaps[field_idx] {
-                                        last_mmap = Some(&**mmap_pair);
+                            for (seg_id, local_id) in chunk {
+                                if *seg_id != last_seg_id {
+                                    last_seg_id = *seg_id;
+                                    last_mmap = None;
+                                    if let Some(mmaps) = segment_field_mmaps.get(seg_id) {
+                                        if let Some(mmap_pair) = &mmaps[field_idx] {
+                                            last_mmap = Some(&**mmap_pair);
+                                        }
                                     }
                                 }
-                            }
 
-                            let val = if let Some(mmap_pair) = last_mmap {
-                                unsafe { Segment::read_value_unchecked(mmap_pair, *local_id) }
-                            } else {
-                                String::new()
-                            };
-                            col_values.push(val);
-                        }
-                        columns_data.push(col_values);
-                    }
+                                let val = if let Some(mmap_pair) = last_mmap {
+                                    unsafe { Segment::read_value_unchecked(mmap_pair, *local_id) }
+                                } else {
+                                    String::new()
+                                };
+                                col_values.push(val);
+                            }
+                            col_values
+                        })
+                        .collect();
 
                     // 2. Transpose: Construct rows from columns
                     // This is a fast memory-only operation
