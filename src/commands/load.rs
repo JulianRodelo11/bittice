@@ -90,6 +90,15 @@ fn load_data_to_table(
     }
     let mut table = Table::open(&base_path, table_name)?;
 
+    // Auto-detect Primary Key
+    let candidates = ["pk", "id", "PK", "ID", "key", "KEY", "uuid", "UUID"];
+    for cand in candidates {
+        if detected_fields.contains_key(cand) {
+            table.manifest.primary_key = cand.to_string();
+            break;
+        }
+    }
+
     // Guardar campos originales en el manifest
     let original_fields_list: Vec<String> = detected_fields.keys().cloned().collect();
     table.set_original_fields(original_fields_list)?;

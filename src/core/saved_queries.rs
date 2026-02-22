@@ -14,6 +14,14 @@ pub enum SavedOperation {
     Update(SavedUpdate),
     #[serde(rename = "delete")]
     Delete(SavedDelete),
+    #[serde(rename = "batch")]
+    Batch(SavedBatch),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedBatch {
+    pub name: String,
+    pub operations: Vec<String>, // Names of other saved operations
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -98,6 +106,7 @@ impl SavedOperation {
             SavedOperation::Insert(i) => &i.name,
             SavedOperation::Update(u) => &u.name,
             SavedOperation::Delete(d) => &d.name,
+            SavedOperation::Batch(b) => &b.name,
         }
     }
 }

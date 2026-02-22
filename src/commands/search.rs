@@ -35,6 +35,11 @@ pub fn init_crud(app: &mut App, mode: SearchCriteria) {
     app.filter_value_options = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
     app.selected_entity = None;
     app.selected_table = None;
+    if !app.saved_queries.is_empty() {
+        app.saved_queries_state.select(Some(0));
+    } else {
+        app.saved_queries_state.select(None);
+    }
 }
 
 /// Inicializa el estado para la búsqueda: carga entidades y resetea paneles.
@@ -69,6 +74,11 @@ pub fn init_search(app: &mut App) {
     app.limit = Some(100);
     app.limit_variable = None;
     app.selected_fields.clear();
+    if !app.saved_queries.is_empty() {
+        app.saved_queries_state.select(Some(0));
+    } else {
+        app.saved_queries_state.select(None);
+    }
     update_middle_panel_content(app);
 }
 
@@ -109,6 +119,160 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
         return;
     }
 
+    // 0.1 Handle Saved Queries List Overlay (PRIORITY)
+    if app.show_saved_queries {
+        let filtered_ops_indices: Vec<usize> = app.saved_queries.iter().enumerate().filter(|(_, op)| {
+            match app.active_task {
+                Some("Search") => matches!(op, SavedOperation::Read(_)),
+                Some("Create") => matches!(op, SavedOperation::Insert(_)),
+                Some("Update") => matches!(op, SavedOperation::Update(_)),
+                Some("Delete") => matches!(op, SavedOperation::Delete(_)),
+                Some("Batch") => matches!(op, SavedOperation::Read(_)),
+                _ => true,
+            }
+        }).map(|(i, _)| i).collect();
+
+        let filtered_len = filtered_ops_indices.len();
+
+        match key.code {
+            KeyCode::Esc => {
+                app.show_saved_queries = false;
+                app.is_loading_to_edit = false;
+                if app.active_task == Some("Batch") {
+                    app.active_task = None;
+                    app.batch_selected_ops.clear();
+                }
+                return;
+            },
+            KeyCode::Up => {
+                 let i = match app.saved_queries_state.selected() {
+                    Some(i) => if i == 0 { filtered_len.saturating_sub(1) } else { i - 1 },
+                    None => 0,
+                };
+                if filtered_len > 0 { app.saved_queries_state.select(Some(i)); }
+                return;
+            },
+            KeyCode::Down => {
+                let i = match app.saved_queries_state.selected() {
+                    Some(i) => if i >= filtered_len.saturating_sub(1) { 0 } else { i + 1 },
+                    None => 0,
+                };
+                if filtered_len > 0 { app.saved_queries_state.select(Some(i)); }
+                return;
+            },
+            KeyCode::Enter => {
+                if let Some(idx) = app.saved_queries_state.selected() {
+                    if idx < filtered_len {
+                        let original_idx = filtered_ops_indices[idx];
+                        let op = app.saved_queries[original_idx].clone();
+                        
+                        if app.active_task == Some("Batch") {
+                            let name = op.name().to_string();
+                            if let Some(pos) = app.batch_selected_ops.iter().position(|x| x == &name) {
+                                app.batch_selected_ops.remove(pos);
+                            } else {
+                                app.batch_selected_ops.push(name);
+                            }
+                            return;
+                        }
+
+                        match op {
+                            SavedOperation::Read(query) => {
+                                load_saved_query_into_app(app, &query);
+                                let run_immediately = !app.is_loading_to_edit;
+                                app.show_saved_queries = false;
+                                app.is_loading_to_edit = false;
+                                if run_immediately {
+                                    execute_search_action(app);
+                                }
+                            }
+                            SavedOperation::Insert(ins) => {
+                                app.selected_entity = Some(ins.entity.clone());
+                                app.selected_table = Some(ins.table.clone());
+                                app.loaded_query_name = Some(ins.name.clone());
+                                app.crud_payload.clear();
+                                for f in &ins.expected_fields {
+                                    app.crud_payload.insert(f.clone(), format!("${}", f));
+                                }
+                                app.show_saved_queries = false;
+                                if !app.is_loading_to_edit { execute_crud_action(app); }
+                            }
+                            SavedOperation::Update(upd) => {
+                                app.selected_entity = Some(upd.entity.clone());
+                                app.selected_table = Some(upd.table.clone());
+                                app.loaded_query_name = Some(upd.name.clone());
+                                app.crud_payload.clear();
+                                for f in &upd.allowed_fields {
+                                    app.crud_payload.insert(f.clone(), format!("${}", f));
+                                }
+                                app.show_saved_queries = false;
+                                if !app.is_loading_to_edit { execute_crud_action(app); }
+                            }
+                            SavedOperation::Delete(del) => {
+                                app.selected_entity = Some(del.entity.clone());
+                                app.selected_table = Some(del.table.clone());
+                                app.loaded_query_name = Some(del.name.clone());
+                                app.crud_target_id = "$id".to_string();
+                                app.show_saved_queries = false;
+                                if !app.is_loading_to_edit { execute_crud_action(app); }
+                            }
+                            SavedOperation::Batch(_) => {
+                                app.show_saved_queries = false;
+                            }
+                        }
+                    }
+                }
+                return;
+            },
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                 // Delete saved query
+                 if let Some(idx) = app.saved_queries_state.selected() {
+                    if idx < filtered_len {
+                        let original_idx = filtered_ops_indices[idx];
+                        app.saved_queries.remove(original_idx);
+                        let _ = save_operations(&app.saved_queries);
+                        
+                        let new_len = filtered_len - 1;
+                        if new_len == 0 {
+                            app.saved_queries_state.select(None);
+                        } else {
+                            let new_selection = idx.min(new_len - 1);
+                            app.saved_queries_state.select(Some(new_selection));
+                        }
+                    }
+                 }
+                 return;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // 0.2 Handle Batch specific keys (when selection list is CLOSED but task is Batch)
+    if app.active_task == Some("Batch") && !app.is_saving_query {
+        match key.code {
+            KeyCode::Char('S') | KeyCode::Char('s') => {
+                if !app.batch_selected_ops.is_empty() {
+                    app.is_saving_query = true;
+                    app.show_saved_queries = false;
+                    app.save_query_name_input.clear();
+                }
+                return;
+            }
+            KeyCode::Esc => {
+                app.active_task = None;
+                app.batch_selected_ops.clear();
+                return;
+            }
+            KeyCode::Char('L') | KeyCode::Char('l') => {
+                app.show_saved_queries = true;
+                if !app.saved_queries.is_empty() { app.saved_queries_state.select(Some(0)); }
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // 1. Handle Saving Query Input Overlay
     if app.is_saving_query {
         match key.code {
@@ -140,6 +304,12 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                 entity: app.selected_entity.clone().unwrap_or_default(),
                                 table: app.selected_table.clone().unwrap_or_default(),
                                 filters: vec![],
+                            })
+                        },
+                        Some("Batch") => {
+                            SavedOperation::Batch(crate::core::saved_queries::SavedBatch {
+                                name: name.clone(),
+                                operations: app.batch_selected_ops.clone(),
                             })
                         },
                         _ => {
@@ -178,11 +348,17 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                     
                     app.is_saving_query = false;
                     app.save_query_name_input.clear();
+                    app.batch_selected_ops.clear();
+                    app.active_task = None;
+                    app.show_saved_queries = false;
                 }
             },
             KeyCode::Esc => {
                 app.is_saving_query = false;
                 app.save_query_name_input.clear();
+                if app.active_task == Some("Batch") {
+                    app.show_saved_queries = true;
+                }
             },
             KeyCode::Char(c) => {
                 app.save_query_name_input.push(c);
@@ -197,105 +373,6 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
 
     if matches!(app.active_task, Some("Create") | Some("Update") | Some("Delete")) {
         handle_crud_input(app, key);
-        return;
-    }
-
-    // 2. Handle Saved Queries List Overlay
-    if app.show_saved_queries {
-        match key.code {
-            KeyCode::Esc => {
-                app.show_saved_queries = false;
-            },
-            KeyCode::Up => {
-                 let i = match app.saved_queries_state.selected() {
-                    Some(i) => if i == 0 { app.saved_queries.len().saturating_sub(1) } else { i - 1 },
-                    None => 0,
-                };
-                app.saved_queries_state.select(Some(i));
-            },
-            KeyCode::Down => {
-                let i = match app.saved_queries_state.selected() {
-                    Some(i) => if i >= app.saved_queries.len().saturating_sub(1) { 0 } else { i + 1 },
-                    None => 0,
-                };
-                app.saved_queries_state.select(Some(i));
-            },
-            KeyCode::Enter => {
-                if let Some(idx) = app.saved_queries_state.selected() {
-                    // Get only the operations relevant to the current task
-                    let filtered_ops: Vec<_> = app.saved_queries.iter().filter(|op| {
-                        match app.active_task {
-                            Some("Search") => matches!(op, SavedOperation::Read(_)),
-                            Some("Create") => matches!(op, SavedOperation::Insert(_)),
-                            Some("Update") => matches!(op, SavedOperation::Update(_)),
-                            Some("Delete") => matches!(op, SavedOperation::Delete(_)),
-                            _ => true,
-                        }
-                    }).collect();
-
-                    if idx < filtered_ops.len() {
-                        let op = filtered_ops[idx];
-                        match op {
-                            SavedOperation::Read(query) => {
-                                let query_clone = query.clone();
-                                load_saved_query_into_app(app, &query_clone);
-                                let run_immediately = !app.is_loading_to_edit;
-                                app.show_saved_queries = false;
-                                app.is_loading_to_edit = false;
-                                if run_immediately {
-                                    execute_search_action(app);
-                                }
-                            }
-                            SavedOperation::Insert(ins) => {
-                                app.selected_entity = Some(ins.entity.clone());
-                                app.selected_table = Some(ins.table.clone());
-                                app.loaded_query_name = Some(ins.name.clone());
-                                app.crud_payload.clear();
-                                for f in &ins.expected_fields {
-                                    app.crud_payload.insert(f.clone(), format!("${}", f));
-                                }
-                                app.show_saved_queries = false;
-                                if !app.is_loading_to_edit { execute_crud_action(app); }
-                            }
-                            SavedOperation::Update(upd) => {
-                                app.selected_entity = Some(upd.entity.clone());
-                                app.selected_table = Some(upd.table.clone());
-                                app.loaded_query_name = Some(upd.name.clone());
-                                app.crud_payload.clear();
-                                for f in &upd.allowed_fields {
-                                    app.crud_payload.insert(f.clone(), format!("${}", f));
-                                }
-                                app.show_saved_queries = false;
-                                if !app.is_loading_to_edit { execute_crud_action(app); }
-                            }
-                            SavedOperation::Delete(del) => {
-                                app.selected_entity = Some(del.entity.clone());
-                                app.selected_table = Some(del.table.clone());
-                                app.loaded_query_name = Some(del.name.clone());
-                                app.crud_target_id = "$id".to_string();
-                                app.show_saved_queries = false;
-                                if !app.is_loading_to_edit { execute_crud_action(app); }
-                            }
-                        }
-                    }
-                }
-            },
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                 // Delete saved query
-                 if let Some(idx) = app.saved_queries_state.selected() {
-                    if idx < app.saved_queries.len() {
-                        app.saved_queries.remove(idx);
-                        let _ = save_operations(&app.saved_queries);
-                        if app.saved_queries.is_empty() {
-                            app.saved_queries_state.select(None);
-                        } else if idx >= app.saved_queries.len() {
-                            app.saved_queries_state.select(Some(app.saved_queries.len() - 1));
-                        }
-                    }
-                 }
-            }
-            _ => {}
-        }
         return;
     }
 
@@ -868,7 +945,7 @@ fn execute_search_action(app: &mut App) {
          let order_by = app.order_by.clone();
          
          let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
-             app.available_fields.clone()
+             get_base_fields(&app.available_fields)
          } else {
              app.selected_fields.clone()
          };
@@ -1238,7 +1315,7 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
          let order_by = app.order_by.clone();
          
          let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
-             app.available_fields.clone()
+             get_base_fields(&app.available_fields)
          } else {
              app.selected_fields.clone()
          };
@@ -1308,7 +1385,7 @@ fn execute_paged_query(app: &mut App) {
         let offset = (app.results_page - 1) * limit;
 
         let fields = if app.selected_fields.is_empty() && app.aggregations.is_empty() {
-            app.available_fields.clone()
+            get_base_fields(&app.available_fields)
         } else {
             app.selected_fields.clone()
         };
@@ -1382,7 +1459,12 @@ pub fn handle_crud_input(app: &mut App, key: event::KeyEvent) {
             } else {
                 app.active_task = None;
                 app.status_message = None;
+                app.selected_entity = None;
+                app.selected_table = None;
+                app.crud_payload.clear();
+                app.crud_target_id.clear();
                 app.focus_panel = FocusPanel::Left;
+                app.search_criteria = SearchCriteria::Entity;
             }
         }
         KeyCode::Up => navigate_list(app, -1),

@@ -20,7 +20,7 @@ pub fn ui(f: &mut Frame, app: &mut App, _purple: Color) {
 
     let is_overlay_active = app.is_saving_query || app.show_saved_queries || app.is_prompting_variable;
 
-    if matches!(app.active_task, Some("Search") | Some("Create") | Some("Update") | Some("Delete")) {
+    if matches!(app.active_task, Some("Search") | Some("Create") | Some("Update") | Some("Delete") | Some("Batch")) {
         draw_search_ui(f, app, central_area, is_overlay_active);
         draw_overlays(f, app, size);
     } else if app.active_task == Some("Load") {
@@ -367,7 +367,39 @@ fn draw_load_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
     draw_menu_widget(f, app, chunks[0], purple, purple_muted, text_color);
     if !loaded_data.is_empty() { draw_loaded_data_widget(f, &loaded_data, chunks[1]); }
     if app.load_step == LoadStep::Processing { return; }
-    draw_input_widget(f, app, chunks[3], "Input...", purple, purple_muted);
+
+    let (label, placeholder): (&str, String) = match app.load_step {
+        LoadStep::InputPath => (" Path to NDJSON ", "Type or select a path...".to_string()),
+        LoadStep::InputEntity => {
+            let path = Path::new(&app.ndjson_path);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("default");
+            (" Entity Name ", stem.to_string())
+        },
+        LoadStep::InputTable => {
+            let path = Path::new(&app.ndjson_path);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("records");
+            (" Table Name ", stem.to_string())
+        },
+        _ => (" Input ", "Type here...".to_string())
+    };
+
+    draw_input_widget_with_label(f, app, chunks[3], &placeholder, label, purple, purple_muted);
+
+    // Render suggestions only for path input
+    if app.load_step == LoadStep::InputPath && !app.suggestions.is_empty() {
+        let items: Vec<ListItem> = app.suggestions.iter().enumerate().map(|(i, s)| {
+            let is_selected = Some(i) == app.suggestion_index;
+            let style = if is_selected {
+                Style::default().fg(colors::PRIMARY_COLOR).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(Span::styled(format!("  {}", s), style))
+        }).collect();
+        let list = List::new(items)
+            .block(Block::default().title(" Suggestions ").borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(list, chunks[4]);
+    }
 }
 
 fn draw_main_menu(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
@@ -430,6 +462,38 @@ fn draw_server_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
             SavedOperation::Insert(_) => ("POST", op.name(), String::new()),
             SavedOperation::Update(_) => ("PUT", op.name(), String::new()),
             SavedOperation::Delete(_) => ("DEL", op.name(), String::new()),
+            SavedOperation::Batch(b) => {
+                 let mut params = Vec::new();
+                 // Load all queries in the batch to collect their params
+                 let all_ops = crate::core::saved_queries::load_operations().unwrap_or_default();
+                 for op_name in &b.operations {
+                     if let Some(SavedOperation::Read(rq)) = all_ops.iter().find(|o| o.name() == op_name) {
+                         for f in &rq.filters {
+                             if let Some(k) = f.value.strip_prefix('$') { params.push(k.to_string()); }
+                         }
+                         if let Some(ref p) = rq.limit_param {
+                             if let Some(k) = p.strip_prefix('$') { params.push(k.to_string()); }
+                         }
+                         for agg in &rq.aggregations {
+                            if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                                for val in obj.values() {
+                                    if let Some(s) = val.as_str().and_then(|v| v.strip_prefix('$')) {
+                                        params.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                     }
+                 }
+                 params.sort();
+                 params.dedup();
+                 let hint = if params.is_empty() {
+                    String::new()
+                } else {
+                    format!("?{}", params.iter().map(|p| format!("{}?", p)).collect::<Vec<_>>().join("&"))
+                };
+                ("GET", b.name.as_str(), hint)
+            }
         };
         
         let method_color = match method { 
@@ -479,9 +543,17 @@ fn draw_loaded_data_widget(f: &mut Frame, data: &[String], area: Rect) {
     f.render_widget(List::new(items).block(Block::default().padding(Padding::new(0, 0, 1, 0))), area);
 }
 
-fn draw_input_widget(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str, _color: Color, purple_muted: Color) {
-    let is_focused = app.focus_panel == FocusPanel::Bottom;
-    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(if is_focused { colors::SAND } else { purple_muted }));
+fn draw_input_widget(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str, color: Color, purple_muted: Color) {
+    draw_input_widget_with_label(f, app, area, placeholder, " Input ", color, purple_muted);
+}
+
+fn draw_input_widget_with_label(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str, label: &str, _color: Color, purple_muted: Color) {
+    let is_focused = app.focus_panel == FocusPanel::Bottom || app.active_task == Some("Load");
+    let block = Block::default()
+        .title(label)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if is_focused { colors::SAND } else { purple_muted }));
     f.render_widget(&block, area);
     let inner = block.inner(area).inner(&Margin { vertical: 0, horizontal: 1 });
     let centered_area = Rect { x: inner.x, y: inner.y + (inner.height / 2), width: inner.width, height: 1 };
@@ -557,8 +629,9 @@ fn draw_save_query_overlay(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_saved_queries_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    let title = if app.active_task == Some("Batch") { " Define Batch Operation " } else { " Saved Queries " };
     let area = centered_rect(60, 60, area); f.render_widget(Clear, area);
-    f.render_widget(Block::default().title(" Saved Queries ").borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(0, 0, 0))), area);
+    f.render_widget(Block::default().title(title).borders(Borders::ALL).border_type(BorderType::Rounded).style(Style::default().bg(Color::Rgb(0, 0, 0))), area);
     let chunks = Layout::default().direction(Direction::Vertical).margin(2).constraints([Constraint::Min(0), Constraint::Length(3)]).split(area);
     
     let items: Vec<ListItem> = app.saved_queries.iter().filter(|op| {
@@ -567,6 +640,7 @@ fn draw_saved_queries_overlay(f: &mut Frame, app: &mut App, area: Rect) {
             Some("Create") => matches!(op, SavedOperation::Insert(_)),
             Some("Update") => matches!(op, SavedOperation::Update(_)),
             Some("Delete") => matches!(op, SavedOperation::Delete(_)),
+            Some("Batch") => matches!(op, SavedOperation::Read(_)),
             _ => true,
         }
     }).map(|op| {
@@ -574,13 +648,26 @@ fn draw_saved_queries_overlay(f: &mut Frame, app: &mut App, area: Rect) {
             SavedOperation::Read(q) => (q.name.clone(), format!("Search: {}/{}", q.entity, q.table)), 
             SavedOperation::Insert(i) => (i.name.clone(), format!("Insert: {}/{}", i.entity, i.table)), 
             SavedOperation::Update(u) => (u.name.clone(), format!("Update: {}/{}", u.entity, u.table)), 
-            SavedOperation::Delete(d) => (d.name.clone(), format!("Delete: {}/{}", d.entity, d.table)) 
+            SavedOperation::Delete(d) => (d.name.clone(), format!("Delete: {}/{}", d.entity, d.table)),
+            SavedOperation::Batch(b) => (b.name.clone(), format!("Batch: {} ops", b.operations.len())),
         };
-        ListItem::new(format!("{} ({})", n, d))
+        
+        if app.active_task == Some("Batch") {
+            let is_sel = app.batch_selected_ops.contains(&n);
+            let check = if is_sel { "[x] " } else { "[ ] " };
+            ListItem::new(format!("{}{}", check, n))
+        } else {
+            ListItem::new(format!("{} ({})", n, d))
+        }
     }).collect();
     
     f.render_stateful_widget(List::new(items).highlight_style(Style::default().fg(colors::ACTIVE_COLOR).add_modifier(Modifier::BOLD)).highlight_symbol("> "), chunks[0], &mut app.saved_queries_state);
-    f.render_widget(Paragraph::new("Enter: Load & Run • d: Delete • Esc: Close").style(Style::default().fg(Color::DarkGray)), chunks[1]);
+    let help = if app.active_task == Some("Batch") {
+        "Enter: Toggle Selection • S: Save Batch • Esc: Close"
+    } else {
+        "Enter: Load & Run • d: Delete • Esc: Close"
+    };
+    f.render_widget(Paragraph::new(help).style(Style::default().fg(Color::DarkGray)), chunks[1]);
 }
 
 fn draw_variable_prompt_overlay(f: &mut Frame, app: &mut App, area: Rect) {

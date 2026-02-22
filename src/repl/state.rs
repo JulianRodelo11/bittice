@@ -166,6 +166,9 @@ pub struct App {
     pub is_prompting_variable: bool,
     pub current_variable: String,
     pub variable_input: String,
+
+    // --- Batch ---
+    pub batch_selected_ops: Vec<String>,
 }
 
 impl Default for App {
@@ -187,7 +190,7 @@ impl App {
 
         App {
             // General
-            menu_items: vec!["Load", "Create", "Read", "Update", "Delete", "Local Server", "Exit"],
+            menu_items: vec!["Load", "Create", "Read", "Update", "Delete", "Batch", "Local Server", "Exit"],
             menu_state,
             active_task: None,
             // Load
@@ -280,6 +283,9 @@ impl App {
             is_prompting_variable: false,
             current_variable: String::new(),
             variable_input: String::new(),
+
+            // Batch
+            batch_selected_ops: Vec::new(),
         }
     }
 

@@ -13,6 +13,7 @@ use crossterm::{
 use ratatui::{prelude::*};
 use state::{App, LoadStep};
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 use ui::ui;
 use crate::ui::colors;
@@ -105,7 +106,7 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
 
                     if let Some(task) = app.active_task {
                         match task {
-                            "Search" | "Create" | "Update" | "Delete" => search::handle_search_input(app, key),
+                            "Search" | "Create" | "Update" | "Delete" | "Batch" => search::handle_search_input(app, key),
                             "Load" => handle_load_input(app, key),
                             "Server" => handle_server_input(app, key),
                             _ => {}
@@ -156,8 +157,8 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
             Some(0) => {
                 app.active_task = Some("Load");
                 app.status_message = None; // Limpiar mensajes previos
-                // Iniciar sugerencias desde ROOT inmediatamente al entrar
-                app.suggestions = get_path_suggestions("");
+                // Iniciar sugerencias desde LOCAL inmediatamente al entrar
+                app.suggestions = get_path_suggestions("./");
                 app.suggestion_index = if app.suggestions.is_empty() {
                     None
                 } else {
@@ -177,6 +178,15 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
                 search::init_crud(app, crate::repl::state::SearchCriteria::Delete);
             }
             Some(5) => {
+                app.active_task = Some("Batch");
+                app.show_saved_queries = true;
+                app.is_loading_to_edit = false;
+                app.batch_selected_ops.clear();
+                if !app.saved_queries.is_empty() {
+                    app.saved_queries_state.select(Some(0));
+                }
+            }
+            Some(6) => {
                 // Start Local Server
                 app.active_task = Some("Server");
                 let (log_tx, log_rx) = mpsc::channel(100);
@@ -196,7 +206,7 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
                     rt.block_on(crate::server::start_server(log_tx, shutdown_rx));
                 });
             }
-            Some(6) => return Err(anyhow::anyhow!("Quit")),
+            Some(7) => return Err(anyhow::anyhow!("Quit")),
             _ => {}
         },
         _ => {}
@@ -303,6 +313,34 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
                                 crate::core::saved_queries::SavedOperation::Insert(_) => "POST",
                                 crate::core::saved_queries::SavedOperation::Update(_) => "PUT",
                                 crate::core::saved_queries::SavedOperation::Delete(_) => "DELETE",
+                                crate::core::saved_queries::SavedOperation::Batch(b) => {
+                                    for op_name in &b.operations {
+                                        if let Some(crate::core::saved_queries::SavedOperation::Read(q)) = ops.iter().find(|o| o.name() == op_name) {
+                                            for f in &q.filters {
+                                                if f.value.starts_with('$') {
+                                                    params.push(f.value[1..].to_string());
+                                                }
+                                            }
+                                            if let Some(ref p) = q.limit_param {
+                                                if let Some(k) = p.strip_prefix('$') {
+                                                    params.push(k.to_string());
+                                                }
+                                            }
+                                            for agg in &q.aggregations {
+                                                if let Some(obj) = agg.as_object().and_then(|o| o.values().next()).and_then(|v| v.as_object()) {
+                                                    for val in obj.values() {
+                                                        if let Some(s) = val.as_str() {
+                                                            if s.starts_with('$') {
+                                                                params.push(s[1..].to_string());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "GET"
+                                }
                             };
                             
                             params.sort();
@@ -379,12 +417,30 @@ fn handle_load_input(app: &mut App, key: event::KeyEvent) {
                     }
                 }
                 LoadStep::InputEntity => {
-                    app.entity_name = app.input_buffer.clone();
+                    if app.input_buffer.is_empty() {
+                        // Si está vacío, intentar usar el nombre del archivo como default
+                        let path = Path::new(&app.ndjson_path);
+                        app.entity_name = path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("default")
+                            .to_string();
+                    } else {
+                        app.entity_name = app.input_buffer.clone();
+                    }
                     app.input_buffer.clear();
                     app.load_step = LoadStep::InputTable;
                 }
                 LoadStep::InputTable => {
-                    app.table_name = app.input_buffer.clone();
+                    if app.input_buffer.is_empty() {
+                        // Si está vacío, usar el nombre del archivo como nombre de tabla (no el de la entidad)
+                        let path = Path::new(&app.ndjson_path);
+                        app.table_name = path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("records")
+                            .to_string();
+                    } else {
+                        app.table_name = app.input_buffer.clone();
+                    }
                     app.input_buffer.clear();
                     app.load_step = LoadStep::Processing;
                 }

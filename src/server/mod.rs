@@ -73,6 +73,9 @@ async fn handle_request(
             (Method::GET, SavedOperation::Read(q)) => {
                 handle_read(q, query_params, state).await.into_response()
             },
+            (Method::GET, SavedOperation::Batch(b)) => {
+                handle_batch(b, query_params, state).await.into_response()
+            },
             (Method::POST, SavedOperation::Insert(i)) => {
                 // Extract body as JSON
                 let body_bytes = ax_body_to_bytes(req).await;
@@ -107,6 +110,93 @@ async fn handle_read(
     params: HashMap<String, String>,
     state: Arc<ServerState>,
 ) -> impl IntoResponse {
+    match execute_read_operation(query, params, state).await {
+        Ok(json) => (StatusCode::OK, Json(json)),
+        Err((code, json)) => (code, Json(json)),
+    }
+}
+
+async fn handle_batch(
+    batch: &crate::core::saved_queries::SavedBatch,
+    params: HashMap<String, String>,
+    state: Arc<ServerState>,
+) -> impl IntoResponse {
+    let mut results = serde_json::Map::new();
+    let ops = load_operations().unwrap_or_default();
+    
+    let mut max_pages = 0;
+    let mut total_items_sum = 0;
+    let mut execution_time_sum = 0.0;
+
+    // Ejecutar todas las operaciones del batch
+    for op_name in &batch.operations {
+        if let Some(op) = ops.iter().find(|o| o.name() == op_name) {
+            match op {
+                SavedOperation::Read(q) => {
+                    // Soporte para parámetros específicos -> nombre_query:param
+                    let mut targeted_params = params.clone();
+                    let prefix = format!("{}:", op_name);
+                    for (k, v) in &params {
+                        if let Some(stripped) = k.strip_prefix(&prefix) {
+                            targeted_params.insert(stripped.to_string(), v.clone());
+                        }
+                    }
+
+                    match execute_read_operation(q, targeted_params, state.clone()).await {
+                        Ok(res) => { 
+                            if let Some(obj) = res.as_object() {
+                                if let Some(pagination) = obj.get("pagination").and_then(|p| p.as_object()) {
+                                    let pages = pagination.get("total_pages").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let items = pagination.get("total_items").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    if pages > max_pages { max_pages = pages; }
+                                    total_items_sum += items;
+                                }
+                                if let Some(meta) = obj.get("meta").and_then(|m| m.as_object()) {
+                                    execution_time_sum += meta.get("engine_time_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                }
+                            }
+                            results.insert(op_name.clone(), res); 
+                        },
+                        Err((code, res)) => {
+                            results.insert(op_name.clone(), serde_json::json!({
+                                "error": "Query failed",
+                                "status": code.as_u16(),
+                                "details": res
+                            }));
+                        }
+                    }
+                },
+                _ => {
+                    results.insert(op_name.clone(), serde_json::json!({
+                        "error": "Only Read operations are currently supported in Batch"
+                    }));
+                }
+            }
+        } else {
+             results.insert(op_name.clone(), serde_json::json!({
+                 "error": "Operation not found"
+             }));
+        }
+    }
+
+    let response = serde_json::json!({
+        "results": results,
+        "batch_meta": {
+            "max_pages": max_pages,
+            "total_items_combined": total_items_sum,
+            "total_engine_time_ms": execution_time_sum,
+            "queries_count": batch.operations.len()
+        }
+    });
+
+    (StatusCode::OK, Json(response))
+}
+
+async fn execute_read_operation(
+    query: &crate::core::saved_queries::SavedQuery,
+    params: HashMap<String, String>,
+    state: Arc<ServerState>,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
     let mut missing_params = Vec::new();
 
     // Convert SavedQuery to arguments for execute_query
@@ -152,7 +242,7 @@ async fn handle_read(
     if !missing_params.is_empty() {
          missing_params.sort();
          missing_params.dedup();
-         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+         return Err((StatusCode::BAD_REQUEST, serde_json::json!({
              "error": "Missing required query parameters",
              "missing_parameters": missing_params
          })));
@@ -180,14 +270,15 @@ async fn handle_read(
         params.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
     } else {
         query.limit
-    }.unwrap_or(100).max(1);
+    }.unwrap_or(100);
     let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
 
     let fields = if !param_fields.is_empty() {
         param_fields
     } else if query.selected_fields.is_empty() && query.aggregations.is_empty() {
-        crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &query.entity, &query.table)
+        let all_fields = crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &query.entity, &query.table);
+        crate::repl::utils::get_base_fields(&all_fields)
     } else {
         query.selected_fields.clone()
     };
@@ -219,7 +310,7 @@ async fn handle_read(
                             // No incluir claves con valor vacío (ahorra payload)
                             continue;
                         }
-                        let first_char = val.as_bytes()[0];
+                        let first_char = if val.is_empty() { b'\0' } else { val.as_bytes()[0] };
                         let json_val = if first_char.is_ascii_digit() || first_char == b'-' {
                             if let Ok(n) = val.parse::<i64>() {
                                 serde_json::Value::Number(n.into())
@@ -255,14 +346,12 @@ async fn handle_read(
                 }).collect()
             });
 
-            let total_pages = if limit > 0 { (result.total_found + limit - 1) / limit } else { 1 };
             let engine_time_ms = result.execution_time_micros as f64 / 1000.0;
             
             let mut response_map = serde_json::Map::new();
             
-            if !data.is_empty() {
-                response_map.insert("data".to_string(), serde_json::json!(data));
-            }
+            // Siempre incluir data, aunque esté vacía
+            response_map.insert("data".to_string(), serde_json::json!(data));
             
             if let Some(aggs) = aggregations_data {
                 response_map.insert("aggregations".to_string(), serde_json::json!(aggs));
@@ -275,20 +364,26 @@ async fn handle_read(
                 "debug_info": result.debug_info
             }));
             
-            response_map.insert("pagination".to_string(), serde_json::json!({
-                "page": page,
-                "per_page": limit,
-                "total_pages": total_pages.max(1),
-                "total_items": result.total_found
-            }));
+            // Solo incluir paginación si hay registros totales Y NO es solo una agregación
+            // O si hay data presente
+            if result.total_found > 0 && !headers.is_empty() {
+                let total_pages = if limit > 0 { (result.total_found + limit - 1) / limit } else { 1 };
+                response_map.insert("pagination".to_string(), serde_json::json!({
+                    "page": page,
+                    "per_page": limit,
+                    "total_pages": total_pages.max(1),
+                    "total_items": result.total_found
+                }));
+            }
 
-            (StatusCode::OK, Json(serde_json::Value::Object(response_map)))
+            Ok(serde_json::Value::Object(response_map))
         },
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))
+            Err((StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e.to_string() })))
         }
     }
 }
+
 
 async fn handle_insert(
     def: &crate::core::saved_queries::SavedInsert,

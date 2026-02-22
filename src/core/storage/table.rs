@@ -273,7 +273,6 @@ impl Table {
     ) -> Result<QueryResult> {
         let start_time = std::time::Instant::now();
         
-        // 1. Parallel Segment Filtering
         let mut segment_tasks: Vec<&Segment> = self.immutable_segments.iter().collect();
         if let Some(writer) = &self.active_segment {
             segment_tasks.push(&writer.segment);
@@ -281,30 +280,35 @@ impl Table {
 
         let filter_start = std::time::Instant::now();
         let cache_ref = self.index_cache.clone();
-        let segment_results: Vec<Result<(u64, RoaringBitmap)>> = segment_tasks.par_iter()
-            .map(|segment| {
-                let bitmap = if let Some(writer) = &self.active_segment {
-                    if writer.segment.id == segment.id {
-                        writer.search(filters, filters_op)?
-                    } else {
-                        segment.search_thread_safe(filters, filters_op, &cache_ref)?
-                    }
-                } else {
-                    segment.search_thread_safe(filters, filters_op, &cache_ref)?
-                };
-                Ok((segment.id, bitmap))
-            })
-            .collect();
 
-        let mut segment_matches = Vec::new();
-        let mut total_found = 0;
-        for res in segment_results {
-            let (id, bitmap) = res?;
-            if !bitmap.is_empty() {
-                total_found += bitmap.len();
-                segment_matches.push((id, bitmap));
+        // --- OPTIMIZATION: Primary Key Lookup ---
+        let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
+        let pk_filter = filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::Eq);
+        
+        let segment_matches = if let Some(f) = pk_filter {
+            // If we have a PK filter and it's an AND operation (or single filter), we can use the index directly.
+            let use_index = filters.len() == 1 || *filters_op == LogicalOp::And;
+            
+            if use_index {
+                if let Some((seg_id, local_id)) = self.primary_index.get(&f.value) {
+                    let mut bm = RoaringBitmap::new();
+                    bm.insert(*local_id);
+                    vec![(*seg_id, bm)]
+                } else {
+                    vec![] // PK not found, result is empty
+                }
+            } else {
+                self.scan_segments_parallel(&segment_tasks, filters, filters_op, &cache_ref)?
             }
+        } else {
+            self.scan_segments_parallel(&segment_tasks, filters, filters_op, &cache_ref)?
+        };
+
+        let mut total_found = 0;
+        for (_, bitmap) in &segment_matches {
+            total_found += bitmap.len();
         }
+        
         let filter_elapsed = filter_start.elapsed().as_micros();
 
         let mut aggregation_results = Vec::new();
@@ -455,6 +459,21 @@ impl Table {
             }
         }
 
+        // Si el límite es 0, no necesitamos procesar filas ni ordenamiento
+        if limit == 0 {
+            let total_elapsed = start_time.elapsed().as_micros();
+            let debug = format!("Filter: {}ms, Limit: 0, Segments: {}", 
+                filter_elapsed / 1000, segment_tasks.len());
+
+            return Ok(QueryResult { 
+                headers: fields.to_vec(), 
+                rows: vec![], 
+                total_found: total_found as usize, 
+                execution_time_micros: total_elapsed, 
+                debug_info: Some(debug),
+                aggregations: if aggregation_results.is_empty() { None } else { Some(aggregation_results) }
+            });
+        }
 
         // --- ORDENAMIENTO ---
         let sort_start = std::time::Instant::now();
@@ -701,6 +720,38 @@ impl Table {
             debug_info: Some(debug),
             aggregations: if aggregation_results.is_empty() { None } else { Some(aggregation_results) }
         })
+    }
+
+    fn scan_segments_parallel(
+        &self,
+        segment_tasks: &[&Segment],
+        filters: &[Filter],
+        filters_op: &LogicalOp,
+        cache_ref: &Arc<RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>>
+    ) -> Result<Vec<(u64, RoaringBitmap)>> {
+        let segment_results: Vec<Result<(u64, RoaringBitmap)>> = segment_tasks.par_iter()
+            .map(|segment| {
+                let bitmap = if let Some(writer) = &self.active_segment {
+                    if writer.segment.id == segment.id {
+                        writer.search(filters, filters_op)?
+                    } else {
+                        segment.search_thread_safe(filters, filters_op, cache_ref)?
+                    }
+                } else {
+                    segment.search_thread_safe(filters, filters_op, cache_ref)?
+                };
+                Ok((segment.id, bitmap))
+            })
+            .collect();
+
+        let mut matches = Vec::new();
+        for res in segment_results {
+            let (id, bitmap) = res?;
+            if !bitmap.is_empty() {
+                matches.push((id, bitmap));
+            }
+        }
+        Ok(matches)
     }
 
     fn process_seg_sum_grouped(
