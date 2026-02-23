@@ -113,31 +113,48 @@ impl SavedOperation {
 
 pub fn save_operations(ops: &[SavedOperation]) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(ops)?;
-    fs::write(".bittice_ops.json", json)?;
+    let path = Path::new("data").join(".bittice_ops.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, json)?;
     Ok(())
 }
 
 pub fn load_operations() -> anyhow::Result<Vec<SavedOperation>> {
-    // Migration: Check if old .bittice_queries.json exists and no .bittice_ops.json
-    let old_path = Path::new(".bittice_queries.json");
-    let new_path = Path::new(".bittice_ops.json");
+    let new_path = Path::new("data").join(".bittice_ops.json");
+    let old_path_root = Path::new(".bittice_ops.json");
+    let very_old_path = Path::new(".bittice_queries.json");
 
-    if !new_path.exists() && old_path.exists() {
-        // Migrate old queries to new Read operations
-        let content = fs::read_to_string(old_path)?;
+    // 1. Check if we have the file in the new location (data/.bittice_ops.json)
+    if new_path.exists() {
+        let content = fs::read_to_string(new_path)?;
+        let ops: Vec<SavedOperation> = serde_json::from_str(&content)?;
+        return Ok(ops);
+    }
+
+    // 2. Migration: Check if we have the file in the OLD location (root/.bittice_ops.json)
+    if old_path_root.exists() {
+        let content = fs::read_to_string(old_path_root)?;
+        // Validate format
+        let ops: Vec<SavedOperation> = serde_json::from_str(&content)?;
+        // Move to new location
+        save_operations(&ops)?;
+        // Remove old file
+        let _ = fs::remove_file(old_path_root);
+        return Ok(ops);
+    }
+
+    // 3. Migration (Legacy): Check for .bittice_queries.json (very old format)
+    if very_old_path.exists() {
+        let content = fs::read_to_string(very_old_path)?;
         if let Ok(queries) = serde_json::from_str::<Vec<SavedQuery>>(&content) {
             let ops: Vec<SavedOperation> = queries.into_iter().map(SavedOperation::Read).collect();
-            save_operations(&ops)?; // Save to new format
-            // Optional: fs::remove_file(old_path)?; 
+            save_operations(&ops)?; // Save to new format in data/
+            // Optional: fs::remove_file(very_old_path)?; 
             return Ok(ops);
         }
     }
 
-    if !new_path.exists() {
-        return Ok(Vec::new());
-    }
-    
-    let content = fs::read_to_string(new_path)?;
-    let ops: Vec<SavedOperation> = serde_json::from_str(&content)?;
-    Ok(ops)
+    Ok(Vec::new())
 }

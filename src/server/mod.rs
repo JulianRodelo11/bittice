@@ -38,8 +38,9 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    let addr = "127.0.0.1:3000";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{}:3000", host);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     let _ = log_sender.send(format!("Server started on http://{}", addr)).await;
     
     // --- SMART PRE-WARMING ---

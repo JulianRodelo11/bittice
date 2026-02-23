@@ -346,7 +346,8 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
                             params.sort();
                             params.dedup();
                             
-                            let mut url = format!("http://127.0.0.1:3000/{}", name);
+                            let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+                            let mut url = format!("http://{}:3000/{}", host, name);
                             if method == "GET" && !params.is_empty() {
                                 let query_string = params.iter().map(|p| format!("{}=?", p)).collect::<Vec<_>>().join("&");
                                 url.push('?');
