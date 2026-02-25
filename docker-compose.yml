@@ -4,6 +4,12 @@ services:
     container_name: bittice-container
     ports:
       - "3000:3000"
+      - "50051:50051"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 500M
     # volumes:
       # Montamos la carpeta local "data" en "/app/data" dentro del contenedor
       # Así los datos persisten aunque borres el contenedor.
@@ -11,3 +17,4 @@ services:
     environment:
       - BITTICE_HOST=0.0.0.0
     restart: unless-stopped
+    command: ["./bittice", "server", "--type", "grpc", "--port", "50051"]

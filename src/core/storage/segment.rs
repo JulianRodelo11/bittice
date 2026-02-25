@@ -181,33 +181,17 @@ impl Segment {
         &self,
         field: &str,
         filter_bitmap: &RoaringBitmap,
-        cache: &RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>
     ) -> Result<HashMap<String, u64>> {
-        let cache_key = (self.id, field.to_string());
-        
-        let bitmaps = {
-            let r = cache.read().unwrap();
-            r.get(&cache_key).cloned()
-        };
-
-        let bitmaps = if let Some(bm) = bitmaps {
-            bm
+        let bitmap_path = self.path.join(format!("bitmaps_{}.dat", field));
+        let bitmaps: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
+            let file = File::open(bitmap_path)?;
+            bincode::deserialize_from(file)?
         } else {
-            let bitmap_path = self.path.join(format!("bitmaps_{}.dat", field));
-            let bm_loaded: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
-                let file = File::open(bitmap_path)?;
-                bincode::deserialize_from(file)?
-            } else {
-                HashMap::new()
-            };
-            let arc_bm = Arc::new(bm_loaded);
-            let mut w = cache.write().unwrap();
-            w.insert(cache_key, arc_bm.clone());
-            arc_bm
+            HashMap::new()
         };
 
         let mut counts = HashMap::new();
-        for (val, bm) in bitmaps.as_ref() {
+        for (val, bm) in &bitmaps {
             let count = (bm & filter_bitmap).len();
             if count > 0 {
                 counts.insert(val.clone(), count);
@@ -220,7 +204,6 @@ impl Segment {
         &self,
         filters: &[Filter],
         filters_op: &LogicalOp,
-        cache: &RwLock<HashMap<(u64, String), Arc<HashMap<String, RoaringBitmap>>>>
     ) -> Result<RoaringBitmap> {
         let valid_filters: Vec<&Filter> = filters.iter().filter(|f| f.field != "?" && f.value != "?").collect();
 
@@ -250,45 +233,29 @@ impl Segment {
         let mut first = true;
 
         for f in &valid_filters {
-            let cache_key = (self.id, f.field.clone());
-            
-            // Try with read lock first
-            let bitmaps = {
-                let r = cache.read().unwrap();
-                r.get(&cache_key).cloned()
-            };
-
-            let bitmaps = if let Some(bm) = bitmaps {
-                bm
+            let bitmap_path = self.path.join(format!("bitmaps_{}.dat", f.field));
+            let bitmaps: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
+                let file = File::open(bitmap_path)?;
+                bincode::deserialize_from(file)?
             } else {
-                // If missing, load from disk and insert with write lock
-                let bitmap_path = self.path.join(format!("bitmaps_{}.dat", f.field));
-                let bm_loaded: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
-                    let file = File::open(bitmap_path)?;
-                    bincode::deserialize_from(file)?
-                } else {
-                    HashMap::new()
-                };
-                let arc_bm = Arc::new(bm_loaded);
-                let mut w = cache.write().unwrap();
-                w.entry(cache_key).or_insert(arc_bm.clone()).clone()
+                HashMap::new()
             };
 
             let mut filter_bitmap = RoaringBitmap::new();
             match f.op {
                 ComparisonOp::Eq => { if let Some(bm) = bitmaps.get(&f.value) { filter_bitmap = bm.clone(); } },
-                ComparisonOp::Ne => { for (k, bm) in bitmaps.as_ref() { if k != &f.value { filter_bitmap |= bm; } } },
-                ComparisonOp::Gt => { for (k, bm) in bitmaps.as_ref() { if k.as_str() > f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Gte => { for (k, bm) in bitmaps.as_ref() { if k.as_str() >= f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Lt => { for (k, bm) in bitmaps.as_ref() { if k.as_str() < f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Lte => { for (k, bm) in bitmaps.as_ref() { if k.as_str() <= f.value.as_str() { filter_bitmap |= bm; } } },
+                ComparisonOp::Ne => { for (k, bm) in &bitmaps { if k != &f.value { filter_bitmap |= bm; } } },
+                ComparisonOp::Gt => { for (k, bm) in &bitmaps { if k.as_str() > f.value.as_str() { filter_bitmap |= bm; } } },
+                ComparisonOp::Gte => { for (k, bm) in &bitmaps { if k.as_str() >= f.value.as_str() { filter_bitmap |= bm; } } },
+                ComparisonOp::Lt => { for (k, bm) in &bitmaps { if k.as_str() < f.value.as_str() { filter_bitmap |= bm; } } },
+                ComparisonOp::Lte => { for (k, bm) in &bitmaps { if k.as_str() <= f.value.as_str() { filter_bitmap |= bm; } } },
                 ComparisonOp::Like => {
                     let pattern = f.value.replace("%", "");
-                    for (k, bm) in bitmaps.as_ref() { if k.contains(&pattern) { filter_bitmap |= bm; } }
+                    for (k, bm) in &bitmaps { if k.contains(&pattern) { filter_bitmap |= bm; } }
                 },
                 ComparisonOp::In => {
                     let vals: Vec<&str> = f.value.split(';').map(|s| s.trim()).collect();
-                    for (k, bm) in bitmaps.as_ref() { if vals.contains(&k.as_str()) { filter_bitmap |= bm; } }
+                    for (k, bm) in &bitmaps { if vals.contains(&k.as_str()) { filter_bitmap |= bm; } }
                 }
             }
             
@@ -439,11 +406,39 @@ impl Segment {
                 Ok((field, pair)) => {
                     cache.entry(field).or_insert(pair);
                 }
-                Err(_) => { 
-                    // Log error or ignore? For now, we ignore failures to open individual cols 
-                    // so we don't crash the whole batch, but in practice this might panic later.
-                    // Given the existing code style, we'll let it fail later or implicitly handle it.
-                }
+                Err(_) => { }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hints the OS that these fields will be needed soon (or to keep them in cache).
+    /// This helps mitigate cold start latency after inactivity.
+    pub fn prefetch_fields(&self, fields: &[String]) -> Result<()> {
+        // Ensure they are mapped first
+        self.ensure_mmaps_batch(fields)?;
+        
+        let cache = self.mmap_cache.read().unwrap();
+        for field in fields {
+            if let Some(pair) = cache.get(field) {
+                let (dat, off) = &**pair;
+                // Safe: advise does not mutate data, only hints kernel
+                let _ = dat.advise(memmap2::Advice::WillNeed);
+                let _ = off.advise(memmap2::Advice::WillNeed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Selective loading of bitmap indexes to memory.
+    pub fn warm_up_indices(&self, fields: &[String]) -> Result<()> {
+        for field in fields {
+            let bitmap_path = self.path.join(format!("bitmaps_{}.dat", field));
+            if bitmap_path.exists() {
+                let file = File::open(bitmap_path)?;
+                // Simplemente lo leemos para que el SO lo suba al Page Cache.
+                // No guardamos el resultado en la RAM privada de Rust.
+                let _bitmaps: HashMap<String, RoaringBitmap> = bincode::deserialize_from(file)?;
             }
         }
         Ok(())

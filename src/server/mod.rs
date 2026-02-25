@@ -21,14 +21,14 @@ use crate::server::table_manager::TableManager;
 // Estructura para compartir estado con los handlers de Axum
 struct ServerState {
     log_sender: mpsc::Sender<String>,
-    table_manager: TableManager,
+    table_manager: Arc<TableManager>,
     ops_cache: Arc<RwLock<Option<(std::time::Instant, Vec<SavedOperation>)>>>,
 }
 
 pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot::Receiver<()>) {
     let state = Arc::new(ServerState {
         log_sender: log_sender.clone(),
-        table_manager: TableManager::new(),
+        table_manager: Arc::new(TableManager::new()),
         ops_cache: Arc::new(RwLock::new(None)),
     });
 
@@ -43,33 +43,71 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     let _ = log_sender.send(format!("Server started on http://{}", addr)).await;
     
-    // --- SMART PRE-WARMING ---
-    // Carga en segundo plano las tablas que se usan en las operaciones guardadas.
+    // --- CACHE WARMING & MAINTENANCE ---
+    // Periodically re-warms tables used in saved queries to prevent OS page cache eviction.
     let warm_state = state.clone();
     let warm_logger = log_sender.clone();
     tokio::spawn(async move {
-        let start = std::time::Instant::now();
-        if let Ok(ops) = load_operations() {
-            let mut targets = std::collections::HashSet::new();
-            for op in ops {
-                if let SavedOperation::Read(q) = op {
-                    targets.insert((q.entity, q.table));
+        loop {
+            let start = std::time::Instant::now();
+            // Reload operations from disk
+            if let Ok(ops) = load_operations() {
+                let mut targets: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
+                
+                for op in ops {
+                    if let SavedOperation::Read(q) = op {
+                        let entry = targets.entry((q.entity.clone(), q.table.clone())).or_default();
+                        // Add selected fields
+                        for f in &q.selected_fields { if f != "*" { entry.insert(f.clone()); } }
+                        // Add filter fields
+                        for f in &q.filters { if f.field != "?" { entry.insert(f.field.clone()); } }
+                        // Add order by fields
+                        for o in &q.order_by { entry.insert(o.field.clone()); }
+                        // Add aggregation fields
+                        for agg in &q.aggregations {
+                            if let Some(obj) = agg.as_object() {
+                                for val in obj.values() {
+                                    if let Some(inner) = val.as_object() {
+                                        if let Some(f) = inner.get("field").and_then(|v| v.as_str()) {
+                                             if f != "?" { entry.insert(f.to_string()); }
+                                        }
+                                        // Handle expressions fields if needed? (Complex, skipping for now)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if !targets.is_empty() {
+                    let warm_state_inner = warm_state.clone();
+                    
+                    // Run blocking IO task
+                    let res = tokio::task::spawn_blocking(move || {
+                        let mut warmed_count = 0;
+                        for ((entity, table_name), fields_set) in targets {
+                            if let Ok(table_lock) = warm_state_inner.table_manager.get_table(&entity, &table_name) {
+                                let fields: Vec<String> = fields_set.into_iter().collect();
+                                let table = table_lock.read().unwrap();
+                                if table.warm_up(&fields).is_ok() {
+                                    warmed_count += 1;
+                                }
+                            }
+                        }
+                        warmed_count
+                    }).await;
+
+                    if let Ok(c) = res {
+                        let elapsed = start.elapsed().as_millis();
+                        // Only log if it took significant time (>100ms), to avoid noise
+                        if elapsed > 100 { 
+                            let _ = warm_logger.send(format!("  -> Maintenance: Warmed {} tables in {}ms", c, elapsed)).await;
+                        }
+                    }
                 }
             }
-            
-            if !targets.is_empty() {
-                let count = targets.len();
-                // Ejecutamos la carga en un hilo blocking para no afectar el event loop
-                tokio::task::spawn_blocking(move || {
-                    for (entity, table) in targets {
-                        // Al llamar a get_table, se carga en el cache del TableManager
-                        let _ = warm_state.table_manager.get_table(&entity, &table);
-                    }
-                }).await.ok();
-                
-                let elapsed = start.elapsed().as_millis();
-                let _ = warm_logger.send(format!("  -> Pre-warmed {} unique tables in {}ms", count, elapsed)).await;
-            }
+            // Sleep for 5 minutes
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
     // -------------------------
@@ -339,7 +377,7 @@ async fn execute_read_operation(
         params.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
     } else {
         query.limit
-    }.unwrap_or(100);
+    }.unwrap_or(100).min(100);
     let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
 
@@ -352,23 +390,24 @@ async fn execute_read_operation(
         query.selected_fields.clone()
     };
 
-    let query_entity = query.entity.clone();
-    let query_table = query.table.clone();
-    let state_clone = state.clone();
+    let query_entity_for_search = query.entity.clone();
+    let query_table_for_search = query.table.clone();
+    let state_clone_for_search = state.clone();
+    let fields_for_search = fields.clone();
 
     let setup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let engine_start = std::time::Instant::now();
 
     let result = tokio::task::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
-        let table_res = state_clone.table_manager.get_table(&query_entity, &query_table);
+        let table_res = state_clone_for_search.table_manager.get_table(&query_entity_for_search, &query_table_for_search);
         let t1 = std::time::Instant::now();
 
         match table_res {
             Ok(table_lock) => {
                 let table = table_lock.read().unwrap();
                 let t2 = std::time::Instant::now();
-                let mut search_res = table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)?;
+                let mut search_res = table.search(&fields_for_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)?;
                 
                 // Add server-side timing diagnostics to debug_info
                 let open_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
@@ -389,12 +428,33 @@ async fn execute_read_operation(
     let engine_total_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
 
     match result {
-        Ok(result) => {
+        Ok(query_result) => {
             let mapping_start = std::time::Instant::now();
-            let headers = &result.headers;
-            let rows = result.rows;
+            let headers = &query_result.headers;
             
-            let row_to_json = |headers: &[String], row: &[String]| {
+            // --- LAZY LOADING OPTIMIZATION ---
+            // If the motor returned row_ids but empty rows (lazy mode), fetch them now.
+            // This is safer for memory as we don't hold two copies of the data as long.
+            let rows = if query_result.rows.is_empty() && query_result.row_ids.is_some() {
+                let ids = query_result.row_ids.as_ref().unwrap().clone();
+                let entity_inner = query.entity.clone();
+                let table_inner = query.table.clone();
+                let fields_inner = fields.clone();
+                let table_manager_inner = state.table_manager.clone();
+                
+                // Fetch all rows in one go for HTTP (as we must return a single JSON)
+                let fetch_res: anyhow::Result<Vec<Vec<String>>> = tokio::task::spawn_blocking(move || {
+                    let table_lock = table_manager_inner.get_table(&entity_inner, &table_inner).unwrap();
+                    let table = table_lock.read().unwrap();
+                    table.get_rows_batch(&fields_inner, &ids)
+                }).await.unwrap();
+                fetch_res.unwrap()
+            } else {
+                query_result.rows
+            };
+            // ---------------------------------
+
+            let row_to_json = |headers: &[String], row: &Vec<String>| {
                 let mut map = serde_json::Map::new();
                 for (i, header) in headers.iter().enumerate() {
                     if let Some(val) = row.get(i) {
@@ -424,7 +484,7 @@ async fn execute_read_operation(
                 row_to_json(headers, &row)
             }).collect();
 
-            let aggregations_data: Option<Vec<serde_json::Value>> = result.aggregations.map(|aggs| {
+            let aggregations_data: Option<Vec<serde_json::Value>> = query_result.aggregations.map(|aggs| {
                 aggs.into_iter().map(|agg| {
                     let agg_headers = agg.headers;
                     let rows_json: Vec<serde_json::Map<String, serde_json::Value>> = agg.rows.into_iter().map(|row| {
@@ -439,7 +499,7 @@ async fn execute_read_operation(
             });
 
             let mapping_ms = mapping_start.elapsed().as_secs_f64() * 1000.0;
-            let engine_time_ms = result.execution_time_micros as f64 / 1000.0;
+            let engine_time_ms = query_result.execution_time_micros as f64 / 1000.0;
             
             let mut response_map = serde_json::Map::new();
             
@@ -459,20 +519,20 @@ async fn execute_read_operation(
                 "setup_ms": setup_ms,
                 "mapping_ms": mapping_ms,
                 "total_server_ms": total_server_ms,
-                "total_found": result.total_found,
+                "total_found": query_result.total_found,
                 "fields_count": headers.len(),
-                "debug_info": result.debug_info
+                "debug_info": query_result.debug_info
             }));
             
             // Solo incluir paginación si hay registros totales Y NO es solo una agregación
             // O si hay data presente
-            if result.total_found > 0 && !headers.is_empty() {
-                let total_pages = if limit > 0 { (result.total_found + limit - 1) / limit } else { 1 };
+            if query_result.total_found > 0 && !headers.is_empty() {
+                let total_pages = if limit > 0 { (query_result.total_found + limit - 1) / limit } else { 1 };
                 response_map.insert("pagination".to_string(), serde_json::json!({
                     "page": page,
                     "per_page": limit,
                     "total_pages": total_pages.max(1),
-                    "total_items": result.total_found
+                    "total_items": query_result.total_found
                 }));
             }
 

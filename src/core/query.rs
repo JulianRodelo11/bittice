@@ -45,7 +45,7 @@ pub fn execute_query(
 ) -> Result<QueryResult> {
     let start_time = Instant::now();
     if fields.is_empty() && aggregations.is_empty() {
-        return Ok(QueryResult { headers: vec![], rows: vec![], total_found: 0, execution_time_micros: 0, debug_info: None, aggregations: None });
+        return Ok(QueryResult { headers: vec![], rows: vec![], row_ids: None, total_found: 0, execution_time_micros: 0, debug_info: None, aggregations: None });
     }
 
     let base_path = Path::new("data").join(entity).join(table);
@@ -193,7 +193,7 @@ pub fn execute_query(
         }).collect()
     }).collect();
 
-    Ok(QueryResult { headers: fields.to_vec(), rows, total_found, execution_time_micros: start_time.elapsed().as_micros(), debug_info: None, aggregations: None })
+    Ok(QueryResult { headers: fields.to_vec(), rows, row_ids: None, total_found, execution_time_micros: start_time.elapsed().as_micros(), debug_info: None, aggregations: None })
 }
 
 fn mmap_field(stores_dir: &Path, field: &str) -> Result<(Mmap, Mmap)> {
@@ -306,5 +306,5 @@ fn handle_aggregations(
             }
         }
     }
-    Ok(QueryResult { headers, rows, total_found: 0, execution_time_micros: 0, debug_info: None, aggregations: None })
+    Ok(QueryResult { headers, rows, row_ids: None, total_found: 0, execution_time_micros: 0, debug_info: None, aggregations: None })
 }

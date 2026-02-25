@@ -91,6 +91,8 @@ pub struct AggregationResult {
 pub struct QueryResult {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// Optional row identifiers (segment_id, local_id) for lazy-fetching
+    pub row_ids: Option<Vec<(u64, u32)>>,
     pub total_found: usize,
     pub execution_time_micros: u128,
     pub debug_info: Option<String>,
