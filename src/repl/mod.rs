@@ -11,14 +11,15 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{prelude::*};
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::Terminal;
 use state::{App, LoadStep};
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 use ui::ui;
 use crate::ui::colors;
-use utils::{get_path_suggestions, get_loaded_data};
+use crate::repl::utils::{get_path_suggestions, get_loaded_data};
 use tokio::sync::{mpsc, oneshot};
 use view::{handle_bittice_input};
 
@@ -52,23 +53,12 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
     loop {
         terminal.draw(|f| ui(f, app, colors::PRIMARY_COLOR))?;
 
-        // Si estamos en estado de procesamiento, ejecutamos la tarea y luego limpiamos
         if let LoadStep::Processing = app.load_step {
-             // Calcular posición Y para el spinner (Misma lógica que ui.rs)
-            // Top Margin (2) + Menu (7) + LoadedData + Separator (1)
             let loaded_data = get_loaded_data();
-            let loaded_height = if loaded_data.is_empty() {
-                0
-            } else {
-                (loaded_data.len() as u16).min(8) + 1
-            };
-            
-            // Y exacto donde empieza el bloque de input
+            let loaded_height = if loaded_data.is_empty() { 0 } else { (loaded_data.len() as u16).min(8) + 1 };
             let spinner_y = 2 + 7 + loaded_height + 1;
-            // X alineado con el margen: 4 (margin)
             let spinner_x = 4;
 
-            // Ejecutar tarea bloqueante (CLI Spinner)
             let _ = execute_load_tui(
                 &app.ndjson_path,
                 &app.entity_name,
@@ -77,10 +67,8 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
                 spinner_y
             );
 
-            // LIMPIEZA POST-CARGA: Forzar a Ratatui a redibujar todo
             let _ = terminal.clear(); 
 
-            // Finalizamos la tarea y volvemos al menú principal
             app.active_task = None;
             app.load_step = LoadStep::InputPath;
             app.input_buffer.clear();
@@ -89,12 +77,9 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
             app.table_name.clear();
             app.suggestions.clear();
             app.suggestion_index = None;
-            
-            // Forzar redibujado inmediato con el nuevo estado
             continue;
         }
 
-        // Poll Server Logs
         if let Some(rx) = &mut app.server_log_receiver {
              while let Ok(msg) = rx.try_recv() {
                  app.server_logs.push(msg);
@@ -105,7 +90,6 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
             let ev = event::read()?;
             
             if app.active_task == Some("Bittice") {
-                // Filter out non-press key events to prevent double processing
                 if let Event::Key(key) = ev {
                     if key.kind != KeyEventKind::Press { continue; }
                 }
@@ -169,14 +153,9 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
         KeyCode::Enter => match app.menu_state.selected() {
             Some(0) => {
                 app.active_task = Some("Load");
-                app.status_message = None; // Limpiar mensajes previos
-                // Iniciar sugerencias desde LOCAL inmediatamente al entrar
+                app.status_message = None;
                 app.suggestions = get_path_suggestions("./");
-                app.suggestion_index = if app.suggestions.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                };
+                app.suggestion_index = if app.suggestions.is_empty() { None } else { Some(0) };
             }
             Some(1) => {
                 search::init_crud(app, crate::repl::state::SearchCriteria::Create);
@@ -200,7 +179,6 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
                 }
             }
             Some(6) => {
-                // Start Local Server
                 app.active_task = Some("Server");
                 let (log_tx, log_rx) = mpsc::channel(100);
                 app.server_log_receiver = Some(log_rx);
@@ -213,7 +191,6 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
                 app.endpoint_state.select(Some(0));
                 app.log_state.select(Some(0));
 
-                // Spawn server thread
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     rt.block_on(crate::server::start_server(log_tx, shutdown_rx));
@@ -377,7 +354,6 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
                 }
                 crate::repl::state::ServerFocus::Logs => {
                     if let Some(i) = app.log_state.selected() {
-                        // Logs are rev() in UI, so we need to match that
                         let logs: Vec<_> = app.server_logs.iter().rev().collect();
                         if let Some(log) = logs.get(i) {
                             let _ = clipboard.set_text((*log).clone());
@@ -394,23 +370,15 @@ fn handle_server_input(app: &mut App, key: event::KeyEvent) {
 fn handle_load_input(app: &mut App, key: event::KeyEvent) {
     match key.code {
         KeyCode::Enter => {
-            // 1. Manejo de selección de sugerencia (Prioritario)
             if let Some(idx) = app.suggestion_index {
                 if !app.suggestions.is_empty() && idx < app.suggestions.len() {
                     let selected = &app.suggestions[idx];
-
-                    // Si es directorio (termina en /), navegamos
                     if selected.ends_with(std::path::MAIN_SEPARATOR) {
                         app.input_buffer = selected.clone();
                         app.suggestions = get_path_suggestions(&app.input_buffer);
-                        app.suggestion_index = if app.suggestions.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        };
+                        app.suggestion_index = if app.suggestions.is_empty() { None } else { Some(0) };
                         return;
                     }
-                    // Si es archivo .ndjson, LO SELECCIONAMOS Y AVANZAMOS
                     else if selected.ends_with(".ndjson") {
                         app.ndjson_path = selected.clone();
                         app.input_buffer.clear();
@@ -422,7 +390,6 @@ fn handle_load_input(app: &mut App, key: event::KeyEvent) {
                 }
             }
 
-            // 2. Manejo normal de Enter
             match app.load_step {
                 LoadStep::InputPath => {
                     if !app.input_buffer.is_empty() {
@@ -435,12 +402,8 @@ fn handle_load_input(app: &mut App, key: event::KeyEvent) {
                 }
                 LoadStep::InputEntity => {
                     if app.input_buffer.is_empty() {
-                        // Si está vacío, intentar usar el nombre del archivo como default
                         let path = Path::new(&app.ndjson_path);
-                        app.entity_name = path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("default")
-                            .to_string();
+                        app.entity_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_string();
                     } else {
                         app.entity_name = app.input_buffer.clone();
                     }
@@ -449,12 +412,8 @@ fn handle_load_input(app: &mut App, key: event::KeyEvent) {
                 }
                 LoadStep::InputTable => {
                     if app.input_buffer.is_empty() {
-                        // Si está vacío, usar el nombre del archivo como nombre de tabla (no el de la entidad)
                         let path = Path::new(&app.ndjson_path);
-                        app.table_name = path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("records")
-                            .to_string();
+                        app.table_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("records").to_string();
                     } else {
                         app.table_name = app.input_buffer.clone();
                     }
@@ -506,5 +465,3 @@ fn handle_load_input(app: &mut App, key: event::KeyEvent) {
         _ => {}
     }
 }
-
-
