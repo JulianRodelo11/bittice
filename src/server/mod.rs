@@ -384,7 +384,7 @@ async fn execute_read_operation(
     let fields = if !param_fields.is_empty() {
         param_fields
     } else if query.selected_fields.is_empty() && query.aggregations.is_empty() {
-        let all_fields = crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &query.entity, &query.table);
+        let all_fields = crate::repl::utils::get_indexed_fields(&query.entity, &query.table);
         crate::repl::utils::get_base_fields(&all_fields)
     } else {
         query.selected_fields.clone()

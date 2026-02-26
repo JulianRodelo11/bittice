@@ -18,7 +18,9 @@ pub fn init_crud(app: &mut App, mode: SearchCriteria) {
     app.search_criteria = SearchCriteria::Entity;
     
     // Read entities
-    if let Ok(entries) = std::fs::read_dir("data") {
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() { data_path = Path::new("data"); }
+    if let Ok(entries) = std::fs::read_dir(data_path) {
         app.search_entities = entries.flatten()
             .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -49,8 +51,11 @@ pub fn init_search(app: &mut App) {
     app.focus_panel = FocusPanel::Left;
     app.search_entities.clear();
     
-    // LEER ENTIDADES DESDE data/
-    if let Ok(entries) = std::fs::read_dir("data") {
+    // LEER ENTIDADES
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() { data_path = Path::new("data"); }
+
+    if let Ok(entries) = std::fs::read_dir(data_path) {
         app.search_entities = entries.flatten()
             .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -738,7 +743,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                             app.filters[f_idx].field = field.clone();
                                             // ACTUALIZAR VALORES EXISTENTES
                                             let mut values = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                                                get_field_values(Path::new("data"), e, t, field)
+                                                get_field_values(e, t, field)
                                             } else {
                                                 vec!["Write value".to_string(), "Variable (ask later)".to_string()]
                                             };
@@ -878,7 +883,7 @@ pub fn handle_search_input(app: &mut App, key: event::KeyEvent) {
                                  match app.right_panel_state.selected() {
                                      Some(0) => {
                                          let fields = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                                             get_order_by_fields(Path::new("data"), e, t)
+                                             get_order_by_fields(e, t)
                                          } else {
                                              vec![]
                                          };
@@ -962,7 +967,9 @@ fn execute_search_action(app: &mut App) {
              start_y,
              start_x,
              |_, _| {
-                 let base_path = Path::new("data").join(&entity);
+                 let mut data_path = Path::new("bittice/data");
+                 if !data_path.exists() { data_path = Path::new("data"); }
+                 let base_path = data_path.join(&entity);
                  let table = Table::open(&base_path, &table_name)?;
                  
                  // Execute Search on Table
@@ -985,7 +992,7 @@ fn load_saved_query_into_app(app: &mut App, query: &SavedQuery) {
     
     // Explicitly load available fields regardless of search_criteria
     if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-        app.available_fields = get_indexed_fields(Path::new("data"), e, t);
+        app.available_fields = get_indexed_fields(e, t);
     }
     
     // Update other panel content (like table list if we are in Entity view)
@@ -1114,7 +1121,7 @@ fn navigate_list(app: &mut App, delta: isize) {
                     match app.right_panel_state.selected() {
                         Some(0) => {
                             if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                                get_order_by_fields(Path::new("data"), e, t).len()
+                                get_order_by_fields(e, t).len()
                             } else {
                                 0
                             }
@@ -1236,7 +1243,7 @@ fn navigate_list(app: &mut App, delta: isize) {
 
                     if let Some(field) = fields.get(next) {
                         let mut values = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                            get_field_values(Path::new("data"), e, t, field)
+                            get_field_values(e, t, field)
                         } else {
                             vec![]
                         };
@@ -1331,8 +1338,10 @@ fn execute_search_action_with_resolved_vars(app: &mut App) {
              start_y,
              start_x,
              |_, _| {
-                 let base_path = Path::new("data").join(&entity);
-                                                                   let table = Table::open(&base_path, &table_name)?;
+                 let mut data_path = Path::new("bittice/data");
+                 if !data_path.exists() { data_path = Path::new("data"); }
+                 let base_path = data_path.join(&entity);
+                 let table = Table::open(&base_path, &table_name)?;
                                   match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, 0) {
                      Ok(result) => {
                          app.search_results = Some(result);
@@ -1399,7 +1408,9 @@ fn execute_paged_query(app: &mut App) {
             "Fetching next page...",
             spinner_y, 4,
             |_, _| {
-                                                  let base_path = Path::new("data").join(&entity);
+                                                  let mut data_path = Path::new("bittice/data");
+                                                  if !data_path.exists() { data_path = Path::new("data"); }
+                                                  let base_path = data_path.join(&entity);
                                                   let table = Table::open(&base_path, &table_name)?;
                                                   
                                                   match table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset) {
@@ -1421,7 +1432,9 @@ pub fn update_middle_panel_content(app: &mut App) {
         SearchCriteria::Table => {
             app.search_tables.clear();
             if let Some(entity) = &app.selected_entity {
-                let path = format!("data/{}", entity);
+                let mut data_path = Path::new("bittice/data");
+                if !data_path.exists() { data_path = Path::new("data"); }
+                let path = data_path.join(entity);
                 if let Ok(tables) = std::fs::read_dir(path) {
                     app.search_tables = tables.flatten()
                         .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
@@ -1432,7 +1445,7 @@ pub fn update_middle_panel_content(app: &mut App) {
             app.search_tables.sort();
 
             if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                app.available_fields = get_indexed_fields(Path::new("data"), e, t);
+                app.available_fields = get_indexed_fields(e, t);
             } else {
                 app.available_fields.clear();
             }
@@ -1540,7 +1553,7 @@ pub fn handle_crud_input(app: &mut App, key: event::KeyEvent) {
                     if let Some(idx) = app.middle_panel_state.selected() {
                         app.selected_table = app.search_tables.get(idx).cloned();
                         if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-                            app.available_fields = get_indexed_fields(Path::new("data"), e, t);
+                            app.available_fields = get_indexed_fields(e, t);
                             
                             app.crud_payload.clear();
                             // Only auto-populate for Update, not for Create
@@ -1762,7 +1775,9 @@ fn execute_crud_action(app: &mut App) {
 
 fn execute_crud_action_with_resolved_vars(app: &mut App) {
     if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) {
-        let base_path = Path::new("data").join(e);
+        let mut data_path = Path::new("bittice/data");
+        if !data_path.exists() { data_path = Path::new("data"); }
+        let base_path = data_path.join(e);
         let mut table = match Table::open(&base_path, t) {
             Ok(table) => table,
             Err(err) => {

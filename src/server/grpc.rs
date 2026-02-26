@@ -117,7 +117,7 @@ async fn execute_query_internal(
     let offset = offset_override as usize;
 
     let fields = if query.selected_fields.is_empty() && query.aggregations.is_empty() {
-         crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &entity, &table_name)
+         crate::repl::utils::get_indexed_fields(&entity, &table_name)
     } else { query.selected_fields.clone() };
 
     let table_manager_inner = table_manager.clone();
@@ -292,7 +292,7 @@ impl Database for MyDatabase {
             let limit = (req.limit as usize).min(100);
             let offset = req.offset as usize;
             let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-                crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &entity, &table_name)
+                crate::repl::utils::get_indexed_fields(&entity, &table_name)
             } else { req.selected_fields.clone() };
 
             let fields_for_search = fields.clone();
@@ -386,7 +386,7 @@ impl Database for MyDatabase {
         let limit = (req.limit as usize).min(100);
         let offset = req.offset as usize;
         let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-            crate::repl::utils::get_indexed_fields(std::path::Path::new("data"), &entity, &table_name)
+            crate::repl::utils::get_indexed_fields(&entity, &table_name)
         } else { req.selected_fields.clone() };
 
         let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {

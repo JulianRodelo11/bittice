@@ -1,5 +1,6 @@
+use crate::repl::view::bittice_ui;
 use crate::repl::state::{App, FocusPanel, SearchCriteria, FilterStep, LoadStep};
-use crate::repl::utils::{get_loaded_data, get_filtered_fields, get_base_fields, get_order_by_fields};
+use crate::repl::utils::{get_filtered_fields, get_base_fields, get_order_by_fields, get_loaded_data};
 use crate::core::saved_queries::SavedOperation;
 use crate::ui::colors;
 use ratatui::layout::Margin;
@@ -7,7 +8,7 @@ use ratatui::{prelude::*, widgets::*};
 use std::path::Path;
 
 pub fn ui(f: &mut Frame, app: &mut App, _purple: Color) {
-    let size = f.size();
+    let size = f.area();
     let root_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(2)])
@@ -20,7 +21,9 @@ pub fn ui(f: &mut Frame, app: &mut App, _purple: Color) {
 
     let is_overlay_active = app.is_saving_query || app.show_saved_queries || app.is_prompting_variable;
 
-    if matches!(app.active_task, Some("Search") | Some("Create") | Some("Update") | Some("Delete") | Some("Batch")) {
+    if app.active_task == Some("Bittice") {
+        bittice_ui(f, app);
+    } else if matches!(app.active_task, Some("Search") | Some("Create") | Some("Update") | Some("Delete") | Some("Batch")) {
         draw_search_ui(f, app, central_area, is_overlay_active);
         draw_overlays(f, app, size);
     } else if app.active_task == Some("Load") {
@@ -308,7 +311,7 @@ fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
                     if let Some(o) = app.order_by.get(app.middle_panel_state.selected().unwrap_or(0)) {
                         match app.right_panel_state.selected().unwrap_or(0) {
                             0 => {
-                                let fields = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) { get_order_by_fields(Path::new("data"), e, t) } else { vec![] };
+                                let fields = if let (Some(e), Some(t)) = (&app.selected_entity, &app.selected_table) { get_order_by_fields(e, t) } else { vec![] };
                                 fields.into_iter().map(|f| ListItem::new(Line::from(vec![if o.field == f { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(format!(" {}", f))]))).collect()
                             }
                             _ => vec![ListItem::new(Line::from(vec![if o.direction == crate::repl::state::SortDirection::Asc { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Asc")])), ListItem::new(Line::from(vec![if o.direction == crate::repl::state::SortDirection::Desc { Span::styled("◉", Style::default().fg(active_color)) } else { Span::raw("○") }, Span::raw(" Desc")]))]
@@ -555,14 +558,19 @@ fn draw_input_widget_with_label(f: &mut Frame, app: &mut App, area: Rect, placeh
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if is_focused { colors::SAND } else { purple_muted }));
     f.render_widget(&block, area);
-    let inner = block.inner(area).inner(&Margin { vertical: 0, horizontal: 1 });
+    let inner = block.inner(area).inner(Margin { vertical: 0, horizontal: 1 });
     let centered_area = Rect { x: inner.x, y: inner.y + (inner.height / 2), width: inner.width, height: 1 };
     let buffer = if matches!(app.active_task, Some("Search") | Some("Create") | Some("Update") | Some("Delete")) { &app.filter_value_input } else { &app.input_buffer };
     let mut spans = vec![Span::styled(" > ", Style::default().fg(colors::SAND).add_modifier(Modifier::BOLD))];
     if buffer.is_empty() { spans.push(Span::styled(" ", Style::default().bg(Color::White))); spans.push(Span::raw(" ")); spans.push(Span::styled(placeholder, Style::default().fg(Color::DarkGray))); } 
     else { spans.push(Span::raw(" ")); spans.push(Span::raw(buffer)); }
     f.render_widget(Paragraph::new(Line::from(spans)), centered_area);
-    if !buffer.is_empty() { f.set_cursor(centered_area.x + 4 + buffer.chars().count() as u16, centered_area.y); }
+    if !buffer.is_empty() { 
+        f.set_cursor_position(Position::new(
+            centered_area.x + 4 + buffer.chars().count() as u16, 
+            centered_area.y
+        )); 
+    }
 }
 
 

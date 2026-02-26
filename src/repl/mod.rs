@@ -1,6 +1,7 @@
 pub mod state;
 pub mod ui;
 pub mod utils;
+pub mod view;
 
 use crate::commands::load::execute_load_tui;
 use crate::commands::search;
@@ -19,11 +20,12 @@ use ui::ui;
 use crate::ui::colors;
 use utils::{get_path_suggestions, get_loaded_data};
 use tokio::sync::{mpsc, oneshot};
+use view::{handle_bittice_input};
 
 pub fn run_interactive() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, event::EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -100,7 +102,18 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
         }
 
         if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
+            let ev = event::read()?;
+            
+            if app.active_task == Some("Bittice") {
+                // Filter out non-press key events to prevent double processing
+                if let Event::Key(key) = ev {
+                    if key.kind != KeyEventKind::Press { continue; }
+                }
+                handle_bittice_input(app, ev)?;
+                continue;
+            }
+
+            match ev {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press { continue; }
 
@@ -206,7 +219,10 @@ fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
                     rt.block_on(crate::server::start_server(log_tx, shutdown_rx));
                 });
             }
-            Some(7) => return Err(anyhow::anyhow!("Quit")),
+            Some(7) => {
+                app.active_task = Some("Bittice");
+            }
+            Some(8) => return Err(anyhow::anyhow!("Quit")),
             _ => {}
         },
         _ => {}

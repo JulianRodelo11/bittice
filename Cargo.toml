@@ -16,8 +16,9 @@ anyhow = "1.0"
 console = "0.15"
 # rustyline = "14.0" # Ya no lo necesitamos para el menú principal
 shell-words = "1.1"
-ratatui = "0.26"
-crossterm = "0.27"
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = { version = "0.7", features = ["ratatui", "crossterm"] }
 memmap2 = "0.9"
 tokio = { version = "1.36", features = ["full"] }
 axum = { version = "0.7.5", features = ["macros"] }

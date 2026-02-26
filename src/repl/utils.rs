@@ -1,4 +1,128 @@
 use std::path::Path;
+use crate::core::storage::manifest::Manifest;
+use crate::repl::state::{CatalogNode, CatalogNodeType};
+
+pub fn get_catalog_tree() -> Vec<CatalogNode> {
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() {
+        data_path = Path::new("data");
+    }
+    
+    let mut nodes = Vec::new();
+    if let Ok(entities) = std::fs::read_dir(data_path) {
+        let mut entity_entries: Vec<_> = entities.flatten().collect();
+        entity_entries.sort_by_key(|a| a.file_name());
+        for entity in entity_entries {
+            if let Ok(ft) = entity.file_type() {
+                if ft.is_dir() {
+                    let entity_name = entity.file_name().to_string_lossy().to_string();
+                    let mut tables_nodes = Vec::new();
+                    if let Ok(tables) = std::fs::read_dir(entity.path()) {
+                        let mut table_entries: Vec<_> = tables.flatten().collect();
+                        table_entries.sort_by_key(|a| a.file_name());
+                        for table in table_entries {
+                            if let Ok(t_ft) = table.file_type() {
+                                if t_ft.is_dir() {
+                                    let table_name = table.file_name().to_string_lossy().to_string();
+                                    let mut fields = get_table_original_fields(&entity_name, &table_name);
+                                    fields.sort();
+                                    let field_nodes = fields.into_iter().map(|f| CatalogNode {
+                                        name: f,
+                                        node_type: CatalogNodeType::Field,
+                                        children: Vec::new(),
+                                        is_expanded: false,
+                                        depth: 2,
+                                    }).collect();
+                                    
+                                    tables_nodes.push(CatalogNode {
+                                        name: table_name,
+                                        node_type: CatalogNodeType::Table,
+                                        children: field_nodes,
+                                        is_expanded: true,
+                                        depth: 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    nodes.push(CatalogNode {
+                        name: entity_name,
+                        node_type: CatalogNodeType::Entity,
+                        children: tables_nodes,
+                        is_expanded: true,
+                        depth: 0,
+                    });
+                }
+            }
+        }
+    }
+    nodes
+}
+
+pub fn flatten_catalog_nodes(nodes: &[CatalogNode], result: &mut Vec<String>, parent_is_last: &[bool]) {
+    for (i, node) in nodes.iter().enumerate() {
+        let is_last = i == nodes.len() - 1;
+        let mut line = String::new();
+        
+        match node.node_type {
+            CatalogNodeType::Entity => {
+                line.push_str(&format!("󰆼{}", node.name));
+            }
+            CatalogNodeType::Table => {
+                let guide = if is_last { "└──" } else { "├──" };
+                line.push_str(&format!("{}󰓫{}", guide, node.name));
+            }
+            CatalogNodeType::Field => {
+                let mut guides = String::new();
+                for &p_last in &parent_is_last[1..] {
+                    if p_last { guides.push_str("   "); } else { guides.push_str("│  "); }
+                }
+                let branch = if is_last { "└──" } else { "├──" };
+                line.push_str(&format!("{}{}󰇽{}", guides, branch, node.name));
+            }
+        }
+        
+        result.push(line);
+        
+        if node.is_expanded && !node.children.is_empty() {
+            let mut next_parent_is_last = parent_is_last.to_vec();
+            next_parent_is_last.push(is_last);
+            flatten_catalog_nodes(&node.children, result, &next_parent_is_last);
+        }
+    }
+}
+
+pub fn toggle_catalog_node(nodes: &mut [CatalogNode], target_index: usize, current_index: &mut usize) -> bool {
+    for node in nodes.iter_mut() {
+        if *current_index == target_index {
+            node.is_expanded = !node.is_expanded;
+            return true;
+        }
+        *current_index += 1;
+        
+        if node.is_expanded && !node.children.is_empty() {
+            if toggle_catalog_node(&mut node.children, target_index, current_index) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn get_table_original_fields(entity: &str, table: &str) -> Vec<String> {
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() {
+        data_path = Path::new("data");
+    }
+    let manifest_path = data_path.join(entity).join(table).join("manifest.json");
+    if let Ok(file) = std::fs::File::open(manifest_path) {
+        let reader = std::io::BufReader::new(file);
+        if let Ok(manifest) = serde_json::from_reader::<_, Manifest>(reader) {
+            return manifest.original_fields;
+        }
+    }
+    Vec::new()
+}
 
 pub fn get_path_suggestions(input: &str) -> Vec<String> {
     let raw_query = if input.is_empty() { "./" } else { input };
@@ -45,8 +169,16 @@ pub fn get_path_suggestions(input: &str) -> Vec<String> {
 }
 
 pub fn get_loaded_data() -> Vec<String> {
-    let data_path = Path::new("data");
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() {
+        data_path = Path::new("data");
+    }
+    
     let mut tree_lines = Vec::new();
+    if !data_path.exists() {
+        return vec!["Error: 'data' folder not found".to_string(), format!("Checked: {:?}", std::env::current_dir())];
+    }
+
     if let Ok(entities) = std::fs::read_dir(data_path) {
         let mut entity_entries: Vec<_> = entities.flatten().collect();
         entity_entries.sort_by_key(|a| a.file_name());
@@ -66,10 +198,24 @@ pub fn get_loaded_data() -> Vec<String> {
                     }
                     tables_list.sort();
                     if !tables_list.is_empty() {
-                        tree_lines.push(format!("  ── {}", entity_name));
+                        tree_lines.push(format!("󰆼{}", entity_name)); // Database icon
                         for (i, table) in tables_list.iter().enumerate() {
-                            let prefix = if i == tables_list.len() - 1 { "     └── " } else { "     ├── " };
-                            tree_lines.push(format!("{}{}", prefix, table));
+                            let is_last_table = i == tables_list.len() - 1;
+                            let prefix = if is_last_table { "└──" } else { "├──" };
+                            tree_lines.push(format!("{}󰓫{}", prefix, table)); // Table icon
+                            
+                            // Original Fields
+                            let fields = get_table_original_fields(&entity_name, table);
+                            for (j, field) in fields.iter().enumerate() {
+                                let is_last_field = j == fields.len() - 1;
+                                let field_prefix = match (is_last_table, is_last_field) {
+                                    (false, false) => "│  ├──",
+                                    (false, true)  => "│  └──",
+                                    (true, false)  => "   ├──",
+                                    (true, true)   => "   └──",
+                                };
+                                tree_lines.push(format!("{}󰇽{}", field_prefix, field)); // Column icon
+                            }
                         }
                     }
                 }
@@ -79,7 +225,11 @@ pub fn get_loaded_data() -> Vec<String> {
     tree_lines
 }
 
-pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
+pub fn get_indexed_fields(entity: &str, table: &str) -> Vec<String> {
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() {
+        data_path = Path::new("data");
+    }
     let table_path = data_path.join(entity).join(table);
     let mut all_fields = std::collections::HashSet::new();
     
@@ -106,7 +256,11 @@ pub fn get_indexed_fields(data_path: &Path, entity: &str, table: &str) -> Vec<St
     result
 }
 
-pub fn get_entities(data_path: &Path) -> Vec<String> {
+pub fn get_entities() -> Vec<String> {
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() {
+        data_path = Path::new("data");
+    }
     let mut entities = Vec::new();
     if let Ok(entries) = std::fs::read_dir(data_path) {
         for entry in entries.flatten() {
@@ -121,7 +275,11 @@ pub fn get_entities(data_path: &Path) -> Vec<String> {
     entities
 }
 
-pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str) -> Vec<String> {
+pub fn get_field_values(entity: &str, table: &str, field: &str) -> Vec<String> {
+    let mut data_path = Path::new("bittice/data");
+    if !data_path.exists() {
+        data_path = Path::new("data");
+    }
     let mut values = vec!["Write value".to_string(), "Variable (ask later)".to_string()];
     let table_path = data_path.join(entity).join(table);
     let segments_dir = table_path.join("segments");
@@ -142,9 +300,9 @@ pub fn get_field_values(data_path: &Path, entity: &str, table: &str, field: &str
     values
 }
 
-pub fn get_order_by_fields(data_path: &Path, entity: &str, table: &str) -> Vec<String> {
+pub fn get_order_by_fields(entity: &str, table: &str) -> Vec<String> {
     // Aquí sí devolvemos todo lo disponible para ordenar
-    let all = get_indexed_fields(data_path, entity, table);
+    let all = get_indexed_fields(entity, table);
     all
 }
 

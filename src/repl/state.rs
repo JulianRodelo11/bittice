@@ -62,11 +62,43 @@ pub enum ServerFocus {
     Logs,
 }
 
+// Paneles principales en el modo Bittice
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum BitticePanel { Catalog, Editor, Results }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CatalogNodeType { Entity, Table, Field }
+
+#[derive(Clone, Debug)]
+pub struct CatalogNode {
+    pub name: String,
+    pub node_type: CatalogNodeType,
+    pub children: Vec<CatalogNode>,
+    pub is_expanded: bool,
+    pub depth: usize,
+}
+
 pub struct App {
     // --- Estado General ---
     pub menu_items: Vec<&'static str>,
     pub menu_state: ListState,
     pub active_task: Option<&'static str>,
+
+    // --- Tarea: Bittice ---
+    pub b_focused: BitticePanel,
+    pub b_editor_lines: Vec<String>,
+    pub b_cursor: (usize, usize), // (line, col)
+    pub b_selection: Option<((usize, usize), (usize, usize))>, // (start, end)
+    pub b_is_selecting: bool,
+    pub b_clipboard: Option<arboard::Clipboard>,
+    pub b_catalog_state: ListState,
+    pub b_catalog_nodes: Vec<CatalogNode>,
+    pub b_catalog_data: Vec<String>, // Cached tree lines
+    pub b_catalog_scroll: usize,
+    pub b_editor_scroll: usize,
+    pub b_editor_scroll_x: usize,
+    pub b_editor_viewport_height: u16,
+
 
     // --- Tarea: Load ---
     pub input_buffer: String,
@@ -190,9 +222,27 @@ impl App {
 
         App {
             // General
-            menu_items: vec!["Load", "Create", "Read", "Update", "Delete", "Batch", "Local Server", "Exit"],
+            menu_items: vec!["Load", "Create", "Read", "Update", "Delete", "Batch", "Local Server", "Bittice Query", "Exit"],
             menu_state,
-            active_task: None,
+            active_task: Some("Bittice"),
+            // Bittice
+            b_focused: BitticePanel::Catalog,
+            b_editor_lines: vec![String::new()],
+            b_cursor: (0, 0),
+            b_selection: None,
+            b_is_selecting: false,
+            b_clipboard: arboard::Clipboard::new().ok(),
+            b_catalog_state: {
+                let mut s = ListState::default();
+                s.select(Some(0));
+                s
+            },
+            b_catalog_nodes: Vec::new(),
+            b_catalog_data: Vec::new(),
+            b_catalog_scroll: 0,
+            b_editor_scroll: 0,
+            b_editor_scroll_x: 0,
+            b_editor_viewport_height: 0,
             // Load
             input_buffer: String::new(),
             load_step: LoadStep::InputPath,

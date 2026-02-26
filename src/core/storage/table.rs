@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::fs;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use memmap2::Mmap;
 use anyhow::{Result, Context};
 use roaring::RoaringBitmap;
