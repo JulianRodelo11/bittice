@@ -43,6 +43,36 @@ async fn main() -> Result<()> {
                     bittice::server::start_server(log_tx, shutdown_rx).await;
                 }
             }
+            Commands::Cdc { url, entity, database } => {
+                let worker = bittice::core::cdc::CdcWorker::new(url, entity, database);
+                worker.run().await?;
+            }
+            Commands::Query { entity, table, limit } => {
+                let base_path = std::path::Path::new("data").join(&entity);
+                let table_obj = bittice::core::storage::table::Table::open(&base_path, &table)?;
+                let fields = if !table_obj.manifest.original_fields.is_empty() {
+                    table_obj.manifest.original_fields.clone()
+                } else {
+                    // Si no hay campos originales, intentar deducirlos de los archivos .dat
+                    let mut detected = Vec::new();
+                    let seg_path = table_obj.base_path.join("segments").join("seg_0000");
+                    if let Ok(entries) = std::fs::read_dir(seg_path) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.ends_with(".dat") && !name.starts_with("bitmaps_") {
+                                detected.push(name.replace(".dat", ""));
+                            }
+                        }
+                    }
+                    detected
+                };
+                let result = table_obj.search(&fields, &[], &bittice::core::types::LogicalOp::And, &[], &[], limit, 0)?;
+                println!("Query results for {}/{} (total found: {}):", entity, table, result.total_found);
+                println!("Headers: {:?}", result.headers);
+                for row in result.rows {
+                    println!("{:?}", row);
+                }
+            }
         }
     } else {
         // Run REPL in a blocking way on this thread.

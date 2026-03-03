@@ -33,4 +33,28 @@ pub enum Commands {
         #[arg(short, long, default_value = "grpc")]
         r#type: String,
     },
+    /// Inicia la sincronización CDC desde MySQL
+    Cdc {
+        /// URL de conexión MySQL (ej: mysql://root:sakila@localhost:3306/sakila)
+        #[arg(short, long)]
+        url: String,
+        /// Nombre de la entidad en Bittice
+        #[arg(short, long)]
+        entity: String,
+        /// Base de datos a sincronizar
+        #[arg(short, long)]
+        database: String,
+    },
+    /// Consulta una tabla directamente (CLI)
+    Query {
+        /// Nombre de la entidad
+        #[arg(short, long)]
+        entity: String,
+        /// Nombre de la tabla
+        #[arg(short, long)]
+        table: String,
+        /// Límite de resultados
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+    },
 }

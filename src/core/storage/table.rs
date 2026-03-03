@@ -104,6 +104,43 @@ impl Table {
         Ok(table)
     }
 
+    pub fn reload_if_needed(&mut self) -> Result<()> {
+        let manifest_path = self.base_path.join("manifest.json");
+        if !manifest_path.exists() {
+            return Ok(());
+        }
+
+        // Solo recargamos si el archivo en disco es más nuevo que nuestro último registro
+        // O si no tenemos datos cargados aún.
+        if self.manifest.segments.is_empty() || self.manifest.last_sequence_number == 0 {
+             // Forzar carga inicial
+        } else {
+            // Nota: Aquí podríamos guardar el mtime en la estructura Table para ser más precisos,
+            // pero comparar el last_sequence_number del JSON es más seguro.
+        }
+
+        let file = fs::File::open(&manifest_path)?;
+        let reader = std::io::BufReader::new(file);
+        let new_manifest: Manifest = serde_json::from_reader(reader)?;
+
+        if new_manifest.last_sequence_number > self.manifest.last_sequence_number 
+           || (new_manifest.last_sequence_number == self.manifest.last_sequence_number && self.immutable_segments.is_empty() && !new_manifest.segments.is_empty()) 
+        {
+            println!("Table '{}' change detected (seq {} -> {}). Reloading segments...", 
+                self.name, self.manifest.last_sequence_number, new_manifest.last_sequence_number);
+            
+            self.manifest = new_manifest;
+            self.load_segments()?;
+            self.load_primary_index()?;
+            
+            // Limpiar el active segment para que se re-cree si es necesario
+            self.active_segment = None;
+            self.ensure_active_segment()?;
+        }
+
+        Ok(())
+    }
+
     fn load_primary_index(&mut self) -> Result<()> {
         let idx_path = self.base_path.join("primary.idx");
         if idx_path.exists() {
@@ -313,7 +350,10 @@ impl Table {
             } else { self.scan_segments_parallel(&segment_tasks, filters, filters_op)? }
         } else { self.scan_segments_parallel(&segment_tasks, filters, filters_op)? };
         let mut total_found = 0;
-        for (_, bitmap) in &segment_matches { total_found += bitmap.len(); }
+        for (seg_id, bitmap) in &segment_matches { 
+            total_found += bitmap.len(); 
+            println!("Search: Segment {} matched {} rows", seg_id, bitmap.len());
+        }
         let filter_elapsed = filter_start.elapsed().as_micros();
         let mut aggregation_results = Vec::new();
         let agg_start = std::time::Instant::now();

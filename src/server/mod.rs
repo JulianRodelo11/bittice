@@ -405,7 +405,9 @@ async fn execute_read_operation(
 
         match table_res {
             Ok(table_lock) => {
-                let table = table_lock.read().unwrap();
+                let mut table = table_lock.write().unwrap();
+                let _ = table.reload_if_needed(); // Forzar refresco si el CDC escribió algo nuevo
+                
                 let t2 = std::time::Instant::now();
                 let mut search_res = table.search(&fields_for_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)?;
                 

@@ -10,11 +10,25 @@ services:
         limits:
           cpus: '2.0'
           memory: 500M
-    # volumes:
+    volumes:
       # Montamos la carpeta local "data" en "/app/data" dentro del contenedor
       # Así los datos persisten aunque borres el contenedor.
-      # - ./data:/app/data
+      - ./data:/app/data
     environment:
       - BITTICE_HOST=0.0.0.0
     restart: unless-stopped
     command: ["./bittice", "server", "--type", "grpc", "--port", "50051"]
+
+  bittice-cdc:
+    build: .
+    container_name: bittice-cdc
+    depends_on:
+      - bittice-server
+    environment:
+      - BITTICE_HOST=0.0.0.0
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    # Conectamos al MySQL que corre en el host usando host.docker.internal 
+    # o si estuvieran en la misma red de docker, por nombre de servicio.
+    command: ["./bittice", "cdc", "--url", "mysql://root:sakila@host.docker.internal:3306/sakila", "--entity", "sakila", "--database", "sakila"]

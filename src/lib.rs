@@ -8,6 +8,7 @@ pub mod core {
     pub mod storage;
     pub mod types;
     pub mod expression;
+    pub mod cdc;
 }
 
 pub mod commands {
