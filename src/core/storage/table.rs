@@ -385,11 +385,20 @@ impl Table {
                 }
                 aggregation_results.push(crate::core::types::AggregationResult { headers: agg_headers, rows: agg_rows, summary: None });
             }
+            // EARLY RETURN: Si hay agregaciones y NO se pidieron campos específicos, devolver solo los agregados.
             if fields.is_empty() {
                 let total_elapsed = start_time.elapsed().as_micros();
                 let agg_elapsed = agg_start.elapsed().as_micros();
-                let debug = format!("Filter: {}ms, Agg: {}ms, Segments: {}", filter_elapsed / 1000, agg_elapsed / 1000, segment_tasks.len());
-                return Ok(QueryResult { headers: vec![], rows: vec![], row_ids: None, total_found: total_found as usize, execution_time_micros: total_elapsed, debug_info: Some(debug), aggregations: Some(aggregation_results) });
+                let debug = format!("Filter: {}ms, Agg: {}ms, Segments: {}, Mode: AggOnly", filter_elapsed / 1000, agg_elapsed / 1000, segment_tasks.len());
+                return Ok(QueryResult { 
+                    headers: vec![], 
+                    rows: vec![], 
+                    row_ids: None, 
+                    total_found: total_found as usize, 
+                    execution_time_micros: total_elapsed, 
+                    debug_info: Some(debug), 
+                    aggregations: Some(aggregation_results) 
+                });
             }
         }
         if limit == 0 {

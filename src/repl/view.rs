@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, BorderType, List, ListItem, Table as TuiTable, Row, Cell},
+    widgets::{Block, Borders, Paragraph, BorderType, List, ListItem},
     Frame,
 };
 use crossterm::event::{self, KeyCode, MouseEventKind, MouseButton, KeyModifiers};
@@ -26,9 +26,12 @@ struct QueryPayload {
     #[serde(default)]
     filters: Vec<crate::core::types::Filter>,
     #[serde(default)]
+    aggregations: Vec<serde_json::Value>,
+    #[serde(default)]
     fields: Vec<String>,
     #[serde(default)]
     order_by: Vec<crate::core::types::OrderBy>,
+    page: Option<usize>,
 }
 
 fn execute_query(app: &mut App) {
@@ -40,6 +43,8 @@ fn execute_query(app: &mut App) {
             return;
         }
     };
+
+    app.results_page = payload.page.unwrap_or(1).max(1);
 
     let mut data_path = Path::new("bittice/data");
     if !data_path.exists() { data_path = Path::new("data"); }
@@ -53,7 +58,7 @@ fn execute_query(app: &mut App) {
         }
     };
 
-    let fields = if payload.fields.is_empty() {
+    let fields = if payload.fields.is_empty() && payload.aggregations.is_empty() {
         get_base_fields(&get_indexed_fields(&payload.entity, &payload.table))
     } else {
         payload.fields
@@ -61,7 +66,10 @@ fn execute_query(app: &mut App) {
 
     app.status_message = Some(("Running query...".to_string(), true));
     
-    match table.search(&fields, &payload.filters, &crate::core::types::LogicalOp::And, &[], &payload.order_by, 100, 0) {
+    let limit = 100;
+    let offset = (app.results_page.saturating_sub(1)) * limit;
+    
+    match table.search(&fields, &payload.filters, &crate::core::types::LogicalOp::And, &payload.aggregations, &payload.order_by, limit, offset) {
         Ok(result) => {
             app.search_results = Some(result);
             app.status_message = Some(("Query executed successfully".to_string(), true));
@@ -91,10 +99,19 @@ fn validate_json_status(app: &mut App) {
 fn delete_selection(app: &mut App) -> bool {
     if let Some(((s_l, s_c), (e_l, e_c))) = get_sorted_selection(app.b_selection) {
         if s_l == e_l {
-            app.b_editor_lines[s_l].replace_range(s_c..e_c, "");
+            let line = &mut app.b_editor_lines[s_l];
+            let start_byte = line.char_indices().nth(s_c).map(|(i, _)| i).unwrap_or(line.len());
+            let end_byte = line.char_indices().nth(e_c).map(|(i, _)| i).unwrap_or(line.len());
+            line.replace_range(start_byte..end_byte, "");
         } else {
-            let prefix = app.b_editor_lines[s_l][..s_c].to_string();
-            let suffix = app.b_editor_lines[e_l][e_c..].to_string();
+            let prefix_line = &app.b_editor_lines[s_l];
+            let prefix_byte = prefix_line.char_indices().nth(s_c).map(|(i, _)| i).unwrap_or(prefix_line.len());
+            let prefix = prefix_line[..prefix_byte].to_string();
+
+            let suffix_line = &app.b_editor_lines[e_l];
+            let suffix_byte = suffix_line.char_indices().nth(e_c).map(|(i, _)| i).unwrap_or(suffix_line.len());
+            let suffix = suffix_line[suffix_byte..].to_string();
+
             app.b_editor_lines[s_l] = format!("{}{}", prefix, suffix);
             for _ in (s_l + 1)..=e_l {
                 app.b_editor_lines.remove(s_l + 1);
@@ -122,7 +139,7 @@ fn paste_and_format(app: &mut App, text: &str) {
         }
         if current_pos.0 < app.b_editor_lines.len() {
             app.b_editor_lines[current_pos.0].insert_str(current_pos.1, line_text);
-            current_pos.1 += line_text.len();
+            current_pos.1 += line_text.chars().count();
         }
     }
     app.b_cursor = current_pos;
@@ -145,14 +162,21 @@ fn get_selected_text(app: &App) -> Option<String> {
     
     for l_idx in s_l..=e_l {
         let line = &app.b_editor_lines[l_idx];
+        let chars: Vec<char> = line.chars().collect();
+        let line_len = chars.len();
+        
         if s_l == e_l {
-            selected.push(&line[s_c..e_c]);
+            let start = s_c.min(line_len);
+            let end = e_c.min(line_len);
+            selected.push(chars[start..end].iter().collect::<String>());
         } else if l_idx == s_l {
-            selected.push(&line[s_c..]);
+            let start = s_c.min(line_len);
+            selected.push(chars[start..].iter().collect::<String>());
         } else if l_idx == e_l {
-            selected.push(&line[..e_c]);
+            let end = e_c.min(line_len);
+            selected.push(chars[..end].iter().collect::<String>());
         } else {
-            selected.push(line);
+            selected.push(line.clone());
         }
     }
     Some(selected.join("\n"))
@@ -203,7 +227,7 @@ pub fn handle_bittice_input(app: &mut App, event: event::Event) -> anyhow::Resul
                         let rel_x = x.saturating_sub(editor_area.x + 1 + gutter_width);
                         
                         let target_y = (rel_y as usize + app.b_editor_scroll).min(app.b_editor_lines.len().saturating_sub(1));
-                        let target_x = (rel_x as usize + app.b_editor_scroll_x).min(app.b_editor_lines[target_y].len());
+                        let target_x = (rel_x as usize + app.b_editor_scroll_x).min(app.b_editor_lines[target_y].chars().count());
                         
                         app.b_cursor = (target_y, target_x);
                         app.b_selection = Some(((target_y, target_x), (target_y, target_x)));
@@ -228,7 +252,7 @@ pub fn handle_bittice_input(app: &mut App, event: event::Event) -> anyhow::Resul
                         let rel_x = (x as i32).saturating_sub(editor_area.x as i32 + 1 + gutter_width);
                         
                         let target_y = ((rel_y + app.b_editor_scroll as i32) as usize).clamp(0, app.b_editor_lines.len().saturating_sub(1));
-                        let target_x = ((rel_x + app.b_editor_scroll_x as i32) as usize).clamp(0, app.b_editor_lines[target_y].len());
+                        let target_x = ((rel_x + app.b_editor_scroll_x as i32) as usize).clamp(0, app.b_editor_lines[target_y].chars().count());
                         
                         app.b_cursor = (target_y, target_x);
                         if let Some((start, _)) = app.b_selection {
@@ -243,35 +267,45 @@ pub fn handle_bittice_input(app: &mut App, event: event::Event) -> anyhow::Resul
                     }
                 }
                 MouseEventKind::ScrollUp => {
-                    if app.b_focused == BitticePanel::Catalog && catalog_area.contains(pos) {
-                        app.b_catalog_scroll = app.b_catalog_scroll.saturating_sub(3);
-                        app.b_catalog_state.select(Some(app.b_catalog_scroll));
-                    } else if app.b_focused == BitticePanel::Editor && editor_area.contains(pos) {
-                        app.b_editor_scroll = app.b_editor_scroll.saturating_sub(3);
-                    } else if app.b_focused == BitticePanel::Results && results_area.contains(pos) {
-                        app.results_scroll = app.results_scroll.saturating_sub(3);
+                    match app.b_focused {
+                        BitticePanel::Catalog if catalog_area.contains(pos) => {
+                            app.b_catalog_scroll = app.b_catalog_scroll.saturating_sub(3);
+                            app.b_catalog_state.select(Some(app.b_catalog_scroll));
+                        }
+                        BitticePanel::Editor if editor_area.contains(pos) => {
+                            app.b_editor_scroll = app.b_editor_scroll.saturating_sub(3);
+                        }
+                        BitticePanel::Results if results_area.contains(pos) => {
+                            app.results_scroll = app.results_scroll.saturating_sub(3);
+                        }
+                        _ => {}
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if app.b_focused == BitticePanel::Catalog && catalog_area.contains(pos) {
-                        let visible_h = catalog_area.height.saturating_sub(2) as usize;
-                        let max_scroll = app.b_catalog_data.len().saturating_sub(visible_h);
-                        if app.b_catalog_scroll < max_scroll {
-                            app.b_catalog_scroll = (app.b_catalog_scroll + 3).min(max_scroll);
-                            app.b_catalog_state.select(Some(app.b_catalog_scroll));
+                    match app.b_focused {
+                        BitticePanel::Catalog if catalog_area.contains(pos) => {
+                            let visible_h = catalog_area.height.saturating_sub(2) as usize;
+                            let max_scroll = app.b_catalog_data.len().saturating_sub(visible_h);
+                            if app.b_catalog_scroll < max_scroll {
+                                app.b_catalog_scroll = (app.b_catalog_scroll + 3).min(max_scroll);
+                                app.b_catalog_state.select(Some(app.b_catalog_scroll));
+                            }
                         }
-                    } else if app.b_focused == BitticePanel::Editor && editor_area.contains(pos) {
-                        let visible_h = editor_area.height.saturating_sub(2) as usize;
-                        let max_editor = app.b_editor_lines.len().saturating_sub(visible_h);
-                        if app.b_editor_scroll < max_editor {
-                            app.b_editor_scroll = (app.b_editor_scroll + 3).min(max_editor);
+                        BitticePanel::Editor if editor_area.contains(pos) => {
+                            let visible_h = editor_area.height.saturating_sub(2) as usize;
+                            let max_editor = app.b_editor_lines.len().saturating_sub(visible_h);
+                            if app.b_editor_scroll < max_editor {
+                                app.b_editor_scroll = (app.b_editor_scroll + 3).min(max_editor);
+                            }
                         }
-                    } else if app.b_focused == BitticePanel::Results && results_area.contains(pos) {
-                        if let Some(results) = &app.search_results {
-                            let visible_h = results_area.height.saturating_sub(4) as usize;
-                            let max_scroll = results.rows.len().saturating_sub(visible_h);
-                            app.results_scroll = (app.results_scroll + 3).min(max_scroll as u16);
+                        BitticePanel::Results if results_area.contains(pos) => {
+                            if let Some(results) = &app.search_results {
+                                let visible_h = results_area.height.saturating_sub(4) as usize;
+                                let max_scroll = results.rows.len().saturating_sub(visible_h);
+                                app.results_scroll = (app.results_scroll + 3).min(max_scroll as u16);
+                            }
                         }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -341,31 +375,37 @@ pub fn handle_bittice_input(app: &mut App, event: event::Event) -> anyhow::Resul
 
 fn handle_native_editor(app: &mut App, key: event::KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let _shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let (mut l, mut c) = app.b_cursor;
+    let old_cursor = app.b_cursor;
     let mut changed = false;
 
     match key.code {
-        KeyCode::Char('a') if ctrl => {
+        KeyCode::Char('a') if ctrl || cmd => {
             let last_l = app.b_editor_lines.len().saturating_sub(1);
-            let last_c = app.b_editor_lines[last_l].len();
+            let last_c = app.b_editor_lines[last_l].chars().count();
             app.b_selection = Some(((0, 0), (last_l, last_c)));
             app.b_cursor = (last_l, last_c);
             return;
         }
-        KeyCode::Char('r') if ctrl => { execute_query(app); return; }
-        KeyCode::Char('c') if ctrl => {
+        KeyCode::Char('r') if ctrl || cmd => { execute_query(app); return; }
+        KeyCode::Char('c') if ctrl || cmd => {
             if let Some(text) = get_selected_text(app) {
-                if let Some(ref mut cb) = app.b_clipboard { let _ = cb.set_text(text); }
+                if let Some(ref mut cb) = app.b_clipboard { 
+                    if let Ok(_) = cb.set_text(text) {
+                        app.status_message = Some(("Copied to clipboard".to_string(), true));
+                    }
+                }
             }
             return;
         }
-        KeyCode::Char('v') if ctrl => {
+        KeyCode::Char('v') if ctrl || cmd => {
             if let Some(ref mut cb) = app.b_clipboard {
                 if let Ok(text) = cb.get_text() { paste_and_format(app, &text); changed = true; }
             }
         }
-        KeyCode::Char('f') if ctrl => {
+        KeyCode::Char('f') if ctrl || cmd => {
             let full_content = app.b_editor_lines.join("\n");
             if let Ok(value) = serde_json::from_str::<Value>(&full_content) {
                 if let Ok(pretty) = serde_json::to_string_pretty(&value) {
@@ -380,7 +420,8 @@ fn handle_native_editor(app: &mut App, key: event::KeyEvent) {
         KeyCode::Char(ch) => {
             delete_selection(app);
             let (nl, nc) = app.b_cursor;
-            app.b_editor_lines[nl].insert(nc, ch);
+            let byte_pos = app.b_editor_lines[nl].char_indices().nth(nc).map(|(i,_)| i).unwrap_or(app.b_editor_lines[nl].len());
+            app.b_editor_lines[nl].insert(byte_pos, ch);
             app.b_cursor = (nl, nc + 1);
             changed = true;
         }
@@ -388,8 +429,9 @@ fn handle_native_editor(app: &mut App, key: event::KeyEvent) {
             delete_selection(app);
             let (nl, nc) = app.b_cursor;
             let line = app.b_editor_lines[nl].clone();
-            let before = &line[..nc];
-            let after = &line[nc..];
+            let split_pos = line.char_indices().nth(nc).map(|(i,_)| i).unwrap_or(line.len());
+            let before = &line[..split_pos];
+            let after = &line[split_pos..];
             let indent_len = line.chars().take_while(|ch| *ch == ' ').count();
             
             if (before.trim_end().ends_with('{') && after.trim_start().starts_with('}')) ||
@@ -412,13 +454,14 @@ fn handle_native_editor(app: &mut App, key: event::KeyEvent) {
         KeyCode::Backspace => {
             if !delete_selection(app) {
                 if c > 0 {
-                    app.b_editor_lines[l].remove(c - 1);
+                    let byte_pos = app.b_editor_lines[l].char_indices().nth(c-1).map(|(i,_)| i).unwrap();
+                    app.b_editor_lines[l].remove(byte_pos);
                     app.b_cursor = (l, c - 1);
                     changed = true;
                 } else if l > 0 {
                     let current_line = app.b_editor_lines.remove(l);
                     l -= 1;
-                    c = app.b_editor_lines[l].len();
+                    c = app.b_editor_lines[l].chars().count();
                     app.b_editor_lines[l].push_str(&current_line);
                     app.b_cursor = (l, c);
                     changed = true;
@@ -429,8 +472,9 @@ fn handle_native_editor(app: &mut App, key: event::KeyEvent) {
         }
         KeyCode::Delete => {
             if !delete_selection(app) {
-                if c < app.b_editor_lines[l].len() {
-                    app.b_editor_lines[l].remove(c);
+                if c < app.b_editor_lines[l].chars().count() {
+                    let byte_pos = app.b_editor_lines[l].char_indices().nth(c).map(|(i,_)| i).unwrap();
+                    app.b_editor_lines[l].remove(byte_pos);
                     changed = true;
                 } else if l < app.b_editor_lines.len() - 1 {
                     let next_line = app.b_editor_lines.remove(l + 1);
@@ -442,39 +486,49 @@ fn handle_native_editor(app: &mut App, key: event::KeyEvent) {
             }
         }
         KeyCode::Left => {
-            app.b_selection = None;
-            if c > 0 { app.b_cursor = (l, c - 1); }
-            else if l > 0 { l -= 1; app.b_cursor = (l, app.b_editor_lines[l].len()); }
+            if c > 0 { c -= 1; }
+            else if l > 0 { l -= 1; c = app.b_editor_lines[l].chars().count(); }
+            app.b_cursor = (l, c);
         }
         KeyCode::Right => {
-            app.b_selection = None;
-            if c < app.b_editor_lines[l].len() { app.b_cursor = (l, c + 1); }
-            else if l < app.b_editor_lines.len() - 1 { app.b_cursor = (l + 1, 0); }
+            if c < app.b_editor_lines[l].chars().count() { c += 1; }
+            else if l < app.b_editor_lines.len() - 1 { l += 1; c = 0; }
+            app.b_cursor = (l, c);
         }
         KeyCode::Up => {
-            app.b_selection = None;
             if l > 0 {
                 l -= 1;
-                c = c.min(app.b_editor_lines[l].len());
+                c = c.min(app.b_editor_lines[l].chars().count());
                 app.b_cursor = (l, c);
             }
         }
         KeyCode::Down => {
-            app.b_selection = None;
             if l < app.b_editor_lines.len() - 1 {
                 l += 1;
-                c = c.min(app.b_editor_lines[l].len());
+                c = c.min(app.b_editor_lines[l].chars().count());
                 app.b_cursor = (l, c);
             }
         }
         KeyCode::Tab => {
             delete_selection(app);
             let (nl, nc) = app.b_cursor;
-            app.b_editor_lines[nl].insert_str(nc, "  ");
+            let byte_pos = app.b_editor_lines[nl].char_indices().nth(nc).map(|(i,_)| i).unwrap_or(app.b_editor_lines[nl].len());
+            app.b_editor_lines[nl].insert_str(byte_pos, "  ");
             app.b_cursor = (nl, nc + 2);
             changed = true;
         }
         _ => {}
+    }
+
+    // Handle Selection with Shift
+    if shift && !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('v') | KeyCode::Char('a')) {
+        if app.b_selection.is_none() {
+            app.b_selection = Some((old_cursor, app.b_cursor));
+        } else if let Some((start, _)) = app.b_selection {
+            app.b_selection = Some((start, app.b_cursor));
+        }
+    } else if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('v') | KeyCode::Char('a')) && !changed {
+        app.b_selection = None;
     }
 
     sync_editor_scroll(app);
@@ -538,9 +592,7 @@ pub fn bittice_ui(f: &mut Frame, app: &mut App) {
         ListItem::new(Line::from(spans))
     }).collect();
     
-    // Manual sync offset with our manual scroll
     *app.b_catalog_state.offset_mut() = app.b_catalog_scroll;
-    
     f.render_stateful_widget(
         List::new(catalog_items).block(catalog_block),
         body_chunks[0], 
@@ -594,7 +646,7 @@ pub fn bittice_ui(f: &mut Frame, app: &mut App) {
                 }
                 line_spans.push(Span::styled(ch.to_string(), style));
             }
-            if is_cursor_line && app.b_cursor.1 == line_content.len() {
+            if is_cursor_line && app.b_cursor.1 == line_content.chars().count() {
                 line_spans.push(Span::styled(" ", Style::default().bg(Color::White)));
             } else if line_idx >= s_l && line_idx < e_l {
                  line_spans.push(Span::styled(" ", Style::default().bg(SELECTION)));
@@ -603,10 +655,11 @@ pub fn bittice_ui(f: &mut Frame, app: &mut App) {
             let style = Style::default().fg(TEXT);
             if is_cursor_line {
                 let c_idx = app.b_cursor.1;
-                if c_idx < line_content.len() {
-                    let before = &line_content[..c_idx];
-                    let cursor_char = &line_content[c_idx..c_idx+1];
-                    let after = &line_content[c_idx+1..];
+                let char_count = line_content.chars().count();
+                if c_idx < char_count {
+                    let before: String = line_content.chars().take(c_idx).collect();
+                    let cursor_char: String = line_content.chars().skip(c_idx).take(1).collect();
+                    let after: String = line_content.chars().skip(c_idx+1).collect();
                     line_spans.push(Span::styled(before, style.bg(CURSOR_LINE)));
                     line_spans.push(Span::styled(cursor_char, Style::default().bg(Color::White).fg(Color::Black)));
                     line_spans.push(Span::styled(after, style.bg(CURSOR_LINE)));
@@ -634,61 +687,77 @@ pub fn bittice_ui(f: &mut Frame, app: &mut App) {
     let results_inner_area = results_block.inner(right_chunks[1]);
 
     if let Some(results) = &app.search_results {
-        let results_layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(results_inner_area);
-
+        let mut results_content = Vec::new();
+        
+        let limit = 100;
+        let total_pages = results.total_found.div_ceil(limit);
+        let page_info = if !results.rows.is_empty() {
+            Some(format!("Page {} of {}", app.results_page, total_pages.max(1)))
+        } else {
+            None
+        };
         let time_str = if results.execution_time_micros < 1000 { 
             format!("{}µs", results.execution_time_micros) 
         } else { 
             format!("{:.2}ms", results.execution_time_micros as f64 / 1000.0) 
         };
-        let summary_text = format!("{} records found", results.total_found);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(summary_text, Style::default().fg(PRIMARY)),
-                Span::styled(" | ", Style::default().fg(SECONDARY)),
-                Span::styled(time_str, Style::default().fg(Color::DarkGray)),
-            ])),
-            results_layout[0]
-        );
+        
+        let mut header_spans = vec![
+            Span::styled(format!("{} records found", results.total_found), Style::default().fg(PRIMARY)),
+        ];
+
+        if let Some(info) = page_info {
+            header_spans.push(Span::styled(" | ", Style::default().fg(SECONDARY)));
+            header_spans.push(Span::styled(info, Style::default().fg(PRIMARY)));
+        }
+
+        header_spans.push(Span::styled(" | ", Style::default().fg(SECONDARY)));
+        header_spans.push(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
+
+        results_content.push(Line::from(header_spans));
+
+        if let Some(aggs) = &results.aggregations {
+            for (agg_idx, agg) in aggs.iter().enumerate() {
+                results_content.push(Line::from(""));
+                results_content.push(Line::from(Span::styled(format!("Aggregation #{}", agg_idx + 1), Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD))));
+                
+                let header_spans: Vec<Span> = agg.headers.iter().map(|h| Span::styled(format!(" {:<15} ", h), Style::default().fg(DARK).bg(PRIMARY))).collect();
+                results_content.push(Line::from(header_spans));
+                
+                for row in &agg.rows {
+                    let row_spans: Vec<Span> = row.iter().map(|c| Span::styled(format!(" {:<15} ", c), Style::default().fg(TEXT))).collect();
+                    results_content.push(Line::from(row_spans));
+                }
+                
+                if let Some(sum) = agg.summary {
+                    results_content.push(Line::from(Span::styled(format!("  Total Sum: {:.2}", sum), Style::default().fg(Color::Rgb(222, 185, 133)))));
+                }
+            }
+            if !results.rows.is_empty() {
+                results_content.push(Line::from(""));
+                results_content.push(Line::from(Span::styled("Data Rows:", Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD))));
+            }
+        }
 
         if results.rows.is_empty() {
-            f.render_widget(Paragraph::new(Span::styled("  No results found", Style::default().fg(Color::Red))), results_layout[1]);
-        } else {
-            let mut col_widths = Vec::new();
-            for (i, header) in results.headers.iter().enumerate() {
-                let mut max_w = header.len();
-                for row in &results.rows {
-                    if let Some(val) = row.get(i) {
-                        if val.len() > max_w { max_w = val.len(); }
-                    }
-                }
-                max_w = max_w.min(40).max(10);
-                col_widths.push(Constraint::Length((max_w + 2) as u16));
+            if results.aggregations.is_none() {
+                results_content.push(Line::from(Span::styled("  No results found", Style::default().fg(Color::Red))));
             }
-
-            let header_cells = results.headers.iter().map(|h| {
-                Cell::from(h.as_str()).style(Style::default().fg(DARK).bg(PRIMARY).add_modifier(Modifier::BOLD))
-            });
-            let header = Row::new(header_cells).height(1);
-
-            let rows = results.rows.iter().enumerate().skip(app.results_scroll as usize).map(|(i, row_data)| {
-                let cells = row_data.iter().map(|c| Cell::from(c.as_str()).style(Style::default().fg(TEXT)));
-                let base_row = Row::new(cells).height(1);
-                if i % 2 == 0 { base_row.style(Style::default().bg(Color::Rgb(35, 35, 55))) } else { base_row }
-            });
-
-            let table = TuiTable::new(rows, col_widths)
-                .header(header)
-                .column_spacing(1);
-
-            f.render_widget(table, results_layout[1]);
+        } else {
+            let data_header: Vec<Span> = results.headers.iter().map(|h| Span::styled(format!(" {:<15} ", h), Style::default().fg(DARK).bg(PRIMARY))).collect();
+            results_content.push(Line::from(data_header));
             
-            app.last_rendered_content_height = results.rows.len() as u16;
-            app.results_viewport_height = results_layout[1].height;
+            for (i, row) in results.rows.iter().enumerate().skip(app.results_scroll as usize) {
+                let style = if i % 2 == 0 { Style::default().bg(Color::Rgb(35, 35, 55)) } else { Style::default() };
+                let row_spans: Vec<Span> = row.iter().map(|c| Span::styled(format!(" {:<15} ", c), style.fg(TEXT))).collect();
+                results_content.push(Line::from(row_spans));
+            }
         }
+
+        f.render_widget(Paragraph::new(results_content), results_inner_area);
+        
+        app.last_rendered_content_height = results.rows.len() as u16 + (results.aggregations.as_ref().map(|a| a.len() * 5).unwrap_or(0) as u16);
+        app.results_viewport_height = results_inner_area.height;
     }
 
     // --- FOOTER ---
