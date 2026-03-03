@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio_stream::StreamExt;
 use crate::server::table_manager::TableManager;
+use crate::core::date_utils::{extract_day, extract_month, extract_hour_bucket, is_date_format, has_time_component};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CdcState {
@@ -26,6 +27,7 @@ pub struct CdcWorker {
     state_path: String,
     table_manager: Arc<TableManager>,
     column_maps: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    date_columns: Arc<RwLock<HashMap<String, Vec<String>>>>, // table -> list of date column names
     table_map_events: Arc<RwLock<HashMap<u64, TableMapEvent<'static>>>>,
 }
 
@@ -39,6 +41,7 @@ impl CdcWorker {
             state_path,
             table_manager: Arc::new(TableManager::new()),
             column_maps: Arc::new(RwLock::new(HashMap::new())),
+            date_columns: Arc::new(RwLock::new(HashMap::new())),
             table_map_events: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -76,26 +79,40 @@ impl CdcWorker {
         Ok(tables)
     }
 
-    async fn fetch_column_names(&self, conn: &mut Conn, table_name: &str) -> Result<Vec<String>> {
+    async fn fetch_column_info(&self, conn: &mut Conn, table_name: &str) -> Result<(Vec<String>, Vec<String>)> {
         let rows: Vec<(String, String, String, String, Option<String>, String)> = 
             conn.query(format!("DESCRIBE {}", table_name)).await?;
         
-        Ok(rows.into_iter().map(|r| r.0).collect())
+        let mut all_cols = Vec::new();
+        let mut date_cols = Vec::new();
+
+        for row in rows {
+            let col_name = row.0;
+            let col_type = row.1.to_lowercase();
+            all_cols.push(col_name.clone());
+            
+            if col_type.contains("date") || col_type.contains("timestamp") {
+                date_cols.push(col_name);
+            }
+        }
+        
+        Ok((all_cols, date_cols))
     }
 
     async fn bootstrap_table(&self, conn: &mut Conn, table_name: &str, state: &mut CdcState) -> Result<()> {
         println!("CDC: Bootstrapping table '{}'...", table_name);
         
-        let cols = self.fetch_column_names(conn, table_name).await?;
+        let (cols, dates) = self.fetch_column_info(conn, table_name).await?;
         {
             let mut maps = self.column_maps.write().unwrap();
             maps.insert(table_name.to_string(), cols.clone());
+            let mut d_maps = self.date_columns.write().unwrap();
+            d_maps.insert(table_name.to_string(), dates.clone());
         }
 
         let table_lock = self.table_manager.get_table(&self.entity, table_name)?;
         let mut table = table_lock.write().unwrap();
 
-        // Configurar PK real desde MySQL
         let pk_query = format!(
             "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
              WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
@@ -135,6 +152,16 @@ impl CdcWorker {
                         }
                     }
                 }
+                
+                // Expansión de fecha si aplica
+                if dates.contains(col_name) && is_date_format(&val_str) {
+                    if let Some(d) = extract_day(&val_str) { data.insert(format!("{}_day", col_name), d); }
+                    if let Some(m) = extract_month(&val_str) { data.insert(format!("{}_month", col_name), m); }
+                    if has_time_component(&val_str) {
+                        if let Some(h) = extract_hour_bucket(&val_str) { data.insert(format!("{}_hour_bucket", col_name), h); }
+                    }
+                }
+
                 data.insert(col_name.clone(), val_str);
             }
             table.insert(data)?;
@@ -162,9 +189,13 @@ impl CdcWorker {
                 state.bootstrapped_tables.push(table_name.clone());
                 self.save_state(&state)?;
             } else {
-                let cols = self.fetch_column_names(&mut conn, table_name).await?;
-                let mut maps = self.column_maps.write().unwrap();
-                maps.insert(table_name.to_string(), cols);
+                let (cols, dates) = self.fetch_column_info(&mut conn, table_name).await?;
+                {
+                    let mut maps = self.column_maps.write().unwrap();
+                    maps.insert(table_name.to_string(), cols);
+                    let mut d_maps = self.date_columns.write().unwrap();
+                    d_maps.insert(table_name.to_string(), dates);
+                }
             }
         }
 
@@ -281,6 +312,9 @@ impl CdcWorker {
         let maps = self.column_maps.read().unwrap();
         let columns_names = maps.get(table_name).context("Column map not found for table")?;
         
+        let d_maps = self.date_columns.read().unwrap();
+        let dates = d_maps.get(table_name).cloned().unwrap_or_default();
+
         for i in 0..row.len() {
             let col_name = columns_names.get(i).cloned().unwrap_or_else(|| format!("col_{}", i));
             
@@ -299,6 +333,15 @@ impl CdcWorker {
                     if let Some(end) = val_str.find(')') {
                         val_str = val_str[start+1..end].to_string();
                     }
+                }
+            }
+
+            // Expansión de fecha
+            if dates.contains(&col_name) && is_date_format(&val_str) {
+                if let Some(d) = extract_day(&val_str) { map.insert(format!("{}_day", col_name), d); }
+                if let Some(m) = extract_month(&val_str) { map.insert(format!("{}_month", col_name), m); }
+                if has_time_component(&val_str) {
+                    if let Some(h) = extract_hour_bucket(&val_str) { map.insert(format!("{}_hour_bucket", col_name), h); }
                 }
             }
 

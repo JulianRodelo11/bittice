@@ -50,10 +50,9 @@ async fn main() -> Result<()> {
             Commands::Query { entity, table, limit } => {
                 let base_path = std::path::Path::new("data").join(&entity);
                 let table_obj = bittice::core::storage::table::Table::open(&base_path, &table)?;
-                let fields = if !table_obj.manifest.original_fields.is_empty() {
-                    table_obj.manifest.original_fields.clone()
-                } else {
-                    // Si no hay campos originales, intentar deducirlos de los archivos .dat
+                
+                // Si no se especificaron campos, detectar todos los .dat disponibles en el primer segmento
+                let fields = {
                     let mut detected = Vec::new();
                     let seg_path = table_obj.base_path.join("segments").join("seg_0000");
                     if let Ok(entries) = std::fs::read_dir(seg_path) {
@@ -64,8 +63,10 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                    detected.sort();
                     detected
                 };
+                
                 let result = table_obj.search(&fields, &[], &bittice::core::types::LogicalOp::And, &[], &[], limit, 0)?;
                 println!("Query results for {}/{} (total found: {}):", entity, table, result.total_found);
                 println!("Headers: {:?}", result.headers);
