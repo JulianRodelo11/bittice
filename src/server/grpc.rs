@@ -143,11 +143,21 @@ async fn execute_query_internal(
 
     match result {
         Ok(query_result) => {
+            let total_found = query_result.total_found as u64;
+            let page = (offset as u32 / limit as u32) + 1;
+            let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
+
             let meta = SearchMetadata {
                 headers: query_result.headers.clone(),
-                total_found: query_result.total_found as u64,
+                total_found,
                 execution_time_micros: query_result.execution_time_micros as u64,
                 debug_info: query_result.debug_info.unwrap_or_default(),
+                pagination: Some(bittice_proto::PaginationMetadata {
+                    page,
+                    per_page: limit as u32,
+                    total_pages,
+                    total_items: total_found,
+                }),
             };
             if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Metadata(meta)) })).await { return Ok(()); }
 
@@ -308,11 +318,21 @@ impl Database for MyDatabase {
 
             match result {
                 Ok(query_result) => {
+                    let total_found = query_result.total_found as u64;
+                    let page_num = (offset as u32 / limit as u32) + 1;
+                    let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
+
                     let meta = SearchMetadata {
                         headers: query_result.headers.clone(),
-                        total_found: query_result.total_found as u64,
+                        total_found,
                         execution_time_micros: query_result.execution_time_micros as u64,
                         debug_info: query_result.debug_info.unwrap_or_default(),
+                        pagination: Some(bittice_proto::PaginationMetadata {
+                            page: page_num,
+                            per_page: limit as u32,
+                            total_pages,
+                            total_items: total_found,
+                        }),
                     };
                     if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Metadata(meta)) })).await { return; }
 
@@ -397,9 +417,27 @@ impl Database for MyDatabase {
 
         match result {
             Ok(query_result) => {
+                let total_found = query_result.total_found as u64;
+                let page_num = (offset as u32 / limit as u32) + 1;
+                let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
+
                 let proto_rows: Vec<ProtoRow> = query_result.rows.into_iter().map(|r| ProtoRow { values: r }).collect();
                 let proto_aggs: Vec<ProtoAggregationResult> = query_result.aggregations.unwrap_or_default().into_iter().map(|agg| ProtoAggregationResult { headers: agg.headers, rows: agg.rows.into_iter().map(|r| ProtoRow { values: r }).collect(), summary: agg.summary.unwrap_or(0.0) }).collect();
-                Ok(Response::new(SearchUnaryResponse { headers: query_result.headers, rows: proto_rows, total_found: query_result.total_found as u64, execution_time_micros: query_result.execution_time_micros as u64, debug_info: query_result.debug_info.unwrap_or_default(), aggregations: proto_aggs }))
+                
+                Ok(Response::new(SearchUnaryResponse { 
+                    headers: query_result.headers, 
+                    rows: proto_rows, 
+                    total_found, 
+                    execution_time_micros: query_result.execution_time_micros as u64, 
+                    debug_info: query_result.debug_info.unwrap_or_default(), 
+                    aggregations: proto_aggs,
+                    pagination: Some(bittice_proto::PaginationMetadata {
+                        page: page_num,
+                        per_page: limit as u32,
+                        total_pages,
+                        total_items: total_found,
+                    }),
+                }))
             },
             Err(e) => Err(Status::internal(e.to_string())),
         }
