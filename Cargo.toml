@@ -33,6 +33,7 @@ mysql_common = "0.32"
 tonic = "0.12"
 prost = "0.13"
 tokio-stream = "0.1"
+chrono = { version = "0.4.44", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3.10"

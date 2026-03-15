@@ -113,6 +113,9 @@ impl CdcWorker {
         let table_lock = self.table_manager.get_table(&self.entity, table_name)?;
         let mut table = table_lock.write().unwrap();
 
+        // Guardar los campos originales en el manifest
+        let _ = table.set_original_fields(cols.clone());
+
         let pk_query = format!(
             "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
              WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
@@ -271,6 +274,7 @@ impl CdcWorker {
 
         match rows_data {
             RowsEventData::WriteRowsEvent(ev) => {
+                println!("CDC: Received Write event for table '{}'", table_name);
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -280,22 +284,28 @@ impl CdcWorker {
                 }
             }
             RowsEventData::UpdateRowsEvent(ev) => {
+                println!("CDC: Received Update event for table '{}'", table_name);
                 for row_pair in ev.rows(tm) {
                     if let Ok((_, Some(after_row))) = row_pair {
                         let row = Row::try_from(after_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                         let data = self.parse_row(row, &table_name)?;
                         if let Some(pk_val) = data.get(&pk_field).cloned() {
+                            println!("CDC: Updating row with {}='{}' in table '{}'", pk_field, pk_val, table_name);
                             table.update(&pk_val, data)?;
+                        } else {
+                            println!("CDC: WARN - PK value not found for update in table '{}'", table_name);
                         }
                     }
                 }
             }
             RowsEventData::DeleteRowsEvent(ev) => {
+                println!("CDC: Received Delete event for table '{}'", table_name);
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                         let data = self.parse_row(row, &table_name)?;
                         if let Some(pk_val) = data.get(&pk_field) {
+                            println!("CDC: Deleting row with {}='{}' in table '{}'", pk_field, pk_val, table_name);
                             table.delete(pk_val)?;
                         }
                     }
@@ -332,6 +342,21 @@ impl CdcWorker {
                 if let Some(start) = val_str.find('(') {
                     if let Some(end) = val_str.find(')') {
                         val_str = val_str[start+1..end].to_string();
+                    }
+                }
+            }
+
+            // Si es una columna de fecha conocida pero viene como número (TIMESTAMP en binlog),
+            // lo convertimos a formato legible para que la expansión de fecha funcione.
+            if dates.contains(&col_name) && !val_str.is_empty() && val_str.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(timestamp) = val_str.parse::<i64>() {
+                    // Solo convertimos si parece un timestamp ( > año 2000 aprox )
+                    if timestamp > 946684800 {
+                        use chrono::{TimeZone, Utc};
+                        let dt = Utc.timestamp_opt(timestamp, 0).single();
+                        if let Some(dt) = dt {
+                            val_str = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+                        }
                     }
                 }
             }

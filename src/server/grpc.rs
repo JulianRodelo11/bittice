@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::server::table_manager::TableManager;
 use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, QueryResult};
 use crate::core::saved_queries::{load_operations, SavedOperation, SavedQuery};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub mod bittice_proto {
     tonic::include_proto!("bittice");
@@ -23,7 +23,6 @@ const BATCH_SIZE: usize = 1000;
 
 pub struct MyDatabase {
     table_manager: Arc<TableManager>,
-    // Usamos Arc<Vec<...>> para evitar clonar la lista entera en cada request
     ops_cache: Arc<RwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
 }
 
@@ -36,7 +35,6 @@ impl MyDatabase {
     }
 
     async fn get_operations(&self) -> Arc<Vec<SavedOperation>> {
-        // 1. Intentar obtener con bloqueo de lectura (rápido)
         {
             let cache = self.ops_cache.read().await;
             if let Some((ts, ops)) = &*cache {
@@ -45,7 +43,6 @@ impl MyDatabase {
                 }
             }
         }
-        // 2. Si expiró o no existe, actualizar con bloqueo de escritura
         let mut cache = self.ops_cache.write().await;
         let loaded = load_operations().unwrap_or_default();
         let ops_arc = Arc::new(loaded);
@@ -66,7 +63,6 @@ async fn execute_query_internal(
     let entity = query.entity.clone();
     let table_name = query.table.clone();
 
-    // Reemplazo de parámetros (Optimizado)
     let filters: Vec<CoreFilter> = query.filters.iter().map(|sf| {
         let mut val = sf.value.clone();
         if val.starts_with('$') {
@@ -113,11 +109,13 @@ async fn execute_query_internal(
         params_map.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
     } else { query.limit }.unwrap_or(100).min(100);
     
+    if limit == 0 { limit = 100; }
     if limit_override > 0 { limit = (limit_override as usize).min(100); }
     let offset = offset_override as usize;
 
     let fields = if query.selected_fields.is_empty() && query.aggregations.is_empty() {
-         crate::repl::utils::get_indexed_fields(&entity, &table_name)
+         let all_fields = crate::repl::utils::get_indexed_fields(&entity, &table_name);
+         crate::repl::utils::get_base_fields(&all_fields)
     } else { query.selected_fields.clone() };
 
     let table_manager_inner = table_manager.clone();
@@ -125,12 +123,16 @@ async fn execute_query_internal(
     let entity_inner = entity.clone();
     let table_name_inner = table_name.clone();
 
-    // Ejecutar búsqueda
     let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
         let t_open_start = Instant::now();
         let table_lock = table_manager_inner.get_table(&entity_inner, &table_name_inner)?;
         let t_open_ms = t_open_start.elapsed().as_millis();
         
+        {
+            let mut table = table_lock.write().unwrap();
+            let _ = table.reload_if_needed();
+        }
+
         let table = table_lock.read().unwrap();
         let mut search_res = table.search(&fields_inner, &filters, &filters_op, &aggregations, &order_by, limit, offset)?;
         
@@ -144,7 +146,7 @@ async fn execute_query_internal(
     match result {
         Ok(query_result) => {
             let total_found = query_result.total_found as u64;
-            let page = (offset as u32 / limit as u32) + 1;
+            let page = if limit > 0 { (offset as u32 / limit as u32) + 1 } else { 1 };
             let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
 
             let meta = SearchMetadata {
@@ -208,6 +210,7 @@ async fn execute_query_internal(
 impl Database for MyDatabase {
     type SearchStream = ReceiverStream<Result<SearchResponse, Status>>;
     type ExecuteSavedQueryStream = ReceiverStream<Result<SearchResponse, Status>>;
+    type SubscribeUpdatesStream = ReceiverStream<Result<bittice_proto::UpdateEvent, Status>>;
 
     async fn execute_saved_query(
         &self,
@@ -299,10 +302,11 @@ impl Database for MyDatabase {
                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&agg_req.aggregation_json) { aggregations.push(json_val); }
             }
 
-            let limit = (req.limit as usize).min(100);
+            let limit = if req.limit == 0 { 100 } else { (req.limit as usize).min(100) };
             let offset = req.offset as usize;
             let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-                crate::repl::utils::get_indexed_fields(&entity, &table_name)
+                let all_fields = crate::repl::utils::get_indexed_fields(&entity, &table_name);
+                crate::repl::utils::get_base_fields(&all_fields)
             } else { req.selected_fields.clone() };
 
             let fields_for_search = fields.clone();
@@ -312,6 +316,10 @@ impl Database for MyDatabase {
 
             let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
                 let table_lock = table_manager_for_search.get_table(&entity_for_search, &table_name_for_search)?;
+                {
+                    let mut table = table_lock.write().unwrap();
+                    let _ = table.reload_if_needed();
+                }
                 let table = table_lock.read().unwrap();
                 table.search(&fields_for_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)
             }).await.unwrap();
@@ -319,7 +327,7 @@ impl Database for MyDatabase {
             match result {
                 Ok(query_result) => {
                     let total_found = query_result.total_found as u64;
-                    let page_num = (offset as u32 / limit as u32) + 1;
+                    let page_num = if limit > 0 { (offset as u32 / limit as u32) + 1 } else { 1 };
                     let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
 
                     let meta = SearchMetadata {
@@ -403,14 +411,19 @@ impl Database for MyDatabase {
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&agg_req.aggregation_json) { aggregations.push(json_val); }
         }
 
-        let limit = (req.limit as usize).min(100);
+        let limit = if req.limit == 0 { 100 } else { (req.limit as usize).min(100) };
         let offset = req.offset as usize;
         let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-            crate::repl::utils::get_indexed_fields(&entity, &table_name)
+            let all_fields = crate::repl::utils::get_indexed_fields(&entity, &table_name);
+            crate::repl::utils::get_base_fields(&all_fields)
         } else { req.selected_fields.clone() };
 
         let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
             let table_lock = table_manager.get_table(&entity, &table_name)?;
+            {
+                let mut table = table_lock.write().unwrap();
+                let _ = table.reload_if_needed();
+            }
             let table = table_lock.read().unwrap();
             table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
         }).await.unwrap();
@@ -418,7 +431,7 @@ impl Database for MyDatabase {
         match result {
             Ok(query_result) => {
                 let total_found = query_result.total_found as u64;
-                let page_num = (offset as u32 / limit as u32) + 1;
+                let page_num = if limit > 0 { (offset as u32 / limit as u32) + 1 } else { 1 };
                 let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
 
                 let proto_rows: Vec<ProtoRow> = query_result.rows.into_iter().map(|r| ProtoRow { values: r }).collect();
@@ -442,51 +455,134 @@ impl Database for MyDatabase {
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
+
+    async fn subscribe_updates(
+        &self,
+        request: Request<bittice_proto::SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeUpdatesStream>, Status> {
+        let req = request.into_inner();
+        let entity = req.entity.trim().to_lowercase();
+        let table_name = req.table.trim().to_lowercase();
+        let table_manager = Arc::clone(&self.table_manager);
+        let mut events_rx = table_manager.events_tx.subscribe();
+        
+        let (tx, rx) = mpsc::channel(100);
+
+        tokio::spawn(async move {
+            let entity_filter = entity.clone();
+            let table_filter = table_name.clone();
+
+            println!("gRPC: Client subscribed to updates for {}/{}", entity_filter, table_filter);
+
+            while let Ok(event) = events_rx.recv().await {
+                let e_name = event.entity.trim().to_lowercase();
+                let t_name = event.table_name.trim().to_lowercase();
+                
+                if e_name == entity_filter && t_name == table_filter {
+                    println!("gRPC: Dispatching event to stream for client: {}/{} type={}", event.entity, event.table_name, event.event_type);
+                    let proto_event = bittice_proto::UpdateEvent {
+                        r#type: event.event_type.clone(),
+                        table: event.table_name.clone(),
+                        row: Some(bittice_proto::Row { values: event.row.clone() }),
+                        pk: event.pk.clone(),
+                    };
+                    if let Err(e) = tx.send(Ok(proto_event)).await {
+                        println!("gRPC: Client disconnected or channel closed: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 }
 
 pub async fn start_grpc_server(port: u16) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", port).parse()?;
     let table_manager = Arc::new(TableManager::new());
     
-    // --- CACHE WARMING & MAINTENANCE ---
-    let warm_state = Arc::clone(&table_manager);
+    let tm_watcher = Arc::clone(&table_manager);
     tokio::spawn(async move {
-        let mut first_run = true;
+        let mut last_sequences: HashMap<String, u64> = HashMap::new();
         loop {
-            if !first_run { tokio::time::sleep(std::time::Duration::from_secs(300)).await; }
-            first_run = false;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            
+            let data_dir = std::path::Path::new("data");
+            if let Ok(entities) = std::fs::read_dir(data_dir) {
+                for entity_entry in entities.flatten() {
+                    if entity_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        let entity = entity_entry.file_name().to_string_lossy().to_string();
+                        let entity_path = data_dir.join(&entity);
+                        
+                        if let Ok(tables) = std::fs::read_dir(entity_path) {
+                            for table_entry in tables.flatten() {
+                                if table_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                    let t_name = table_entry.file_name().to_string_lossy().to_string();
+                                    let key = format!("{}/{}", entity, t_name);
+                                    
+                                    if let Ok(table_lock) = tm_watcher.get_table(&entity, &t_name) {
+                                        let mut event_to_send = None;
+                                        {
+                                            let mut table = table_lock.write().unwrap();
+                                            
+                                            // Siempre intentamos recargar del disco
+                                            let _ = table.reload_if_needed();
+                                            let current_seq = table.manifest.last_sequence_number;
+                                            
+                                            if !last_sequences.contains_key(&key) {
+                                                last_sequences.insert(key.clone(), current_seq);
+                                                continue;
+                                            }
 
-            if let Ok(ops) = load_operations() {
-                let mut targets: HashMap<(String, String), HashSet<String>> = HashMap::new();
-                let mut read_ops = Vec::new();
-                for op in &ops {
-                    match op {
-                        SavedOperation::Read(q) => read_ops.push(q.clone()),
-                        SavedOperation::Batch(b) => {
-                            for name in &b.operations {
-                                if let Some(SavedOperation::Read(q)) = ops.iter().find(|o| o.name() == name) { read_ops.push(q.clone()); }
+                                            let old_seq = *last_sequences.get(&key).unwrap();
+                                            
+                                            if current_seq > old_seq {
+                                                println!("Watcher: Change detected in {}/{} (seq {} -> {})", entity, t_name, old_seq, current_seq);
+                                                let pk_field = table.manifest.primary_key.clone();
+                                                
+                                                let fields_to_fetch = if table.manifest.original_fields.is_empty() {
+                                                    crate::repl::utils::get_indexed_fields(&entity, &t_name)
+                                                } else {
+                                                    table.manifest.original_fields.clone()
+                                                };
+
+                                                let mut row_data = vec![];
+                                                
+                                                if !fields_to_fetch.is_empty() {
+                                                    // Intentar obtener la fila más reciente usando last_update
+                                                    let mut order_by = vec![];
+                                                    if fields_to_fetch.iter().any(|f| f == "last_update") {
+                                                        order_by.push(CoreOrderBy {
+                                                            field: "last_update".to_string(),
+                                                            direction: SortDirection::Desc,
+                                                        });
+                                                    }
+
+                                                    if let Ok(res) = table.search(&fields_to_fetch, &[], &LogicalOp::And, &[], &order_by, 1, 0) {
+                                                        if let Some(r) = res.rows.into_iter().next() { row_data = r; }
+                                                    }
+                                                }
+
+                                                event_to_send = Some(crate::server::table_manager::TableUpdateEvent {
+                                                    entity: entity.clone(),
+                                                    table_name: t_name.clone(),
+                                                    event_type: "UPDATE".to_string(),
+                                                    pk: pk_field,
+                                                    row: row_data,
+                                                });
+                                                last_sequences.insert(key.clone(), current_seq);
+                                            }
+                                        }
+                                        if let Some(ev) = event_to_send {
+                                            println!("Watcher: Emitting broadcast event for {} (listeners: {})", key, tm_watcher.events_tx.receiver_count());
+                                            let _ = tm_watcher.events_tx.send(ev);
+                                        }
+                                    }
+                                }
                             }
                         }
-                        _ => {}
                     }
-                }
-                for q in read_ops {
-                    let entry = targets.entry((q.entity.clone(), q.table.clone())).or_default();
-                    for f in &q.filters { if f.field != "?" { entry.insert(f.field.clone()); } }
-                    for o in &q.order_by { entry.insert(o.field.clone()); }
-                }
-                
-                if !targets.is_empty() {
-                    let warm_state_inner = Arc::clone(&warm_state);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        for ((entity, table_name), fields_set) in targets {
-                            if let Ok(table_lock) = warm_state_inner.get_table(&entity, &table_name) {
-                                let fields: Vec<String> = fields_set.into_iter().collect();
-                                let table = table_lock.read().unwrap();
-                                let _ = table.warm_up(&fields);
-                            }
-                        }
-                    }).await;
                 }
             }
         }
