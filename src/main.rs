@@ -76,11 +76,11 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        // Run REPL in a blocking way on this thread.
-        // Since we are in a tokio runtime, we should use spawn_blocking if it was heavy,
-        // but since it takes over the whole process loop, calling it directly is fine
-        // as long as we don't expect other async tasks to run in background.
-        repl::run_interactive()?;
+        // Run startup flow with Cliclack
+        if let Some(app) = bittice::repl::startup::run_startup_cliclack()? {
+            // Run REPL in a blocking way on this thread.
+            bittice::repl::run_interactive(Some(app))?;
+        }
     }
 
     Ok(())

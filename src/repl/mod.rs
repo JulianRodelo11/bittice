@@ -2,6 +2,7 @@ pub mod state;
 pub mod ui;
 pub mod utils;
 pub mod view;
+pub mod startup;
 
 use crate::commands::load::execute_load_tui;
 use crate::commands::search;
@@ -23,14 +24,14 @@ use crate::repl::utils::{get_path_suggestions, get_loaded_data};
 use tokio::sync::{mpsc, oneshot};
 use view::{handle_bittice_input};
 
-pub fn run_interactive() -> Result<()> {
+pub fn run_interactive(app: Option<App>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, event::EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = app.unwrap_or_else(App::new);
     let res = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -103,9 +104,15 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
 
                     if let Some(task) = app.active_task {
                         match task {
+                            "Startup" => handle_startup_input(app, key)?,
                             "Search" | "Create" | "Update" | "Delete" | "Batch" => search::handle_search_input(app, key),
                             "Load" => handle_load_input(app, key),
                             "Server" => handle_server_input(app, key),
+                            "Bittice" => {
+                                if let Event::Key(key_ev) = ev {
+                                    handle_bittice_input(app, Event::Key(key_ev))?;
+                                }
+                            }
                             _ => {}
                         }
                     } else {
@@ -143,6 +150,166 @@ fn run_app<B: Backend + io::Write>(terminal: &mut Terminal<B>, app: &mut App) ->
             }
         }
     }
+}
+
+fn handle_startup_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
+    use crate::repl::state::StartupStep;
+
+    match app.startup_step {
+        StartupStep::Selection => {
+            match key.code {
+                KeyCode::Esc => return Err(anyhow::anyhow!("Quit")),
+                KeyCode::Down => app.startup_menu_next(),
+                KeyCode::Up => app.startup_menu_previous(),
+                KeyCode::Enter => match app.startup_menu_state.selected() {
+                    Some(0) => {
+                        app.startup_step = StartupStep::Host;
+                        app.input_buffer = app.cdc_info.host.clone();
+                    }
+                    Some(1) => {
+                        app.active_task = None; // Ir al menú principal
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        StartupStep::Host | StartupStep::Port | StartupStep::User | StartupStep::Password | StartupStep::Database | StartupStep::Entity => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.startup_step = StartupStep::Selection;
+                    app.input_buffer.clear();
+                }
+                KeyCode::Enter => {
+                    match app.startup_step {
+                        StartupStep::Host => {
+                            if !app.input_buffer.is_empty() { app.cdc_info.host = app.input_buffer.clone(); }
+                            app.startup_step = StartupStep::Port;
+                            app.input_buffer = app.cdc_info.port.clone();
+                        }
+                        StartupStep::Port => {
+                            if !app.input_buffer.is_empty() { app.cdc_info.port = app.input_buffer.clone(); }
+                            app.startup_step = StartupStep::User;
+                            app.input_buffer = app.cdc_info.user.clone();
+                        }
+                        StartupStep::User => {
+                            if !app.input_buffer.is_empty() { app.cdc_info.user = app.input_buffer.clone(); }
+                            app.startup_step = StartupStep::Password;
+                            app.input_buffer.clear();
+                        }
+                        StartupStep::Password => {
+                            app.cdc_info.pass = app.input_buffer.clone();
+                            app.startup_step = StartupStep::Database;
+                            app.input_buffer.clear();
+                        }
+                        StartupStep::Database => {
+                            app.cdc_info.database = app.input_buffer.clone();
+                            app.startup_step = StartupStep::Entity;
+                            app.input_buffer = app.cdc_info.database.clone();
+                        }
+                        StartupStep::Entity => {
+                            if !app.input_buffer.is_empty() { app.cdc_info.entity = app.input_buffer.clone(); }
+                            app.input_buffer.clear();
+                            app.startup_step = StartupStep::CdcRunning;
+                            
+                            // Construir URL y lanzar CDC
+                            let url = format!("mysql://{}:{}@{}:{}/{}", 
+                                app.cdc_info.user, app.cdc_info.pass, 
+                                app.cdc_info.host, app.cdc_info.port, 
+                                app.cdc_info.database);
+                            
+                            let entity = app.cdc_info.entity.clone();
+                            let database = app.cdc_info.database.clone();
+                            
+                            let (log_tx, log_rx) = mpsc::channel(100);
+                            app.server_log_receiver = Some(log_rx);
+                            app.server_logs.clear();
+                            
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                let worker = crate::core::cdc::CdcWorker::with_log(url, entity, database, Some(log_tx));
+                                if let Err(e) = rt.block_on(worker.run()) {
+                                    eprintln!("CDC Worker error: {}", e);
+                                }
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Char(c) => app.input_buffer.push(c),
+                KeyCode::Backspace => { app.input_buffer.pop(); }
+                _ => {}
+            }
+        }
+        StartupStep::CdcRunning => {
+            if key.code == KeyCode::Esc {
+                app.active_task = None; // Volver al menú principal
+            } else if key.code == KeyCode::Enter {
+                app.startup_step = StartupStep::DockerBuild;
+            }
+        }
+        StartupStep::DockerBuild => {
+            match key.code {
+                KeyCode::Esc => { app.startup_step = StartupStep::CdcRunning; }
+                KeyCode::Enter => {
+                    // Solo iniciamos el build si no está ya en curso
+                    if app.docker_build_status.is_none() || app.docker_build_status.as_ref().map(|s| s.contains("Error")).unwrap_or(false) {
+                        app.docker_build_status = Some("Iniciando build de Docker...".to_string());
+                        
+                        let entity = app.cdc_info.entity.clone();
+                        let (log_tx, _log_rx) = mpsc::channel(100);
+                        let log_tx_clone = log_tx.clone();
+                        
+                        // Capturar logs del build para mostrarlos en el TUI
+                        std::thread::spawn(move || {
+                            use std::process::{Command, Stdio};
+                            use std::io::{BufRead, BufReader};
+                            
+                            let mut child = Command::new("docker")
+                                .args(["build", "-t", &format!("bittice-{}", entity), "."])
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()
+                                .expect("Falló al iniciar comando Docker");
+
+                            let stdout = child.stdout.take().unwrap();
+                            let stderr = child.stderr.take().unwrap();
+                            let log_tx_inner = log_tx_clone.clone();
+
+                            // Thread para stdout
+                            let tx_out = log_tx_inner.clone();
+                            std::thread::spawn(move || {
+                                let reader = BufReader::new(stdout);
+                                for line in reader.lines().flatten() {
+                                    let _ = tx_out.try_send(format!(" [docker] {}", line));
+                                }
+                            });
+
+                            // Thread para stderr
+                            let tx_err = log_tx_inner.clone();
+                            std::thread::spawn(move || {
+                                let reader = BufReader::new(stderr);
+                                for line in reader.lines().flatten() {
+                                    let _ = tx_err.try_send(format!(" [docker-err] {}", line));
+                                }
+                            });
+
+                            let status = child.wait().expect("Error esperando a Docker");
+                            if status.success() {
+                                let _ = log_tx_inner.try_send("✓ Imagen de Docker creada con éxito.".to_string());
+                            } else {
+                                let _ = log_tx_inner.try_send("✗ Error al crear imagen de Docker.".to_string());
+                            }
+                        });
+
+                        // El receptor de estos logs ya existe en run_app (app.server_log_receiver)
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_main_menu_input(app: &mut App, key: event::KeyEvent) -> Result<()> {

@@ -21,7 +21,9 @@ pub fn ui(f: &mut Frame, app: &mut App, _purple: Color) {
 
     let is_overlay_active = app.is_saving_query || app.show_saved_queries || app.is_prompting_variable;
 
-    if app.active_task == Some("Bittice") {
+    if app.active_task == Some("Startup") {
+        draw_startup_ui(f, app, central_area);
+    } else if app.active_task == Some("Bittice") {
         bittice_ui(f, app);
     } else if matches!(app.active_task, Some("Search") | Some("Create") | Some("Update") | Some("Delete") | Some("Batch")) {
         draw_search_ui(f, app, central_area, is_overlay_active);
@@ -33,6 +35,139 @@ pub fn ui(f: &mut Frame, app: &mut App, _purple: Color) {
     } else {
         draw_main_menu(f, app, central_area, is_overlay_active);
     }
+}
+
+fn draw_startup_ui(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::repl::state::StartupStep;
+    
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Margen superior
+            Constraint::Min(0),    // Contenido
+            Constraint::Length(1), // Ayuda inferior
+        ])
+        .split(area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" bittice", Style::default().fg(colors::PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
+        Span::raw(" v1.0.0-alpha"),
+    ]));
+    lines.push(Line::from(""));
+
+    match app.startup_step {
+        StartupStep::Selection => {
+            lines.push(Line::from(" Seleccione el modo de operación:"));
+            lines.push(Line::from(""));
+            let selected = app.startup_menu_state.selected().unwrap_or(0);
+            for (i, item) in app.startup_menu_items.iter().enumerate() {
+                let prefix = if i == selected { " > " } else { "   " };
+                let style = if i == selected { 
+                    Style::default().fg(colors::PRIMARY_COLOR).add_modifier(Modifier::BOLD) 
+                } else { 
+                    Style::default().fg(Color::Gray) 
+                };
+                lines.push(Line::from(Span::styled(format!("{}{}", prefix, item), style)));
+            }
+        }
+        StartupStep::Host | StartupStep::Port | StartupStep::User | StartupStep::Password | StartupStep::Database | StartupStep::Entity => {
+            lines.push(Line::from(" Configuración de Sincronización (CDC)"));
+            lines.push(Line::from(" ------------------------------------"));
+            
+            let steps = [
+                (StartupStep::Host, "Host", app.cdc_info.host.clone()),
+                (StartupStep::Port, "Port", app.cdc_info.port.clone()),
+                (StartupStep::User, "User", app.cdc_info.user.clone()),
+                (StartupStep::Password, "Password", if app.cdc_info.pass.is_empty() { String::new() } else { "********".to_string() }),
+                (StartupStep::Database, "Database", app.cdc_info.database.clone()),
+                (StartupStep::Entity, "Entity", app.cdc_info.entity.clone()),
+            ];
+
+            for (step, label, value) in steps {
+                let is_current = app.startup_step == step;
+                let is_done = (app.startup_step as u8) > (step as u8);
+                
+                let icon = if is_done { "✓" } else if is_current { "»" } else { " " };
+                let color = if is_done { Color::Green } else if is_current { colors::PRIMARY_COLOR } else { Color::DarkGray };
+                
+                let mut row = vec![
+                    Span::styled(format!(" {} {:<10} ", icon, label), Style::default().fg(color)),
+                ];
+
+                if is_current {
+                    let display_val = if step == StartupStep::Password {
+                        "*".repeat(app.input_buffer.len())
+                    } else {
+                        app.input_buffer.clone()
+                    };
+                    row.push(Span::styled(display_val, Style::default().fg(colors::SAND).add_modifier(Modifier::UNDERLINED)));
+                    row.push(Span::styled("█", Style::default().fg(colors::SAND).add_modifier(Modifier::SLOW_BLINK)));
+                } else if is_done {
+                    row.push(Span::styled(value, Style::default().fg(Color::White)));
+                }
+
+                lines.push(Line::from(row));
+            }
+        }
+        StartupStep::CdcRunning => {
+            lines.push(Line::from(vec![
+                Span::styled(" ● ", Style::default().fg(Color::Green)),
+                Span::styled("Sincronización activa: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{} ⟷ {}", app.cdc_info.database, app.cdc_info.entity)),
+            ]));
+            lines.push(Line::from(""));
+            
+            let log_count = app.server_logs.len();
+            lines.push(Line::from(format!(" Eventos procesados: {}", log_count)));
+            lines.push(Line::from(" ------------------------------------"));
+            
+            for log in app.server_logs.iter().rev().take(10) {
+                lines.push(Line::from(vec![
+                    Span::styled("  [log] ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(log),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(" » Presiona ENTER para crear Imagen de Docker con estos datos", Style::default().fg(colors::SAND).add_modifier(Modifier::BOLD))));
+        }
+        StartupStep::DockerBuild => {
+            lines.push(Line::from(vec![
+                Span::styled(" 📦 ", Style::default().fg(Color::Cyan)),
+                Span::styled("Docker Build Engine", Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+            lines.push(Line::from(format!(" Imagen: bittice-{}", app.cdc_info.entity)));
+            lines.push(Line::from(" ------------------------------------"));
+            lines.push(Line::from(""));
+
+            if let Some(status) = &app.docker_build_status {
+                lines.push(Line::from(vec![Span::styled(format!(" Status: {}", status), Style::default().fg(colors::SAND))]));
+            } else {
+                lines.push(Line::from(" Presiona ENTER para iniciar la construcción de la imagen."));
+            }
+            lines.push(Line::from(""));
+
+            // Mostrar últimos logs de Docker
+            for log in app.server_logs.iter().rev().take(15) {
+                if log.contains("[docker]") || log.contains("[docker-err]") || log.contains("Imagen de Docker") {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::raw(log),
+                    ]));
+                }
+            }
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), chunks[1]);
+    
+    let help = match app.startup_step {
+        StartupStep::Selection => "↑↓ Navegar • Enter Seleccionar",
+        StartupStep::CdcRunning => "Enter Crear Docker • Esc Menú Principal",
+        StartupStep::DockerBuild => "Enter Iniciar Build • Esc Volver",
+        _ => "Enter Confirmar • Esc Cancelar",
+    };
+    f.render_widget(Paragraph::new(help).style(Style::default().fg(Color::DarkGray)), chunks[2]);
 }
 
 fn draw_search_ui(f: &mut Frame, app: &mut App, area: Rect, dimmed: bool) {
@@ -551,7 +686,7 @@ fn draw_input_widget(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str
 }
 
 fn draw_input_widget_with_label(f: &mut Frame, app: &mut App, area: Rect, placeholder: &str, label: &str, _color: Color, purple_muted: Color) {
-    let is_focused = app.focus_panel == FocusPanel::Bottom || app.active_task == Some("Load");
+    let is_focused = app.focus_panel == FocusPanel::Bottom || app.active_task == Some("Load") || app.active_task == Some("Startup");
     let block = Block::default()
         .title(label)
         .borders(Borders::ALL)
@@ -562,8 +697,23 @@ fn draw_input_widget_with_label(f: &mut Frame, app: &mut App, area: Rect, placeh
     let centered_area = Rect { x: inner.x, y: inner.y + (inner.height / 2), width: inner.width, height: 1 };
     let buffer = if matches!(app.active_task, Some("Search") | Some("Create") | Some("Update") | Some("Delete")) { &app.filter_value_input } else { &app.input_buffer };
     let mut spans = vec![Span::styled(" > ", Style::default().fg(colors::SAND).add_modifier(Modifier::BOLD))];
-    if buffer.is_empty() { spans.push(Span::styled(" ", Style::default().bg(Color::White))); spans.push(Span::raw(" ")); spans.push(Span::styled(placeholder, Style::default().fg(Color::DarkGray))); } 
-    else { spans.push(Span::raw(" ")); spans.push(Span::raw(buffer)); }
+    
+    // Si es el paso de Password, ocultamos los caracteres
+    let display_buffer = if app.active_task == Some("Startup") && app.startup_step == crate::repl::state::StartupStep::Password {
+        "*".repeat(buffer.chars().count())
+    } else {
+        buffer.clone()
+    };
+
+    if buffer.is_empty() { 
+        spans.push(Span::styled(" ", Style::default().bg(Color::White))); 
+        spans.push(Span::raw(" ")); 
+        spans.push(Span::styled(placeholder, Style::default().fg(Color::DarkGray))); 
+    } 
+    else { 
+        spans.push(Span::raw(" ")); 
+        spans.push(Span::raw(display_buffer)); 
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), centered_area);
     if !buffer.is_empty() { 
         f.set_cursor_position(Position::new(

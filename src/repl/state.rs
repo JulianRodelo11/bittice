@@ -12,6 +12,29 @@ pub enum LoadStep {
     Done,
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum StartupStep {
+    Selection,
+    Host,
+    Port,
+    User,
+    Password,
+    Database,
+    Entity,
+    CdcRunning,
+    DockerBuild,
+}
+
+pub struct CdcConnectionInfo {
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub pass: String,
+    pub database: String,
+    pub entity: String,
+}
+
 // Paneles principales en el modo búsqueda
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum SearchCriteria {
@@ -83,6 +106,13 @@ pub struct App {
     pub menu_items: Vec<&'static str>,
     pub menu_state: ListState,
     pub active_task: Option<&'static str>,
+
+    // --- Startup ---
+    pub startup_step: StartupStep,
+    pub startup_menu_items: Vec<&'static str>,
+    pub startup_menu_state: ListState,
+    pub cdc_info: CdcConnectionInfo,
+    pub docker_build_status: Option<String>,
 
     // --- Tarea: Bittice ---
     pub b_focused: BitticePanel,
@@ -217,6 +247,9 @@ impl App {
         let mut left_panel_state = ListState::default();
         left_panel_state.select(Some(0));
 
+        let mut startup_menu_state = ListState::default();
+        startup_menu_state.select(Some(0));
+
         // Load saved queries
         let saved_queries = crate::core::saved_queries::load_operations().unwrap_or_default();
 
@@ -224,7 +257,23 @@ impl App {
             // General
             menu_items: vec!["Load", "Create", "Read", "Update", "Delete", "Batch", "Local Server", "Bittice Query", "Exit"],
             menu_state,
-            active_task: Some("Bittice"),
+            active_task: Some("Startup"),
+            // Startup
+            startup_step: StartupStep::Selection,
+            startup_menu_items: vec![
+                "Conectar y sincronizar a una base de datos",
+                "Usar Bittice a una base de datos ya conectada"
+            ],
+            startup_menu_state,
+            cdc_info: CdcConnectionInfo {
+                host: "localhost".to_string(),
+                port: "3306".to_string(),
+                user: "root".to_string(),
+                pass: String::new(),
+                database: String::new(),
+                entity: String::new(),
+            },
+            docker_build_status: None,
             // Bittice
             b_focused: BitticePanel::Catalog,
             b_editor_lines: vec![String::new()],
@@ -353,6 +402,22 @@ impl App {
             None => 0,
         };
         self.menu_state.select(Some(i));
+    }
+
+    pub fn startup_menu_next(&mut self) {
+        let i = match self.startup_menu_state.selected() {
+            Some(i) => if i >= self.startup_menu_items.len() - 1 { 0 } else { i + 1 },
+            None => 0,
+        };
+        self.startup_menu_state.select(Some(i));
+    }
+
+    pub fn startup_menu_previous(&mut self) {
+        let i = match self.startup_menu_state.selected() {
+            Some(i) => if i == 0 { self.startup_menu_items.len() - 1 } else { i - 1 },
+            None => 0,
+        };
+        self.startup_menu_state.select(Some(i));
     }
     
     pub fn suggestion_next(&mut self) {

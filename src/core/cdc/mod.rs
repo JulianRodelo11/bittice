@@ -29,10 +29,15 @@ pub struct CdcWorker {
     column_maps: Arc<RwLock<HashMap<String, Vec<String>>>>,
     date_columns: Arc<RwLock<HashMap<String, Vec<String>>>>, // table -> list of date column names
     table_map_events: Arc<RwLock<HashMap<u64, TableMapEvent<'static>>>>,
+    log_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl CdcWorker {
     pub fn new(url: String, entity: String, database: String) -> Self {
+        Self::with_log(url, entity, database, None)
+    }
+
+    pub fn with_log(url: String, entity: String, database: String, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
         let state_path = format!("data/{}/cdc_state.json", entity);
         Self { 
             url, 
@@ -43,7 +48,15 @@ impl CdcWorker {
             column_maps: Arc::new(RwLock::new(HashMap::new())),
             date_columns: Arc::new(RwLock::new(HashMap::new())),
             table_map_events: Arc::new(RwLock::new(HashMap::new())),
+            log_tx,
         }
+    }
+
+    fn log(&self, msg: String) {
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send(msg.clone());
+        }
+        println!("{}", msg);
     }
 
     fn load_state(&self) -> CdcState {
@@ -100,7 +113,7 @@ impl CdcWorker {
     }
 
     async fn bootstrap_table(&self, conn: &mut Conn, table_name: &str, state: &mut CdcState) -> Result<()> {
-        println!("CDC: Bootstrapping table '{}'...", table_name);
+        self.log(format!("CDC: Bootstrapping table '{}'...", table_name));
         
         let (cols, dates) = self.fetch_column_info(conn, table_name).await?;
         {
@@ -127,7 +140,7 @@ impl CdcWorker {
         if let Some(col) = pk_col {
             table.manifest.primary_key = col.clone();
             state.pk_map.insert(table_name.to_string(), col);
-            println!("CDC: Detected PK='{}' for table '{}'", table.manifest.primary_key, table_name);
+            self.log(format!("CDC: Detected PK='{}' for table '{}'", table.manifest.primary_key, table_name));
         } else {
             if let Some(pk_cand) = cols.iter().find(|c| c.ends_with("_id") || *c == "id") {
                 table.manifest.primary_key = pk_cand.clone();
@@ -172,7 +185,7 @@ impl CdcWorker {
         }
 
         table.flush_active_segment()?;
-        println!("CDC: Table '{}' bootstrapped successfully ({} rows).", table_name, count);
+        self.log(format!("CDC: Table '{}' bootstrapped successfully ({} rows).", table_name, count));
         Ok(())
     }
 
@@ -210,7 +223,7 @@ impl CdcWorker {
             }
         }
 
-        println!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos);
+        self.log(format!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos));
 
         let request = BinlogStreamRequest::new(1337)
             .with_filename(state.binlog_file.as_bytes())
@@ -274,7 +287,7 @@ impl CdcWorker {
 
         match rows_data {
             RowsEventData::WriteRowsEvent(ev) => {
-                println!("CDC: Received Write event for table '{}'", table_name);
+                self.log(format!("CDC: Received Write event for table '{}'", table_name));
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -284,28 +297,28 @@ impl CdcWorker {
                 }
             }
             RowsEventData::UpdateRowsEvent(ev) => {
-                println!("CDC: Received Update event for table '{}'", table_name);
+                self.log(format!("CDC: Received Update event for table '{}'", table_name));
                 for row_pair in ev.rows(tm) {
                     if let Ok((_, Some(after_row))) = row_pair {
                         let row = Row::try_from(after_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                         let data = self.parse_row(row, &table_name)?;
                         if let Some(pk_val) = data.get(&pk_field).cloned() {
-                            println!("CDC: Updating row with {}='{}' in table '{}'", pk_field, pk_val, table_name);
+                            self.log(format!("CDC: Updating row with {}='{}' in table '{}'", pk_field, pk_val, table_name));
                             table.update(&pk_val, data)?;
                         } else {
-                            println!("CDC: WARN - PK value not found for update in table '{}'", table_name);
+                            self.log(format!("CDC: WARN - PK value not found for update in table '{}'", table_name));
                         }
                     }
                 }
             }
             RowsEventData::DeleteRowsEvent(ev) => {
-                println!("CDC: Received Delete event for table '{}'", table_name);
+                self.log(format!("CDC: Received Delete event for table '{}'", table_name));
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                         let data = self.parse_row(row, &table_name)?;
                         if let Some(pk_val) = data.get(&pk_field) {
-                            println!("CDC: Deleting row with {}='{}' in table '{}'", pk_field, pk_val, table_name);
+                            self.log(format!("CDC: Deleting row with {}='{}' in table '{}'", pk_field, pk_val, table_name));
                             table.delete(pk_val)?;
                         }
                     }

@@ -478,7 +478,9 @@ impl Database for MyDatabase {
                 let e_name = event.entity.trim().to_lowercase();
                 let t_name = event.table_name.trim().to_lowercase();
                 
-                if e_name == entity_filter && t_name == table_filter {
+                let matches_table = table_filter.is_empty() || table_filter == "*" || t_name == table_filter;
+                
+                if e_name == entity_filter && matches_table {
                     println!("gRPC: Dispatching event to stream for client: {}/{} type={}", event.entity, event.table_name, event.event_type);
                     let proto_event = bittice_proto::UpdateEvent {
                         r#type: event.event_type.clone(),
@@ -499,7 +501,8 @@ impl Database for MyDatabase {
 }
 
 pub async fn start_grpc_server(port: u16) -> anyhow::Result<()> {
-    let addr = format!("0.0.0.0:{}", port).parse()?;
+    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{}:{}", host, port).parse()?;
     let table_manager = Arc::new(TableManager::new());
     
     let tm_watcher = Arc::clone(&table_manager);
