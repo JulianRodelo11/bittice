@@ -15,7 +15,9 @@ async fn main() -> Result<()> {
                 bittice::commands::load::execute_load_cli(&input, &entity, &table)?;
             }
             Commands::Server { port, r#type } => {
-                if r#type == "grpc" {
+                if r#type == "all" {
+                    bittice::server::start_all_servers().await?;
+                } else if r#type == "grpc" {
                     bittice::server::grpc::start_grpc_server(port).await?;
                 } else {
                     // Setup for HTTP server (needs log channel and shutdown signal)

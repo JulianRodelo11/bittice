@@ -17,7 +17,10 @@ pub enum BinaryOp {
 
 pub fn parse_expression(input: &str) -> Result<Expr> {
     let tokens = tokenize(input);
-    let (expr, _) = parse_expr(&tokens)?;
+    let (expr, pos) = parse_expr(&tokens)?;
+    if pos < tokens.len() {
+        return Err(anyhow!("Unexpected tokens at end of expression: {:?}", &tokens[pos..]));
+    }
     Ok(expr)
 }
 
@@ -152,7 +155,7 @@ fn parse_primary(tokens: &[String]) -> Result<(Expr, usize)> {
         } else {
              return Err(anyhow!("Missing closing parenthesis"));
         }
-    } else if token == "IF" {
+    } else if token.eq_ignore_ascii_case("IF") {
         if tokens.len() > 1 && tokens[1] == "(" {
             let (cond, p1) = parse_expr(&tokens[2..])?;
             let mut current = 2 + p1;
@@ -224,5 +227,36 @@ pub fn extract_fields(expr: &Expr) -> Vec<String> {
             fields.extend(extract_fields(f));
             fields
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple() {
+        let expr = parse_expression("1 + 2 * 3").unwrap();
+        assert_eq!(evaluate(&expr, &HashMap::new()), 7.0);
+    }
+
+    #[test]
+    fn test_parse_if_case_insensitive() {
+        let expr_str = "If(amount > 7, amount * 0.10, amount * 0.05)";
+        let expr = parse_expression(expr_str).unwrap();
+        
+        let mut context = HashMap::new();
+        context.insert("amount".to_string(), 10.0);
+        assert_eq!(evaluate(&expr, &context), 1.0);
+        
+        context.insert("amount".to_string(), 5.0);
+        assert_eq!(evaluate(&expr, &context), 0.25);
+    }
+
+    #[test]
+    fn test_parse_error_trailing() {
+        let res = parse_expression("1 + 2 extra");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Unexpected tokens"));
     }
 }

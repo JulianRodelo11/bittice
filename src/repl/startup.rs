@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cliclack::{intro, outro, select, input, password, note, spinner, confirm};
-use crate::repl::state::{App, StartupStep};
+use crate::repl::state::App;
 use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
@@ -16,9 +16,59 @@ pub async fn run_startup_cliclack() -> Result<Option<App>> {
         .interact()?;
 
     if option == 1 {
-        let mut app = App::new();
-        app.active_task = None;
-        return Ok(Some(app));
+        // Listar entidades disponibles
+        let data_dir = std::path::Path::new("data");
+        let mut entities = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(data_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    entities.push(entry.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+
+        if entities.is_empty() {
+            note("No se encontraron entidades", "Debes conectar al menos una base de datos primero.")?;
+            return Ok(None);
+        }
+
+        let mut select_entity = select("Seleccione la Entidad que desea usar");
+        for (i, entity) in entities.iter().enumerate() {
+            select_entity = select_entity.item(i, entity, "");
+        }
+        let entity_idx = select_entity.interact()?;
+        let selected_entity = &entities[entity_idx];
+
+        // Verificar si existe un docker-compose para esta entidad
+        let compose_file = format!("docker-compose-bittice-{}.yml", selected_entity.to_lowercase().replace(" ", "-"));
+        let mut use_docker = false;
+        
+        if std::path::Path::new(&compose_file).exists() {
+            use_docker = confirm(format!("Se detectó un archivo Docker Compose para '{}'. ¿Deseas iniciarlo?", selected_entity))
+                .initial_value(true)
+                .interact()?;
+        }
+
+        if use_docker {
+            let s = spinner();
+            s.start(format!("Iniciando Docker stack para {}...", selected_entity));
+            let run_status = Command::new("docker-compose")
+                .args(["-f", &compose_file, "-p", &format!("bittice-{}", selected_entity), "up", "-d"])
+                .status()?;
+            
+            if run_status.success() {
+                s.stop(format!("✓ Contenedores de '{}' activos.", selected_entity));
+                crate::server::show_banner();
+                crate::server::wait_for_exit(None).await?;
+            } else {
+                s.stop("✗ Error al iniciar Docker. Intentando inicio local...");
+                crate::server::start_all_servers().await?;
+            }
+        } else {
+            crate::server::start_all_servers().await?;
+        }
+        
+        return Ok(None);
     }
 
     // Flujo de conexión
@@ -141,7 +191,7 @@ services:
     ports:
       - "3000:3000"
       - "50051:50051"
-    command: ["./bittice", "server", "--type", "grpc", "--port", "50051"]
+    command: ["./bittice", "server", "--type", "all"]
     environment:
       - BITTICE_HOST=0.0.0.0
     volumes:
@@ -186,17 +236,27 @@ services:
         }
     }
 
-    // 3. Finalizar o entrar al TUI
-    let go_to_tui = confirm("¿Deseas entrar al panel de consultas (Dashboard)?")
+    // 3. Finalizar mostrando el banner del servidor
+    note("Sincronización Completa", "El motor de Bittice ya tiene acceso a tus datos.")?;
+    
+    let start_now = confirm("¿Deseas activar el motor de consultas ahora mismo?")
         .initial_value(true)
         .interact()?;
 
-    if go_to_tui {
-        app.active_task = None; // Ir al dashboard
-        app.startup_step = StartupStep::CdcRunning;
-        Ok(Some(app))
+    if start_now {
+        // Si ya levantamos Docker, solo mostramos el banner y esperamos
+        // Si no, iniciamos los servidores locales
+        let docker_active = build_docker && std::path::Path::new(&format!("docker-compose-bittice-{}.yml", app.cdc_info.entity.to_lowercase().replace(" ", "-"))).exists();
+        
+        if docker_active {
+            crate::server::show_banner();
+            crate::server::wait_for_exit(None).await?;
+        } else {
+            crate::server::start_all_servers().await?;
+        }
     } else {
-        outro("Bittice sigue corriendo en segundo plano.")?;
-        Ok(None) // Salir del programa pero dejar procesos activos si fuera necesario (o simplemente salir)
+        outro("Bittice está listo. Puedes iniciarlo más tarde desde el menú principal.")?;
     }
+    
+    Ok(None)
 }

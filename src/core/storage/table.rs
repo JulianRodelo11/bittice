@@ -545,15 +545,34 @@ impl Table {
         let segment = if let Some(writer) = &self.active_segment { if writer.segment.id == seg_id { Some(&writer.segment) } else { self.immutable_segments.iter().find(|s| s.id == seg_id) } }
         else { self.immutable_segments.iter().find(|s| s.id == seg_id) };
         if let Some(s) = segment {
+            // Pre-load all necessary mmaps for grouping and expressions
             let group_mmap = s.get_mmap_pair(field_name).ok();
             let mmaps: Vec<Option<Arc<(Mmap, Mmap)>>> = required_fields.iter().map(|f| s.get_mmap_pair(f).ok()).collect();
+            
+            // Check if it's a simple Field(name) expression to avoid the generic evaluate() overhead
+            let simple_field = match expr {
+                crate::core::expression::Expr::Field(f) => Some(f.clone()),
+                _ => None,
+            };
+
             let mut context = HashMap::with_capacity(required_fields.len());
             for id in bitmap {
-                let group_val = if let Some(m) = &group_mmap { s.get_row_values_from_mmaps(id, &[Some(m.clone())]).pop().unwrap_or_default() } else { "Unknown".to_string() };
-                let row_nums = s.get_row_numbers_from_mmaps(id, &mmaps);
-                context.clear();
-                for (i, val) in row_nums.into_iter().enumerate() { context.insert(required_fields[i].clone(), val); }
-                let val = crate::core::expression::evaluate(expr, &context);
+                let group_val = if let Some(m) = &group_mmap { 
+                    s.get_row_values_from_mmaps(id, &[Some(m.clone())]).pop().unwrap_or_else(|| "Unknown".to_string()) 
+                } else { "Unknown".to_string() };
+
+                let val = if let Some(f_name) = &simple_field {
+                    // Direct numeric access if possible
+                    if let Some(idx) = required_fields.iter().position(|r| r == f_name) {
+                        s.get_row_numbers_from_mmaps(id, &[mmaps[idx].clone()]).pop().unwrap_or(0.0)
+                    } else { 0.0 }
+                } else {
+                    let row_nums = s.get_row_numbers_from_mmaps(id, &mmaps);
+                    context.clear();
+                    for (i, v) in row_nums.into_iter().enumerate() { context.insert(required_fields[i].clone(), v); }
+                    crate::core::expression::evaluate(expr, &context)
+                };
+                
                 *seg_group_sums.entry(group_val).or_insert(0.0) += val;
             }
         }
