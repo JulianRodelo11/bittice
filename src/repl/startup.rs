@@ -2,13 +2,12 @@ use anyhow::Result;
 use cliclack::{intro, outro, select, input, password, note, spinner, confirm};
 use crate::repl::state::{App, StartupStep};
 use std::thread;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
 use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
 
-pub fn run_startup_cliclack() -> Result<Option<App>> {
+pub async fn run_startup_cliclack() -> Result<Option<App>> {
     intro(" bittice ")?;
 
     let option: u8 = select("Seleccione el modo de operación")
@@ -33,7 +32,7 @@ pub fn run_startup_cliclack() -> Result<Option<App>> {
     // 1. Spinner de Sincronización
     let s = spinner();
     s.start("Iniciando motor de sincronización CDC...");
-    
+
     let mut app = App::new();
     app.cdc_info.host = host;
     app.cdc_info.port = port;
@@ -41,33 +40,44 @@ pub fn run_startup_cliclack() -> Result<Option<App>> {
     app.cdc_info.pass = pass;
     app.cdc_info.database = database;
     app.cdc_info.entity = entity;
-    
-    let url = format!("mysql://{}:{}@{}:{}/{}", 
-        app.cdc_info.user, app.cdc_info.pass, 
-        app.cdc_info.host, app.cdc_info.port, 
+
+    let url = format!("mysql://{}:{}@{}:{}/{}",
+        app.cdc_info.user, app.cdc_info.pass,
+        app.cdc_info.host, app.cdc_info.port,
         app.cdc_info.database);
-    
+
     let (log_tx, mut log_rx) = mpsc::channel(100);
     app.server_log_receiver = None; // Se lo pasaremos al TUI después
-    
+
     let worker_url = url.clone();
     let worker_entity = app.cdc_info.entity.clone();
     let worker_db = app.cdc_info.database.clone();
-    
+
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let worker = CdcWorker::with_log(worker_url, worker_entity, worker_db, Some(log_tx));
         let _ = rt.block_on(worker.run());
     });
 
-    // Esperar unos segundos a que procese los primeros eventos
-    thread::sleep(Duration::from_secs(2));
-    let mut total_events = 0;
-    while let Ok(_) = log_rx.try_recv() { total_events += 1; }
-    
-    s.stop(format!("✓ Sincronización establecida. {} tablas inicializadas.", total_events));
+    // Esperar a que el bootstrap termine
+    let mut bootstrap_success = false;
+    while let Some(msg) = log_rx.recv().await {
+        if msg == "CDC_READY" {
+            bootstrap_success = true;
+            break;
+        }
+        if msg.starts_with("CDC: Bootstrapping table") {
+            s.set_message(format!("{}...", msg));
+        }
+    }
 
-    // 2. Preguntar por Docker
+    if !bootstrap_success {
+        s.stop("✗ Error al sincronizar con la base de datos.");
+        return Err(anyhow::anyhow!("Sincronización fallida. Verifica las credenciales y el estado de la base de datos."));
+    }
+
+    s.stop("✓ Sincronización establecida.");
+    app.server_log_receiver = Some(log_rx);    // 2. Preguntar por Docker
     let build_docker = confirm("¿Deseas crear una imagen de Docker con estos datos?")
         .initial_value(true)
         .interact()?;

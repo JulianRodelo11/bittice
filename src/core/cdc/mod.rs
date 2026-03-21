@@ -55,8 +55,9 @@ impl CdcWorker {
     fn log(&self, msg: String) {
         if let Some(tx) = &self.log_tx {
             let _ = tx.try_send(msg.clone());
+        } else {
+            println!("{}", msg);
         }
-        println!("{}", msg);
     }
 
     fn load_state(&self) -> CdcState {
@@ -223,6 +224,7 @@ impl CdcWorker {
             }
         }
 
+        self.log("CDC_READY".to_string());
         self.log(format!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos));
 
         let request = BinlogStreamRequest::new(1337)

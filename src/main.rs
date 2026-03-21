@@ -3,7 +3,6 @@ use anyhow::Result;
 
 // Importar módulos desde la librería (nombre del paquete: bittice)
 use bittice::cli::{Cli, Commands};
-use bittice::repl;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -77,7 +76,7 @@ async fn main() -> Result<()> {
         }
     } else {
         // Run startup flow with Cliclack
-        if let Some(app) = bittice::repl::startup::run_startup_cliclack()? {
+        if let Some(app) = bittice::repl::startup::run_startup_cliclack().await? {
             // Run REPL in a blocking way on this thread.
             bittice::repl::run_interactive(Some(app))?;
         }
