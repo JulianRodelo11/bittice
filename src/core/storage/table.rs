@@ -396,8 +396,19 @@ impl Table {
                         aggregation_results.push(crate::core::types::AggregationResult { headers: agg_headers, rows: agg_rows, summary: Some(total_count as f64) });
                         continue;
                     } else if agg_type == "Sum" {
-                        let field_name_opt = params.get("field").and_then(|v| v.as_str()).filter(|&s| s != "?");
-                        let expression_str = params.get("expression").and_then(|v| v.as_str()).unwrap_or("0");
+                        let group_by = params.get("group_by").and_then(|v| v.as_str());
+                        let field_val = params.get("field").and_then(|v| v.as_str()).filter(|&s| s != "?");
+                        let expr_val = params.get("expression").and_then(|v| v.as_str());
+
+                        let (field_name_opt, expression_str) = match (group_by, field_val, expr_val) {
+                            (Some(gb), Some(f), None) => (Some(gb), f),
+                            (Some(gb), _, Some(e)) => (Some(gb), e),
+                            (None, Some(f), Some(e)) => (Some(f), e),
+                            (None, Some(f), None) => (Some(f), "0"),
+                            (None, None, Some(e)) => (None, e),
+                            _ => (None, "0")
+                        };
+
                         if let Ok(expr) = crate::core::expression::parse_expression(expression_str) {
                             let required_fields = crate::core::expression::extract_fields(&expr);
                             if let Some(field_name) = field_name_opt {
@@ -409,7 +420,12 @@ impl Table {
                                 for seg_map in segment_group_results { for (k, v) in seg_map { total_sum += v; *global_group_sums.entry(k).or_insert(0.0) += v; } }
                                 let mut results: Vec<(String, f64)> = global_group_sums.into_iter().collect();
                                 results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                                agg_headers = vec![field_name.to_string(), "sum".to_string()];
+                                
+                                let header_sum = if expression_str.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                                    format!("{}_sum", expression_str)
+                                } else { "sum".to_string() };
+
+                                agg_headers = vec![field_name.to_string(), header_sum];
                                 agg_rows = results.into_iter().map(|(v, s)| vec![v, format!("{:.2}", s)]).collect();
                                 aggregation_results.push(crate::core::types::AggregationResult { headers: agg_headers, rows: agg_rows, summary: Some(total_sum) });
                                 continue; 
