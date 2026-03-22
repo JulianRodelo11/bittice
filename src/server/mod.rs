@@ -16,6 +16,7 @@ use crate::core::saved_queries::{load_operations, SavedOperation};
 use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy};
 use std::collections::HashMap;
 use rayon::prelude::*;
+use crate::core::storage::table::Table;
 use crate::server::table_manager::TableManager;
 
 // Estructura para compartir estado con los handlers de Axum
@@ -476,14 +477,14 @@ async fn execute_read_operation(
                 let _ = table.reload_if_needed();
                 let mut f_search = if !param_fields.is_empty() { param_fields }
                                    else if sel_fields.is_empty() && aggs_query.is_empty() {
-                                       let all = crate::repl::utils::get_indexed_fields(&query_entity, &query_table);
-                                       crate::repl::utils::get_base_fields(&all)
+                                       let all = Table::get_indexed_fields_static(&query_entity, &query_table);
+                                       Table::get_base_fields_static(&all)
                                    } else { sel_fields };
 
                 if f_search.iter().any(|f| f == "*") {
                     let mut all_cols = table.manifest.original_fields.clone();
                     if all_cols.is_empty() {
-                        all_cols = crate::repl::utils::get_indexed_fields(&query_entity, &query_table);
+                        all_cols = Table::get_indexed_fields_static(&query_entity, &query_table);
                         all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
                         if !all_cols.is_empty() { let _ = table.set_original_fields(all_cols.clone()); }
                     }

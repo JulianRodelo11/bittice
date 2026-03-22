@@ -110,15 +110,6 @@ impl Table {
             return Ok(());
         }
 
-        // Solo recargamos si el archivo en disco es más nuevo que nuestro último registro
-        // O si no tenemos datos cargados aún.
-        if self.manifest.segments.is_empty() || self.manifest.last_sequence_number == 0 {
-             // Forzar carga inicial
-        } else {
-            // Nota: Aquí podríamos guardar el mtime en la estructura Table para ser más precisos,
-            // pero comparar el last_sequence_number del JSON es más seguro.
-        }
-
         let file = fs::File::open(&manifest_path)?;
         let reader = std::io::BufReader::new(file);
         let new_manifest: Manifest = serde_json::from_reader(reader)?;
@@ -610,5 +601,54 @@ impl Table {
             }
         }
         seg_sum
+    }
+
+    pub fn get_indexed_fields_static(entity: &str, table: &str) -> Vec<String> {
+        let mut data_path = Path::new("bittice/data");
+        if !data_path.exists() {
+            data_path = Path::new("data");
+        }
+        let table_path = data_path.join(entity).join(table);
+        let mut all_fields = std::collections::HashSet::new();
+        
+        let segments_dir = table_path.join("segments");
+        if let Ok(entries) = std::fs::read_dir(segments_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    if let Ok(seg_files) = std::fs::read_dir(entry.path()) {
+                        for f in seg_files.flatten() {
+                            if let Some(name) = f.file_name().to_str() {
+                                if name.ends_with(".dat") && !name.starts_with("bitmaps_") {
+                                    all_fields.insert(name.trim_end_matches(".dat").to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<String> = all_fields.into_iter().collect();
+        result.sort();
+        result
+    }
+
+    pub fn get_base_fields_static(all_fields: &[String]) -> Vec<String> {
+        let mut filtered: Vec<String> = all_fields.iter()
+            .filter(|f| {
+                !f.ends_with("_day") && !f.ends_with("_month") && 
+                !f.ends_with("_year") && !f.ends_with("_hour_bucket")
+            })
+            .cloned().collect();
+        filtered.sort();
+        filtered
+    }
+
+    pub fn get_all_fields(&self) -> Vec<String> {
+        let entity = self.base_path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        Self::get_indexed_fields_static(entity, &self.name)
     }
 }

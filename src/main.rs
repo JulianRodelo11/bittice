@@ -78,10 +78,8 @@ async fn main() -> Result<()> {
         }
     } else {
         // Run startup flow with Cliclack
-        if let Some(app) = bittice::repl::startup::run_startup_cliclack().await? {
-            // Run REPL in a blocking way on this thread.
-            bittice::repl::run_interactive(Some(app))?;
-        }
+        // This flow handles its own execution and server startup
+        let _ = bittice::repl::startup::run_startup_cliclack().await?;
     }
 
     Ok(())

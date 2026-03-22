@@ -4,6 +4,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use std::sync::Arc;
 use std::time::Instant;
 use crate::server::table_manager::TableManager;
+use crate::core::storage::table::Table;
 use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, QueryResult};
 use crate::core::saved_queries::{load_operations, SavedOperation, SavedQuery};
 use std::collections::HashMap;
@@ -115,8 +116,8 @@ async fn execute_query_unary_internal(
         let _ = table.reload_if_needed();
 
         let mut fields_for_search = if fields_inner.is_empty() && aggregations.is_empty() {
-            let all_fields = crate::repl::utils::get_indexed_fields(&e_inner, &t_inner);
-            crate::repl::utils::get_base_fields(&all_fields)
+            let all_fields = Table::get_indexed_fields_static(&e_inner, &t_inner);
+            Table::get_base_fields_static(&all_fields)
         } else {
             fields_inner
         };
@@ -124,7 +125,7 @@ async fn execute_query_unary_internal(
         if fields_for_search.iter().any(|f| f == "*") {
             let mut all_cols = table.manifest.original_fields.clone();
             if all_cols.is_empty() {
-                all_cols = crate::repl::utils::get_indexed_fields(&e_inner, &t_inner);
+                all_cols = Table::get_indexed_fields_static(&e_inner, &t_inner);
                 all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
                 if !all_cols.is_empty() { let _ = table.set_original_fields(all_cols.clone()); }
             }
@@ -245,8 +246,8 @@ async fn execute_query_internal(
     let offset = offset_override as usize;
 
     let fields = if query.selected_fields.is_empty() && query.aggregations.is_empty() {
-         let all_fields = crate::repl::utils::get_indexed_fields(&entity, &table_name);
-         crate::repl::utils::get_base_fields(&all_fields)
+         let all_fields = Table::get_indexed_fields_static(&entity, &table_name);
+         Table::get_base_fields_static(&all_fields)
     } else { query.selected_fields.clone() };
 
     let table_manager_inner = table_manager.clone();
@@ -264,8 +265,8 @@ async fn execute_query_internal(
         
         // --- FIELD EXPANSION ---
         let mut fields_for_search = if fields_inner.is_empty() && aggregations.is_empty() {
-            let all_fields = crate::repl::utils::get_indexed_fields(&entity_inner, &table_name_inner);
-            crate::repl::utils::get_base_fields(&all_fields)
+            let all_fields = Table::get_indexed_fields_static(&entity_inner, &table_name_inner);
+            Table::get_base_fields_static(&all_fields)
         } else {
             fields_inner
         };
@@ -274,7 +275,7 @@ async fn execute_query_internal(
         if fields_for_search.iter().any(|f| f == "*") {
             let mut all_cols = table.manifest.original_fields.clone();
             if all_cols.is_empty() {
-                all_cols = crate::repl::utils::get_indexed_fields(&entity_inner, &table_name_inner);
+                all_cols = Table::get_indexed_fields_static(&entity_inner, &table_name_inner);
                 all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
                 if !all_cols.is_empty() {
                     let _ = table.set_original_fields(all_cols.clone());
@@ -499,8 +500,8 @@ impl Database for MyDatabase {
             let limit = if req.limit == 0 { 100 } else { (req.limit as usize).min(100) };
             let offset = req.offset as usize;
             let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-                let all_fields = crate::repl::utils::get_indexed_fields(&entity, &table_name);
-                crate::repl::utils::get_base_fields(&all_fields)
+                let all_fields = Table::get_indexed_fields_static(&entity, &table_name);
+                Table::get_base_fields_static(&all_fields)
             } else { req.selected_fields.clone() };
 
             let fields_for_search = fields.clone();
@@ -608,8 +609,8 @@ impl Database for MyDatabase {
         let limit = if req.limit == 0 { 100 } else { (req.limit as usize).min(100) };
         let offset = req.offset as usize;
         let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-            let all_fields = crate::repl::utils::get_indexed_fields(&entity, &table_name);
-            crate::repl::utils::get_base_fields(&all_fields)
+            let all_fields = Table::get_indexed_fields_static(&entity, &table_name);
+            Table::get_base_fields_static(&all_fields)
         } else { req.selected_fields.clone() };
 
         let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
@@ -739,7 +740,7 @@ pub async fn start_grpc_server(port: u16) -> anyhow::Result<()> {
                                                 let pk_field = table.manifest.primary_key.clone();
                                                 
                                                 let fields_to_fetch = if table.manifest.original_fields.is_empty() {
-                                                    crate::repl::utils::get_indexed_fields(&entity, &t_name)
+                                                    Table::get_indexed_fields_static(&entity, &t_name)
                                                 } else {
                                                     table.manifest.original_fields.clone()
                                                 };

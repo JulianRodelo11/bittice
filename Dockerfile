@@ -4,12 +4,8 @@ FROM rust:bookworm as builder
 
 # Install system dependencies required for compilation
 # protobuf-compiler is needed for tonic/prost
-# libxcb* are needed for arboard (clipboard)
 RUN apt-get update && apt-get install -y \
     protobuf-compiler \
-    libxcb-shape0-dev \
-    libxcb-xfixes0-dev \
-    libx11-dev \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*

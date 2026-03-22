@@ -7,48 +7,9 @@ use std::fs::File;
 use serde_json::Value;
 
 use crate::core::schema::analyze_schema;
-use crate::ui::spinner::run_with_spinner;
 use crate::core::storage::table::Table;
 use crate::core::date_utils::{extract_day, extract_hour_bucket, extract_month};
 use crate::core::config::FieldStats;
-
-// Función para ser llamada desde el modo TUI
-pub fn execute_load_tui(
-    input_path: &str,
-    entity: &str,
-    table: &str,
-    start_x: u16,
-    start_y: u16,
-) -> Result<()> {
-    let initial_msg = "Analyzing schema and detecting field types (Pass 1 of 2)...";
-
-    run_with_spinner(
-        initial_msg,
-        start_y,
-        start_x,
-        |spinner, should_cancel| {
-            // --- Pasada 1: Análisis ---
-            let detected_fields = analyze_schema(input_path, spinner, should_cancel)?;
-
-            if should_cancel.load(Ordering::Relaxed) {
-                return Err(anyhow!("Operation cancelled by user"));
-            }
-
-            // --- Pasada 2: Escritura (Nuevo Motor) ---
-            spinner.set_message("Processing records and generating segments (Pass 2 of 2)...");
-
-            load_data_to_table(
-                input_path,
-                entity,
-                table,
-                &detected_fields,
-                should_cancel,
-            )?;
-
-            Ok(())
-        },
-    )
-}
 
 /// Función para ser llamada desde la línea de comandos (sin TUI compleja)
 pub fn execute_load_cli(input_path: &str, entity: &str, table: &str) -> Result<()> {

@@ -1,13 +1,21 @@
 use anyhow::Result;
 use cliclack::{intro, outro, select, input, password, note, spinner, confirm};
-use crate::repl::state::App;
 use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
 use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
 
-pub async fn run_startup_cliclack() -> Result<Option<App>> {
+struct CdcInfo {
+    host: String,
+    port: String,
+    user: String,
+    pass: String,
+    database: String,
+    entity: String,
+}
+
+pub async fn run_startup_cliclack() -> Result<()> {
     intro(" bittice ")?;
 
     let option: u8 = select("Seleccione el modo de operación")
@@ -29,7 +37,7 @@ pub async fn run_startup_cliclack() -> Result<Option<App>> {
 
         if entities.is_empty() {
             note("No se encontraron entidades", "Debes conectar al menos una base de datos primero.")?;
-            return Ok(None);
+            return Ok(());
         }
 
         let mut select_entity = select("Seleccione la Entidad que desea usar");
@@ -68,7 +76,7 @@ pub async fn run_startup_cliclack() -> Result<Option<App>> {
             crate::server::start_all_servers().await?;
         }
         
-        return Ok(None);
+        return Ok(());
     }
 
     // Flujo de conexión
@@ -79,29 +87,29 @@ pub async fn run_startup_cliclack() -> Result<Option<App>> {
     let database: String = input("Base de datos a sincronizar").placeholder("sakila").interact()?;
     let entity: String = input("Nombre de la Entidad en Bittice").default_input(&database).interact()?;
 
+    let cdc_info = CdcInfo {
+        host,
+        port,
+        user,
+        pass,
+        database,
+        entity,
+    };
+
     // 1. Spinner de Sincronización
     let s = spinner();
     s.start("Iniciando motor de sincronización CDC...");
 
-    let mut app = App::new();
-    app.cdc_info.host = host;
-    app.cdc_info.port = port;
-    app.cdc_info.user = user;
-    app.cdc_info.pass = pass;
-    app.cdc_info.database = database;
-    app.cdc_info.entity = entity;
-
     let url = format!("mysql://{}:{}@{}:{}/{}",
-        app.cdc_info.user, app.cdc_info.pass,
-        app.cdc_info.host, app.cdc_info.port,
-        app.cdc_info.database);
+        cdc_info.user, cdc_info.pass,
+        cdc_info.host, cdc_info.port,
+        cdc_info.database);
 
     let (log_tx, mut log_rx) = mpsc::channel(100);
-    app.server_log_receiver = None; // Se lo pasaremos al TUI después
 
     let worker_url = url.clone();
-    let worker_entity = app.cdc_info.entity.clone();
-    let worker_db = app.cdc_info.database.clone();
+    let worker_entity = cdc_info.entity.clone();
+    let worker_db = cdc_info.database.clone();
 
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -127,7 +135,8 @@ pub async fn run_startup_cliclack() -> Result<Option<App>> {
     }
 
     s.stop("✓ Sincronización establecida.");
-    app.server_log_receiver = Some(log_rx);    // 2. Preguntar por Docker
+
+    // 2. Preguntar por Docker
     let build_docker = confirm("¿Deseas crear una imagen de Docker con estos datos?")
         .initial_value(true)
         .interact()?;
@@ -137,7 +146,7 @@ pub async fn run_startup_cliclack() -> Result<Option<App>> {
         s.start("Construyendo imagen Docker...");
         
         // Docker requiere nombres en minúsculas
-        let image_name = format!("bittice-{}", app.cdc_info.entity).to_lowercase().replace(" ", "-");
+        let image_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
         
         let mut child = Command::new("docker")
             .args(["build", "-t", &image_name, "."])
@@ -166,20 +175,20 @@ pub async fn run_startup_cliclack() -> Result<Option<App>> {
                 let s = spinner();
                 s.start("Generando stack de Docker Compose...");
                 
-                let project_name = format!("bittice-{}", app.cdc_info.entity).to_lowercase().replace(" ", "-");
+                let project_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
                 let compose_file = format!("docker-compose-{}.yml", project_name);
                 
                 // Ajustar URL para Docker: si es localhost, usar host.docker.internal
-                let docker_mysql_host = if app.cdc_info.host == "localhost" || app.cdc_info.host == "127.0.0.1" {
+                let docker_mysql_host = if cdc_info.host == "localhost" || cdc_info.host == "127.0.0.1" {
                     "host.docker.internal"
                 } else {
-                    &app.cdc_info.host
+                    &cdc_info.host
                 };
 
                 let mysql_url = format!("mysql://{}:{}@{}:{}/{}", 
-                    app.cdc_info.user, app.cdc_info.pass, 
-                    docker_mysql_host, app.cdc_info.port, 
-                    app.cdc_info.database);
+                    cdc_info.user, cdc_info.pass, 
+                    docker_mysql_host, cdc_info.port, 
+                    cdc_info.database);
 
                 // Crear un archivo docker-compose con DOS servicios (Engine + Sync)
                 let compose_content = format!(r#"
@@ -209,7 +218,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: always
-"#, project_name, mysql_url, app.cdc_info.entity, app.cdc_info.database);
+"#, project_name, mysql_url, cdc_info.entity, cdc_info.database);
 
                 std::fs::write(&compose_file, compose_content)?;
 
@@ -246,7 +255,7 @@ services:
     if start_now {
         // Si ya levantamos Docker, solo mostramos el banner y esperamos
         // Si no, iniciamos los servidores locales
-        let docker_active = build_docker && std::path::Path::new(&format!("docker-compose-bittice-{}.yml", app.cdc_info.entity.to_lowercase().replace(" ", "-"))).exists();
+        let docker_active = build_docker && std::path::Path::new(&format!("docker-compose-bittice-{}.yml", cdc_info.entity.to_lowercase().replace(" ", "-"))).exists();
         
         if docker_active {
             crate::server::show_banner();
@@ -255,8 +264,8 @@ services:
             crate::server::start_all_servers().await?;
         }
     } else {
-        outro("Bittice está listo. Puedes iniciarlo más tarde desde el menú principal.")?;
+        outro("Bittice está listo. Puedes iniciarlo más tarde desde la línea de comandos.")?;
     }
     
-    Ok(None)
+    Ok(())
 }
