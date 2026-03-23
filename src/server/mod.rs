@@ -27,16 +27,16 @@ struct ServerState {
 }
 
 pub fn show_banner() {
-    println!("\n  \x1b[1m\x1b[34mBittice Query Engine está activo\x1b[0m");
+    println!("\n  \x1b[1m\x1b[34mBittice Query Engine is active\x1b[0m");
     println!("  ----------------------------------------");
     println!("  \x1b[1mREST API:\x1b[0m    http://127.0.0.1:3000");
     println!("  \x1b[1mgRPC API:\x1b[0m    127.0.0.1:50051");
     println!("  ----------------------------------------");
     
-    // Mostrar consultas guardadas
+    // Show saved queries
     if let Ok(ops) = load_operations() {
         if !ops.is_empty() {
-            println!("  \x1b[1mConsultas cargadas:\x1b[0m");
+            println!("  \x1b[1mLoaded queries:\x1b[0m");
             for op in ops {
                 println!("    • /{}", op.name());
             }
@@ -44,19 +44,19 @@ pub fn show_banner() {
         }
     }
 
-    println!("  \x1b[1mConfiguración dinámica:\x1b[0m");
-    println!("  GET    /_config             (Listar todas)");
-    println!("  GET    /_config?name=...    (Ver definición)");
-    println!("  POST   /_config             (Crear)");
-    println!("  PUT    /_config             (Editar)");
-    println!("  DELETE /_config?name=...    (Eliminar)");
+    println!("  \x1b[1mDynamic configuration:\x1b[0m");
+    println!("  GET    /_config             (List all)");
+    println!("  GET    /_config?name=...    (View definition)");
+    println!("  POST   /_config             (Create)");
+    println!("  PUT    /_config             (Edit)");
+    println!("  DELETE /_config?name=...    (Delete)");
     println!("  ----------------------------------------");
-    println!("  Presiona \x1b[1mCtrl+C\x1b[0m para detener el servidor\n");
+    println!("  Press \x1b[1mCtrl+C\x1b[0m to stop the server\n");
 }
 
 pub async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
-    println!("\n  Apagando Bittice...");
+    println!("\n  Shutting down Bittice...");
     if let Some(tx) = shutdown_tx {
         let _ = tx.send(());
     }

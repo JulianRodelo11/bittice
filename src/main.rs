@@ -1,13 +1,13 @@
 use clap::Parser;
 use anyhow::Result;
 
-// Importar módulos desde la librería (nombre del paquete: bittice)
+// Import modules from the library (package name: bittice)
 use bittice::cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Si hay argumentos (más allá del nombre del programa), ejecutamos normalmente.
-    // Si no, entramos al modo interactivo.
+    // If there are arguments (beyond the program name), we execute normally.
+    // If not, we enter interactive mode.
     if std::env::args().len() > 1 {
         let cli = Cli::parse();
         match cli.command {
@@ -47,33 +47,6 @@ async fn main() -> Result<()> {
             Commands::Cdc { url, entity, database } => {
                 let worker = bittice::core::cdc::CdcWorker::new(url, entity, database);
                 worker.run().await?;
-            }
-            Commands::Query { entity, table, limit } => {
-                let base_path = std::path::Path::new("data").join(&entity);
-                let table_obj = bittice::core::storage::table::Table::open(&base_path, &table)?;
-                
-                // Si no se especificaron campos, detectar todos los .dat disponibles en el primer segmento
-                let fields = {
-                    let mut detected = Vec::new();
-                    let seg_path = table_obj.base_path.join("segments").join("seg_0000");
-                    if let Ok(entries) = std::fs::read_dir(seg_path) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name.ends_with(".dat") && !name.starts_with("bitmaps_") {
-                                detected.push(name.replace(".dat", ""));
-                            }
-                        }
-                    }
-                    detected.sort();
-                    detected
-                };
-                
-                let result = table_obj.search(&fields, &[], &bittice::core::types::LogicalOp::And, &[], &[], limit, 0)?;
-                println!("Query results for {}/{} (total found: {}):", entity, table, result.total_found);
-                println!("Headers: {:?}", result.headers);
-                for row in result.rows {
-                    println!("{:?}", row);
-                }
             }
         }
     } else {

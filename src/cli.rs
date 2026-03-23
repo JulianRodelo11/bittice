@@ -11,50 +11,38 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Carga datos desde un NDJSON al formato Bittice
+    /// Load data from an NDJSON to Bittice format
     Load {
-        /// Ruta al archivo .ndjson
+        /// Path to the .ndjson file
         #[arg(short, long)]
         input: String,
-        /// Nombre de la entidad
+        /// Entity name
         #[arg(short, long)]
         entity: String,
-        /// Nombre de la tabla
+        /// Table name
         #[arg(short, long)]
         table: String,
     },
-    /// Inicia el servidor
+    /// Start the server
     Server {
-        /// Puerto para escuchar (default: 50051)
+        /// Port to listen on (default: 50051)
         #[arg(short, long, default_value_t = 50051)]
         port: u16,
 
-        /// Tipo de servidor: 'grpc' o 'http'
+        /// Server type: 'grpc' or 'http'
         #[arg(short, long, default_value = "grpc")]
         r#type: String,
     },
-    /// Inicia la sincronización CDC desde MySQL
+    /// Start CDC synchronization from MySQL
     Cdc {
-        /// URL de conexión MySQL (ej: mysql://root:sakila@localhost:3306/sakila)
+        /// MySQL connection URL (e.g., mysql://root:sakila@localhost:3306/sakila)
         #[arg(short, long)]
         url: String,
-        /// Nombre de la entidad en Bittice
+        /// Entity name in Bittice
         #[arg(short, long)]
         entity: String,
-        /// Base de datos a sincronizar
+        /// Database to synchronize
         #[arg(short, long)]
         database: String,
-    },
-    /// Consulta una tabla directamente (CLI)
-    Query {
-        /// Nombre de la entidad
-        #[arg(short, long)]
-        entity: String,
-        /// Nombre de la tabla
-        #[arg(short, long)]
-        table: String,
-        /// Límite de resultados
-        #[arg(short, long, default_value_t = 10)]
-        limit: usize,
     },
 }

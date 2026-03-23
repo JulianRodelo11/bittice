@@ -18,13 +18,13 @@ struct CdcInfo {
 pub async fn run_startup_cliclack() -> Result<()> {
     intro(" bittice ")?;
 
-    let option: u8 = select("Seleccione el modo de operación")
-        .item(0, "Conectar y sincronizar a una base de datos", "Configura una nueva conexión MySQL CDC")
-        .item(1, "Usar Bittice a una base de datos ya conectada", "Entra directamente al panel de consultas")
+    let option: u8 = select("Select operation mode")
+        .item(0, "Connect and synchronize to a database", "Configure a new MySQL CDC connection")
+        .item(1, "Use Bittice with an already connected database", "Enter the query dashboard directly")
         .interact()?;
 
     if option == 1 {
-        // Listar entidades disponibles
+        // List available entities
         let data_dir = std::path::Path::new("data");
         let mut entities = Vec::new();
         if let Ok(entries) = std::fs::read_dir(data_dir) {
@@ -36,40 +36,40 @@ pub async fn run_startup_cliclack() -> Result<()> {
         }
 
         if entities.is_empty() {
-            note("No se encontraron entidades", "Debes conectar al menos una base de datos primero.")?;
+            note("No entities found", "You must connect at least one database first.")?;
             return Ok(());
         }
 
-        let mut select_entity = select("Seleccione la Entidad que desea usar");
+        let mut select_entity = select("Select the Entity you want to use");
         for (i, entity) in entities.iter().enumerate() {
             select_entity = select_entity.item(i, entity, "");
         }
         let entity_idx = select_entity.interact()?;
         let selected_entity = &entities[entity_idx];
 
-        // Verificar si existe un docker-compose para esta entidad
+        // Check if a docker-compose exists for this entity
         let compose_file = format!("docker-compose-bittice-{}.yml", selected_entity.to_lowercase().replace(" ", "-"));
         let mut use_docker = false;
         
         if std::path::Path::new(&compose_file).exists() {
-            use_docker = confirm(format!("Se detectó un archivo Docker Compose para '{}'. ¿Deseas iniciarlo?", selected_entity))
+            use_docker = confirm(format!("Docker Compose file detected for '{}'. Do you want to start it?", selected_entity))
                 .initial_value(true)
                 .interact()?;
         }
 
         if use_docker {
             let s = spinner();
-            s.start(format!("Iniciando Docker stack para {}...", selected_entity));
+            s.start(format!("Starting Docker stack for {}...", selected_entity));
             let run_status = Command::new("docker-compose")
                 .args(["-f", &compose_file, "-p", &format!("bittice-{}", selected_entity), "up", "-d"])
                 .status()?;
             
             if run_status.success() {
-                s.stop(format!("✓ Contenedores de '{}' activos.", selected_entity));
+                s.stop(format!("✓ Containers for '{}' are active.", selected_entity));
                 crate::server::show_banner();
                 crate::server::wait_for_exit(None).await?;
             } else {
-                s.stop("✗ Error al iniciar Docker. Intentando inicio local...");
+                s.stop("✗ Error starting Docker. Attempting local startup...");
                 crate::server::start_all_servers().await?;
             }
         } else {
@@ -79,13 +79,13 @@ pub async fn run_startup_cliclack() -> Result<()> {
         return Ok(());
     }
 
-    // Flujo de conexión
+    // Connection flow
     let host: String = input("MySQL Host").default_input("localhost").interact()?;
-    let port: String = input("Puerto").default_input("3306").interact()?;
-    let user: String = input("Usuario").default_input("root").interact()?;
-    let pass: String = password("Contraseña").mask('*').interact()?;
-    let database: String = input("Base de datos a sincronizar").placeholder("sakila").interact()?;
-    let entity: String = input("Nombre de la Entidad en Bittice").default_input(&database).interact()?;
+    let port: String = input("Port").default_input("3306").interact()?;
+    let user: String = input("User").default_input("root").interact()?;
+    let pass: String = password("Password").mask('*').interact()?;
+    let database: String = input("Database to synchronize").placeholder("sakila").interact()?;
+    let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
 
     let cdc_info = CdcInfo {
         host,
@@ -96,9 +96,9 @@ pub async fn run_startup_cliclack() -> Result<()> {
         entity,
     };
 
-    // 1. Spinner de Sincronización
+    // 1. Sync Spinner
     let s = spinner();
-    s.start("Iniciando motor de sincronización CDC...");
+    s.start("Starting CDC sync engine...");
 
     let url = format!("mysql://{}:{}@{}:{}/{}",
         cdc_info.user, cdc_info.pass,
@@ -117,7 +117,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
         let _ = rt.block_on(worker.run());
     });
 
-    // Esperar a que el bootstrap termine
+    // Wait for bootstrap to finish
     let mut bootstrap_success = false;
     while let Some(msg) = log_rx.recv().await {
         if msg == "CDC_READY" {
@@ -130,22 +130,22 @@ pub async fn run_startup_cliclack() -> Result<()> {
     }
 
     if !bootstrap_success {
-        s.stop("✗ Error al sincronizar con la base de datos.");
-        return Err(anyhow::anyhow!("Sincronización fallida. Verifica las credenciales y el estado de la base de datos."));
+        s.stop("✗ Error synchronizing with the database.");
+        return Err(anyhow::anyhow!("Sync failed. Verify credentials and database status."));
     }
 
-    s.stop("✓ Sincronización establecida.");
+    s.stop("✓ Sync established.");
 
-    // 2. Preguntar por Docker
-    let build_docker = confirm("¿Deseas crear una imagen de Docker con estos datos?")
+    // 2. Ask for Docker
+    let build_docker = confirm("Do you want to create a Docker image with this data?")
         .initial_value(true)
         .interact()?;
 
     if build_docker {
         let s = spinner();
-        s.start("Construyendo imagen Docker...");
+        s.start("Building Docker image...");
         
-        // Docker requiere nombres en minúsculas
+        // Docker requires lowercase names
         let image_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
         
         let mut child = Command::new("docker")
@@ -164,21 +164,21 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
         let status = child.wait()?;
         if status.success() {
-            s.stop(format!("✓ Imagen '{}' creada con éxito.", image_name));
+            s.stop(format!("✓ Image '{}' created successfully.", image_name));
             
-            // NUEVO: Preguntar si desea iniciar el contenedor
-            let run_container = confirm(format!("¿Deseas iniciar un contenedor con la imagen '{}'?", image_name))
+            // NEW: Ask if user wants to start the container
+            let run_container = confirm(format!("Do you want to start a container with image '{}'?", image_name))
                 .initial_value(true)
                 .interact()?;
             
             if run_container {
                 let s = spinner();
-                s.start("Generando stack de Docker Compose...");
+                s.start("Generating Docker Compose stack...");
                 
                 let project_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
                 let compose_file = format!("docker-compose-{}.yml", project_name);
                 
-                // Ajustar URL para Docker: si es localhost, usar host.docker.internal
+                // Adjust URL for Docker: if localhost, use host.docker.internal
                 let docker_mysql_host = if cdc_info.host == "localhost" || cdc_info.host == "127.0.0.1" {
                     "host.docker.internal"
                 } else {
@@ -190,7 +190,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
                     docker_mysql_host, cdc_info.port, 
                     cdc_info.database);
 
-                // Crear un archivo docker-compose con DOS servicios (Engine + Sync)
+                // Create a docker-compose file with TWO services (Engine + Sync)
                 let compose_content = format!(r#"
 version: "3.9"
 services:
@@ -222,9 +222,9 @@ services:
 
                 std::fs::write(&compose_file, compose_content)?;
 
-                s.set_message("Levantando servicios con Docker Compose...");
+                s.set_message("Bringing up services with Docker Compose...");
                 
-                // Ejecutar docker-compose up -d
+                // Run docker-compose up -d
                 let run_status = Command::new("docker-compose")
                     .args([
                         "-f", &compose_file,
@@ -234,27 +234,27 @@ services:
                     .status()?;
 
                 if run_status.success() {
-                    s.stop(format!("✓ Stack '{}' iniciado correctamente.", project_name));
-                    note("Docker Compose", format!("Ahora verás el grupo '{}' en Docker Desktop con el motor de Bittice dentro.\nURL: http://localhost:3000", project_name))?;
+                    s.stop(format!("✓ Stack '{}' started correctly.", project_name));
+                    note("Docker Compose", format!("You will now see the group '{}' in Docker Desktop with the Bittice engine inside.\nURL: http://localhost:3000", project_name))?;
                 } else {
-                    s.stop("✗ Error al iniciar docker-compose. Asegúrate de tenerlo instalado.");
+                    s.stop("✗ Error starting docker-compose. Make sure you have it installed.");
                 }
             }
         } else {
-            s.stop("✗ Error al construir la imagen de Docker (revisa que el nombre sea válido).");
+            s.stop("✗ Error building Docker image (check that the name is valid).");
         }
     }
 
-    // 3. Finalizar mostrando el banner del servidor
-    note("Sincronización Completa", "El motor de Bittice ya tiene acceso a tus datos.")?;
+    // 3. Finish showing server banner
+    note("Sync Complete", "Bittice engine now has access to your data.")?;
     
-    let start_now = confirm("¿Deseas activar el motor de consultas ahora mismo?")
+    let start_now = confirm("Do you want to activate the query engine right now?")
         .initial_value(true)
         .interact()?;
 
     if start_now {
-        // Si ya levantamos Docker, solo mostramos el banner y esperamos
-        // Si no, iniciamos los servidores locales
+        // If we already brought up Docker, just show banner and wait
+        // If not, start local servers
         let docker_active = build_docker && std::path::Path::new(&format!("docker-compose-bittice-{}.yml", cdc_info.entity.to_lowercase().replace(" ", "-"))).exists();
         
         if docker_active {
@@ -264,7 +264,7 @@ services:
             crate::server::start_all_servers().await?;
         }
     } else {
-        outro("Bittice está listo. Puedes iniciarlo más tarde desde la línea de comandos.")?;
+        outro("Bittice is ready. You can start it later from the command line.")?;
     }
     
     Ok(())

@@ -11,11 +11,11 @@ use crate::core::storage::table::Table;
 use crate::core::date_utils::{extract_day, extract_hour_bucket, extract_month};
 use crate::core::config::FieldStats;
 
-/// Función para ser llamada desde la línea de comandos (sin TUI compleja)
+/// Function to be called from the command line (without complex TUI)
 pub fn execute_load_cli(input_path: &str, entity: &str, table: &str) -> Result<()> {
     let should_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     
-    // Spinner simple de consola
+    // Simple console spinner
     let pb = indicatif::ProgressBar::new_spinner();
     pb.set_style(indicatif::ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -37,15 +37,15 @@ fn load_data_to_table(
     detected_fields: &HashMap<String, FieldStats>,
     should_cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
-    // 1. Limpiar datos existentes (Overwrite mode)
+    // 1. Clear existing data (Overwrite mode)
     let table_dir = Path::new("data").join(entity).join(table_name);
     if table_dir.exists() {
         std::fs::remove_dir_all(&table_dir)?;
     }
 
-    // 2. Inicializar Tabla
+    // 2. Initialize Table
     let base_path = Path::new("data").join(entity);
-    // Asegurar que el directorio de entidad existe
+    // Ensure entity directory exists
     if !base_path.exists() {
         std::fs::create_dir_all(&base_path)?;
     }
@@ -60,11 +60,11 @@ fn load_data_to_table(
         }
     }
 
-    // Guardar campos originales en el manifest
+    // Save original fields in the manifest
     let original_fields_list: Vec<String> = detected_fields.keys().cloned().collect();
     table.set_original_fields(original_fields_list)?;
 
-    // 3. Preparar expansión de fechas
+    // 3. Prepare date expansion
     let mut fields_to_process: HashMap<String, Vec<String>> = HashMap::new();
     for (name, stats) in detected_fields {
         let mut subfields = vec![name.clone()];
@@ -78,7 +78,7 @@ fn load_data_to_table(
         fields_to_process.insert(name.clone(), subfields);
     }
 
-    // 4. Leer y Escribir
+    // 4. Read and Write
     let file = File::open(input_path)?;
     let reader = BufReader::new(file);
 
@@ -95,7 +95,7 @@ fn load_data_to_table(
         let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         let mut row_data: HashMap<String, String> = HashMap::new();
 
-        // Procesar campos detectados y expandir fechas
+        // Process detected fields and expand dates
         for (base_field, derived_names) in &fields_to_process {
             let val_raw = v.get(base_field);
             
@@ -125,11 +125,11 @@ fn load_data_to_table(
             }
         }
         
-        // Insertar en el nuevo motor
+        // Insert into the new engine
         table.insert(row_data)?;
     }
 
-    // 5. Commit final (Flush activo)
+    // 5. Final commit (Active flush)
     table.flush_active_segment()?;
 
     Ok(())
