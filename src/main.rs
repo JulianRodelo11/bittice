@@ -11,9 +11,6 @@ async fn main() -> Result<()> {
     if std::env::args().len() > 1 {
         let cli = Cli::parse();
         match cli.command {
-            Commands::Load { input, entity, table } => {
-                bittice::commands::load::execute_load_cli(&input, &entity, &table)?;
-            }
             Commands::Server { port, r#type } => {
                 if r#type == "all" {
                     bittice::server::start_all_servers().await?;

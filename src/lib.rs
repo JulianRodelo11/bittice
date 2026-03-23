@@ -1,7 +1,6 @@
 pub mod core {
     pub mod config;
     pub mod date_utils;
-    pub mod schema;
     pub mod writer;
     pub mod query;
     pub mod saved_queries;
@@ -11,9 +10,7 @@ pub mod core {
     pub mod cdc;
 }
 
-pub mod commands {
-    pub mod load;
-}
+pub mod commands {}
 
 pub mod cli;
 

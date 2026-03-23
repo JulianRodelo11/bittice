@@ -1,14 +1,6 @@
 # Bittice: High-Performance Local Data Engine
 
-**Bittice** is a high-performance local data engine designed to process massive NDJSON files or synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC).
-
-## 🛠 Prerequisites
-
-Before starting, ensure you have the following installed:
-- **Docker & Docker Desktop:** Mandatory. Bittice uses Docker to containerize the engine and the synchronization worker.
-- **Rust (Cargo):** To run the project locally.
-
----
+**Bittice** is a high-performance local data engine designed to synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC).
 
 ## ⚡ Why Bittice? (Performance vs. Traditional DBs)
 
@@ -31,6 +23,14 @@ Instead of calculating year, month, or day during query time (which is slow), **
 
 ---
 
+## 🛠 Prerequisites
+
+Before starting, ensure you have the following installed:
+- **Docker & Docker Desktop:** Mandatory. Bittice uses Docker to containerize the engine and the synchronization worker.
+- **Rust (Cargo):** To run the project locally.
+
+---
+
 ## 🚀 Getting Started
 
 To start Bittice, simply run the project. The interactive wizard will guide you through the setup:
@@ -41,7 +41,7 @@ cargo run
 
 This single command gives you two clear paths:
 1. **Connect and synchronize:** Configure a new MySQL connection to start a real-time CDC sync.
-2. **Use existing data:** Jump directly to the query engine using data already synchronized or loaded.
+2. **Use existing data:** Jump directly to the query engine using data already synchronized.
 
 ---
 
@@ -88,7 +88,6 @@ Send a `POST` request to `http://localhost:3000/_config` with the query definiti
       { "field": "amount", "op": ">", "value": "5.00" }
     ],
     "filters_op": "And",
-    "aggregations": [],
     "order_by": [{ "field": "payment_date", "direction": "Desc" }],
     "limit": 10,
     "selected_fields": ["*"]

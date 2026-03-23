@@ -11,18 +11,6 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Load data from an NDJSON to Bittice format
-    Load {
-        /// Path to the .ndjson file
-        #[arg(short, long)]
-        input: String,
-        /// Entity name
-        #[arg(short, long)]
-        entity: String,
-        /// Table name
-        #[arg(short, long)]
-        table: String,
-    },
     /// Start the server
     Server {
         /// Port to listen on (default: 50051)
