@@ -119,9 +119,15 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
     // Wait for bootstrap to finish
     let mut bootstrap_success = false;
+    let mut error_msg = String::from("Sync failed. Verify credentials and database status.");
+    
     while let Some(msg) = log_rx.recv().await {
         if msg == "CDC_READY" {
             bootstrap_success = true;
+            break;
+        }
+        if let Some(err) = msg.strip_prefix("CDC_ERROR: ") {
+            error_msg = err.to_string();
             break;
         }
         if msg.starts_with("CDC: Bootstrapping table") {
@@ -130,8 +136,8 @@ pub async fn run_startup_cliclack() -> Result<()> {
     }
 
     if !bootstrap_success {
-        s.stop("✗ Error synchronizing with the database.");
-        return Err(anyhow::anyhow!("Sync failed. Verify credentials and database status."));
+        s.stop(format!("✗ Error: {}", error_msg));
+        return Err(anyhow::anyhow!(error_msg));
     }
 
     s.stop("✓ Sync established.");

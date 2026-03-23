@@ -1,0 +1,27 @@
+
+version: "3.9"
+services:
+  engine:
+    image: bittice-employees
+    container_name: bittice-employees-engine
+    ports:
+      - "3000:3000"
+      - "50051:50051"
+    command: ["./bittice", "server", "--type", "all"]
+    environment:
+      - BITTICE_HOST=0.0.0.0
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+
+  sync:
+    image: bittice-employees
+    container_name: bittice-employees-sync
+    command: ["./bittice", "cdc", "--url", "mysql://root:p_ssW0rd@host.docker.internal:3307/employees", "--entity", "employees", "--database", "employees"]
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always

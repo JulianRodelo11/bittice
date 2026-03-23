@@ -191,18 +191,42 @@ impl CdcWorker {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let opts = Opts::from_url(&self.url)?;
+        let opts = match Opts::from_url(&self.url) {
+            Ok(o) => o,
+            Err(e) => {
+                self.log(format!("CDC_ERROR: Invalid URL: {}", e));
+                return Err(e.into());
+            }
+        };
         let pool = Pool::new(opts);
-        let mut conn = pool.get_conn().await?;
+        let mut conn = match pool.get_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.log(format!("CDC_ERROR: Connection failed: {}", e));
+                return Err(e.into());
+            }
+        };
 
-        conn.query_drop(format!("USE {}", self.database)).await?;
+        if let Err(e) = conn.query_drop(format!("USE {}", self.database)).await {
+            self.log(format!("CDC_ERROR: Database '{}' not found: {}", self.database, e));
+            return Err(e.into());
+        }
 
         let mut state = self.load_state();
-        let tables = self.fetch_all_tables(&mut conn).await?;
+        let tables = match self.fetch_all_tables(&mut conn).await {
+            Ok(t) => t,
+            Err(e) => {
+                self.log(format!("CDC_ERROR: Failed to fetch tables: {}", e));
+                return Err(e.into());
+            }
+        };
 
         for table_name in &tables {
             if !state.bootstrapped_tables.contains(table_name) {
-                self.bootstrap_table(&mut conn, table_name, &mut state).await?;
+                if let Err(e) = self.bootstrap_table(&mut conn, table_name, &mut state).await {
+                    self.log(format!("CDC_ERROR: Bootstrap failed for '{}': {}", table_name, e));
+                    return Err(e);
+                }
                 state.bootstrapped_tables.push(table_name.clone());
                 self.save_state(&state)?;
             } else {
@@ -217,10 +241,25 @@ impl CdcWorker {
         }
 
         if state.binlog_file.is_empty() {
-            let row: Option<(String, u32, String, String, String)> = conn.query_first("SHOW MASTER STATUS").await?;
+            // MySQL 8.4+ uses 'SHOW BINARY LOG STATUS', older versions use 'SHOW MASTER STATUS'
+            let mut row: Option<(String, u32, String, String, String)> = conn.query_first("SHOW BINARY LOG STATUS").await.unwrap_or(None);
+            
+            if row.is_none() {
+                row = match conn.query_first("SHOW MASTER STATUS").await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.log(format!("CDC_ERROR: MySQL Binlog access denied. Ensure 'log_bin' is ON and user has REPLICATION CLIENT/SLAVE permissions. Error: {}", e));
+                        return Err(e.into());
+                    }
+                };
+            }
+            
             if let Some((file, pos, _, _, _)) = row {
                 state.binlog_file = file;
                 state.binlog_pos = pos;
+            } else {
+                self.log("CDC_ERROR: Binlog status not found. Ensure 'log_bin=ON' and 'binlog_format=ROW' are set in your MySQL config.".to_string());
+                return Err(anyhow::anyhow!("Binlog disabled"));
             }
         }
 
