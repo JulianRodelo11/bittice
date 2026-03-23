@@ -29,15 +29,24 @@ pub struct SavedQuery {
     pub name: String,
     pub entity: String,
     pub table: String,
+    #[serde(default)]
     pub filters: Vec<SavedFilter>,
+    #[serde(default = "default_filters_op")]
     pub filters_op: String, // "And" or "Or"
+    #[serde(default)]
     pub aggregations: Vec<serde_json::Value>,
+    #[serde(default)]
     pub order_by: Vec<SavedOrderBy>,
     pub limit: Option<usize>,
     /// When set (e.g. "$limit"), limit is a variable to be asked at runtime
     #[serde(default)]
     pub limit_param: Option<String>,
+    #[serde(default)]
     pub selected_fields: Vec<String>,
+}
+
+fn default_filters_op() -> String {
+    "And".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
