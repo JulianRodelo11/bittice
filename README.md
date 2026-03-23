@@ -15,22 +15,15 @@
 
 ## 🚀 Getting Started
 
-Simply run `bittice` without arguments to enter the interactive startup flow:
+To start Bittice, simply run the project. The interactive wizard will guide you through the setup:
 
 ```bash
-./bittice
+cargo run
 ```
 
-This will guide you through:
-1. **Selecting Operation Mode:** Connect a new database or use existing data.
-2. **MySQL Synchronization:** Configure your connection (Host, Port, User, Password, Database).
-3. **Docker Integration:** Optionally build a Docker image and generate a `docker-compose.yml` for your stack.
-
-### Manual CLI Commands
-
-- **Load NDJSON:** `./bittice load --input data.ndjson --entity my_app --table users`
-- **Start Server:** `./bittice server --type all --port 50051` (Starts both REST on `:3000` and gRPC on `:50051`).
-- **Manual CDC:** `./bittice cdc --url "mysql://user:pass@host:port/db" --entity my_app --database db`
+This single command gives you two clear paths:
+1. **Connect and synchronize:** Configure a new MySQL connection to start a real-time CDC sync.
+2. **Use existing data:** Jump directly to the query engine using data already synchronized or loaded.
 
 ---
 
