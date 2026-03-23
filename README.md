@@ -10,6 +10,27 @@ Before starting, ensure you have the following installed:
 
 ---
 
+## ⚡ Why Bittice? (Performance vs. Traditional DBs)
+
+Bittice is not a replacement for your primary transactional database; it is a **high-performance read-layer** designed to handle massive search and analysis workloads that would otherwise slow down your production environment.
+
+### 1. Dynamic Bitmaps vs. Static Indexes
+In traditional SQL databases, you need specific composite indexes (e.g., `INDEX(a, b)`) for every combination of filters. 
+**Bittice uses Roaring Bitmaps** for every unique value. This allows the engine to perform ultra-fast logical `AND`/`OR` operations between filters dynamically, providing total flexibility without the overhead of maintaining hundreds of traditional indexes.
+
+### 2. Columnar Efficiency
+Traditional databases (Row-Oriented) must read entire rows from disk even if you only need one or two fields.
+**Bittice is Column-Oriented.** It only touches the specific data requested. This drastically reduces I/O pressure and allows it to process millions of records in milliseconds.
+
+### 3. Production Isolation (via CDC)
+Running heavy analytical queries (GroupBys, deep filters) on your production database can cause locks and slow down users.
+**Bittice uses Change Data Capture (CDC)** to act as an isolated, real-time replica. You can run intensive search workloads on Bittice with **zero impact** on your main database's performance.
+
+### 4. Native Time-Series Enrichment
+Instead of calculating year, month, or day during query time (which is slow), **Bittice automatically expands date fields** into sub-columns during ingestion. This transforms expensive date calculations into simple, instant index lookups.
+
+---
+
 ## 🚀 Getting Started
 
 To start Bittice, simply run the project. The interactive wizard will guide you through the setup:
