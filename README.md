@@ -2,14 +2,11 @@
 
 **Bittice** is a high-performance local data engine designed to process massive NDJSON files or synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC).
 
-## Key Features
+## 🛠 Prerequisites
 
-- **Blazing Fast Indexing:** Transform JSON Lines into optimized binary structures (`.dat`) and position indexes (`.offsets`).
-- **MySQL CDC (Change Data Capture):** Real-time synchronization with MySQL databases.
-- **Roaring Bitmaps:** Millisecond-level filtering using advanced bitmap indices.
-- **Time Components:** Automatic date detection and generation of sub-fields (day, month, hour) for time-series analysis.
-- **Dual API Surface:** Serve your data via **REST (Axum)** or **gRPC (Tonic)**.
-- **Interactive Startup:** A guided CLI flow to connect databases, sync data, and even containerize your setup.
+Before starting, ensure you have the following installed:
+- **Docker & Docker Desktop:** Mandatory. Bittice uses Docker to containerize the engine and the synchronization worker.
+- **Rust (Cargo):** To run the project locally.
 
 ---
 
@@ -27,14 +24,28 @@ This single command gives you two clear paths:
 
 ---
 
+## 🔄 Step-by-Step: Connecting to MySQL
+
+When you choose **"Connect and synchronize"**, follow these steps:
+
+1.  **MySQL Host:** Enter the address of your database (e.g., `localhost` or `192.168.1.100`).
+2.  **Port:** The port where MySQL is listening (usually `3306`).
+3.  **User & Password:** Your database credentials.
+4.  **Database to synchronize:** The name of the specific database you want to index.
+5.  **Entity Name:** A nickname for this connection in Bittice (used in your API paths).
+6.  **Initial Sync:** Bittice will start a "Bootstrap" to clone your existing data into local indices.
+7.  **Docker Image Build:** The wizard will ask to build a custom Docker image for your entity. **This is highly recommended.**
+8.  **Docker Compose Stack:** Finally, it will offer to generate and start a `docker-compose.yml`. This creates two containers:
+    -   `engine`: The query server (REST/gRPC).
+    -   `sync`: The worker that keeps data updated in real-time using the MySQL Binlog.
+
+---
+
 ## 🔄 MySQL Synchronization (CDC)
 
-Bittice can act as a real-time replica of your MySQL database. 
+Bittice acts as a real-time replica of your MySQL database. Once the initial sync is complete, it listens to the MySQL binary log (Binlog) to reflect `INSERT`, `UPDATE`, and `DELETE` operations instantly in your local indices. 
 
-1. **Connection:** Provide your MySQL credentials during startup.
-2. **Bootstrap:** Bittice first performs a full snapshot of your tables.
-3. **Real-time Sync:** Once bootstrapped, it listens to the MySQL binary log (Binlog) to reflect `INSERT`, `UPDATE`, and `DELETE` operations instantly in your local indices.
-4. **Offline Support:** If the sync stops, it resumes from the last known state upon restart.
+**Offline Support:** If the sync stops, it resumes from the last known state upon restart.
 
 ---
 
@@ -87,7 +98,7 @@ Bittice provides a high-performance gRPC interface defined in `proto/bittice.pro
 
 - **`Search` / `SearchUnary`:** Direct ad-hoc searching.
 - **`ExecuteSavedQuery`:** Run a pre-configured operation by name.
-- **`SubscribeUpdates` (Real-time):** Stream updates for a specific table. Get notified instantly when data changes in the underlying storage.
+- **`SubscribeUpdates` (Real-time):** Stream updates for a specific table. Get notified instantly when data changes.
 
 ---
 
