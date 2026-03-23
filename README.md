@@ -1,5 +1,7 @@
 # Bittice: High-Performance Local Data Engine
 
+[Read in English](README.md) | [Leer en Español](README.es.md)
+
 **Bittice** is a high-performance local data engine designed to synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC).
 
 ## ⚡ Why Bittice? (Performance vs. Traditional DBs)
