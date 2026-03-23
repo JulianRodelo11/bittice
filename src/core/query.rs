@@ -56,6 +56,16 @@ pub fn execute_query(
     let target_ids = if filters.is_empty() {
         None
     } else {
+        // Obtenemos el total de registros para optimizar operaciones de exclusión (Ne)
+        let mut total_records = 0;
+        if let Ok(entries) = std::fs::read_dir(&stores_dir) {
+            if let Some(entry) = entries.flatten().find(|e| e.file_name().to_string_lossy().ends_with(".offsets")) {
+                if let Ok(meta) = entry.metadata() {
+                    total_records = (meta.len() >> 3) as usize;
+                }
+            }
+        }
+
         let mut result_bitmap = RoaringBitmap::new();
         let mut first = true;
         for f in filters {
@@ -72,7 +82,7 @@ pub fn execute_query(
 
             let mut filter_bitmap = RoaringBitmap::new();
             if let Some(bitmaps) = query_cache.get(&f.field) {
-                // Operación de filtro sobre el índice en PARALELO
+                // Operación de filtro sobre el índice
                 match f.op {
                     ComparisonOp::Eq => {
                         if let Some(bm) = bitmaps.get(&f.value) {
@@ -80,9 +90,11 @@ pub fn execute_query(
                         }
                     },
                     ComparisonOp::Ne => {
-                        bitmaps.iter()
-                            .filter(|(k, _)| *k != &f.value)
-                            .for_each(|(_, bm)| filter_bitmap |= bm);
+                        // OPTIMIZACIÓN: Universo - Excluido (AND NOT)
+                        filter_bitmap = RoaringBitmap::from_iter(0..total_records as u32);
+                        if let Some(bm) = bitmaps.get(&f.value) {
+                            filter_bitmap -= bm;
+                        }
                     },
                     ComparisonOp::Gt => {
                         bitmaps.iter()
@@ -102,12 +114,6 @@ pub fn execute_query(
                     ComparisonOp::Lte => {
                         bitmaps.iter()
                             .filter(|(k, _)| k.as_str() <= f.value.as_str())
-                            .for_each(|(_, bm)| filter_bitmap |= bm);
-                    },
-                    ComparisonOp::Like => {
-                        let pattern = f.value.replace("%", "");
-                        bitmaps.iter()
-                            .filter(|(k, _)| k.contains(&pattern))
                             .for_each(|(_, bm)| filter_bitmap |= bm);
                     },
                     ComparisonOp::In => {

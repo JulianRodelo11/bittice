@@ -479,7 +479,6 @@ impl Database for MyDatabase {
                         bittice_proto::ComparisonOp::Gte => ComparisonOp::Gte,
                         bittice_proto::ComparisonOp::Lt => ComparisonOp::Lt,
                         bittice_proto::ComparisonOp::Lte => ComparisonOp::Lte,
-                        bittice_proto::ComparisonOp::Like => ComparisonOp::Like,
                         bittice_proto::ComparisonOp::In => ComparisonOp::In,
                     },
                     value: f.value.clone(),
@@ -593,7 +592,7 @@ impl Database for MyDatabase {
         if entity.is_empty() || table_name.is_empty() { return Err(Status::invalid_argument("Entity/Table required")); }
 
         let filters: Vec<CoreFilter> = req.filters.iter().map(|f| {
-            CoreFilter { field: f.field.clone(), op: match f.op() { bittice_proto::ComparisonOp::Eq => ComparisonOp::Eq, bittice_proto::ComparisonOp::Ne => ComparisonOp::Ne, bittice_proto::ComparisonOp::Gt => ComparisonOp::Gt, bittice_proto::ComparisonOp::Gte => ComparisonOp::Gte, bittice_proto::ComparisonOp::Lt => ComparisonOp::Lt, bittice_proto::ComparisonOp::Lte => ComparisonOp::Lte, bittice_proto::ComparisonOp::Like => ComparisonOp::Like, bittice_proto::ComparisonOp::In => ComparisonOp::In, }, value: f.value.clone(), value_options: f.value_options.clone() }
+            CoreFilter { field: f.field.clone(), op: match f.op() { bittice_proto::ComparisonOp::Eq => ComparisonOp::Eq, bittice_proto::ComparisonOp::Ne => ComparisonOp::Ne, bittice_proto::ComparisonOp::Gt => ComparisonOp::Gt, bittice_proto::ComparisonOp::Gte => ComparisonOp::Gte, bittice_proto::ComparisonOp::Lt => ComparisonOp::Lt, bittice_proto::ComparisonOp::Lte => ComparisonOp::Lte, bittice_proto::ComparisonOp::In => ComparisonOp::In, }, value: f.value.clone(), value_options: f.value_options.clone() }
         }).collect();
 
         let filters_op = match req.filters_op() { bittice_proto::LogicalOp::Or => LogicalOp::Or, _ => LogicalOp::And };

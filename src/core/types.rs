@@ -8,7 +8,6 @@ pub enum ComparisonOp {
     Gte,
     Lt,
     Lte,
-    Like,
     In,
 }
 
@@ -21,7 +20,6 @@ impl ComparisonOp {
             ComparisonOp::Gte => "Gte",
             ComparisonOp::Lt => "Lt",
             ComparisonOp::Lte => "Lte",
-            ComparisonOp::Like => "Like",
             ComparisonOp::In => "In",
         }
     }
@@ -34,7 +32,6 @@ impl ComparisonOp {
             "Gte" => ComparisonOp::Gte,
             "Lt" => ComparisonOp::Lt,
             "Lte" => ComparisonOp::Lte,
-            "Like" => ComparisonOp::Like,
             "In" => ComparisonOp::In,
             _ => ComparisonOp::Eq,
         }
