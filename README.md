@@ -23,6 +23,17 @@ Instead of calculating year, month, or day during query time (which is slow), **
 
 ---
 
+## 🦀 Built with Rust
+
+Bittice is written entirely in **Rust**, which is crucial for its performance and reliability:
+
+- **Zero-Cost Abstractions:** High-level code that compiles down to efficient machine instructions without the overhead of a Garbage Collector (GC).
+- **Memory Safety:** Rust's ownership model ensures memory safety and prevents common bugs like null pointers or data races, critical for a multi-threaded data engine.
+- **High Concurrency:** Leveraging `Tokio` and `Rayon`, Bittice parallelizes searches and data materialization across all CPU cores with minimal overhead.
+- **Direct System Access:** Rust allows fine-grained control over memory-mapped files (`mmap`), enabling the engine to handle datasets much larger than available RAM by letting the OS manage page caching.
+
+---
+
 ## 🛠 Prerequisites
 
 Before starting, ensure you have the following installed:
