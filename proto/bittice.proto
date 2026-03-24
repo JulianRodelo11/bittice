@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package bittice;
+
+service Database {
+  // Realiza una búsqueda y devuelve los resultados como un stream de filas
+  rpc Search (SearchRequest) returns (stream SearchResponse);
+  
+  // Realiza una búsqueda y devuelve todos los resultados en una sola respuesta
+  rpc SearchUnary (SearchRequest) returns (SearchUnaryResponse);
+
+  // Ejecuta una query guardada por nombre
+  rpc ExecuteSavedQuery (SavedQueryRequest) returns (stream SearchResponse);
+  rpc ExecuteSavedQueryUnary (SavedQueryRequest) returns (SearchUnaryResponse);
+
+  // SUSCRIPCIÓN EN TIEMPO REAL: Recibe notificaciones de cambios en una tabla
+  rpc SubscribeUpdates (SubscribeRequest) returns (stream UpdateEvent);
+}
+
+message SubscribeRequest {
+  string entity = 1;
+  string table = 2;
+}
+
+message UpdateEvent {
+  string type = 1; // "INSERT", "UPDATE", "DELETE"
+  string table = 2;
+  Row row = 3;     // Los datos de la fila que cambió
+  string pk = 4;   // El ID de la fila
+}
+
+message SavedQueryRequest {
+  string query_name = 1;
+  map<string, string> params = 2;
+  uint32 limit_override = 3;
+  uint32 offset_override = 4;
+}
+
+enum ComparisonOp {
+  EQ = 0;
+  NE = 1;
+  GT = 2;
+  GTE = 3;
+  LT = 4;
+  LTE = 5;
+  
+  IN = 6;
+}
+
+enum LogicalOp {
+  AND = 0;
+  OR = 1;
+}
+
+enum SortDirection {
+  ASC = 0;
+  DESC = 1;
+}
+
+message Filter {
+  string field = 1;
+  ComparisonOp op = 2;
+  string value = 3;
+  repeated string value_options = 4;
+}
+
+message OrderBy {
+  string field = 1;
+  SortDirection direction = 2;
+}
+
+message AggregationRequest {
+    string aggregation_json = 1;
+}
+
+message SearchRequest {
+  string entity = 1;
+  string table = 2;
+  repeated string selected_fields = 3;
+  repeated Filter filters = 4;
+  LogicalOp filters_op = 5;
+  repeated OrderBy order_by = 6;
+  uint32 limit = 7;
+  uint32 offset = 8;
+  repeated AggregationRequest aggregations = 9;
+}
+
+message Row {
+  repeated string values = 1;
+}
+
+message AggregationResult {
+    repeated string headers = 1;
+    repeated Row rows = 2;
+    double summary = 3;
+}
+
+message SearchResponse {
+  oneof content {
+    SearchMetadata metadata = 1;
+    RowBatch rows = 2;
+    AggregationResult aggregation = 3;
+  }
+}
+
+message RowBatch {
+    repeated Row rows = 1;
+}
+
+message SearchMetadata {
+  repeated string headers = 1;
+  uint64 total_found = 2;
+  uint64 execution_time_micros = 3;
+  string debug_info = 4;
+  PaginationMetadata pagination = 5;
+}
+
+message PaginationMetadata {
+  uint32 page = 1;
+  uint32 per_page = 2;
+  uint32 total_pages = 3;
+  uint64 total_items = 4;
+}
+
+message SearchUnaryResponse {
+  repeated string headers = 1;
+  repeated Row rows = 2;
+  uint64 total_found = 3;
+  uint64 execution_time_micros = 4;
+  string debug_info = 5;
+  repeated AggregationResult aggregations = 6;
+  PaginationMetadata pagination = 7;
+}

@@ -1,11 +1,9 @@
 /target/
 /data/
-/proto/
 
 # Generated docker-compose files
 docker-compose-bittice-*.yml
 
-build.rs
 input.ndjson
 .bittice_ops.json
 resultado_limpio.ndjson

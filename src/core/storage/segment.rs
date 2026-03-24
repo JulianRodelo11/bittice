@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use crate::core::storage::manifest::SegmentMeta;
 use crate::core::types::{Filter, ComparisonOp, LogicalOp};
+use crate::core::date_utils::is_date_format;
 use memmap2::Mmap;
 use std::sync::{Arc, RwLock};
 
@@ -245,13 +246,45 @@ impl Segment {
             match f.op {
                 ComparisonOp::Eq => { if let Some(bm) = bitmaps.get(&f.value) { filter_bitmap = bm.clone(); } },
                 ComparisonOp::Ne => { for (k, bm) in &bitmaps { if k != &f.value { filter_bitmap |= bm; } } },
-                ComparisonOp::Gt => { for (k, bm) in &bitmaps { if k.as_str() > f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Gte => { for (k, bm) in &bitmaps { if k.as_str() >= f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Lt => { for (k, bm) in &bitmaps { if k.as_str() < f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Lte => { for (k, bm) in &bitmaps { if k.as_str() <= f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Like => {
-                    let pattern = f.value.replace("%", "");
-                    for (k, bm) in &bitmaps { if k.contains(&pattern) { filter_bitmap |= bm; } }
+                ComparisonOp::Gt => {
+                    let filter_val = &f.value;
+                    for (k, bm) in &bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k > n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() > filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
+                },
+                ComparisonOp::Gte => {
+                    let filter_val = &f.value;
+                    for (k, bm) in &bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k >= n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() >= filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
+                },
+                ComparisonOp::Lt => {
+                    let filter_val = &f.value;
+                    for (k, bm) in &bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k < n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() < filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
+                },
+                ComparisonOp::Lte => {
+                    let filter_val = &f.value;
+                    for (k, bm) in &bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k <= n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() <= filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
                 },
                 ComparisonOp::In => {
                     let vals: Vec<&str> = f.value.split(';').map(|s| s.trim()).collect();
@@ -529,13 +562,45 @@ impl SegmentWriter {
             match f.op {
                 ComparisonOp::Eq => { if let Some(bm) = bitmaps.get(&f.value) { filter_bitmap = bm.clone(); } },
                 ComparisonOp::Ne => { for (k, bm) in bitmaps { if k != &f.value { filter_bitmap |= bm; } } },
-                ComparisonOp::Gt => { for (k, bm) in bitmaps { if k.as_str() > f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Gte => { for (k, bm) in bitmaps { if k.as_str() >= f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Lt => { for (k, bm) in bitmaps { if k.as_str() < f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Lte => { for (k, bm) in bitmaps { if k.as_str() <= f.value.as_str() { filter_bitmap |= bm; } } },
-                ComparisonOp::Like => {
-                    let pattern = f.value.replace("%", "");
-                    for (k, bm) in bitmaps { if k.contains(&pattern) { filter_bitmap |= bm; } }
+                ComparisonOp::Gt => {
+                    let filter_val = &f.value;
+                    for (k, bm) in bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k > n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() > filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
+                },
+                ComparisonOp::Gte => {
+                    let filter_val = &f.value;
+                    for (k, bm) in bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k >= n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() >= filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
+                },
+                ComparisonOp::Lt => {
+                    let filter_val = &f.value;
+                    for (k, bm) in bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k < n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() < filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
+                },
+                ComparisonOp::Lte => {
+                    let filter_val = &f.value;
+                    for (k, bm) in bitmaps {
+                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                            if n_k <= n_f { filter_bitmap |= bm; }
+                        } else if is_date_format(k) && is_date_format(filter_val) {
+                            if k.as_str() <= filter_val.as_str() { filter_bitmap |= bm; }
+                        }
+                    }
                 },
                 ComparisonOp::In => {
                     let vals: Vec<&str> = f.value.split(';').map(|s| s.trim()).collect();

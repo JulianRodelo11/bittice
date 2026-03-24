@@ -8,6 +8,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use crate::core::types::{Filter, ComparisonOp, LogicalOp, SortDirection};
+use crate::core::date_utils::is_date_format;
 pub use crate::core::types::QueryResult;
 
 #[derive(Eq, PartialEq)]
