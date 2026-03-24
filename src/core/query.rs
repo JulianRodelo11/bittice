@@ -97,23 +97,59 @@ pub fn execute_query(
                         }
                     },
                     ComparisonOp::Gt => {
+                        let filter_val = &f.value;
                         bitmaps.iter()
-                            .filter(|(k, _)| k.as_str() > f.value.as_str())
+                            .filter(|(k, _)| {
+                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                                    n_k > n_f
+                                } else if is_date_format(k) && is_date_format(filter_val) {
+                                    k.as_str() > filter_val.as_str()
+                                } else {
+                                    false // Bloquear comparaciones de texto plano
+                                }
+                            })
                             .for_each(|(_, bm)| filter_bitmap |= bm);
                     },
                     ComparisonOp::Gte => {
+                        let filter_val = &f.value;
                         bitmaps.iter()
-                            .filter(|(k, _)| k.as_str() >= f.value.as_str())
+                            .filter(|(k, _)| {
+                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                                    n_k >= n_f
+                                } else if is_date_format(k) && is_date_format(filter_val) {
+                                    k.as_str() >= filter_val.as_str()
+                                } else {
+                                    false
+                                }
+                            })
                             .for_each(|(_, bm)| filter_bitmap |= bm);
                     },
                     ComparisonOp::Lt => {
+                        let filter_val = &f.value;
                         bitmaps.iter()
-                            .filter(|(k, _)| k.as_str() < f.value.as_str())
+                            .filter(|(k, _)| {
+                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                                    n_k < n_f
+                                } else if is_date_format(k) && is_date_format(filter_val) {
+                                    k.as_str() < filter_val.as_str()
+                                } else {
+                                    false
+                                }
+                            })
                             .for_each(|(_, bm)| filter_bitmap |= bm);
                     },
                     ComparisonOp::Lte => {
+                        let filter_val = &f.value;
                         bitmaps.iter()
-                            .filter(|(k, _)| k.as_str() <= f.value.as_str())
+                            .filter(|(k, _)| {
+                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
+                                    n_k <= n_f
+                                } else if is_date_format(k) && is_date_format(filter_val) {
+                                    k.as_str() <= filter_val.as_str()
+                                } else {
+                                    false
+                                }
+                            })
                             .for_each(|(_, bm)| filter_bitmap |= bm);
                     },
                     ComparisonOp::In => {
