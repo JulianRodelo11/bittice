@@ -5,7 +5,7 @@ use anyhow::{Result, Context};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use crate::core::storage::manifest::SegmentMeta;
-use crate::core::types::{Filter, ComparisonOp, LogicalOp};
+use crate::core::types::{Filter, ComparisonOp, LogicalOp, FieldType};
 use crate::core::date_utils::is_date_format;
 use memmap2::Mmap;
 use std::sync::{Arc, RwLock};
@@ -244,8 +244,40 @@ impl Segment {
 
             let mut filter_bitmap = RoaringBitmap::new();
             match f.op {
-                ComparisonOp::Eq => { if let Some(bm) = bitmaps.get(&f.value) { filter_bitmap = bm.clone(); } },
-                ComparisonOp::Ne => { for (k, bm) in &bitmaps { if k != &f.value { filter_bitmap |= bm; } } },
+                ComparisonOp::Eq => {
+                    if let Some(t) = f.field_type {
+                        match t {
+                            FieldType::Int | FieldType::Float => {
+                                let target = f.value.parse::<f64>().unwrap_or(0.0);
+                                for (k, bm) in &bitmaps {
+                                    if let Ok(n_k) = k.parse::<f64>() {
+                                        if (n_k - target).abs() < f64::EPSILON { filter_bitmap |= bm; }
+                                    }
+                                }
+                            }
+                            _ => { if let Some(bm) = bitmaps.get(&f.value) { filter_bitmap = bm.clone(); } }
+                        }
+                    } else if let Some(bm) = bitmaps.get(&f.value) {
+                        filter_bitmap = bm.clone();
+                    }
+                },
+                ComparisonOp::Ne => {
+                    if let Some(t) = f.field_type {
+                        match t {
+                            FieldType::Int | FieldType::Float => {
+                                let target = f.value.parse::<f64>().unwrap_or(0.0);
+                                for (k, bm) in &bitmaps {
+                                    if let Ok(n_k) = k.parse::<f64>() {
+                                        if (n_k - target).abs() >= f64::EPSILON { filter_bitmap |= bm; }
+                                    } else { filter_bitmap |= bm; }
+                                }
+                            }
+                            _ => { for (k, bm) in &bitmaps { if k != &f.value { filter_bitmap |= bm; } } }
+                        }
+                    } else {
+                        for (k, bm) in &bitmaps { if k != &f.value { filter_bitmap |= bm; } }
+                    }
+                },
                 ComparisonOp::Gt => {
                     let filter_val = &f.value;
                     for (k, bm) in &bitmaps {

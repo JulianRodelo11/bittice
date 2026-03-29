@@ -242,14 +242,17 @@ impl CdcWorker {
 
         if state.binlog_file.is_empty() {
             // MySQL 8.4+ uses 'SHOW BINARY LOG STATUS', older versions use 'SHOW MASTER STATUS'
-            let mut row: Option<(String, u32, String, String, String)> = conn.query_first("SHOW BINARY LOG STATUS").await.unwrap_or(None);
+            let mut row: Option<(String, u32, String, String, String)> = match conn.query_first("SHOW BINARY LOG STATUS").await {
+                Ok(r) => r,
+                Err(_) => None,
+            };
             
             if row.is_none() {
                 row = match conn.query_first("SHOW MASTER STATUS").await {
                     Ok(r) => r,
                     Err(e) => {
-                        self.log(format!("CDC_ERROR: MySQL Binlog access denied. Ensure 'log_bin' is ON and user has REPLICATION CLIENT/SLAVE permissions. Error: {}", e));
-                        return Err(e.into());
+                        self.log(format!("CDC_WARNING: MySQL Binlog access denied or syntax error. Real-time sync will be disabled. Error: {}", e));
+                        None
                     }
                 };
             }
@@ -258,8 +261,15 @@ impl CdcWorker {
                 state.binlog_file = file;
                 state.binlog_pos = pos;
             } else {
-                self.log("CDC_ERROR: Binlog status not found. Ensure 'log_bin=ON' and 'binlog_format=ROW' are set in your MySQL config.".to_string());
-                return Err(anyhow::anyhow!("Binlog disabled"));
+                self.log("CDC_WARNING: Could not determine Binlog position. Continuing without real-time updates.".to_string());
+            }
+        }
+
+        if state.binlog_file.is_empty() {
+            self.log("CDC_DISABLED".to_string());
+            self.log("CDC_IDLE: Live sync disabled due to missing Binlog position.".to_string());
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             }
         }
 

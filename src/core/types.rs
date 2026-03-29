@@ -68,11 +68,20 @@ impl SortDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum FieldType {
+    String,
+    Int,
+    Float,
+    Date,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Filter {
     pub field: String,
     pub op: ComparisonOp,
     pub value: String,
+    pub field_type: Option<FieldType>,
     #[serde(skip)]
     pub value_options: Vec<String>,
 }

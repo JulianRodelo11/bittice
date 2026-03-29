@@ -47,6 +47,13 @@ enum ComparisonOp {
   IN = 6;
 }
 
+enum FieldType {
+  STRING = 0;
+  INT = 1;
+  FLOAT = 2;
+  DATE = 3;
+}
+
 enum LogicalOp {
   AND = 0;
   OR = 1;
@@ -62,6 +69,7 @@ message Filter {
   ComparisonOp op = 2;
   string value = 3;
   repeated string value_options = 4;
+  FieldType field_type = 5;
 }
 
 message OrderBy {

@@ -121,9 +121,16 @@ pub async fn run_startup_cliclack() -> Result<()> {
     let mut bootstrap_success = false;
     let mut error_msg = String::from("Sync failed. Verify credentials and database status.");
     
+    let mut spinner_stopped = false;
     while let Some(msg) = log_rx.recv().await {
         if msg == "CDC_READY" {
             bootstrap_success = true;
+            break;
+        }
+        if msg == "CDC_DISABLED" {
+            bootstrap_success = true;
+            s.stop("⚠ Sync partially established (static data only).");
+            spinner_stopped = true;
             break;
         }
         if let Some(err) = msg.strip_prefix("CDC_ERROR: ") {
@@ -140,7 +147,9 @@ pub async fn run_startup_cliclack() -> Result<()> {
         return Err(anyhow::anyhow!(error_msg));
     }
 
-    s.stop("✓ Sync established.");
+    if !spinner_stopped {
+        s.stop("✓ Sync established.");
+    }
 
     // 2. Ask for Docker
     let build_docker = confirm("Do you want to create a Docker image with this data?")

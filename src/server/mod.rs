@@ -421,7 +421,7 @@ async fn execute_read_operation(
             if let Some(param_val) = params.get(key) { val = param_val.clone(); }
             else { missing_params.push(key.to_string()); }
         }
-        Filter { field: sf.field.clone(), op: ComparisonOp::from_str(&sf.op), value: val, value_options: vec![] }
+        Filter { field: sf.field.clone(), op: ComparisonOp::from_str(&sf.op), value: val, value_options: vec![], field_type: sf.field_type }
     }).collect();
     
     let mut aggregations = query.aggregations.clone();

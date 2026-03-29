@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use crate::server::table_manager::TableManager;
 use crate::core::storage::table::Table;
-use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, QueryResult};
+use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, QueryResult, FieldType};
 use crate::core::saved_queries::{load_operations, SavedOperation, SavedQuery};
 use std::collections::HashMap;
 
@@ -72,6 +72,7 @@ async fn execute_query_unary_internal(
             op: ComparisonOp::from_str(&sf.op),
             value: val,
             value_options: vec![],
+            field_type: sf.field_type,
         }
     }).collect();
 
@@ -202,7 +203,7 @@ async fn execute_query_internal(
             if let Some(param_val) = params_map.get(key) { val = param_val.clone(); }
             else { missing_params.push(key.to_string()); }
         }
-        CoreFilter { field: sf.field.clone(), op: ComparisonOp::from_str(&sf.op), value: val, value_options: vec![] }
+        CoreFilter { field: sf.field.clone(), op: ComparisonOp::from_str(&sf.op), value: val, value_options: vec![], field_type: sf.field_type }
     }).collect();
 
     let mut aggregations = query.aggregations.clone();
@@ -483,6 +484,12 @@ impl Database for MyDatabase {
                     },
                     value: f.value.clone(),
                     value_options: f.value_options.clone(),
+                    field_type: match f.field_type() {
+                        bittice_proto::FieldType::Int => Some(FieldType::Int),
+                        bittice_proto::FieldType::Float => Some(FieldType::Float),
+                        bittice_proto::FieldType::Date => Some(FieldType::Date),
+                        _ => Some(FieldType::String),
+                    },
                 }
             }).collect();
 
@@ -592,7 +599,26 @@ impl Database for MyDatabase {
         if entity.is_empty() || table_name.is_empty() { return Err(Status::invalid_argument("Entity/Table required")); }
 
         let filters: Vec<CoreFilter> = req.filters.iter().map(|f| {
-            CoreFilter { field: f.field.clone(), op: match f.op() { bittice_proto::ComparisonOp::Eq => ComparisonOp::Eq, bittice_proto::ComparisonOp::Ne => ComparisonOp::Ne, bittice_proto::ComparisonOp::Gt => ComparisonOp::Gt, bittice_proto::ComparisonOp::Gte => ComparisonOp::Gte, bittice_proto::ComparisonOp::Lt => ComparisonOp::Lt, bittice_proto::ComparisonOp::Lte => ComparisonOp::Lte, bittice_proto::ComparisonOp::In => ComparisonOp::In, }, value: f.value.clone(), value_options: f.value_options.clone() }
+            CoreFilter { 
+                field: f.field.clone(), 
+                op: match f.op() { 
+                    bittice_proto::ComparisonOp::Eq => ComparisonOp::Eq, 
+                    bittice_proto::ComparisonOp::Ne => ComparisonOp::Ne, 
+                    bittice_proto::ComparisonOp::Gt => ComparisonOp::Gt, 
+                    bittice_proto::ComparisonOp::Gte => ComparisonOp::Gte, 
+                    bittice_proto::ComparisonOp::Lt => ComparisonOp::Lt, 
+                    bittice_proto::ComparisonOp::Lte => ComparisonOp::Lte, 
+                    bittice_proto::ComparisonOp::In => ComparisonOp::In, 
+                }, 
+                value: f.value.clone(), 
+                value_options: f.value_options.clone(),
+                field_type: match f.field_type() {
+                    bittice_proto::FieldType::Int => Some(FieldType::Int),
+                    bittice_proto::FieldType::Float => Some(FieldType::Float),
+                    bittice_proto::FieldType::Date => Some(FieldType::Date),
+                    _ => Some(FieldType::String),
+                },
+            }
         }).collect();
 
         let filters_op = match req.filters_op() { bittice_proto::LogicalOp::Or => LogicalOp::Or, _ => LogicalOp::And };

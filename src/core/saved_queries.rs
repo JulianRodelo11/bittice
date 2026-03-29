@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use crate::core::types::{OrderBy, Filter};
+use crate::core::types::{OrderBy, Filter, FieldType};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", content = "details")]
@@ -81,6 +81,7 @@ pub struct SavedFilter {
     pub field: String,
     pub op: String,
     pub value: String,
+    pub field_type: Option<FieldType>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -95,6 +96,7 @@ impl From<&Filter> for SavedFilter {
             field: f.field.clone(),
             op: f.op.as_str().to_string(),
             value: f.value.clone(),
+            field_type: f.field_type,
         }
     }
 }
@@ -157,11 +159,12 @@ pub fn load_operations() -> anyhow::Result<Vec<SavedOperation>> {
     // 3. Migration (Legacy): Check for .bittice_queries.json (very old format)
     if very_old_path.exists() {
         let content = fs::read_to_string(very_old_path)?;
-        if let Ok(queries) = serde_json::from_str::<Vec<SavedQuery>>(&content) {
-            let ops: Vec<SavedOperation> = queries.into_iter().map(SavedOperation::Read).collect();
-            save_operations(&ops)?; // Save to new format in data/
-            // Optional: fs::remove_file(very_old_path)?; 
-            return Ok(ops);
+        if let Ok(_) = serde_json::from_str::<Vec<Vec<SavedFilter>>>(&content) {
+            if let Ok(queries) = serde_json::from_str::<Vec<SavedQuery>>(&content) {
+                let ops: Vec<SavedOperation> = queries.into_iter().map(SavedOperation::Read).collect();
+                save_operations(&ops)?; 
+                return Ok(ops);
+            }
         }
     }
 
