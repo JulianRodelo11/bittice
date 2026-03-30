@@ -1,5 +1,5 @@
 services:
-  bittice-server:
+  bittice:
     build: .
     container_name: bittice-container
     ports:
@@ -15,19 +15,5 @@ services:
     environment:
       - BITTICE_HOST=0.0.0.0
     restart: unless-stopped
-    command: ["./bittice", "server", "--type", "grpc", "--port", "50051"]
-
-  bittice-cdc:
-    build: .
-    container_name: bittice-cdc
-    depends_on:
-      - bittice-server
-    environment:
-      - BITTICE_HOST=0.0.0.0
-    volumes:
-      - ./data:/app/data
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-    # Conectamos al MySQL que ya tienes corriendo localmente con el password correcto
-    command: ["./bittice", "cdc", "--url", "mysql://root:p_ssW0rd@host.docker.internal:3306/sakila", "--entity", "sakila", "--database", "sakila"]
+    # El modo 'all' activa REST (3000), gRPC (50051) y los CDC workers automáticos
+    command: ["./bittice", "server", "--type", "all", "--port", "50051"]

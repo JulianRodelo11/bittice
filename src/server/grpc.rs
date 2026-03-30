@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use crate::server::table_manager::TableManager;
 use crate::core::storage::table::Table;
-use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, QueryResult, FieldType};
-use crate::core::saved_queries::{load_operations, SavedOperation, SavedQuery};
+use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, FieldType};
+use crate::core::saved_queries::{SavedOperation, SavedQuery};
 use std::collections::HashMap;
 
 pub mod bittice_proto {
@@ -17,21 +17,62 @@ use bittice_proto::database_server::{Database, DatabaseServer};
 use bittice_proto::{
     SearchRequest, SearchResponse, SearchUnaryResponse, 
     Row as ProtoRow, AggregationResult as ProtoAggregationResult,
-    search_response::Content, SearchMetadata, RowBatch
+    search_response::Content, SearchMetadata, RowBatch,
+    ComparisonOp as ProtoComparisonOp, LogicalOp as ProtoLogicalOp,
+    SortDirection as ProtoSortDirection, FieldType as ProtoFieldType,
+    SavedQueryRequest
 };
+
+fn proto_comparison_op_to_str(op: i32) -> String {
+    match ProtoComparisonOp::try_from(op).unwrap_or(ProtoComparisonOp::Eq) {
+        ProtoComparisonOp::Eq => "Eq",
+        ProtoComparisonOp::Ne => "Ne",
+        ProtoComparisonOp::Gt => "Gt",
+        ProtoComparisonOp::Gte => "Gte",
+        ProtoComparisonOp::Lt => "Lt",
+        ProtoComparisonOp::Lte => "Lte",
+        ProtoComparisonOp::In => "In",
+    }.to_string()
+}
+
+fn proto_logical_op_to_str(op: i32) -> String {
+    match ProtoLogicalOp::try_from(op).unwrap_or(ProtoLogicalOp::And) {
+        ProtoLogicalOp::And => "And",
+        ProtoLogicalOp::Or => "Or",
+    }.to_string()
+}
+
+fn proto_sort_direction_to_str(dir: i32) -> String {
+    match ProtoSortDirection::try_from(dir).unwrap_or(ProtoSortDirection::Asc) {
+        ProtoSortDirection::Asc => "Asc",
+        ProtoSortDirection::Desc => "Desc",
+    }.to_string()
+}
+
+fn proto_field_type_to_core(ft: i32) -> Option<FieldType> {
+    match ProtoFieldType::try_from(ft).ok() {
+        Some(ProtoFieldType::String) => Some(FieldType::String),
+        Some(ProtoFieldType::Int) => Some(FieldType::Int),
+        Some(ProtoFieldType::Float) => Some(FieldType::Float),
+        Some(ProtoFieldType::Date) => Some(FieldType::Date),
+        _ => None,
+    }
+}
 
 const BATCH_SIZE: usize = 1000;
 
 pub struct MyDatabase {
     table_manager: Arc<TableManager>,
     ops_cache: Arc<RwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
+    entity_filter: Option<String>,
 }
 
 impl MyDatabase {
-    pub fn new(table_manager: Arc<TableManager>) -> Self {
+    pub fn new(table_manager: Arc<TableManager>, entity_filter: Option<String>) -> Self {
         Self { 
             table_manager,
             ops_cache: Arc::new(RwLock::new(None)),
+            entity_filter,
         }
     }
 
@@ -45,7 +86,7 @@ impl MyDatabase {
             }
         }
         let mut cache = self.ops_cache.write().await;
-        let loaded = load_operations().unwrap_or_default();
+        let loaded = crate::core::saved_queries::load_operations_with_filter(self.entity_filter.clone()).unwrap_or_default();
         let ops_arc = Arc::new(loaded);
         *cache = Some((Instant::now(), Arc::clone(&ops_arc)));
         ops_arc
@@ -101,615 +142,484 @@ async fn execute_query_unary_internal(
         let key = param.strip_prefix('$').unwrap_or(param);
         params_map.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
     } else { query.limit }.unwrap_or(100).min(100);
+
+    if limit_override > 0 { limit = limit_override as usize; }
     
-    if limit == 0 { limit = 100; }
-    if limit_override > 0 { limit = (limit_override as usize).min(100); }
-    let offset = offset_override as usize;
+    let page = params_map.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
+    let mut offset = (page - 1) * limit;
+    if offset_override > 0 { offset = offset_override as usize; }
 
-    let fields_inner = query.selected_fields.clone();
-    let tm_inner = table_manager.clone();
-    let e_inner = entity.clone();
-    let t_inner = table_name.clone();
-
-    let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
-        let table_lock = tm_inner.get_table(&e_inner, &t_inner)?;
-        let mut table = table_lock.write().unwrap();
-        let _ = table.reload_if_needed();
-
-        let mut fields_for_search = if fields_inner.is_empty() && aggregations.is_empty() {
-            let all_fields = Table::get_indexed_fields_static(&e_inner, &t_inner);
-            Table::get_base_fields_static(&all_fields)
-        } else {
-            fields_inner
-        };
-
-        if fields_for_search.iter().any(|f| f == "*") {
-            let mut all_cols = table.manifest.original_fields.clone();
-            if all_cols.is_empty() {
-                all_cols = Table::get_indexed_fields_static(&e_inner, &t_inner);
-                all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
-                if !all_cols.is_empty() { let _ = table.set_original_fields(all_cols.clone()); }
-            }
-            let mut new_fields = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for f in fields_for_search {
-                if f == "*" { for col in &all_cols { if seen.insert(col.clone()) { new_fields.push(col.clone()); } } }
-                else { if seen.insert(f.clone()) { new_fields.push(f); } }
-            }
-            fields_for_search = new_fields;
-        }
-
-        Ok(table.search(&fields_for_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)?)
-    }).await.unwrap();
-
-    match result {
-        Ok(query_result) => {
-            let mut rows = query_result.rows;
-            let headers = query_result.headers.clone();
-            if rows.is_empty() && query_result.row_ids.is_some() {
-                 let ids = query_result.row_ids.unwrap();
-                 let h_inner = headers.clone();
-                 let tm_inner = table_manager.clone();
-                 rows = tokio::task::spawn_blocking(move || {
-                     let table_lock = tm_inner.get_table(&entity, &table_name)?;
-                     let table = table_lock.read().unwrap();
-                     table.get_rows_batch(&h_inner, &ids)
-                 }).await.unwrap().unwrap_or_default();
-            }
-
-            let pagination = Some(bittice_proto::PaginationMetadata {
-                page: (offset as u32 / limit as u32) + 1,
-                per_page: limit as u32,
-                total_pages: ((query_result.total_found as u32 + limit as u32 - 1) / limit as u32).max(1),
-                total_items: query_result.total_found as u64,
-            });
-
-            Ok(SearchUnaryResponse {
-                headers,
-                rows: rows.into_iter().map(|r| ProtoRow { values: r }).collect(),
-                total_found: query_result.total_found as u64,
-                execution_time_micros: query_result.execution_time_micros as u64,
-                debug_info: query_result.debug_info.unwrap_or_default(),
-                aggregations: query_result.aggregations.map(|aggs| {
-                    aggs.into_iter().map(|agg| ProtoAggregationResult {
-                        headers: agg.headers,
-                        rows: agg.rows.into_iter().map(|r| ProtoRow { values: r }).collect(),
-                        summary: agg.summary.unwrap_or(0.0),
-                    }).collect()
-                }).unwrap_or_default(),
-                pagination,
-            })
-        },
-        Err(e) => Err(Status::internal(e.to_string())),
-    }
-}
-
-async fn execute_query_internal(
-    query: SavedQuery,
-    params_map: HashMap<String, String>,
-    table_manager: Arc<TableManager>,
-    tx: mpsc::Sender<Result<SearchResponse, Status>>,
-    limit_override: u32,
-    offset_override: u32,
-) -> Result<(), Status> {
-    let mut missing_params = Vec::new();
-    let entity = query.entity.clone();
-    let table_name = query.table.clone();
-
-    let filters: Vec<CoreFilter> = query.filters.iter().map(|sf| {
-        let mut val = sf.value.clone();
-        if val.starts_with('$') {
-            let key = &val[1..];
-            if let Some(param_val) = params_map.get(key) { val = param_val.clone(); }
-            else { missing_params.push(key.to_string()); }
-        }
-        CoreFilter { field: sf.field.clone(), op: ComparisonOp::from_str(&sf.op), value: val, value_options: vec![], field_type: sf.field_type }
-    }).collect();
-
-    let mut aggregations = query.aggregations.clone();
-    for agg in &mut aggregations {
-        if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
-            for val in obj.values_mut() {
-                if let Some(s) = val.as_str() {
-                    if let Some(key) = s.strip_prefix('$') {
-                        if let Some(param_val) = params_map.get(key) {
-                            if let Ok(num) = param_val.parse::<u64>() { *val = serde_json::json!(num); }
-                            else { *val = serde_json::json!(param_val); }
-                        } else { missing_params.push(key.to_string()); }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(ref param) = query.limit_param {
-        let key = param.strip_prefix('$').unwrap_or(param);
-        if params_map.get(key).is_none() && limit_override == 0 { missing_params.push(key.to_string()); }
-    }
-
-    if !missing_params.is_empty() {
-        let _ = tx.send(Err(Status::invalid_argument(format!("Missing params for {}: {:?}", query.name, missing_params)))).await;
-        return Ok(());
-    }
-
-    let filters_op = match query.filters_op.as_str() { "Or" => LogicalOp::Or, _ => LogicalOp::And };
-    let order_by: Vec<CoreOrderBy> = query.order_by.iter().map(|so| {
-        CoreOrderBy { field: so.field.clone(), direction: if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc } }
-    }).collect();
-
-    let mut limit = if let Some(ref param) = query.limit_param {
-        let key = param.strip_prefix('$').unwrap_or(param);
-        params_map.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
-    } else { query.limit }.unwrap_or(100).min(100);
-    
-    if limit == 0 { limit = 100; }
-    if limit_override > 0 { limit = (limit_override as usize).min(100); }
-    let offset = offset_override as usize;
-
-    let fields = if query.selected_fields.is_empty() && query.aggregations.is_empty() {
-         let all_fields = Table::get_indexed_fields_static(&entity, &table_name);
-         Table::get_base_fields_static(&all_fields)
-    } else { query.selected_fields.clone() };
-
-    let table_manager_inner = table_manager.clone();
-    let fields_inner = fields.clone();
-    let entity_inner = entity.clone();
-    let table_name_inner = table_name.clone();
-
-    let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
-        let t_open_start = Instant::now();
-        let table_lock = table_manager_inner.get_table(&entity_inner, &table_name_inner)?;
-        let t_open_ms = t_open_start.elapsed().as_millis();
-        
-        let mut table = table_lock.write().unwrap();
-        let _ = table.reload_if_needed();
-        
-        // --- FIELD EXPANSION ---
-        let mut fields_for_search = if fields_inner.is_empty() && aggregations.is_empty() {
-            let all_fields = Table::get_indexed_fields_static(&entity_inner, &table_name_inner);
-            Table::get_base_fields_static(&all_fields)
-        } else {
-            fields_inner
-        };
-
-        // Expand '*' if present
-        if fields_for_search.iter().any(|f| f == "*") {
-            let mut all_cols = table.manifest.original_fields.clone();
-            if all_cols.is_empty() {
-                all_cols = Table::get_indexed_fields_static(&entity_inner, &table_name_inner);
-                all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
-                if !all_cols.is_empty() {
-                    let _ = table.set_original_fields(all_cols.clone());
-                }
-            }
+    let res = tokio::task::spawn_blocking(move || {
+        if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
+            let mut table = table_arc.write().unwrap();
+            let _ = table.reload_if_needed();
             
-            let mut new_fields = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for f in fields_for_search {
-                if f == "*" {
-                    for col in &all_cols {
-                        if seen.insert(col.clone()) { new_fields.push(col.clone()); }
-                    }
-                } else {
-                    if seen.insert(f.clone()) { new_fields.push(f); }
+            let mut f_search = query.selected_fields.clone();
+            if f_search.iter().any(|f| f == "*") {
+                let mut all_cols = table.manifest.original_fields.clone();
+                if all_cols.is_empty() {
+                    all_cols = Table::get_indexed_fields_static(&entity, &table_name);
+                    all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
                 }
+                let mut new_f = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for f in f_search {
+                    if f == "*" {
+                        for c in &all_cols { if seen.insert(c.clone()) { new_f.push(c.clone()); } }
+                    } else {
+                        if seen.insert(f.clone()) { new_f.push(f); }
+                    }
+                }
+                f_search = new_f;
             }
-            fields_for_search = new_fields;
-        }
-        // -----------------------
 
-        let mut search_res = table.search(&fields_for_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)?;
-        
-        let extra_debug = format!(" | OpenTable: {}ms", t_open_ms);
-        if let Some(ref mut d) = search_res.debug_info { d.push_str(&extra_debug); }
-        else { search_res.debug_info = Some(extra_debug); }
-        
-        Ok(search_res)
+            table.search(&f_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)
+        } else {
+            Err(anyhow::anyhow!("Table not found"))
+        }
     }).await.unwrap();
 
-    match result {
+    match res {
         Ok(query_result) => {
-            let total_found = query_result.total_found as u64;
-            let page = if limit > 0 { (offset as u32 / limit as u32) + 1 } else { 1 };
-            let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
-
-            let headers = query_result.headers.clone();
-            let meta = SearchMetadata {
-                headers: headers.clone(),
-                total_found,
-                execution_time_micros: query_result.execution_time_micros as u64,
-                debug_info: query_result.debug_info.unwrap_or_default(),
-                pagination: Some(bittice_proto::PaginationMetadata {
-                    page,
-                    per_page: limit as u32,
-                    total_pages,
-                    total_items: total_found,
-                }),
-            };
-            if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Metadata(meta)) })).await { return Ok(()); }
-
-            if let Some(row_ids) = query_result.row_ids {
-                for chunk in row_ids.chunks(BATCH_SIZE) {
-                    let tm_chunk = table_manager.clone();
-                    let h_chunk = headers.clone();
-                    let ids_chunk = chunk.to_vec();
-                    let e_chunk = entity.clone();
-                    let t_chunk = table_name.clone();
-
-                    let rows_res: anyhow::Result<Vec<Vec<String>>> = tokio::task::spawn_blocking(move || {
-                        let table_lock = tm_chunk.get_table(&e_chunk, &t_chunk)?;
-                        let table = table_lock.read().unwrap();
-                        table.get_rows_batch(&h_chunk, &ids_chunk)
-                    }).await.unwrap();
-
-                    match rows_res {
-                        Ok(rows) => {
-                            let proto_rows = rows.into_iter().map(|r| ProtoRow { values: r }).collect();
-                            if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Rows(RowBatch { rows: proto_rows })) })).await { return Ok(()); }
-                        },
-                        Err(e) => {
-                            let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                            return Ok(());
-                        }
-                    }
-                }
+            let mut proto_rows = Vec::new();
+            for row in query_result.rows {
+                proto_rows.push(ProtoRow { values: row });
             }
 
+            let mut proto_aggs = Vec::new();
             if let Some(aggs) = query_result.aggregations {
                 for agg in aggs {
-                    let proto_agg = ProtoAggregationResult {
+                    let mut rows = Vec::new();
+                    for r in agg.rows { rows.push(ProtoRow { values: r }); }
+                    proto_aggs.push(ProtoAggregationResult {
                         headers: agg.headers,
-                        rows: agg.rows.into_iter().map(|r| ProtoRow { values: r }).collect(),
+                        rows,
                         summary: agg.summary.unwrap_or(0.0),
-                    };
-                    if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Aggregation(proto_agg)) })).await { return Ok(()); }
+                    });
                 }
             }
-        },
-        Err(e) => { let _ = tx.send(Err(Status::internal(e.to_string()))).await; }
+
+            Ok(SearchUnaryResponse {
+                headers: query_result.headers,
+                rows: proto_rows,
+                total_found: query_result.total_found as u64,
+                execution_time_micros: query_result.execution_time_micros as u64,
+                debug_info: "".to_string(),
+                aggregations: proto_aggs,
+                pagination: None,
+            })
+        }
+        Err(e) => Err(Status::internal(e.to_string())),
     }
-    Ok(())
 }
 
 #[tonic::async_trait]
 impl Database for MyDatabase {
     type SearchStream = ReceiverStream<Result<SearchResponse, Status>>;
-    type ExecuteSavedQueryStream = ReceiverStream<Result<SearchResponse, Status>>;
-    type SubscribeUpdatesStream = ReceiverStream<Result<bittice_proto::UpdateEvent, Status>>;
 
-    async fn execute_saved_query_unary(
+    async fn search(
         &self,
-        request: Request<bittice_proto::SavedQueryRequest>,
-    ) -> Result<Response<SearchUnaryResponse>, Status> {
+        request: Request<SearchRequest>,
+    ) -> Result<Response<Self::SearchStream>, Status> {
         let req = request.into_inner();
-        let table_manager = Arc::clone(&self.table_manager);
-        let ops = self.get_operations().await;
-        let operation = ops.iter().find(|o| o.name() == req.query_name).cloned();
-
-        match operation {
-            Some(SavedOperation::Read(query)) => {
-                let res = execute_query_unary_internal(query, req.params, table_manager, req.limit_override, req.offset_override).await?;
-                Ok(Response::new(res))
-            },
-            Some(SavedOperation::Batch(batch)) => {
-                // Para batch unary, ejecutamos secuencialmente y combinamos (simplificado)
-                // O retornamos el primero para este ejemplo. 
-                // En un sistema real, querríamos una estructura que soporte múltiples resultados.
-                if let Some(op_name) = batch.operations.first() {
-                    if let Some(SavedOperation::Read(q)) = ops.iter().find(|o| o.name() == op_name).cloned() {
-                        let res = execute_query_unary_internal(q, req.params, table_manager, req.limit_override, req.offset_override).await?;
-                        return Ok(Response::new(res));
-                    }
-                }
-                Err(Status::unimplemented("Batch unary not fully implemented (only first op)"))
-            },
-            Some(_) => Err(Status::unimplemented("Only READ/BATCH supported")),
-            None => Err(Status::not_found(format!("Query '{}' not found", req.query_name))),
-        }
-    }
-
-    async fn execute_saved_query(
-        &self,
-        request: Request<bittice_proto::SavedQueryRequest>,
-    ) -> Result<Response<Self::ExecuteSavedQueryStream>, Status> {
-        let req = request.into_inner();
-        let table_manager = Arc::clone(&self.table_manager);
-        let (tx, rx) = mpsc::channel(100);
-
-        let ops = self.get_operations().await;
-        let operation = ops.iter().find(|o| o.name() == req.query_name).cloned();
-
-        match operation {
-            Some(SavedOperation::Read(query)) => {
-                tokio::spawn(async move {
-                    let _ = execute_query_internal(query, req.params, table_manager, tx, req.limit_override, req.offset_override).await;
-                });
-            },
-            Some(SavedOperation::Batch(batch)) => {
-                tokio::spawn(async move {
-                    let mut handles = Vec::new();
-                    for op_name in batch.operations {
-                        if let Some(SavedOperation::Read(q)) = ops.iter().find(|o| o.name() == op_name).cloned() {
-                            let mut targeted_params = req.params.clone();
-                            let prefix = format!("{}:", op_name);
-                            for (k, v) in &req.params {
-                                if let Some(stripped) = k.strip_prefix(&prefix) { targeted_params.insert(stripped.to_string(), v.clone()); }
-                            }
-                            let tx_clone = tx.clone();
-                            let tm_clone = table_manager.clone();
-                            let lim = req.limit_override;
-                            let off = req.offset_override;
-                            
-                            handles.push(tokio::spawn(async move {
-                                let _ = execute_query_internal(q, targeted_params, tm_clone, tx_clone, lim, off).await;
-                            }));
-                        }
-                    }
-                    for h in handles { let _ = h.await; }
-                });
-            },
-            Some(_) => return Err(Status::unimplemented("Only READ/BATCH supported")),
-            None => return Err(Status::not_found(format!("Query '{}' not found", req.query_name))),
+        let entity = req.entity.clone();
+        let table_name = req.table.clone();
+        
+        let mut filters = Vec::new();
+        for f in req.filters {
+            filters.push(CoreFilter {
+                field: f.field,
+                op: ComparisonOp::from_str(&proto_comparison_op_to_str(f.op)),
+                value: f.value,
+                value_options: vec![],
+                field_type: proto_field_type_to_core(f.field_type),
+            });
         }
 
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
+        let filters_op = if proto_logical_op_to_str(req.filters_op) == "Or" { LogicalOp::Or } else { LogicalOp::And };
+        let mut order_by = Vec::new();
+        for o in req.order_by {
+            order_by.push(CoreOrderBy {
+                field: o.field,
+                direction: if proto_sort_direction_to_str(o.direction) == "Desc" { SortDirection::Desc } else { SortDirection::Asc },
+            });
+        }
 
-    async fn search(&self, request: Request<SearchRequest>) -> Result<Response<Self::SearchStream>, Status> {
-        let req = request.into_inner();
-        let table_manager_outer = Arc::clone(&self.table_manager);
-        let (tx, rx) = mpsc::channel(100);
+        let limit = if req.limit > 0 { req.limit as usize } else { 100 };
+        let offset = req.offset as usize;
+        let fields = req.selected_fields;
+
+        let table_manager = Arc::clone(&self.table_manager);
+        let (tx, rx) = mpsc::channel(10);
 
         tokio::spawn(async move {
-            let filters_op_enum = req.filters_op();
-            let entity = req.entity.clone();
-            let table_name = req.table.clone();
-
-            if entity.is_empty() || table_name.is_empty() {
-                let _ = tx.send(Err(Status::invalid_argument("Entity/Table required"))).await;
-                return;
-            }
-
-            let filters: Vec<CoreFilter> = req.filters.iter().map(|f| {
-                CoreFilter {
-                    field: f.field.clone(),
-                    op: match f.op() {
-                        bittice_proto::ComparisonOp::Eq => ComparisonOp::Eq,
-                        bittice_proto::ComparisonOp::Ne => ComparisonOp::Ne,
-                        bittice_proto::ComparisonOp::Gt => ComparisonOp::Gt,
-                        bittice_proto::ComparisonOp::Gte => ComparisonOp::Gte,
-                        bittice_proto::ComparisonOp::Lt => ComparisonOp::Lt,
-                        bittice_proto::ComparisonOp::Lte => ComparisonOp::Lte,
-                        bittice_proto::ComparisonOp::In => ComparisonOp::In,
-                    },
-                    value: f.value.clone(),
-                    value_options: f.value_options.clone(),
-                    field_type: match f.field_type() {
-                        bittice_proto::FieldType::Int => Some(FieldType::Int),
-                        bittice_proto::FieldType::Float => Some(FieldType::Float),
-                        bittice_proto::FieldType::Date => Some(FieldType::Date),
-                        _ => Some(FieldType::String),
-                    },
-                }
-            }).collect();
-
-            let filters_op = match filters_op_enum { bittice_proto::LogicalOp::Or => LogicalOp::Or, _ => LogicalOp::And };
-            let order_by: Vec<CoreOrderBy> = req.order_by.iter().map(|o| {
-                CoreOrderBy { field: o.field.clone(), direction: match o.direction() { bittice_proto::SortDirection::Desc => SortDirection::Desc, _ => SortDirection::Asc } }
-            }).collect();
-
-            let mut aggregations = Vec::new();
-            for agg_req in req.aggregations {
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&agg_req.aggregation_json) { aggregations.push(json_val); }
-            }
-
-            let limit = if req.limit == 0 { 100 } else { (req.limit as usize).min(100) };
-            let offset = req.offset as usize;
-            let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-                let all_fields = Table::get_indexed_fields_static(&entity, &table_name);
-                Table::get_base_fields_static(&all_fields)
-            } else { req.selected_fields.clone() };
-
-            let fields_for_search = fields.clone();
-            let table_manager_for_search = Arc::clone(&table_manager_outer);
-            let entity_for_search = entity.clone();
-            let table_name_for_search = table_name.clone();
-
-            let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
-                let table_lock = table_manager_for_search.get_table(&entity_for_search, &table_name_for_search)?;
-                {
-                    let mut table = table_lock.write().unwrap();
+            let res = tokio::task::spawn_blocking(move || {
+                if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
+                    let mut table = table_arc.write().unwrap();
                     let _ = table.reload_if_needed();
+                    table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset)
+                } else {
+                    Err(anyhow::anyhow!("Table not found"))
                 }
-                let table = table_lock.read().unwrap();
-                table.search(&fields_for_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)
             }).await.unwrap();
 
-            match result {
+            match res {
                 Ok(query_result) => {
-                    let total_found = query_result.total_found as u64;
-                    let page_num = if limit > 0 { (offset as u32 / limit as u32) + 1 } else { 1 };
-                    let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
-
-                    let meta = SearchMetadata {
+                    // Send metadata first
+                    let metadata = SearchMetadata {
                         headers: query_result.headers.clone(),
-                        total_found,
+                        total_found: query_result.total_found as u64,
                         execution_time_micros: query_result.execution_time_micros as u64,
-                        debug_info: query_result.debug_info.unwrap_or_default(),
-                        pagination: Some(bittice_proto::PaginationMetadata {
-                            page: page_num,
-                            per_page: limit as u32,
-                            total_pages,
-                            total_items: total_found,
-                        }),
+                        debug_info: "".to_string(),
+                        pagination: None,
                     };
-                    if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Metadata(meta)) })).await { return; }
+                    if let Err(_) = tx.send(Ok(SearchResponse {
+                        content: Some(Content::Metadata(metadata)),
+                    })).await { return; }
 
-                    if let Some(row_ids) = query_result.row_ids {
-                        for chunk in row_ids.chunks(BATCH_SIZE) {
-                            let tm_chunk = Arc::clone(&table_manager_outer);
-                            let f_chunk = fields.clone();
-                            let ids_chunk = chunk.to_vec();
-                            let e_chunk = entity.clone();
-                            let t_chunk = table_name.clone();
-
-                            let rows_res: anyhow::Result<Vec<Vec<String>>> = tokio::task::spawn_blocking(move || {
-                                let table_lock = tm_chunk.get_table(&e_chunk, &t_chunk)?;
-                                let table = table_lock.read().unwrap();
-                                table.get_rows_batch(&f_chunk, &ids_chunk)
-                            }).await.unwrap();
-
-                            match rows_res {
-                                Ok(rows) => {
-                                    let proto_rows = rows.into_iter().map(|r| ProtoRow { values: r }).collect();
-                                    if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Rows(RowBatch { rows: proto_rows })) })).await { return; }
-                                },
-                                Err(e) => {
-                                    let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                                    return;
-                                }
-                            }
+                    // Then send rows in chunks
+                    for chunk in query_result.rows.chunks(BATCH_SIZE) {
+                        let mut proto_rows = Vec::new();
+                        for row in chunk {
+                            proto_rows.push(ProtoRow { values: row.clone() });
                         }
+                        let resp = SearchResponse {
+                            content: Some(Content::Rows(RowBatch { rows: proto_rows })),
+                        };
+                        if let Err(_) = tx.send(Ok(resp)).await { break; }
                     }
-
-                    if let Some(aggs) = query_result.aggregations {
-                        for agg in aggs {
-                            let proto_agg = ProtoAggregationResult {
-                                headers: agg.headers,
-                                rows: agg.rows.into_iter().map(|r| ProtoRow { values: r }).collect(),
-                                summary: agg.summary.unwrap_or(0.0),
-                            };
-                            if let Err(_) = tx.send(Ok(SearchResponse { content: Some(Content::Aggregation(proto_agg)) })).await { return; }
-                        }
-                    }
-                },
-                Err(e) => { let _ = tx.send(Err(Status::internal(e.to_string()))).await; }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                }
             }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn search_unary(&self, request: Request<SearchRequest>) -> Result<Response<SearchUnaryResponse>, Status> {
+    async fn search_unary(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<SearchUnaryResponse>, Status> {
         let req = request.into_inner();
-        let table_manager = Arc::clone(&self.table_manager);
-        let entity = req.entity.clone();
-        let table_name = req.table.clone();
         
-        if entity.is_empty() || table_name.is_empty() { return Err(Status::invalid_argument("Entity/Table required")); }
+        let query = SavedQuery {
+            name: "ad-hoc".to_string(),
+            entity: req.entity,
+            table: req.table,
+            filters: req.filters.into_iter().map(|f| crate::core::saved_queries::SavedFilter {
+                field: f.field,
+                op: proto_comparison_op_to_str(f.op),
+                value: f.value,
+                field_type: proto_field_type_to_core(f.field_type),
+            }).collect(),
+            filters_op: proto_logical_op_to_str(req.filters_op),
+            aggregations: Vec::new(),
+            order_by: req.order_by.into_iter().map(|o| crate::core::saved_queries::SavedOrderBy {
+                field: o.field,
+                direction: proto_sort_direction_to_str(o.direction),
+            }).collect(),
+            limit: Some(req.limit as usize),
+            limit_param: None,
+            selected_fields: req.selected_fields,
+        };
 
-        let filters: Vec<CoreFilter> = req.filters.iter().map(|f| {
-            CoreFilter { 
-                field: f.field.clone(), 
-                op: match f.op() { 
-                    bittice_proto::ComparisonOp::Eq => ComparisonOp::Eq, 
-                    bittice_proto::ComparisonOp::Ne => ComparisonOp::Ne, 
-                    bittice_proto::ComparisonOp::Gt => ComparisonOp::Gt, 
-                    bittice_proto::ComparisonOp::Gte => ComparisonOp::Gte, 
-                    bittice_proto::ComparisonOp::Lt => ComparisonOp::Lt, 
-                    bittice_proto::ComparisonOp::Lte => ComparisonOp::Lte, 
-                    bittice_proto::ComparisonOp::In => ComparisonOp::In, 
-                }, 
-                value: f.value.clone(), 
-                value_options: f.value_options.clone(),
-                field_type: match f.field_type() {
-                    bittice_proto::FieldType::Int => Some(FieldType::Int),
-                    bittice_proto::FieldType::Float => Some(FieldType::Float),
-                    bittice_proto::FieldType::Date => Some(FieldType::Date),
-                    _ => Some(FieldType::String),
-                },
-            }
-        }).collect();
+        let resp = execute_query_unary_internal(
+            query, 
+            HashMap::new(), 
+            Arc::clone(&self.table_manager),
+            req.limit,
+            req.offset,
+        ).await?;
 
-        let filters_op = match req.filters_op() { bittice_proto::LogicalOp::Or => LogicalOp::Or, _ => LogicalOp::And };
-        let order_by: Vec<CoreOrderBy> = req.order_by.iter().map(|o| {
-            CoreOrderBy { field: o.field.clone(), direction: match o.direction() { bittice_proto::SortDirection::Desc => SortDirection::Desc, _ => SortDirection::Asc } }
-        }).collect();
-
-        let mut aggregations = Vec::new();
-        for agg_req in req.aggregations {
-            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&agg_req.aggregation_json) { aggregations.push(json_val); }
-        }
-
-        let limit = if req.limit == 0 { 100 } else { (req.limit as usize).min(100) };
-        let offset = req.offset as usize;
-        let fields = if req.selected_fields.is_empty() && aggregations.is_empty() {
-            let all_fields = Table::get_indexed_fields_static(&entity, &table_name);
-            Table::get_base_fields_static(&all_fields)
-        } else { req.selected_fields.clone() };
-
-        let result: anyhow::Result<QueryResult> = tokio::task::spawn_blocking(move || {
-            let table_lock = table_manager.get_table(&entity, &table_name)?;
-            {
-                let mut table = table_lock.write().unwrap();
-                let _ = table.reload_if_needed();
-            }
-            let table = table_lock.read().unwrap();
-            table.search(&fields, &filters, &filters_op, &aggregations, &order_by, limit, offset)
-        }).await.unwrap();
-
-        match result {
-            Ok(query_result) => {
-                let total_found = query_result.total_found as u64;
-                let page_num = if limit > 0 { (offset as u32 / limit as u32) + 1 } else { 1 };
-                let total_pages = if limit > 0 { (total_found as u32 + limit as u32 - 1) / limit as u32 } else { 1 };
-
-                let proto_rows: Vec<ProtoRow> = query_result.rows.into_iter().map(|r| ProtoRow { values: r }).collect();
-                let proto_aggs: Vec<ProtoAggregationResult> = query_result.aggregations.unwrap_or_default().into_iter().map(|agg| ProtoAggregationResult { headers: agg.headers, rows: agg.rows.into_iter().map(|r| ProtoRow { values: r }).collect(), summary: agg.summary.unwrap_or(0.0) }).collect();
-                
-                Ok(Response::new(SearchUnaryResponse { 
-                    headers: query_result.headers, 
-                    rows: proto_rows, 
-                    total_found, 
-                    execution_time_micros: query_result.execution_time_micros as u64, 
-                    debug_info: query_result.debug_info.unwrap_or_default(), 
-                    aggregations: proto_aggs,
-                    pagination: Some(bittice_proto::PaginationMetadata {
-                        page: page_num,
-                        per_page: limit as u32,
-                        total_pages,
-                        total_items: total_found,
-                    }),
-                }))
-            },
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
+        Ok(Response::new(resp))
     }
+
+    type ExecuteSavedQueryStream = ReceiverStream<Result<SearchResponse, Status>>;
+
+    async fn execute_saved_query(
+        &self,
+        request: Request<SavedQueryRequest>,
+    ) -> Result<Response<Self::ExecuteSavedQueryStream>, Status> {
+        let req = request.into_inner();
+        let ops = self.get_operations().await;
+        
+        let query = if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
+            if let SavedOperation::Read(q) = op {
+                q.clone()
+            } else {
+                return Err(Status::invalid_argument("Not a read operation"));
+            }
+        } else {
+            return Err(Status::not_found("Query not found"));
+        };
+
+        // Reconstruct SearchRequest to reuse search logic or just implement here
+        let entity = query.entity.clone();
+        let table_name = query.table.clone();
+        let params = req.params.clone();
+        
+        let mut filters = Vec::new();
+        for sf in query.filters {
+            let mut val = sf.value.clone();
+            if val.starts_with('$') {
+                if let Some(param_val) = params.get(&val[1..]) { val = param_val.clone(); }
+            }
+            filters.push(CoreFilter {
+                field: sf.field.clone(),
+                op: ComparisonOp::from_str(&sf.op),
+                value: val,
+                value_options: vec![],
+                field_type: sf.field_type,
+            });
+        }
+
+        let filters_op = match query.filters_op.as_str() { "Or" => LogicalOp::Or, _ => LogicalOp::And };
+        let order_by: Vec<CoreOrderBy> = query.order_by.iter().map(|so| {
+            CoreOrderBy { field: so.field.clone(), direction: if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc } }
+        }).collect();
+
+        let limit = if req.limit_override > 0 { req.limit_override as usize } 
+                    else { query.limit.unwrap_or(100) };
+        let offset = req.offset_override as usize;
+        let fields = query.selected_fields.clone();
+
+        let table_manager = Arc::clone(&self.table_manager);
+        let (tx, rx) = mpsc::channel(10);
+
+        tokio::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
+                    let mut table = table_arc.write().unwrap();
+                    let _ = table.reload_if_needed();
+                    table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset)
+                } else {
+                    Err(anyhow::anyhow!("Table not found"))
+                }
+            }).await.unwrap();
+
+            match res {
+                Ok(query_result) => {
+                    let metadata = SearchMetadata {
+                        headers: query_result.headers.clone(),
+                        total_found: query_result.total_found as u64,
+                        execution_time_micros: query_result.execution_time_micros as u64,
+                        debug_info: "".to_string(),
+                        pagination: None,
+                    };
+                    let _ = tx.send(Ok(SearchResponse {
+                        content: Some(Content::Metadata(metadata)),
+                    })).await;
+
+                    for chunk in query_result.rows.chunks(BATCH_SIZE) {
+                        let mut proto_rows = Vec::new();
+                        for row in chunk {
+                            proto_rows.push(ProtoRow { values: row.clone() });
+                        }
+                        let _ = tx.send(Ok(SearchResponse {
+                            content: Some(Content::Rows(RowBatch { rows: proto_rows })),
+                        })).await;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn execute_saved_query_unary(
+        &self,
+        request: Request<SavedQueryRequest>,
+    ) -> Result<Response<SearchUnaryResponse>, Status> {
+        let req = request.into_inner();
+        let ops = self.get_operations().await;
+        
+        if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
+            if let SavedOperation::Read(q) = op {
+                let resp = execute_query_unary_internal(
+                    q.clone(), 
+                    req.params, 
+                    Arc::clone(&self.table_manager),
+                    req.limit_override,
+                    req.offset_override,
+                ).await?;
+                return Ok(Response::new(resp));
+            }
+        }
+        
+        Err(Status::not_found("Query not found"))
+    }
+
+    type SubscribeUpdatesStream = ReceiverStream<Result<bittice_proto::UpdateEvent, Status>>;
 
     async fn subscribe_updates(
         &self,
         request: Request<bittice_proto::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeUpdatesStream>, Status> {
         let req = request.into_inner();
-        let entity = req.entity.trim().to_lowercase();
-        let table_name = req.table.trim().to_lowercase();
+        let query_name = req.query_name.trim().to_string();
+        let params = req.params.clone();
+        
+        if query_name.is_empty() { return Err(Status::invalid_argument("Query name required")); }
+
+        // Use cached and filtered operations
+        let ops = self.get_operations().await;
+        
+        let (entity, table_name, filters) = if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
+            if let SavedOperation::Read(q) = op {
+                let mut resolved_filters = Vec::new();
+                for sf in &q.filters {
+                    let mut val = sf.value.clone();
+                    if val.starts_with('$') {
+                        if let Some(p_val) = params.get(&val[1..]) { val = p_val.clone(); }
+                    }
+                    resolved_filters.push(CoreFilter {
+                        field: sf.field.clone(),
+                        op: ComparisonOp::from_str(&sf.op),
+                        value: val,
+                        value_options: vec![],
+                        field_type: sf.field_type,
+                    });
+                }
+                (q.entity.clone(), q.table.clone(), resolved_filters)
+            } else { return Err(Status::not_found("Query found but it is not a 'read' operation")); }
+        } else { 
+            return Err(Status::not_found(format!("Query name '{}' not found in current configuration", query_name))); 
+        };
+
         let table_manager = Arc::clone(&self.table_manager);
         let mut events_rx = table_manager.events_tx.subscribe();
-        
         let (tx, rx) = mpsc::channel(100);
 
+        // Get table columns for mapping
+        let columns = if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
+            let table = table_arc.read().unwrap();
+            table.manifest.original_fields.clone()
+        } else {
+            vec![]
+        };
+
         tokio::spawn(async move {
-            let entity_filter = entity.clone();
-            let table_filter = table_name.clone();
+            let entity_filter = entity.to_lowercase();
+            let table_filter = table_name.to_lowercase();
+            let filters_internal = filters;
+            let cols_internal = if columns.is_empty() {
+                if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
+                    table_arc.read().unwrap().manifest.original_fields.clone()
+                } else { vec![] }
+            } else { columns };
 
-            println!("gRPC: Client subscribed to updates for {}/{}", entity_filter, table_filter);
+            println!("  \x1b[34m•\x1b[0m gRPC: Client subscribed to '{}' (Entity: {}, Table: {})", 
+                query_name, entity_filter, table_filter);
 
-            while let Ok(event) = events_rx.recv().await {
-                let e_name = event.entity.trim().to_lowercase();
-                let t_name = event.table_name.trim().to_lowercase();
-                
-                let matches_table = table_filter.is_empty() || table_filter == "*" || t_name == table_filter;
-                
-                if e_name == entity_filter && matches_table {
-                    println!("gRPC: Dispatching event to stream for client: {}/{} type={}", event.entity, event.table_name, event.event_type);
-                    let proto_event = bittice_proto::UpdateEvent {
-                        r#type: event.event_type.clone(),
-                        table: event.table_name.clone(),
-                        row: Some(bittice_proto::Row { values: event.row.clone() }),
-                        pk: event.pk.clone(),
-                    };
-                    if let Err(e) = tx.send(Ok(proto_event)).await {
-                        println!("gRPC: Client disconnected or channel closed: {}", e);
+            loop {
+                match events_rx.recv().await {
+                    Ok(event) => {
+                        let e_name = event.entity.trim().to_lowercase();
+                        let t_name = event.table_name.trim().to_lowercase();
+
+                        if e_name == entity_filter && t_name == table_filter {
+                            let mut is_match = true;
+                            
+                            if !filters_internal.is_empty() && !cols_internal.is_empty() && !event.row.is_empty() {
+                                let mut row_data: HashMap<&String, &String> = HashMap::new();
+                                for (i, col_name) in cols_internal.iter().enumerate() {
+                                    if i < event.row.len() { 
+                                        row_data.insert(col_name, &event.row[i]); 
+                                    }
+                                }
+
+                                for f in &filters_internal {
+                                    if let Some(actual_val) = row_data.get(&f.field) {
+                                        let actual_trimmed = actual_val.trim();
+                                        let filter_trimmed = f.value.trim();
+                                        
+                                        let matched = match f.op {
+                                            ComparisonOp::Eq => {
+                                                if let Some(t) = f.field_type {
+                                                    match t {
+                                                        FieldType::Int | FieldType::Float => {
+                                                            let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                            let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                            (n_actual - n_target).abs() < f64::EPSILON
+                                                        }
+                                                        _ => actual_trimmed.to_lowercase() == filter_trimmed.to_lowercase()
+                                                    }
+                                                } else {
+                                                    actual_trimmed.to_lowercase() == filter_trimmed.to_lowercase()
+                                                }
+                                            },
+                                            ComparisonOp::Ne => {
+                                                if let Some(t) = f.field_type {
+                                                    match t {
+                                                        FieldType::Int | FieldType::Float => {
+                                                            let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                            let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                            (n_actual - n_target).abs() >= f64::EPSILON
+                                                        }
+                                                        _ => actual_trimmed.to_lowercase() != filter_trimmed.to_lowercase()
+                                                    }
+                                                } else {
+                                                    actual_trimmed.to_lowercase() != filter_trimmed.to_lowercase()
+                                                }
+                                            },
+                                            ComparisonOp::Gt => {
+                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                n_actual > n_target
+                                            },
+                                            ComparisonOp::Gte => {
+                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                n_actual >= n_target
+                                            },
+                                            ComparisonOp::Lt => {
+                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                n_actual < n_target
+                                            },
+                                            ComparisonOp::Lte => {
+                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
+                                                n_actual <= n_target
+                                            },
+                                            _ => true,
+                                        };
+
+                                        if !matched {
+                                            is_match = false;
+                                            break;
+                                        }
+                                    } else {
+                                        is_match = false; 
+                                        break;
+                                    }
+                                }
+                            } else if !filters_internal.is_empty() {
+                                is_match = false;
+                            }
+
+                            if is_match {
+                                println!("  \x1b[32m•\x1b[0m gRPC [{}]: Notification sent for {}/{} (PK: {})", query_name, e_name, t_name, event.pk);
+                                let proto_event = bittice_proto::UpdateEvent {
+                                    r#type: event.event_type.clone(),
+                                    table: event.table_name.clone(),
+                                    row: Some(bittice_proto::Row { values: event.row.clone() }),
+                                    pk: event.pk.clone(),
+                                };
+                                if let Err(_) = tx.send(Ok(proto_event)).await { break; }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        eprintln!("  \x1b[33m⚠\x1b[0m gRPC [{}]: Stream lagged, skipped {} events", query_name, skipped);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
                     }
                 }
@@ -720,99 +630,25 @@ impl Database for MyDatabase {
     }
 }
 
-pub async fn start_grpc_server(port: u16) -> anyhow::Result<()> {
-    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let addr = format!("{}:{}", host, port).parse()?;
+pub async fn start_grpc_server(port: u16, entity_filter: Option<String>) -> anyhow::Result<()> {
     let table_manager = Arc::new(TableManager::new());
+    start_grpc_server_with_manager(port, table_manager, entity_filter).await
+}
+
+pub async fn start_grpc_server_with_manager(port: u16, table_manager: Arc<TableManager>, entity_filter: Option<String>) -> anyhow::Result<()> {
+    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let addr = format!("{}:{}", host, port).parse()?;
     
-    let tm_watcher = Arc::clone(&table_manager);
-    tokio::spawn(async move {
-        let mut last_sequences: HashMap<String, u64> = HashMap::new();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            
-            let data_dir = std::path::Path::new("data");
-            if let Ok(entities) = std::fs::read_dir(data_dir) {
-                for entity_entry in entities.flatten() {
-                    if entity_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        let entity = entity_entry.file_name().to_string_lossy().to_string();
-                        let entity_path = data_dir.join(&entity);
-                        
-                        if let Ok(tables) = std::fs::read_dir(entity_path) {
-                            for table_entry in tables.flatten() {
-                                if table_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                                    let t_name = table_entry.file_name().to_string_lossy().to_string();
-                                    let key = format!("{}/{}", entity, t_name);
-                                    
-                                    if let Ok(table_lock) = tm_watcher.get_table(&entity, &t_name) {
-                                        let mut event_to_send = None;
-                                        {
-                                            let mut table = table_lock.write().unwrap();
-                                            
-                                            // Siempre intentamos recargar del disco
-                                            let _ = table.reload_if_needed();
-                                            let current_seq = table.manifest.last_sequence_number;
-                                            
-                                            if !last_sequences.contains_key(&key) {
-                                                last_sequences.insert(key.clone(), current_seq);
-                                                continue;
-                                            }
+    // The CdcWorker now emits events directly to the TableManager, 
+    // so we don't need the imprecise file-watcher loop anymore.
 
-                                            let old_seq = *last_sequences.get(&key).unwrap();
-                                            
-                                            if current_seq > old_seq {
-                                                println!("Watcher: Change detected in {}/{} (seq {} -> {})", entity, t_name, old_seq, current_seq);
-                                                let pk_field = table.manifest.primary_key.clone();
-                                                
-                                                let fields_to_fetch = if table.manifest.original_fields.is_empty() {
-                                                    Table::get_indexed_fields_static(&entity, &t_name)
-                                                } else {
-                                                    table.manifest.original_fields.clone()
-                                                };
-
-                                                let mut row_data = vec![];
-                                                
-                                                if !fields_to_fetch.is_empty() {
-                                                    // Intentar obtener la fila más reciente usando last_update
-                                                    let mut order_by = vec![];
-                                                    if fields_to_fetch.iter().any(|f| f == "last_update") {
-                                                        order_by.push(CoreOrderBy {
-                                                            field: "last_update".to_string(),
-                                                            direction: SortDirection::Desc,
-                                                        });
-                                                    }
-
-                                                    if let Ok(res) = table.search(&fields_to_fetch, &[], &LogicalOp::And, &[], &order_by, 1, 0) {
-                                                        if let Some(r) = res.rows.into_iter().next() { row_data = r; }
-                                                    }
-                                                }
-
-                                                event_to_send = Some(crate::server::table_manager::TableUpdateEvent {
-                                                    entity: entity.clone(),
-                                                    table_name: t_name.clone(),
-                                                    event_type: "UPDATE".to_string(),
-                                                    pk: pk_field,
-                                                    row: row_data,
-                                                });
-                                                last_sequences.insert(key.clone(), current_seq);
-                                            }
-                                        }
-                                        if let Some(ev) = event_to_send {
-                                            println!("Watcher: Emitting broadcast event for {} (listeners: {})", key, tm_watcher.events_tx.receiver_count());
-                                            let _ = tm_watcher.events_tx.send(ev);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    let db = MyDatabase::new(table_manager);
+    let db = MyDatabase::new(table_manager, entity_filter);
     println!("gRPC Server listening on {}", addr);
-    tonic::transport::Server::builder().add_service(DatabaseServer::new(db)).serve(addr).await?;
+
+    tonic::transport::Server::builder()
+        .add_service(DatabaseServer::new(db))
+        .serve(addr)
+        .await?;
+
     Ok(())
 }

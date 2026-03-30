@@ -133,40 +133,50 @@ pub fn save_operations(ops: &[SavedOperation]) -> anyhow::Result<()> {
 }
 
 pub fn load_operations() -> anyhow::Result<Vec<SavedOperation>> {
+    load_operations_with_filter(None)
+}
+
+pub fn load_operations_with_filter(entity_filter: Option<String>) -> anyhow::Result<Vec<SavedOperation>> {
     let new_path = Path::new("data").join(".bittice_ops.json");
     let old_path_root = Path::new(".bittice_ops.json");
     let very_old_path = Path::new(".bittice_queries.json");
 
-    // 1. Check if we have the file in the new location (data/.bittice_ops.json)
+    let mut all_ops = Vec::new();
+
+    // 1. Try new path
     if new_path.exists() {
-        let content = fs::read_to_string(new_path)?;
-        let ops: Vec<SavedOperation> = serde_json::from_str(&content)?;
-        return Ok(ops);
-    }
-
-    // 2. Migration: Check if we have the file in the OLD location (root/.bittice_ops.json)
-    if old_path_root.exists() {
-        let content = fs::read_to_string(old_path_root)?;
-        // Validate format
-        let ops: Vec<SavedOperation> = serde_json::from_str(&content)?;
-        // Move to new location
-        save_operations(&ops)?;
-        // Remove old file
+        let content = fs::read_to_string(&new_path)?;
+        all_ops = serde_json::from_str(&content).unwrap_or_default();
+    } else if old_path_root.exists() {
+        // 2. Migrate from old root path
+        let content = fs::read_to_string(&old_path_root)?;
+        all_ops = serde_json::from_str(&content).unwrap_or_default();
+        let _ = save_operations(&all_ops);
         let _ = fs::remove_file(old_path_root);
-        return Ok(ops);
-    }
-
-    // 3. Migration (Legacy): Check for .bittice_queries.json (very old format)
-    if very_old_path.exists() {
-        let content = fs::read_to_string(very_old_path)?;
-        if let Ok(_) = serde_json::from_str::<Vec<Vec<SavedFilter>>>(&content) {
-            if let Ok(queries) = serde_json::from_str::<Vec<SavedQuery>>(&content) {
-                let ops: Vec<SavedOperation> = queries.into_iter().map(SavedOperation::Read).collect();
-                save_operations(&ops)?; 
-                return Ok(ops);
-            }
+    } else if very_old_path.exists() {
+        // 3. Migrate from legacy .bittice_queries.json
+        let content = fs::read_to_string(&very_old_path)?;
+        if let Ok(queries) = serde_json::from_str::<Vec<SavedQuery>>(&content) {
+            all_ops = queries.into_iter().map(SavedOperation::Read).collect();
+            let _ = save_operations(&all_ops);
+            // We don't remove very_old_path to be safe
         }
     }
 
-    Ok(Vec::new())
+    if let Some(filter) = entity_filter {
+        let filter_lower = filter.to_lowercase();
+        let filtered = all_ops.into_iter().filter(|op| {
+            let entity = match op {
+                SavedOperation::Read(q) => &q.entity,
+                SavedOperation::Insert(i) => &i.entity,
+                SavedOperation::Update(u) => &u.entity,
+                SavedOperation::Delete(d) => &d.entity,
+                SavedOperation::Batch(_) => "",
+            };
+            entity.is_empty() || entity.to_lowercase() == filter_lower
+        }).collect();
+        Ok(filtered)
+    } else {
+        Ok(all_ops)
+    }
 }

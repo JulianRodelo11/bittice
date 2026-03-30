@@ -3,15 +3,17 @@ pub mod table_manager;
 
 use axum::{
     debug_handler,
-    extract::{State, Query, Request},
+    extract::{State, Query},
     response::{IntoResponse, Json},
     routing::{any},
     Router,
     http::{Method, StatusCode},
 };
 use std::sync::{Arc};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, RwLock as TokioRwLock};
 use tower_http::trace::TraceLayer;
+use tower_http::catch_panic::CatchPanicLayer;
 use crate::core::saved_queries::{load_operations, SavedOperation};
 use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy};
 use std::collections::HashMap;
@@ -19,18 +21,11 @@ use rayon::prelude::*;
 use crate::core::storage::table::Table;
 use crate::server::table_manager::TableManager;
 
-// Estructura para compartir estado con los handlers de Axum
-struct ServerState {
-    log_sender: mpsc::Sender<String>,
-    table_manager: Arc<TableManager>,
-    ops_cache: Arc<TokioRwLock<Option<(std::time::Instant, Vec<SavedOperation>)>>>,
-}
-
 pub fn show_banner() {
     println!("\n  \x1b[1m\x1b[34mBittice Query Engine is active\x1b[0m");
     println!("  ----------------------------------------");
-    println!("  \x1b[1mREST API:\x1b[0m    http://127.0.0.1:3000");
-    println!("  \x1b[1mgRPC API:\x1b[0m    127.0.0.1:50051");
+    println!("  \x1b[1mREST API:\x1b[0m    http://0.0.0.0:3000");
+    println!("  \x1b[1mgRPC API:\x1b[0m    0.0.0.0:50051");
     println!("  ----------------------------------------");
     
     // Show saved queries
@@ -51,21 +46,31 @@ pub fn show_banner() {
     println!("  PUT    /_config             (Edit)");
     println!("  DELETE /_config?name=...    (Delete)");
     println!("  ----------------------------------------");
-    println!("  Press \x1b[1mCtrl+C\x1b[0m to stop the server\n");
+    println!("  Press Ctrl+C to stop the server\n");
 }
 
-pub async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> anyhow::Result<()> {
+pub(crate) async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
-    println!("\n  Shutting down Bittice...");
+    println!("\n  \x1b[33m•\x1b[0m Shutting down Bittice...");
     if let Some(tx) = shutdown_tx {
         let _ = tx.send(());
     }
     Ok(())
 }
 
-pub async fn start_all_servers() -> anyhow::Result<()> {
+pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<()> {
     let (log_tx, mut log_rx) = mpsc::channel::<String>(100);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let table_manager = Arc::new(TableManager::new());
+    
+    // Convert entity_filter to lowercase and trim it
+    let entity_filter = entity_filter.map(|e| e.trim().to_lowercase());
+    
+    if let Some(ref f) = entity_filter {
+        let _ = log_tx.try_send(format!("[DEBUG] Filtering by entity: '{}'", f));
+    } else {
+        let _ = log_tx.try_send("[DEBUG] No entity filter applied (loading all)".to_string());
+    }
     
     // Task to print logs cleanly
     tokio::spawn(async move {
@@ -78,35 +83,135 @@ pub async fn start_all_servers() -> anyhow::Result<()> {
         }
     });
 
+    // --- AUTO-START CDC WORKERS ---
+    let data_dir = std::path::Path::new("data");
+    
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let entity_folder_name = entry.file_name().to_string_lossy().to_string();
+                
+                // If a filter is provided, skip this directory if it doesn't match
+                if let Some(ref filter) = entity_filter {
+                    if entity_folder_name.to_lowercase() != *filter {
+                        continue;
+                    }
+                }
+
+                let config_path = entry.path().join("cdc_config.json");
+                
+                if config_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&config_path) {
+                        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                            let user = config["user"].as_str().unwrap_or_default().to_string();
+                            let pass = config["pass"].as_str().unwrap_or_default().to_string();
+                            let mut host = config["host"].as_str().unwrap_or_default().to_string();
+                            let db = config["database"].as_str().unwrap_or_default().to_string();
+                            let entity = config["entity"].as_str().unwrap_or(&entity_folder_name).to_string();
+                            
+                            // If a filter is provided, also check against the 'entity' field in JSON
+                            if let Some(ref filter) = entity_filter {
+                                if entity.to_lowercase() != *filter {
+                                    continue;
+                                }
+                            }
+
+                            let port = if let Some(p) = config["port"].as_str() {
+                                p.to_string()
+                            } else if let Some(p) = config["port"].as_u64() {
+                                p.to_string()
+                            } else {
+                                "3306".to_string()
+                            };
+
+                            let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
+                            if (host == "localhost" || host == "0.0.0.0") && is_docker {
+                                host = "host.docker.internal".to_string();
+                            }
+
+                            let url = format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db);
+                            let worker_tm = table_manager.clone();
+                            let worker_log = log_tx.clone();
+                            let worker_entity = entity.clone();
+                            let worker_db = db.clone();
+
+                            let _ = log_tx.try_send(format!("[INFO] CDC: Initializing worker for '{}' (Host: {}, Port: {}, DB: {})", worker_entity, host, port, worker_db));
+                            
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                let db_name_for_log = worker_db.clone();
+                                let error_log_tx = worker_log.clone();
+                                let worker = crate::core::cdc::CdcWorker::with_manager(
+                                    url, 
+                                    worker_entity, 
+                                    worker_db, 
+                                    worker_tm, 
+                                    Some(worker_log)
+                                );
+                                if let Err(e) = rt.block_on(worker.run()) {
+                                    // Only log the failure if it hasn't been logged by the worker itself
+                                    let err_msg = e.to_string();
+                                    if !err_msg.contains("CDC_ERROR") {
+                                        let _ = error_log_tx.try_send(format!("CDC_ERROR: Worker for '{}' failed: {}", db_name_for_log, err_msg));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let http_log_tx = log_tx.clone();
+    let http_tm = table_manager.clone();
+    let http_filter = entity_filter.clone();
     tokio::spawn(async move {
-        start_server(http_log_tx, shutdown_rx).await;
+        start_server(http_log_tx, http_tm, http_filter, shutdown_rx).await;
     });
 
+    let grpc_tm = table_manager.clone();
+    let grpc_filter = entity_filter.clone();
     tokio::spawn(async move {
-        let _ = grpc::start_grpc_server(50051).await;
+        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter).await;
     });
 
     show_banner();
     wait_for_exit(Some(shutdown_tx)).await
 }
 
-pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot::Receiver<()>) {
+pub struct ServerState {
+    pub log_sender: mpsc::Sender<String>,
+    pub table_manager: Arc<TableManager>,
+    pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
+    pub entity_filter: Option<String>,
+}
+
+pub async fn start_server(log_sender: mpsc::Sender<String>, table_manager: Arc<TableManager>, entity_filter: Option<String>, shutdown_rx: oneshot::Receiver<()>) {
     let state = Arc::new(ServerState {
         log_sender: log_sender.clone(),
-        table_manager: Arc::new(TableManager::new()),
+        table_manager,
         ops_cache: Arc::new(TokioRwLock::new(None)),
+        entity_filter: entity_filter.clone(),
     });
 
     // Definir rutas: Catch-all para cualquier método
     let app = Router::new()
         .route("/*path", any(handle_request))
         .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
         .with_state(state.clone());
 
-    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let addr = format!("{}:3000", host);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = log_sender.send(format!("[ERROR] Could not bind HTTP server to {}: {}", addr, e)).await;
+            return;
+        }
+    };
     let _ = log_sender.send(format!("Server started on http://{}", addr)).await;
     
     // --- CACHE WARMING & MAINTENANCE ---
@@ -115,7 +220,7 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot
     tokio::spawn(async move {
         loop {
             let start = std::time::Instant::now();
-            if let Ok(ops) = load_operations() {
+            if let Ok(ops) = crate::core::saved_queries::load_operations_with_filter(warm_state.entity_filter.clone()) {
                 let mut targets: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
                 for op in ops {
                     if let SavedOperation::Read(q) = op {
@@ -162,21 +267,24 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, shutdown_rx: oneshot
         }
     });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
-        .await
-        .unwrap();
+    // Start Axum server with shutdown receiver
+    let _ = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await;
 }
 
 #[debug_handler]
 async fn handle_request(
     State(state): State<Arc<ServerState>>,
-    req: Request,
+    method: Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let start_total = std::time::Instant::now();
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let query_params: HashMap<String, String> = Query::try_from_uri(req.uri())
+    let path = uri.path().to_string();
+    let query_params: HashMap<String, String> = Query::try_from_uri(&uri)
         .map(|Query(params)| params)
         .unwrap_or_default();
     
@@ -184,8 +292,8 @@ async fn handle_request(
     // Non-blocking log send to avoid hanging the request
     let _ = state.log_sender.try_send(format!("{} /{}", method, op_name));
     
-    // Load operations with improved caching
-    let ops: Vec<SavedOperation> = {
+    // Load operations with improved caching and filtering
+    let ops: Arc<Vec<SavedOperation>> = {
         let cache_read = state.ops_cache.read().await;
         let needs_reload = match &*cache_read {
             Some((ts, _)) => ts.elapsed().as_secs() > 60,
@@ -199,14 +307,16 @@ async fn handle_request(
                 if ts.elapsed().as_secs() <= 60 {
                     cached_ops.clone()
                 } else {
-                    let loaded = load_operations().unwrap_or_default();
-                    *cache_write = Some((std::time::Instant::now(), loaded.clone()));
-                    loaded
+                    let loaded = crate::core::saved_queries::load_operations_with_filter(state.entity_filter.clone()).unwrap_or_default();
+                    let loaded_arc = Arc::new(loaded);
+                    *cache_write = Some((std::time::Instant::now(), loaded_arc.clone()));
+                    loaded_arc
                 }
             } else {
-                let loaded = load_operations().unwrap_or_default();
-                *cache_write = Some((std::time::Instant::now(), loaded.clone()));
-                loaded
+                let loaded = crate::core::saved_queries::load_operations_with_filter(state.entity_filter.clone()).unwrap_or_default();
+                let loaded_arc = Arc::new(loaded);
+                *cache_write = Some((std::time::Instant::now(), loaded_arc.clone()));
+                loaded_arc
             }
         } else {
             cache_read.as_ref().unwrap().1.clone()
@@ -248,16 +358,17 @@ async fn handle_request(
     if path == "/_config" {
         match method {
             Method::POST => {
-                let body_bytes = ax_body_to_bytes(req).await;
-                match serde_json::from_slice::<SavedOperation>(&body_bytes) {
+                match serde_json::from_slice::<SavedOperation>(&body) {
                     Ok(new_op) => {
                         let name = new_op.name().to_string();
-                        let mut all_ops = ops.clone();
+                        let mut all_ops = crate::core::saved_queries::load_operations().unwrap_or_default();
                         if all_ops.iter().any(|o| o.name() == name) {
                             (StatusCode::CONFLICT, Json(serde_json::json!({ "error": format!("Operation '{}' already exists. Use PUT to update.", name) }))).into_response()
                         } else {
                             all_ops.push(new_op);
-                            let _ = crate::core::saved_queries::save_operations(&all_ops);
+                            if let Err(e) = crate::core::saved_queries::save_operations(&all_ops) {
+                                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to save configuration", "details": e.to_string() }))).into_response();
+                            }
                             { let mut cache = state.ops_cache.write().await; *cache = None; }
                             (StatusCode::CREATED, Json(serde_json::json!({ "status": "created", "name": name }))).into_response()
                         }
@@ -266,14 +377,15 @@ async fn handle_request(
                 }
             },
             Method::PUT => {
-                let body_bytes = ax_body_to_bytes(req).await;
-                match serde_json::from_slice::<SavedOperation>(&body_bytes) {
+                match serde_json::from_slice::<SavedOperation>(&body) {
                     Ok(new_op) => {
                         let name = new_op.name().to_string();
-                        let mut all_ops = ops.clone();
+                        let mut all_ops = crate::core::saved_queries::load_operations().unwrap_or_default();
                         if let Some(pos) = all_ops.iter().position(|o| o.name() == name) {
                             all_ops[pos] = new_op;
-                            let _ = crate::core::saved_queries::save_operations(&all_ops);
+                            if let Err(e) = crate::core::saved_queries::save_operations(&all_ops) {
+                                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to save configuration", "details": e.to_string() }))).into_response();
+                            }
                             { let mut cache = state.ops_cache.write().await; *cache = None; }
                             (StatusCode::OK, Json(serde_json::json!({ "status": "updated", "name": name }))).into_response()
                         } else {
@@ -285,22 +397,24 @@ async fn handle_request(
             },
             Method::GET => {
                 if let Some(name) = query_params.get("name") {
-                    if let Some(op) = ops.iter().find(|o| o.name() == name) {
+                    if let Some(op) = ops.iter().find(|o: &&SavedOperation| o.name() == name) {
                         (StatusCode::OK, Json(serde_json::json!(op))).into_response()
                     } else {
                         (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Operation not found" }))).into_response()
                     }
                 } else {
-                    (StatusCode::OK, Json(serde_json::json!(ops))).into_response()
+                    (StatusCode::OK, Json(serde_json::json!(&*ops))).into_response()
                 }
             },
             Method::DELETE => {
                 if let Some(name_to_del) = query_params.get("name") {
-                    let mut all_ops = ops.clone();
+                    let mut all_ops = crate::core::saved_queries::load_operations().unwrap_or_default();
                     let initial_len = all_ops.len();
                     all_ops.retain(|o| o.name() != name_to_del);
                     if all_ops.len() < initial_len {
-                        let _ = crate::core::saved_queries::save_operations(&all_ops);
+                        if let Err(e) = crate::core::saved_queries::save_operations(&all_ops) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to save configuration", "details": e.to_string() }))).into_response();
+                        }
                         { let mut cache = state.ops_cache.write().await; *cache = None; }
                         (StatusCode::OK, Json(serde_json::json!({ "status": "deleted", "name": name_to_del }))).into_response()
                     } else {
@@ -314,7 +428,7 @@ async fn handle_request(
         }
     } else {
         // Custom operations
-        let operation = ops.iter().find(|o| o.name() == op_name);
+        let operation = ops.iter().find(|o: &&SavedOperation| o.name() == op_name);
         if let Some(op) = operation {
             match (method, op) {
                 (Method::GET, SavedOperation::Read(ref q)) => {
@@ -327,8 +441,7 @@ async fn handle_request(
                     handle_batch(b, query_params, state).await.into_response()
                 },
                 (Method::POST, SavedOperation::Insert(ref i)) => {
-                    let body_bytes = ax_body_to_bytes(req).await;
-                    let payload: HashMap<String, String> = serde_json::from_slice(&body_bytes).unwrap_or_default();
+                    let payload: HashMap<String, String> = serde_json::from_slice(&body).unwrap_or_default();
                     handle_insert(i, payload, state).await.into_response()
                 },
                 (m, _) => {
@@ -343,12 +456,6 @@ async fn handle_request(
     }
 }
 
-async fn ax_body_to_bytes(req: Request) -> Vec<u8> {
-    use axum::body::to_bytes;
-    let bytes = to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
-    bytes.to_vec()
-}
-
 async fn handle_batch(
     batch: &crate::core::saved_queries::SavedBatch,
     params: HashMap<String, String>,
@@ -357,9 +464,10 @@ async fn handle_batch(
     let mut results = serde_json::Map::new();
     let ops = {
         let mut cache = state.ops_cache.write().await;
-        let loaded = load_operations().unwrap_or_default();
-        *cache = Some((std::time::Instant::now(), loaded.clone()));
-        loaded
+        let loaded = crate::core::saved_queries::load_operations_with_filter(state.entity_filter.clone()).unwrap_or_default();
+        let loaded_arc = Arc::new(loaded);
+        *cache = Some((std::time::Instant::now(), loaded_arc.clone()));
+        loaded_arc
     };
     
     let mut max_pages = 0;
@@ -367,7 +475,7 @@ async fn handle_batch(
     let mut execution_time_sum = 0.0;
 
     for op_name in &batch.operations {
-        if let Some(op) = ops.iter().find(|o| o.name() == op_name) {
+        if let Some(op) = ops.iter().find(|o: &&SavedOperation| o.name() == op_name) {
             match op {
                 SavedOperation::Read(ref q) => {
                     let mut targeted_params = params.clone();

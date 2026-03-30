@@ -17,9 +17,13 @@ pub enum Commands {
         #[arg(short, long, default_value_t = 50051)]
         port: u16,
 
-        /// Server type: 'grpc' or 'http'
-        #[arg(short, long, default_value = "grpc")]
+        /// Server type: 'grpc', 'http' or 'all'
+        #[arg(short, long, default_value = "all")]
         r#type: String,
+
+        /// Specific entity to activate (optional)
+        #[arg(short, long)]
+        entity: Option<String>,
     },
     /// Start CDC synchronization from MySQL
     Cdc {

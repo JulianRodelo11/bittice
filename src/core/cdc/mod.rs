@@ -38,13 +38,17 @@ impl CdcWorker {
     }
 
     pub fn with_log(url: String, entity: String, database: String, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
+        Self::with_manager(url, entity, database, Arc::new(TableManager::new()), log_tx)
+    }
+
+    pub fn with_manager(url: String, entity: String, database: String, table_manager: Arc<TableManager>, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
         let state_path = format!("data/{}/cdc_state.json", entity);
         Self { 
             url, 
             entity, 
             database,
             state_path,
-            table_manager: Arc::new(TableManager::new()),
+            table_manager,
             column_maps: Arc::new(RwLock::new(HashMap::new())),
             date_columns: Arc::new(RwLock::new(HashMap::new())),
             table_map_events: Arc::new(RwLock::new(HashMap::new())),
@@ -85,6 +89,48 @@ impl CdcWorker {
         }
         let file = std::fs::File::create(path)?;
         serde_json::to_writer_pretty(file, state)?;
+        Ok(())
+    }
+
+    /// MySQL replication error 1236 and variants: saved file/pos no longer on server (purged, new volume, etc.).
+    fn is_stale_saved_binlog_error(msg: &str) -> bool {
+        let m = msg.to_lowercase();
+        m.contains("(1236)")
+            || m.contains(" 1236:")
+            || m.contains("error 1236")
+            || m.contains("could not open log file")
+            || m.contains("could not find first log file")
+    }
+
+    async fn resolve_binlog_position(&self, conn: &mut Conn, state: &mut CdcState) -> Result<()> {
+        if !state.binlog_file.is_empty() {
+            return Ok(());
+        }
+        let mut row: Option<(String, u32, String, String, String)> =
+            match conn.query_first("SHOW BINARY LOG STATUS").await {
+                Ok(r) => r,
+                Err(_) => None,
+            };
+
+        if row.is_none() {
+            row = match conn.query_first("SHOW MASTER STATUS").await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.log(format!(
+                        "CDC_WARNING: MySQL Binlog access denied or syntax error. Real-time sync will be disabled. Error: {}",
+                        e
+                    ));
+                    None
+                }
+            };
+        }
+
+        if let Some((file, pos, _, _, _)) = row {
+            state.binlog_file = file;
+            state.binlog_pos = pos;
+        } else {
+            self.log("CDC_WARNING: Could not determine Binlog position. Continuing without real-time updates.".to_string());
+        }
         Ok(())
     }
 
@@ -191,7 +237,19 @@ impl CdcWorker {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let opts = match Opts::from_url(&self.url) {
+        let mut final_url = self.url.clone();
+        
+        // Host translation for Docker (macOS/Windows)
+        let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
+        if is_docker {
+            if final_url.contains("@localhost") {
+                final_url = final_url.replace("@localhost", "@host.docker.internal");
+            } else if final_url.contains("@127.0.0.1") {
+                final_url = final_url.replace("@127.0.0.1", "@host.docker.internal");
+            }
+        }
+
+        let opts = match Opts::from_url(&final_url) {
             Ok(o) => o,
             Err(e) => {
                 self.log(format!("CDC_ERROR: Invalid URL: {}", e));
@@ -240,30 +298,7 @@ impl CdcWorker {
             }
         }
 
-        if state.binlog_file.is_empty() {
-            // MySQL 8.4+ uses 'SHOW BINARY LOG STATUS', older versions use 'SHOW MASTER STATUS'
-            let mut row: Option<(String, u32, String, String, String)> = match conn.query_first("SHOW BINARY LOG STATUS").await {
-                Ok(r) => r,
-                Err(_) => None,
-            };
-            
-            if row.is_none() {
-                row = match conn.query_first("SHOW MASTER STATUS").await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.log(format!("CDC_WARNING: MySQL Binlog access denied or syntax error. Real-time sync will be disabled. Error: {}", e));
-                        None
-                    }
-                };
-            }
-            
-            if let Some((file, pos, _, _, _)) = row {
-                state.binlog_file = file;
-                state.binlog_pos = pos;
-            } else {
-                self.log("CDC_WARNING: Could not determine Binlog position. Continuing without real-time updates.".to_string());
-            }
-        }
+        self.resolve_binlog_position(&mut conn, &mut state).await?;
 
         if state.binlog_file.is_empty() {
             self.log("CDC_DISABLED".to_string());
@@ -273,49 +308,107 @@ impl CdcWorker {
             }
         }
 
-        self.log("CDC_READY".to_string());
-        self.log(format!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos));
-
-        let request = BinlogStreamRequest::new(1337)
-            .with_filename(state.binlog_file.as_bytes())
-            .with_pos(state.binlog_pos as u64);
-            
-        let mut stream = conn.get_binlog_stream(request).await?;
+        let pool = pool.clone();
         let mut last_flush = std::time::Instant::now();
 
-        while let Some(event) = stream.next().await {
-            let event = event?;
-            let header = event.header();
-            let next_pos = header.log_pos();
-            
-            if next_pos > 0 {
-                state.binlog_pos = next_pos;
+        'binlog_retry: loop {
+            self.resolve_binlog_position(&mut conn, &mut state).await?;
+
+            if state.binlog_file.is_empty() {
+                self.log("CDC_DISABLED".to_string());
+                self.log("CDC_IDLE: Live sync disabled due to missing Binlog position.".to_string());
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                }
             }
 
-            let data = event.read_data()?;
-            match data {
-                Some(EventData::TableMapEvent(tm)) => {
-                    let mut map = self.table_map_events.write().unwrap();
-                    map.insert(tm.table_id(), tm.into_owned());
+            self.log("CDC_READY".to_string());
+            self.log(format!(
+                "CDC: Resuming live stream from {}:{}",
+                state.binlog_file, state.binlog_pos
+            ));
+
+            let server_id = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() % 100000) as u32 + 1000;
+
+            let request = BinlogStreamRequest::new(server_id)
+                .with_filename(state.binlog_file.as_bytes())
+                .with_pos(state.binlog_pos as u64);
+
+            let mut stream = match conn.get_binlog_stream(request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if Self::is_stale_saved_binlog_error(&msg) {
+                        self.log(format!(
+                            "CDC: Saved binlog no longer available on server ({}). Re-syncing from current head.",
+                            msg
+                        ));
+                        state.binlog_file.clear();
+                        state.binlog_pos = 4;
+                        self.save_state(&state)?;
+                        conn = pool.get_conn().await?;
+                        conn.query_drop(format!("USE {}", self.database)).await?;
+                        continue 'binlog_retry;
+                    }
+                    return Err(e.into());
                 }
-                Some(EventData::RowsEvent(rows_data)) => {
-                    self.handle_rows_event(rows_data, &state)?;
+            };
+
+            while let Some(event) = stream.next().await {
+                let event = match event {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if Self::is_stale_saved_binlog_error(&msg) {
+                            self.log(format!(
+                                "CDC: Binlog stream error ({}). Re-syncing from current head.",
+                                msg
+                            ));
+                            state.binlog_file.clear();
+                            state.binlog_pos = 4;
+                            self.save_state(&state)?;
+                            conn = pool.get_conn().await?;
+                            conn.query_drop(format!("USE {}", self.database)).await?;
+                            continue 'binlog_retry;
+                        }
+                        return Err(e.into());
+                    }
+                };
+                let header = event.header();
+                let next_pos = header.log_pos();
+
+                if next_pos > 0 {
+                    state.binlog_pos = next_pos;
                 }
-                Some(EventData::RotateEvent(rotate_data)) => {
-                    state.binlog_file = rotate_data.name().to_string();
-                    state.binlog_pos = rotate_data.position() as u32;
+
+                let data = event.read_data()?;
+                match data {
+                    Some(EventData::TableMapEvent(tm)) => {
+                        let mut map = self.table_map_events.write().unwrap();
+                        map.insert(tm.table_id(), tm.into_owned());
+                    }
+                    Some(EventData::RowsEvent(rows_data)) => {
+                        self.handle_rows_event(rows_data, &state)?;
+                    }
+                    Some(EventData::RotateEvent(rotate_data)) => {
+                        state.binlog_file = rotate_data.name().to_string();
+                        state.binlog_pos = rotate_data.position() as u32;
+                    }
+                    _ => {}
                 }
-                _ => {}
+
+                self.save_state(&state)?;
+
+                if last_flush.elapsed() > std::time::Duration::from_secs(10) {
+                    last_flush = std::time::Instant::now();
+                }
             }
 
-            self.save_state(&state)?;
-
-            if last_flush.elapsed() > std::time::Duration::from_secs(10) {
-                last_flush = std::time::Instant::now();
-            }
+            return Ok(());
         }
-
-        Ok(())
     }
 
     fn handle_rows_event(&self, rows_data: RowsEventData, state: &CdcState) -> Result<()> {
@@ -343,34 +436,57 @@ impl CdcWorker {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                         let data = self.parse_row(row, &table_name)?;
-                        table.insert(data)?;
+                        let pk_val = data.get(&pk_field).cloned().unwrap_or_default();
+                        table.insert(data.clone())?;
+                        
+                        // Emit broadcast event
+                        let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
+                            entity: self.entity.clone(),
+                            table_name: table_name.clone(),
+                            event_type: "INSERT".to_string(),
+                            pk: pk_val,
+                            row: table.manifest.original_fields.iter().map(|f| data.get(f).cloned().unwrap_or_default()).collect(),
+                        });
                     }
                 }
             }
             RowsEventData::UpdateRowsEvent(ev) => {
-                self.log(format!("CDC: Received Update event for table '{}'", table_name));
                 for row_pair in ev.rows(tm) {
                     if let Ok((_, Some(after_row))) = row_pair {
                         let row = Row::try_from(after_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                         let data = self.parse_row(row, &table_name)?;
                         if let Some(pk_val) = data.get(&pk_field).cloned() {
-                            self.log(format!("CDC: Updating row with {}='{}' in table '{}'", pk_field, pk_val, table_name));
-                            table.update(&pk_val, data)?;
-                        } else {
-                            self.log(format!("CDC: WARN - PK value not found for update in table '{}'", table_name));
+                            table.update(&pk_val, data.clone())?;
+                            
+                            // Emit broadcast event
+                            let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
+                                entity: self.entity.clone(),
+                                table_name: table_name.clone(),
+                                event_type: "UPDATE".to_string(),
+                                pk: pk_val,
+                                row: table.manifest.original_fields.iter().map(|f| data.get(f).cloned().unwrap_or_default()).collect(),
+                            });
                         }
                     }
                 }
             }
             RowsEventData::DeleteRowsEvent(ev) => {
-                self.log(format!("CDC: Received Delete event for table '{}'", table_name));
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                         let data = self.parse_row(row, &table_name)?;
                         if let Some(pk_val) = data.get(&pk_field) {
-                            self.log(format!("CDC: Deleting row with {}='{}' in table '{}'", pk_field, pk_val, table_name));
+                            let pk_copy = pk_val.clone();
                             table.delete(pk_val)?;
+                            
+                            // Emit broadcast event
+                            let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
+                                entity: self.entity.clone(),
+                                table_name: table_name.clone(),
+                                event_type: "DELETE".to_string(),
+                                pk: pk_copy,
+                                row: vec![],
+                            });
                         }
                     }
                 }

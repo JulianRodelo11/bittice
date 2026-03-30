@@ -6,16 +6,43 @@ use bittice::cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // If there are arguments (beyond the program name), we execute normally.
+    let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
+
+    // If there are arguments (beyond the program name) OR we have BITTICE_ENTITY set, we execute server mode.
     // If not, we enter interactive mode.
-    if std::env::args().len() > 1 {
-        let cli = Cli::parse();
+    if std::env::args().len() > 1 || env_entity.is_some() {
+        if let Some(ref e) = env_entity {
+            println!("[MAIN] Detected BITTICE_ENTITY from environment: '{}'", e);
+        }
+
+        let cli = if std::env::args().len() > 1 {
+            Cli::parse()
+        } else {
+            // Default to 'server' mode if no args but ENV is set
+            println!("[MAIN] No CLI arguments provided, auto-starting server due to BITTICE_ENTITY.");
+            Cli {
+                command: Commands::Server { 
+                    port: 50051, 
+                    r#type: "all".to_string(), 
+                    entity: env_entity.clone() 
+                }
+            }
+        };
+
         match cli.command {
-            Commands::Server { port, r#type } => {
+            Commands::Server { port, r#type, entity } => {
+                let final_entity = entity.or(env_entity);
+                
+                if let Some(ref e) = final_entity {
+                    println!("[MAIN] Starting server with entity filter: '{}'", e);
+                } else {
+                    println!("[MAIN] Starting server with NO entity filter (loading all)");
+                }
+
                 if r#type == "all" {
-                    bittice::server::start_all_servers().await?;
+                    bittice::server::start_all_servers(final_entity).await?;
                 } else if r#type == "grpc" {
-                    bittice::server::grpc::start_grpc_server(port).await?;
+                    bittice::server::grpc::start_grpc_server(port, final_entity).await?;
                 } else {
                     // Setup for HTTP server (needs log channel and shutdown signal)
                     let (log_tx, mut log_rx) = tokio::sync::mpsc::channel(100);
@@ -35,10 +62,11 @@ async fn main() -> Result<()> {
                         let _ = shutdown_tx.send(());
                     });
 
-                    // Note: start_server binds to hardcoded 127.0.0.1:3000 in original code.
+                    // Note: start_server binds to hardcoded 0.0.0.0:3000 in original code.
                     // We might want to pass the port in the future.
                     println!("Starting HTTP server (Port fixed to 3000 in current impl, ignore --port arg for now if different)...");
-                    bittice::server::start_server(log_tx, shutdown_rx).await;
+                    let table_manager = std::sync::Arc::new(bittice::server::table_manager::TableManager::new());
+                    bittice::server::start_server(log_tx, table_manager, final_entity, shutdown_rx).await;
                 }
             }
             Commands::Cdc { url, entity, database } => {

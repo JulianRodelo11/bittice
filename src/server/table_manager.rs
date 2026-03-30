@@ -1,26 +1,29 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
+use std::path::Path;
 use crate::core::storage::table::Table;
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct TableUpdateEvent {
     pub entity: String,
     pub table_name: String,
-    pub event_type: String, // "INSERT", "UPDATE", "DELETE", "REFRESH"
+    pub event_type: String, // "INSERT", "UPDATE", "DELETE"
     pub pk: String,
     pub row: Vec<String>,
 }
 
-// Manejador de tablas para mantenerlas abiertas en memoria
 pub struct TableManager {
-    tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
+    pub tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
     pub events_tx: broadcast::Sender<TableUpdateEvent>,
 }
 
 impl TableManager {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(1000);
+        let (tx, _) = broadcast::channel::<TableUpdateEvent>(100);
+        // We don't spawn the heartbeat here to avoid "no reactor" panics 
+        // during sync startup.
+
         Self {
             tables: RwLock::new(HashMap::new()),
             events_tx: tx,
@@ -32,17 +35,15 @@ impl TableManager {
         {
             let cache = self.tables.read().unwrap();
             if let Some(table) = cache.get(&key) {
-                return Ok(table.clone());
+                return Ok(Arc::clone(table));
             }
         }
+
+        let entity_path = Path::new("data").join(entity);
+        let table = Arc::new(RwLock::new(Table::open(&entity_path, table_name)?));
+        
         let mut cache = self.tables.write().unwrap();
-        if let Some(table) = cache.get(&key) {
-            return Ok(table.clone());
-        }
-        let base_path = std::path::Path::new("data").join(entity);
-        let table = Table::open(&base_path, table_name)?;
-        let table_arc = Arc::new(RwLock::new(table));
-        cache.insert(key, table_arc.clone());
-        Ok(table_arc)
+        cache.insert(key, Arc::clone(&table));
+        Ok(table)
     }
 }
