@@ -28,6 +28,7 @@ pub struct CdcWorker {
     table_manager: Arc<TableManager>,
     column_maps: Arc<RwLock<HashMap<String, Vec<String>>>>,
     date_columns: Arc<RwLock<HashMap<String, Vec<String>>>>, // table -> list of date column names
+    enum_maps: Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>, // table -> column -> values
     table_map_events: Arc<RwLock<HashMap<u64, TableMapEvent<'static>>>>,
     log_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
@@ -51,6 +52,7 @@ impl CdcWorker {
             table_manager,
             column_maps: Arc::new(RwLock::new(HashMap::new())),
             date_columns: Arc::new(RwLock::new(HashMap::new())),
+            enum_maps: Arc::new(RwLock::new(HashMap::new())),
             table_map_events: Arc::new(RwLock::new(HashMap::new())),
             log_tx,
         }
@@ -145,17 +147,34 @@ impl CdcWorker {
         
         let mut all_cols = Vec::new();
         let mut date_cols = Vec::new();
+        let mut enum_info = HashMap::new();
 
         for row in rows {
             let col_name = row.0;
-            let col_type = row.1.to_lowercase();
+            let col_type_raw = row.1;
+            let col_type_lower = col_type_raw.to_lowercase();
             all_cols.push(col_name.clone());
             
-            if col_type.contains("date") || col_type.contains("timestamp") {
-                date_cols.push(col_name);
+            if col_type_lower.contains("date") || col_type_lower.contains("timestamp") {
+                date_cols.push(col_name.clone());
+            }
+
+            // Detectar ENUM y extraer valores (Preservando Mayúsculas/Minúsculas)
+            if col_type_lower.starts_with("enum(") {
+                let values_str = col_type_raw.trim_start_matches(|c| c != '(').trim_start_matches('(').trim_end_matches(')');
+                let values: Vec<String> = values_str
+                    .split(',')
+                    .map(|v| v.trim_matches('\'').to_string())
+                    .collect();
+                enum_info.insert(col_name, values);
             }
         }
         
+        if !enum_info.is_empty() {
+            let mut maps = self.enum_maps.write().unwrap();
+            maps.insert(table_name.to_string(), enum_info);
+        }
+
         Ok((all_cols, date_cols))
     }
 
@@ -505,6 +524,9 @@ impl CdcWorker {
         let d_maps = self.date_columns.read().unwrap();
         let dates = d_maps.get(table_name).cloned().unwrap_or_default();
 
+        let e_maps = self.enum_maps.read().unwrap();
+        let table_enums = e_maps.get(table_name);
+
         for i in 0..row.len() {
             let col_name = columns_names.get(i).cloned().unwrap_or_else(|| format!("col_{}", i));
             
@@ -522,6 +544,19 @@ impl CdcWorker {
                 if let Some(start) = val_str.find('(') {
                     if let Some(end) = val_str.find(')') {
                         val_str = val_str[start+1..end].to_string();
+                    }
+                }
+            }
+
+            // Traducción dinámica de ENUM (MySQL Binlog envía índices numéricos)
+            if let Some(enums) = table_enums {
+                if let Some(values) = enums.get(&col_name) {
+                    if !val_str.is_empty() && val_str.chars().all(|c| c.is_ascii_digit()) {
+                        if let Ok(idx) = val_str.parse::<usize>() {
+                            if idx > 0 && idx <= values.len() {
+                                val_str = values[idx - 1].clone();
+                            }
+                        }
                     }
                 }
             }
