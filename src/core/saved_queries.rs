@@ -43,6 +43,18 @@ pub struct SavedQuery {
     pub limit_param: Option<String>,
     #[serde(default)]
     pub selected_fields: Vec<String>,
+    /// Configuration for Row-Level Security via Bearer Token
+    #[serde(default)]
+    pub auth_config: Option<SavedAuthConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedAuthConfig {
+    pub enabled: bool,
+    pub table: String,
+    pub token_col: String,
+    pub id_col: String,
+    pub filter_col: String,
 }
 
 fn default_filters_op() -> String {

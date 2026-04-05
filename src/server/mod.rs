@@ -4,18 +4,20 @@ pub mod table_manager;
 use axum::{
     debug_handler,
     extract::{State, Query},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{any},
     Router,
-    http::{Method, StatusCode},
+    http::{Method, StatusCode, HeaderMap},
+    middleware::{Next},
 };
+use axum::extract::Request;
 use std::sync::{Arc};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, RwLock as TokioRwLock};
 use tower_http::trace::TraceLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use crate::core::saved_queries::{load_operations, SavedOperation};
-use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy};
+use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy, AuthContext};
 use std::collections::HashMap;
 use rayon::prelude::*;
 use crate::core::storage::table::Table;
@@ -185,19 +187,25 @@ pub struct ServerState {
     pub table_manager: Arc<TableManager>,
     pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
     pub entity_filter: Option<String>,
+    pub auth_service: crate::core::auth::AuthService,
 }
 
 pub async fn start_server(log_sender: mpsc::Sender<String>, table_manager: Arc<TableManager>, entity_filter: Option<String>, shutdown_rx: oneshot::Receiver<()>) {
     let state = Arc::new(ServerState {
         log_sender: log_sender.clone(),
-        table_manager,
+        table_manager: table_manager.clone(),
         ops_cache: Arc::new(TokioRwLock::new(None)),
         entity_filter: entity_filter.clone(),
+        auth_service: crate::core::auth::AuthService::new(table_manager),
     });
+
+    // Middleware de autenticación
+    let auth_layer = axum::middleware::from_fn_with_state(state.clone(), auth_middleware);
 
     // Definir rutas: Catch-all para cualquier método
     let app = Router::new()
         .route("/*path", any(handle_request))
+        .layer(auth_layer) // Añadimos la capa de auth
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
         .with_state(state.clone());
@@ -275,13 +283,28 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, table_manager: Arc<T
         .await;
 }
 
+pub async fn auth_middleware(
+    _state: State<Arc<ServerState>>,
+    _headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // El middleware ahora es transparente. 
+    // La resolución de identidad se hace bajo demanda en handle_request
+    // usando la configuración específica de la query guardada.
+    Ok(next.run(request).await)
+}
+
 #[debug_handler]
 async fn handle_request(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    extensions: axum::http::Extensions,
     method: Method,
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let auth_context = extensions.get::<AuthContext>();
     let start_total = std::time::Instant::now();
     let path = uri.path().to_string();
     let query_params: HashMap<String, String> = Query::try_from_uri(&uri)
@@ -289,6 +312,13 @@ async fn handle_request(
         .unwrap_or_default();
     
     let op_name = path.trim_start_matches('/').to_string();
+    
+    // Obtener token directamente de los headers para evitar problemas con extensiones
+    let raw_auth_token = headers.get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+
     // Non-blocking log send to avoid hanging the request
     let _ = state.log_sender.try_send(format!("{} /{}", method, op_name));
     
@@ -430,9 +460,22 @@ async fn handle_request(
         // Custom operations
         let operation = ops.iter().find(|o: &&SavedOperation| o.name() == op_name);
         if let Some(op) = operation {
+            // Check for custom AuthConfig in the operation
+            let mut effective_auth_ctx = auth_context.cloned();
+            if let SavedOperation::Read(ref q) = op {
+                if let Some(auth_cfg) = &q.auth_config {
+                    if auth_cfg.enabled {
+                        if let Some(token) = &raw_auth_token {
+                            println!("  \x1b[34m[SERVER]\x1b[0m Using custom AuthConfig for operation '{}' (table: {})", op_name, auth_cfg.table);
+                            effective_auth_ctx = state.auth_service.resolve_token(&q.entity, token, Some(auth_cfg)).await;
+                        }
+                    }
+                }
+            }
+
             match (method, op) {
                 (Method::GET, SavedOperation::Read(ref q)) => {
-                    match execute_read_operation(q, query_params, state, start_total, ops_load_ms).await {
+                    match execute_read_operation(q, query_params, state, start_total, ops_load_ms, effective_auth_ctx.as_ref()).await {
                         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
                         Err((status, val)) => (status, Json(val)).into_response(),
                     }
@@ -483,7 +526,7 @@ async fn handle_batch(
                     for (k, v) in &params {
                         if let Some(stripped) = k.strip_prefix(&prefix) { targeted_params.insert(stripped.to_string(), v.clone()); }
                     }
-                    match execute_read_operation(q, targeted_params, state.clone(), std::time::Instant::now(), 0.0).await {
+                    match execute_read_operation(q, targeted_params, state.clone(), std::time::Instant::now(), 0.0, None).await {
                         Ok(res) => { 
                             if let Some(obj) = res.as_object() {
                                 if let Some(pagination) = obj.get("pagination").and_then(|p| p.as_object()) {
@@ -520,6 +563,7 @@ async fn execute_read_operation(
     state: Arc<ServerState>,
     start_time: std::time::Instant,
     ops_load_ms: f64,
+    auth_context: Option<&AuthContext>,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
     let mut missing_params = Vec::new();
     let filters: Vec<Filter> = query.filters.iter().map(|sf| {
@@ -574,6 +618,7 @@ async fn execute_read_operation(
 
     let setup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let engine_start = std::time::Instant::now();
+    let auth_ctx_clone = auth_context.cloned();
 
     let result = tokio::task::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -605,7 +650,7 @@ async fn execute_read_operation(
                 }
 
                 let t2 = std::time::Instant::now();
-                let mut res = table.search(&f_search, &filters, &filters_op, &aggs_query, &order_by, limit, offset)?;
+                let mut res = table.search(&f_search, &filters, &filters_op, &aggs_query, &order_by, limit, offset, auth_ctx_clone.as_ref())?;
                 let open_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
                 let lock_ms = t2.duration_since(t1).as_secs_f64() * 1000.0;
                 let extra = format!(" | Open: {:.2}ms, Lock: {:.2}ms", open_ms, lock_ms);

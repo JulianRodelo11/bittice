@@ -110,3 +110,11 @@ pub struct OrderBy {
     pub field: String,
     pub direction: SortDirection,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthContext {
+    pub user_id: String,
+    pub token: String,
+    pub entity: String,
+    pub filter_col: String, // The column to filter in the business table
+}

@@ -65,14 +65,29 @@ pub struct MyDatabase {
     table_manager: Arc<TableManager>,
     ops_cache: Arc<RwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
     entity_filter: Option<String>,
+    auth_service: crate::core::auth::AuthService,
 }
 
 impl MyDatabase {
     pub fn new(table_manager: Arc<TableManager>, entity_filter: Option<String>) -> Self {
         Self { 
-            table_manager,
+            table_manager: table_manager.clone(),
             ops_cache: Arc::new(RwLock::new(None)),
             entity_filter,
+            auth_service: crate::core::auth::AuthService::new(table_manager),
+        }
+    }
+
+    async fn extract_auth_context(&self, metadata: &tonic::metadata::MetadataMap, config: Option<&crate::core::saved_queries::SavedAuthConfig>) -> Option<crate::core::types::AuthContext> {
+        let token = metadata.get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        
+        if let Some(t) = token {
+            let entity = self.entity_filter.clone().unwrap_or_else(|| "default".to_string());
+            self.auth_service.resolve_token(&entity, t, config).await
+        } else {
+            None
         }
     }
 
@@ -99,6 +114,7 @@ async fn execute_query_unary_internal(
     table_manager: Arc<TableManager>,
     limit_override: u32,
     offset_override: u32,
+    auth_context: Option<crate::core::types::AuthContext>,
 ) -> Result<SearchUnaryResponse, Status> {
     let entity = query.entity.clone();
     let table_name = query.table.clone();
@@ -173,7 +189,7 @@ async fn execute_query_unary_internal(
                 f_search = new_f;
             }
 
-            table.search(&f_search, &filters, &filters_op, &aggregations, &order_by, limit, offset)
+            table.search(&f_search, &filters, &filters_op, &aggregations, &order_by, limit, offset, auth_context.as_ref())
         } else {
             Err(anyhow::anyhow!("Table not found"))
         }
@@ -221,6 +237,8 @@ impl Database for MyDatabase {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStream>, Status> {
+        let metadata = request.metadata().clone();
+        let auth_ctx = self.extract_auth_context(&metadata, None).await;
         let req = request.into_inner();
         let entity = req.entity.clone();
         let table_name = req.table.clone();
@@ -257,7 +275,7 @@ impl Database for MyDatabase {
                 if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
                     let mut table = table_arc.write().unwrap();
                     let _ = table.reload_if_needed();
-                    table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset)
+                    table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset, auth_ctx.as_ref())
                 } else {
                     Err(anyhow::anyhow!("Table not found"))
                 }
@@ -302,6 +320,8 @@ impl Database for MyDatabase {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchUnaryResponse>, Status> {
+        let metadata = request.metadata().clone();
+        let auth_ctx = self.extract_auth_context(&metadata, None).await;
         let req = request.into_inner();
         
         let query = SavedQuery {
@@ -323,6 +343,7 @@ impl Database for MyDatabase {
             limit: Some(req.limit as usize),
             limit_param: None,
             selected_fields: req.selected_fields,
+            auth_config: None,
         };
 
         let resp = execute_query_unary_internal(
@@ -331,6 +352,7 @@ impl Database for MyDatabase {
             Arc::clone(&self.table_manager),
             req.limit,
             req.offset,
+            auth_ctx,
         ).await?;
 
         Ok(Response::new(resp))
@@ -342,6 +364,7 @@ impl Database for MyDatabase {
         &self,
         request: Request<SavedQueryRequest>,
     ) -> Result<Response<Self::ExecuteSavedQueryStream>, Status> {
+        let metadata = request.metadata().clone();
         let req = request.into_inner();
         let ops = self.get_operations().await;
         
@@ -354,6 +377,8 @@ impl Database for MyDatabase {
         } else {
             return Err(Status::not_found("Query not found"));
         };
+
+        let auth_ctx = self.extract_auth_context(&metadata, query.auth_config.as_ref()).await;
 
         // Reconstruct SearchRequest to reuse search logic or just implement here
         let entity = query.entity.clone();
@@ -393,7 +418,7 @@ impl Database for MyDatabase {
                 if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
                     let mut table = table_arc.write().unwrap();
                     let _ = table.reload_if_needed();
-                    table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset)
+                    table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset, auth_ctx.as_ref())
                 } else {
                     Err(anyhow::anyhow!("Table not found"))
                 }
@@ -435,17 +460,20 @@ impl Database for MyDatabase {
         &self,
         request: Request<SavedQueryRequest>,
     ) -> Result<Response<SearchUnaryResponse>, Status> {
+        let metadata = request.metadata().clone();
         let req = request.into_inner();
         let ops = self.get_operations().await;
         
         if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
             if let SavedOperation::Read(q) = op {
+                let auth_ctx = self.extract_auth_context(&metadata, q.auth_config.as_ref()).await;
                 let resp = execute_query_unary_internal(
                     q.clone(), 
                     req.params, 
                     Arc::clone(&self.table_manager),
                     req.limit_override,
                     req.offset_override,
+                    auth_ctx,
                 ).await?;
                 return Ok(Response::new(resp));
             }
@@ -460,6 +488,7 @@ impl Database for MyDatabase {
         &self,
         request: Request<bittice_proto::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeUpdatesStream>, Status> {
+        let metadata = request.metadata().clone();
         let req = request.into_inner();
         let query_name = req.query_name.trim().to_string();
         let params = req.params.clone();
@@ -469,7 +498,7 @@ impl Database for MyDatabase {
         // Use cached and filtered operations
         let ops = self.get_operations().await;
         
-        let (entity, table_name, filters) = if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
+        let (entity, table_name, filters, auth_cfg) = if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
             if let SavedOperation::Read(q) = op {
                 let mut resolved_filters = Vec::new();
                 for sf in &q.filters {
@@ -485,11 +514,14 @@ impl Database for MyDatabase {
                         field_type: sf.field_type,
                     });
                 }
-                (q.entity.clone(), q.table.clone(), resolved_filters)
+                (q.entity.clone(), q.table.clone(), resolved_filters, q.auth_config.clone())
             } else { return Err(Status::not_found("Query found but it is not a 'read' operation")); }
         } else { 
             return Err(Status::not_found(format!("Query name '{}' not found in current configuration", query_name))); 
         };
+
+        // Re-resolve auth context with query-specific configuration
+        let auth_ctx = self.extract_auth_context(&metadata, auth_cfg.as_ref()).await;
 
         let table_manager = Arc::clone(&self.table_manager);
         let mut events_rx = table_manager.events_tx.subscribe();
@@ -506,7 +538,21 @@ impl Database for MyDatabase {
         tokio::spawn(async move {
             let entity_filter = entity.to_lowercase();
             let table_filter = table_name.to_lowercase();
-            let filters_internal = filters;
+            let mut final_filters = filters;
+            
+            // Inject identity filter for subscription
+            if let Some(ctx) = auth_ctx {
+                let filter_col = ctx.filter_col.clone();
+                final_filters.push(CoreFilter {
+                    field: filter_col,
+                    op: ComparisonOp::Eq,
+                    value: ctx.user_id,
+                    value_options: vec![],
+                    field_type: None,
+                });
+            }
+            
+            let filters_internal = final_filters;
             let cols_internal = if columns.is_empty() {
                 if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
                     table_arc.read().unwrap().manifest.original_fields.clone()

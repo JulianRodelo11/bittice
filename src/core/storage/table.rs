@@ -321,25 +321,52 @@ impl Table {
         aggregations: &[serde_json::Value],
         order_by: &[OrderBy],
         limit: usize,
-        offset: usize
+        offset: usize,
+        auth_context: Option<&crate::core::types::AuthContext>,
     ) -> Result<QueryResult> {
         let limit = limit.min(100);
         let start_time = std::time::Instant::now();
+
+        // Security Filter Injection (Row-Level Security)
+        let mut final_filters = filters.to_vec();
+        let mut final_filters_op = filters_op.clone();
+
+        if let Some(ctx) = auth_context {
+            let filter_col = ctx.filter_col.clone();
+            
+            // If the current table is the auth table itself, we don't inject the filter 
+            // to avoid infinite recursion or blocking auth lookups.
+            // Using a simple check against common auth table names or environment
+            let auth_table = std::env::var("BITTICE_AUTH_TABLE").unwrap_or_else(|_| "auth_sessions".to_string());
+            
+            if self.name != auth_table && self.name != "Users" && self.name != "users" {
+                final_filters.push(Filter {
+                    field: filter_col,
+                    op: crate::core::types::ComparisonOp::Eq,
+                    value: ctx.user_id.clone(),
+                    field_type: None,
+                    value_options: vec![],
+                });
+                
+                final_filters_op = LogicalOp::And; 
+            }
+        }
+
         let mut segment_tasks: Vec<&Segment> = self.immutable_segments.iter().collect();
         if let Some(writer) = &self.active_segment { segment_tasks.push(&writer.segment); }
         let filter_start = std::time::Instant::now();
         let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
-        let pk_filter = filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::Eq);
+        let pk_filter = final_filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::Eq);
         let segment_matches = if let Some(f) = pk_filter {
-            let use_index = filters.len() == 1 || *filters_op == LogicalOp::And;
+            let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
             if use_index {
                 if let Some((seg_id, local_id)) = self.primary_index.get(&f.value) {
                     let mut bm = RoaringBitmap::new();
                     bm.insert(*local_id);
                     vec![(*seg_id, bm)]
                 } else { vec![] }
-            } else { self.scan_segments_parallel(&segment_tasks, filters, filters_op)? }
-        } else { self.scan_segments_parallel(&segment_tasks, filters, filters_op)? };
+            } else { self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)? }
+        } else { self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)? };
         let mut total_found = 0;
         for (seg_id, bitmap) in &segment_matches { 
             total_found += bitmap.len(); 

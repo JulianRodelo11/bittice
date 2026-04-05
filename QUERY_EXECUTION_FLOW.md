@@ -22,21 +22,38 @@ Para entender la consulta, primero debemos entender qué hay en el disco para un
 
 ## 🚀 Paso a Paso: El Ciclo de Vida de una Query
 
-Supongamos la siguiente consulta:
+Supongamos la siguiente consulta (Query Guardada):
 ```json
-// SELECT name, age FROM users WHERE age > 20 AND active = "true" LIMIT 10
 {
-  "filters": [
-    { "field": "age", "op": "Gt", "value": "20" },
-    { "field": "active", "op": "Eq", "value": "true" }
-  ],
-  "op": "And",
-  "limit": 10
+  "name": "get-vehicles-user",
+  "entity": "goparking",
+  "table": "Vehicles",
+  "auth_config": {
+    "enabled": true,
+    "table": "Users",
+    "token_col": "identifier",
+    "id_col": "id",
+    "filter_col": "ownerId"
+  },
+  "filters": [{ "field": "deletedAt", "op": "Eq", "value": "" }],
+  "selected_fields": ["*"]
 }
 ```
 
+### 0. Resolución de Identidad (Auth Phase)
+Antes de ejecutar la consulta sobre la tabla de negocio (`Vehicles`), Bittice resuelve quién es el usuario:
+
+1.  **JWT Decoding:** Si el token recibido tiene formato JWT, Bittice decodifica el payload (Base64URL) y extrae el campo `sub` o `username`. 
+    *   *Ejemplo:* Token JWT -> `sub: "b4a894c8-..."`.
+2.  **User Lookup:** Busca ese identificador en la tabla de autenticación configurada (`Users`) usando la columna `token_col` (`identifier`).
+3.  **Identity Mapping:** Obtiene el `id_col` (`id`) interno del usuario. 
+    *   *Resultado:* `AuthContext { user_id: "123", filter_col: "ownerId" }`.
+4.  **Inyección de Filtro (RLS):** Bittice inyecta automáticamente un filtro de seguridad en la consulta original:
+    *   `filters += { field: "ownerId", op: "Eq", value: "123" }`
+    *   `op = "And"` (para asegurar que el usuario no pueda saltarse esta restricción).
+
 ### 1. Parsing y Caché
-El motor recibe la consulta. Antes de tocar el disco, verifica su **Query Cache** (LRU en memoria).
+El motor recibe la consulta ya "aumentada" con el filtro de seguridad...
 *   Si los bitmaps de `age` o `active` ya están en memoria, los usa.
 *   Si no, lee `bitmaps_age.dat` y `bitmaps_active.dat` y los deserializa en un `HashMap<String, RoaringBitmap>`.
 
@@ -93,16 +110,24 @@ Para cada columna solicitada (`name`, `age`):
 4.  **Immutable Segments Cache:** Al ser los segmentos inmutables, la caché del SO y del motor **nunca necesita invalidarse** parcialmente. Si un segmento cambia, es porque se fusionó (Merge) y se creó uno nuevo, invalidando la entrada completa de forma limpia.
 
 ---
-
 ## 📊 Diagrama Visual
 
 ```mermaid
 graph TD
-    Q[Query JSON] --> P[Parser]
+    Q[Query JSON + Token] --> A[Auth Service]
+    A --> JWT[Decode JWT: sub/username]
+    JWT --> UL[Lookup User in Users Table]
+    UL --> AC[AuthContext: internal_id]
+
+    AC --> FI[Filter Injection: ownerId = internal_id]
+    FI --> P[Query Parser]
+
     P --> C{Cache Hit?}
     C -- No --> L[Load Bitmaps from Disk]
     C -- Yes --> M[Memory Bitmaps]
-    L --> M
+...
+```
+
     
     M --> F1[Filter 1 Bitmap]
     M --> F2[Filter 2 Bitmap]
