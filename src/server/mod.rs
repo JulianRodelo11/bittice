@@ -468,6 +468,22 @@ async fn handle_request(
                         if let Some(token) = &raw_auth_token {
                             println!("  \x1b[34m[SERVER]\x1b[0m Using custom AuthConfig for operation '{}' (table: {})", op_name, auth_cfg.table);
                             effective_auth_ctx = state.auth_service.resolve_token(&q.entity, token, Some(auth_cfg)).await;
+                            
+                            // VALIDACIÓN ESTRICTA: Si no se pudo resolver el token (token inválido o usuario inexistente)
+                            if effective_auth_ctx.is_none() {
+                                let _ = state.log_sender.send(format!("  -> 401 Unauthorized (Identity resolution failed for {})", op_name)).await;
+                                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ 
+                                    "error": "Unauthorized", 
+                                    "details": "Identity could not be resolved with the provided token." 
+                                }))).into_response();
+                            }
+                        } else {
+                            // VALIDACIÓN ESTRICTA: Si falta el token por completo
+                            let _ = state.log_sender.send(format!("  -> 401 Unauthorized (No token provided for {})", op_name)).await;
+                            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ 
+                                "error": "Unauthorized", 
+                                "details": "Bearer token is required for this operation." 
+                            }))).into_response();
                         }
                     }
                 }
