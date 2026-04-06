@@ -38,9 +38,8 @@ RUN apt-get update && apt-get install -y \
 # Copy the binary from the builder stage
 COPY --from=builder /app/target/release/bittice .
 
-# Create the data directory and copy data
+# Create the data directory
 RUN mkdir -p /app/data
-COPY data/ /app/data/
 
 # Set environment variable to allow external access
 ENV BITTICE_HOST=0.0.0.0
@@ -49,5 +48,5 @@ ENV BITTICE_HOST=0.0.0.0
 EXPOSE 3000
 EXPOSE 50051
 
-# Default command
-CMD ["./bittice", "server"]
+# Default command: No args triggers the interactive menu
+CMD ["./bittice"]

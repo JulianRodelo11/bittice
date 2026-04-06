@@ -1,7 +1,8 @@
 target/
-
+data/
 .git/
-.gitignore
-.env
-*.log
 .DS_Store
+*.tar
+Dockerfile
+docker-compose.yml
+README*
