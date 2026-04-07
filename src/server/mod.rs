@@ -1,5 +1,6 @@
 pub mod grpc;
 pub mod table_manager;
+pub mod logging;
 
 use axum::{
     debug_handler,
@@ -13,7 +14,7 @@ use axum::{
 use axum::extract::Request;
 use std::sync::{Arc};
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot, RwLock as TokioRwLock};
+use tokio::sync::{oneshot, RwLock as TokioRwLock};
 use tower_http::trace::TraceLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use crate::core::saved_queries::{load_operations, SavedOperation};
@@ -22,46 +23,51 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 use crate::core::storage::table::Table;
 use crate::server::table_manager::TableManager;
+use tracing::{info, debug, warn, error};
 
 pub fn show_banner() {
-    println!("\n  \x1b[1m\x1b[34mBittice Query Engine is active\x1b[0m");
-    println!("  ----------------------------------------");
-    println!("  \x1b[1mREST API:\x1b[0m    http://0.0.0.0:3000");
-    println!("  \x1b[1mgRPC API:\x1b[0m    0.0.0.0:50051");
-    println!("  ----------------------------------------");
-    
+    println!("\x1b[34m┌\x1b[0m  \x1b[1mBittice Query Engine\x1b[0m \x1b[90m----------------------------------┐\x1b[0m");
+    println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  \x1b[32m◆\x1b[0m  \x1b[1mREST API:\x1b[0m    http://0.0.0.0:3000                            \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  \x1b[32m◆\x1b[0m  \x1b[1mgRPC API:\x1b[0m    0.0.0.0:50051                                  \x1b[90m│\x1b[0m");
+
     // Show saved queries
     if let Ok(ops) = load_operations() {
         if !ops.is_empty() {
-            println!("  \x1b[1mLoaded queries:\x1b[0m");
+            println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
+            println!("\x1b[34m│\x1b[0m  \x1b[1mLoaded queries:\x1b[0m                                              \x1b[90m│\x1b[0m");
             for op in ops {
-                println!("    • /{}", op.name());
+                let name = op.name();
+                let padding = " ".repeat(60_usize.saturating_sub(name.len() + 4));
+                println!("\x1b[34m│\x1b[0m    \x1b[32m•\x1b[0m /{}{}\x1b[90m│\x1b[0m", name, padding);
             }
-            println!("  ----------------------------------------");
         }
     }
 
-    println!("  \x1b[1mDynamic configuration:\x1b[0m");
-    println!("  GET    /_config             (List all)");
-    println!("  GET    /_config?name=...    (View definition)");
-    println!("  POST   /_config             (Create)");
-    println!("  PUT    /_config             (Edit)");
-    println!("  DELETE /_config?name=...    (Delete)");
-    println!("  ----------------------------------------");
-    println!("  Press Ctrl+C to stop the server\n");
+    println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  \x1b[1mDynamic configuration:\x1b[0m                                       \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  GET    /_config             (List all)                       \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  GET    /_config?name=...    (View definition)                \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  POST   /_config             (Create)                         \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  PUT    /_config             (Edit)                           \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  DELETE /_config?name=...    (Delete)                         \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  Press Ctrl+C to stop the server                              \x1b[90m│\x1b[0m");
+    println!("\x1b[34m└\x1b[0m\x1b[90m---------------------------------------------------------------┘\x1b[0m\n");
 }
 
 pub(crate) async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
-    println!("\n  \x1b[33m•\x1b[0m Shutting down Bittice...");
+    println!("\n\x1b[34m┌\x1b[0m  \x1b[1mShutting down\x1b[0m \x1b[90m----------------------------------┐\x1b[0m");
+    println!("\x1b[34m│\x1b[0m                                                \x1b[90m│\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  \x1b[33m⚠\x1b[0m  Stopping Bittice engine safely...         \x1b[90m│\x1b[0m");
+    println!("\x1b[34m└\x1b[0m\x1b[90m------------------------------------------------┘\x1b[0m\n");
     if let Some(tx) = shutdown_tx {
         let _ = tx.send(());
     }
     Ok(())
 }
-
 pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<()> {
-    let (log_tx, mut log_rx) = mpsc::channel::<String>(100);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let table_manager = Arc::new(TableManager::new());
     
@@ -69,22 +75,11 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
     let entity_filter = entity_filter.map(|e| e.trim().to_lowercase());
     
     if let Some(ref f) = entity_filter {
-        let _ = log_tx.try_send(format!("[DEBUG] Filtering by entity: '{}'", f));
+        debug!("Filtering by entity: '{}'", f);
     } else {
-        let _ = log_tx.try_send("[DEBUG] No entity filter applied (loading all)".to_string());
+        debug!("No entity filter applied (loading all)");
     }
     
-    // Task to print logs cleanly
-    tokio::spawn(async move {
-        while let Some(msg) = log_rx.recv().await {
-            if !msg.starts_with("  ->") {
-                println!("  \x1b[32m•\x1b[0m {}", msg);
-            } else {
-                println!("    \x1b[90m{}\x1b[0m", msg);
-            }
-        }
-    });
-
     // --- AUTO-START CDC WORKERS ---
     let data_dir = std::path::Path::new("data");
     
@@ -133,29 +128,22 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
 
                             let url = format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db);
                             let worker_tm = table_manager.clone();
-                            let worker_log = log_tx.clone();
                             let worker_entity = entity.clone();
                             let worker_db = db.clone();
 
-                            let _ = log_tx.try_send(format!("[INFO] CDC: Initializing worker for '{}' (Host: {}, Port: {}, DB: {})", worker_entity, host, port, worker_db));
+                            info!("CDC: Initializing worker for '{}' (Host: {}, Port: {}, DB: {})", worker_entity, host, port, worker_db);
                             
                             std::thread::spawn(move || {
                                 let rt = tokio::runtime::Runtime::new().unwrap();
                                 let db_name_for_log = worker_db.clone();
-                                let error_log_tx = worker_log.clone();
                                 let worker = crate::core::cdc::CdcWorker::with_manager(
                                     url, 
                                     worker_entity, 
                                     worker_db, 
                                     worker_tm, 
-                                    Some(worker_log)
                                 );
                                 if let Err(e) = rt.block_on(worker.run()) {
-                                    // Only log the failure if it hasn't been logged by the worker itself
-                                    let err_msg = e.to_string();
-                                    if !err_msg.contains("CDC_ERROR") {
-                                        let _ = error_log_tx.try_send(format!("CDC_ERROR: Worker for '{}' failed: {}", db_name_for_log, err_msg));
-                                    }
+                                    error!("CDC: Worker for '{}' failed: {}", db_name_for_log, e);
                                 }
                             });
                         }
@@ -165,17 +153,16 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
         }
     }
 
-    let http_log_tx = log_tx.clone();
     let http_tm = table_manager.clone();
     let http_filter = entity_filter.clone();
     tokio::spawn(async move {
-        start_server(http_log_tx, http_tm, http_filter, shutdown_rx).await;
+        start_server(http_tm, http_filter, shutdown_rx).await;
     });
 
     let grpc_tm = table_manager.clone();
     let grpc_filter = entity_filter.clone();
     tokio::spawn(async move {
-        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter).await;
+        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter, None).await;
     });
 
     show_banner();
@@ -183,16 +170,14 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
 }
 
 pub struct ServerState {
-    pub log_sender: mpsc::Sender<String>,
     pub table_manager: Arc<TableManager>,
     pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
     pub entity_filter: Option<String>,
     pub auth_service: crate::core::auth::AuthService,
 }
 
-pub async fn start_server(log_sender: mpsc::Sender<String>, table_manager: Arc<TableManager>, entity_filter: Option<String>, shutdown_rx: oneshot::Receiver<()>) {
+pub async fn start_server(table_manager: Arc<TableManager>, entity_filter: Option<String>, shutdown_rx: oneshot::Receiver<()>) {
     let state = Arc::new(ServerState {
-        log_sender: log_sender.clone(),
         table_manager: table_manager.clone(),
         ops_cache: Arc::new(TokioRwLock::new(None)),
         entity_filter: entity_filter.clone(),
@@ -216,15 +201,14 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, table_manager: Arc<T
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            let _ = log_sender.send(format!("[ERROR] Could not bind HTTP server to {}: {}", addr, e)).await;
+            error!("Could not bind HTTP server to {}: {}", addr, e);
             return;
         }
     };
-    let _ = log_sender.send(format!("Server started on http://{}", addr)).await;
+    info!("Server started on http://{}", addr);
     
     // --- CACHE WARMING & MAINTENANCE ---
     let warm_state = state.clone();
-    let warm_logger = log_sender.clone();
     tokio::spawn(async move {
         loop {
             let start = std::time::Instant::now();
@@ -266,12 +250,12 @@ pub async fn start_server(log_sender: mpsc::Sender<String>, table_manager: Arc<T
                     if let Ok(c) = res {
                         let elapsed = start.elapsed().as_millis();
                         if elapsed > 100 { 
-                            let _ = warm_logger.try_send(format!("  -> Maintenance: Warmed {} tables in {}ms", c, elapsed));
+                            debug!("Maintenance: Warmed {} tables in {}ms", c, elapsed);
                         }
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
         }
     });
 
@@ -320,7 +304,7 @@ async fn handle_request(
         .map(|s| s.to_string());
 
     // Non-blocking log send to avoid hanging the request
-    let _ = state.log_sender.try_send(format!("{} /{}", method, op_name));
+    info!("{} /{}", method, op_name);
     
     // Load operations with improved caching and filtering
     let ops: Arc<Vec<SavedOperation>> = {
@@ -466,12 +450,12 @@ async fn handle_request(
                 if let Some(auth_cfg) = &q.auth_config {
                     if auth_cfg.enabled {
                         if let Some(token) = &raw_auth_token {
-                            println!("  \x1b[34m[SERVER]\x1b[0m Using custom AuthConfig for operation '{}' (table: {})", op_name, auth_cfg.table);
+                            debug!("Using custom AuthConfig for operation '{}' (table: {})", op_name, auth_cfg.table);
                             effective_auth_ctx = state.auth_service.resolve_token(&q.entity, token, Some(auth_cfg)).await;
                             
                             // VALIDACIÓN ESTRICTA: Si no se pudo resolver el token (token inválido o usuario inexistente)
                             if effective_auth_ctx.is_none() {
-                                let _ = state.log_sender.send(format!("  -> 401 Unauthorized (Identity resolution failed for {})", op_name)).await;
+                                warn!("-> 401 Unauthorized (Identity resolution failed for {})", op_name);
                                 return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ 
                                     "error": "Unauthorized", 
                                     "details": "Identity could not be resolved with the provided token." 
@@ -479,7 +463,7 @@ async fn handle_request(
                             }
                         } else {
                             // VALIDACIÓN ESTRICTA: Si falta el token por completo
-                            let _ = state.log_sender.send(format!("  -> 401 Unauthorized (No token provided for {})", op_name)).await;
+                            warn!("-> 401 Unauthorized (No token provided for {})", op_name);
                             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ 
                                 "error": "Unauthorized", 
                                 "details": "Bearer token is required for this operation." 
@@ -504,12 +488,12 @@ async fn handle_request(
                     handle_insert(i, payload, state).await.into_response()
                 },
                 (m, _) => {
-                    let _ = state.log_sender.send(format!("  -> 405 Method Not Allowed ({})", m)).await;
+                    warn!("-> 405 Method Not Allowed ({})", m);
                     (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({ "error": "Method not allowed for this operation" }))).into_response()
                 }
             }
         } else {
-            let _ = state.log_sender.send(format!("  -> 404 Not Found ('{}')", op_name)).await;
+            warn!("-> 404 Not Found ('{}')", op_name);
             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("Operation '{}' not found", op_name) }))).into_response()
         }
     }

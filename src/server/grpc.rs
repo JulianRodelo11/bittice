@@ -1,3 +1,4 @@
+use bittice_proto::database_server::DatabaseServer;
 use tonic::{Request, Response, Status};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
@@ -8,12 +9,13 @@ use crate::core::storage::table::Table;
 use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, FieldType};
 use crate::core::saved_queries::{SavedOperation, SavedQuery};
 use std::collections::HashMap;
+use tracing::{info, debug, warn};
 
 pub mod bittice_proto {
     tonic::include_proto!("bittice");
 }
 
-use bittice_proto::database_server::{Database, DatabaseServer};
+use bittice_proto::database_server::{Database};
 use bittice_proto::{
     SearchRequest, SearchResponse, SearchUnaryResponse, 
     Row as ProtoRow, AggregationResult as ProtoAggregationResult,
@@ -559,7 +561,7 @@ impl Database for MyDatabase {
                 } else { vec![] }
             } else { columns };
 
-            println!("  \x1b[34m•\x1b[0m gRPC: Client subscribed to '{}' (Entity: {}, Table: {})", 
+            debug!("gRPC: Client subscribed to '{}' (Entity: {}, Table: {})", 
                 query_name, entity_filter, table_filter);
 
             loop {
@@ -650,7 +652,7 @@ impl Database for MyDatabase {
                             }
 
                             if is_match {
-                                println!("  \x1b[32m•\x1b[0m gRPC [{}]: Notification sent for {}/{} (PK: {})", query_name, e_name, t_name, event.pk);
+                                debug!("gRPC [{}]: Notification sent for {}/{} (PK: {})", query_name, e_name, t_name, event.pk);
                                 let proto_event = bittice_proto::UpdateEvent {
                                     r#type: event.event_type.clone(),
                                     table: event.table_name.clone(),
@@ -662,7 +664,7 @@ impl Database for MyDatabase {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        eprintln!("  \x1b[33m⚠\x1b[0m gRPC [{}]: Stream lagged, skipped {} events", query_name, skipped);
+                        warn!("gRPC [{}]: Stream lagged, skipped {} events", query_name, skipped);
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -678,18 +680,16 @@ impl Database for MyDatabase {
 
 pub async fn start_grpc_server(port: u16, entity_filter: Option<String>) -> anyhow::Result<()> {
     let table_manager = Arc::new(TableManager::new());
-    start_grpc_server_with_manager(port, table_manager, entity_filter).await
+    start_grpc_server_with_manager(port, table_manager, entity_filter, None).await
 }
 
-pub async fn start_grpc_server_with_manager(port: u16, table_manager: Arc<TableManager>, entity_filter: Option<String>) -> anyhow::Result<()> {
+pub async fn start_grpc_server_with_manager(port: u16, table_manager: Arc<TableManager>, entity_filter: Option<String>, _log_tx: Option<mpsc::Sender<String>>) -> anyhow::Result<()> {
     let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let addr = format!("{}:{}", host, port).parse()?;
     
-    // The CdcWorker now emits events directly to the TableManager, 
-    // so we don't need the imprecise file-watcher loop anymore.
-
     let db = MyDatabase::new(table_manager, entity_filter);
-    println!("gRPC Server listening on {}", addr);
+    
+    info!("gRPC Server listening on {}", addr);
 
     tonic::transport::Server::builder()
         .add_service(DatabaseServer::new(db))

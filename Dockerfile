@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:bookworm as builder
+FROM rust:bookworm AS builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

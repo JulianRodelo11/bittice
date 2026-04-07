@@ -105,7 +105,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 s.start("Attempting to re-establish CDC...");
                 
                 let url = format!("mysql://{}:{}@{}:{}/{}", config.user, config.pass, config.host, config.port, config.database);
-                let (log_tx, mut log_rx) = mpsc::channel(100);
+                let (log_tx, mut log_rx) = mpsc::channel::<String>(100);
                 
                 let worker_url = url.clone();
                 let worker_entity = config.entity.clone();
@@ -275,7 +275,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
         cdc_info.host, cdc_info.port,
         cdc_info.database);
 
-    let (log_tx, mut log_rx) = mpsc::channel(100);
+    let (log_tx, mut log_rx) = mpsc::channel::<String>(100);
 
     let worker_url = url.clone();
     let worker_entity = cdc_info.entity.clone();
@@ -321,63 +321,68 @@ pub async fn run_startup_cliclack() -> Result<()> {
         s.stop("✓ Sync established.");
     }
 
-    // 2. Ask for Docker
-    let build_docker = confirm("Do you want to create a Docker image with this data?")
-        .initial_value(true)
-        .interact()?;
+    // Check if we are already running in Docker
+    let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
+    let mut build_docker = false;
 
-    if build_docker {
-        let s = spinner();
-        s.start("Building Docker image...");
-        
-        // Docker requires lowercase names
-        let image_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
-        
-        let mut child = Command::new("docker")
-            .args(["build", "-t", &image_name, "."])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+    if !is_docker {
+        // 2. Ask for Docker (Only if NOT already in docker)
+        build_docker = confirm("Do you want to create a Docker image with this data?")
+            .initial_value(true)
+            .interact()?;
 
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        
-        let s_clone = s.clone();
-        thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().flatten() {
-                let msg = if line.len() > 60 { format!("...{}", &line[line.len()-57..]) } else { line };
-                s_clone.set_message(format!("Docker: {}", msg));
-            }
-        });
-
-        let s_clone_err = s.clone();
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
-                let msg = if line.len() > 60 { format!("...{}", &line[line.len()-57..]) } else { line };
-                s_clone_err.set_message(format!("Docker: {}", msg));
-            }
-        });
-
-        let status = child.wait()?;
-        if status.success() {
-            s.stop(format!("✓ Image '{}' created successfully.", image_name));
+        if build_docker {
+            let s = spinner();
+            s.start("Building Docker image...");
             
-            // NEW: Ask if user wants to start the container
-            let run_container = confirm(format!("Do you want to start a container with image '{}'?", image_name))
-                .initial_value(true)
-                .interact()?;
+            // Docker requires lowercase names
+            let image_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
             
-            if run_container {
-                let s = spinner();
-                s.start("Generating Docker Compose stack...");
-                let project_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
-                let compose_file = format!("docker-compose-{}.yml", project_name);
+            let mut child = Command::new("docker")
+                .args(["build", "-t", &image_name, "."])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
 
-                // ALWAYS update the docker-compose file to ensure latest filters/env vars are applied
-                let image_name = project_name.clone();
-                let compose_content = format!(r#"services:
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            
+            let s_clone = s.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let msg = if line.len() > 60 { format!("...{}", &line[line.len()-57..]) } else { line };
+                    s_clone.set_message(format!("Docker: {}", msg));
+                }
+            });
+
+            let s_clone_err = s.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let msg = if line.len() > 60 { format!("...{}", &line[line.len()-57..]) } else { line };
+                    s_clone_err.set_message(format!("Docker: {}", msg));
+                }
+            });
+
+            let status = child.wait()?;
+            if status.success() {
+                s.stop(format!("✓ Image '{}' created successfully.", image_name));
+                
+                // NEW: Ask if user wants to start the container
+                let run_container = confirm(format!("Do you want to start a container with image '{}'?", image_name))
+                    .initial_value(true)
+                    .interact()?;
+                
+                if run_container {
+                    let s = spinner();
+                    s.start("Generating Docker Compose stack...");
+                    let project_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
+                    let compose_file = format!("docker-compose-{}.yml", project_name);
+
+                    // ALWAYS update the docker-compose file to ensure latest filters/env vars are applied
+                    let image_name = project_name.clone();
+                    let compose_content = format!(r#"services:
   bittice:
     build: .
     image: {0}
@@ -395,34 +400,32 @@ pub async fn run_startup_cliclack() -> Result<()> {
     restart: always
 "#, image_name, cdc_info.entity.to_lowercase().trim());
 
-                std::fs::write(&compose_file, compose_content)?;
+                    std::fs::write(&compose_file, compose_content)?;
 
-                if build_docker {
-                    // (Optional) additional build steps if needed, 
-                    // but 'up --build' already handles this.
+                    s.set_message("Bringing up services with Docker Compose...");
+                    
+                    // Run docker-compose up -d
+                    let run_status = Command::new("docker-compose")
+                        .args([
+                            "-f", &compose_file,
+                            "-p", &project_name,
+                            "up", "-d"
+                        ])
+                        .status()?;
+
+                    if run_status.success() {
+                        s.stop(format!("✓ Stack '{}' started correctly.", project_name));
+                        note("Docker Compose", format!("You will now see the group '{}' in Docker Desktop with the Bittice engine inside.\nURL: http://localhost:3000", project_name))?;
+                    } else {
+                        s.stop("✗ Error starting docker-compose. Make sure you have it installed.");
+                    }
                 }
-
-                s.set_message("Bringing up services with Docker Compose...");
-                
-                // Run docker-compose up -d
-                let run_status = Command::new("docker-compose")
-                    .args([
-                        "-f", &compose_file,
-                        "-p", &project_name,
-                        "up", "-d"
-                    ])
-                    .status()?;
-
-                if run_status.success() {
-                    s.stop(format!("✓ Stack '{}' started correctly.", project_name));
-                    note("Docker Compose", format!("You will now see the group '{}' in Docker Desktop with the Bittice engine inside.\nURL: http://localhost:3000", project_name))?;
-                } else {
-                    s.stop("✗ Error starting docker-compose. Make sure you have it installed.");
-                }
+            } else {
+                s.stop("✗ Error building Docker image (check that the name is valid).");
             }
-        } else {
-            s.stop("✗ Error building Docker image (check that the name is valid).");
         }
+    } else {
+        note("Docker Environment", "Configuration saved. Bittice is already running in Docker.")?;
     }
 
     // 3. Finish showing server banner
@@ -435,7 +438,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
     if start_now {
         let project_name = format!("bittice-{}", cdc_info.entity).to_lowercase().replace(" ", "-");
         let compose_file = format!("docker-compose-{}.yml", project_name);
-        let docker_active = build_docker && std::path::Path::new(&compose_file).exists();
+        let docker_active = !is_docker && build_docker && std::path::Path::new(&compose_file).exists();
 
         if docker_active {
             // Check if container is already running

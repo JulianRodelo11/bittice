@@ -10,6 +10,7 @@ use std::sync::{Arc, RwLock};
 use tokio_stream::StreamExt;
 use crate::server::table_manager::TableManager;
 use crate::core::date_utils::{extract_day, extract_month, extract_hour_bucket, is_date_format, has_time_component};
+use tracing::{info, debug, warn, error};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CdcState {
@@ -39,10 +40,14 @@ impl CdcWorker {
     }
 
     pub fn with_log(url: String, entity: String, database: String, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
-        Self::with_manager(url, entity, database, Arc::new(TableManager::new()), log_tx)
+        Self::with_manager_and_log(url, entity, database, Arc::new(TableManager::new()), log_tx)
     }
 
-    pub fn with_manager(url: String, entity: String, database: String, table_manager: Arc<TableManager>, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
+    pub fn with_manager(url: String, entity: String, database: String, table_manager: Arc<TableManager>) -> Self {
+        Self::with_manager_and_log(url, entity, database, table_manager, None)
+    }
+
+    pub fn with_manager_and_log(url: String, entity: String, database: String, table_manager: Arc<TableManager>, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
         let state_path = format!("data/{}/cdc_state.json", entity);
         Self { 
             url, 
@@ -58,12 +63,19 @@ impl CdcWorker {
         }
     }
 
-    fn log(&self, msg: String) {
-        if let Some(tx) = &self.log_tx {
-            let _ = tx.try_send(msg.clone());
-        } else {
-            println!("{}", msg);
-        }
+    fn log_info(&self, msg: String) {
+        info!("{}", msg);
+        if let Some(tx) = &self.log_tx { let _ = tx.try_send(msg); }
+    }
+
+    fn log_warn(&self, msg: String) {
+        warn!("{}", msg);
+        if let Some(tx) = &self.log_tx { let _ = tx.try_send(msg); }
+    }
+
+    fn log_error(&self, msg: String) {
+        error!("{}", msg);
+        if let Some(tx) = &self.log_tx { let _ = tx.try_send(format!("CDC_ERROR: {}", msg)); }
     }
 
     fn load_state(&self) -> CdcState {
@@ -108,30 +120,52 @@ impl CdcWorker {
         if !state.binlog_file.is_empty() {
             return Ok(());
         }
-        let mut row: Option<(String, u32, String, String, String)> =
-            match conn.query_first("SHOW BINARY LOG STATUS").await {
-                Ok(r) => r,
-                Err(_) => None,
-            };
 
+        // Try modern MySQL command first (MySQL 8.4+)
+        let mut last_err = String::new();
+        let mut row: Option<Row> = match conn.query_first("SHOW BINARY LOG STATUS").await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = e.to_string();
+                None
+            }
+        };
+
+        // Fallback to older MySQL command (MySQL < 8.4)
         if row.is_none() {
             row = match conn.query_first("SHOW MASTER STATUS").await {
                 Ok(r) => r,
                 Err(e) => {
-                    self.log(format!(
-                        "CDC_WARNING: MySQL Binlog access denied or syntax error. Real-time sync will be disabled. Error: {}",
-                        e
-                    ));
+                    let e_msg = e.to_string();
+                    // If this also fails, we decide what to log. 
+                    // If the first error was a permission issue (not syntax), it's more important.
+                    if !last_err.is_empty() && !last_err.contains("1064") {
+                        self.log_warn(format!("Access denied or connection error: {}", last_err));
+                    } else if !e_msg.contains("1064") {
+                        self.log_warn(format!("Access denied or connection error: {}", e_msg));
+                    } else {
+                        self.log_warn(format!(
+                            "MySQL Binlog status command not supported or access denied. (Tried BINARY LOG STATUS and MASTER STATUS). Last error: {}",
+                            e_msg
+                        ));
+                    }
                     None
                 }
             };
         }
 
-        if let Some((file, pos, _, _, _)) = row {
-            state.binlog_file = file;
-            state.binlog_pos = pos;
+        if let Some(r) = row {
+            // Extract file (column 0) and position (column 1)
+            let file: String = r.get(0).unwrap_or_default();
+            let pos: u32 = r.get(1).unwrap_or(4);
+            
+            if !file.is_empty() {
+                state.binlog_file = file;
+                state.binlog_pos = pos;
+                self.log_info(format!("CDC: Real-time sync enabled. Starting from {} at position {}", state.binlog_file, state.binlog_pos));
+            }
         } else {
-            self.log("CDC_WARNING: Could not determine Binlog position. Continuing without real-time updates.".to_string());
+            self.log_warn("CDC: Binlog position could not be determined (Access Denied). Real-time updates will be unavailable, but existing data will be accessible.".to_string());
         }
         Ok(())
     }
@@ -179,7 +213,7 @@ impl CdcWorker {
     }
 
     async fn bootstrap_table(&self, conn: &mut Conn, table_name: &str, state: &mut CdcState) -> Result<()> {
-        self.log(format!("CDC: Bootstrapping table '{}'...", table_name));
+        info!("CDC: Bootstrapping table '{}'...", table_name);
         
         let (cols, dates) = self.fetch_column_info(conn, table_name).await?;
         {
@@ -206,7 +240,7 @@ impl CdcWorker {
         if let Some(col) = pk_col {
             table.manifest.primary_key = col.clone();
             state.pk_map.insert(table_name.to_string(), col);
-            self.log(format!("CDC: Detected PK='{}' for table '{}'", table.manifest.primary_key, table_name));
+            debug!("CDC: Detected PK='{}' for table '{}'", table.manifest.primary_key, table_name);
         } else {
             if let Some(pk_cand) = cols.iter().find(|c| c.ends_with("_id") || *c == "id") {
                 table.manifest.primary_key = pk_cand.clone();
@@ -251,7 +285,7 @@ impl CdcWorker {
         }
 
         table.flush_active_segment()?;
-        self.log(format!("CDC: Table '{}' bootstrapped successfully ({} rows).", table_name, count));
+        info!("CDC: Table '{}' bootstrapped successfully ({} rows).", table_name, count);
         Ok(())
     }
 
@@ -271,7 +305,7 @@ impl CdcWorker {
         let opts = match Opts::from_url(&final_url) {
             Ok(o) => o,
             Err(e) => {
-                self.log(format!("CDC_ERROR: Invalid URL: {}", e));
+                self.log_error(format!("Invalid URL: {}", e));
                 return Err(e.into());
             }
         };
@@ -279,13 +313,13 @@ impl CdcWorker {
         let mut conn = match pool.get_conn().await {
             Ok(c) => c,
             Err(e) => {
-                self.log(format!("CDC_ERROR: Connection failed: {}", e));
+                self.log_error(format!("Connection failed: {}", e));
                 return Err(e.into());
             }
         };
 
         if let Err(e) = conn.query_drop(format!("USE {}", self.database)).await {
-            self.log(format!("CDC_ERROR: Database '{}' not found: {}", self.database, e));
+            self.log_error(format!("Database '{}' not found: {}", self.database, e));
             return Err(e.into());
         }
 
@@ -293,7 +327,7 @@ impl CdcWorker {
         let tables = match self.fetch_all_tables(&mut conn).await {
             Ok(t) => t,
             Err(e) => {
-                self.log(format!("CDC_ERROR: Failed to fetch tables: {}", e));
+                self.log_error(format!("Failed to fetch tables: {}", e));
                 return Err(e.into());
             }
         };
@@ -301,7 +335,7 @@ impl CdcWorker {
         for table_name in &tables {
             if !state.bootstrapped_tables.contains(table_name) {
                 if let Err(e) = self.bootstrap_table(&mut conn, table_name, &mut state).await {
-                    self.log(format!("CDC_ERROR: Bootstrap failed for '{}': {}", table_name, e));
+                    self.log_error(format!("Bootstrap failed for '{}': {}", table_name, e));
                     return Err(e);
                 }
                 state.bootstrapped_tables.push(table_name.clone());
@@ -320,8 +354,10 @@ impl CdcWorker {
         self.resolve_binlog_position(&mut conn, &mut state).await?;
 
         if state.binlog_file.is_empty() {
-            self.log("CDC_DISABLED".to_string());
-            self.log("CDC_IDLE: Live sync disabled due to missing Binlog position.".to_string());
+            self.log_warn("Live sync disabled due to missing Binlog position. Continuing with static data only.".to_string());
+            if let Some(tx) = &self.log_tx {
+                let _ = tx.try_send("CDC_DISABLED".to_string());
+            }
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             }
@@ -334,18 +370,13 @@ impl CdcWorker {
             self.resolve_binlog_position(&mut conn, &mut state).await?;
 
             if state.binlog_file.is_empty() {
-                self.log("CDC_DISABLED".to_string());
-                self.log("CDC_IDLE: Live sync disabled due to missing Binlog position.".to_string());
+                warn!("CDC: Live sync disabled due to missing Binlog position.");
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 }
             }
 
-            self.log("CDC_READY".to_string());
-            self.log(format!(
-                "CDC: Resuming live stream from {}:{}",
-                state.binlog_file, state.binlog_pos
-            ));
+            info!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos);
 
             let server_id = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -361,10 +392,7 @@ impl CdcWorker {
                 Err(e) => {
                     let msg = e.to_string();
                     if Self::is_stale_saved_binlog_error(&msg) {
-                        self.log(format!(
-                            "CDC: Saved binlog no longer available on server ({}). Re-syncing from current head.",
-                            msg
-                        ));
+                        warn!("CDC: Saved binlog no longer available on server ({}). Re-syncing from current head.", msg);
                         state.binlog_file.clear();
                         state.binlog_pos = 4;
                         self.save_state(&state)?;
@@ -382,10 +410,7 @@ impl CdcWorker {
                     Err(e) => {
                         let msg = e.to_string();
                         if Self::is_stale_saved_binlog_error(&msg) {
-                            self.log(format!(
-                                "CDC: Binlog stream error ({}). Re-syncing from current head.",
-                                msg
-                            ));
+                            warn!("CDC: Binlog stream error ({}). Re-syncing from current head.", msg);
                             state.binlog_file.clear();
                             state.binlog_pos = 4;
                             self.save_state(&state)?;
@@ -450,7 +475,7 @@ impl CdcWorker {
 
         match rows_data {
             RowsEventData::WriteRowsEvent(ev) => {
-                self.log(format!("CDC: Received Write event for table '{}'", table_name));
+                debug!("CDC: Received Write event for table '{}'", table_name);
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
