@@ -11,6 +11,7 @@ use crate::core::storage::wal::{Wal, WalOperation};
 use crate::core::types::{Filter, LogicalOp, OrderBy, QueryResult, SortDirection};
 use rayon::prelude::*;
 use std::cmp::Ordering;
+use tracing::{info, debug};
 
 pub struct Table {
     pub name: String,
@@ -117,7 +118,7 @@ impl Table {
         if new_manifest.last_sequence_number > self.manifest.last_sequence_number 
            || (new_manifest.last_sequence_number == self.manifest.last_sequence_number && self.immutable_segments.is_empty() && !new_manifest.segments.is_empty()) 
         {
-            println!("Table '{}' change detected (seq {} -> {}). Reloading segments...", 
+            info!("Table '{}' change detected (seq {} -> {}). Reloading segments...", 
                 self.name, self.manifest.last_sequence_number, new_manifest.last_sequence_number);
             
             self.manifest = new_manifest;
@@ -370,7 +371,7 @@ impl Table {
         let mut total_found = 0;
         for (seg_id, bitmap) in &segment_matches { 
             total_found += bitmap.len(); 
-            println!("Search: Segment {} matched {} rows", seg_id, bitmap.len());
+            debug!("Search: Segment {} matched {} rows", seg_id, bitmap.len());
         }
         let filter_elapsed = filter_start.elapsed().as_micros();
         let mut aggregation_results = Vec::new();

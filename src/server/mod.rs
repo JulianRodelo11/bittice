@@ -452,6 +452,7 @@ async fn handle_request(
                         if let Some(token) = &raw_auth_token {
                             debug!("Using custom AuthConfig for operation '{}' (table: {})", op_name, auth_cfg.table);
                             effective_auth_ctx = state.auth_service.resolve_token(&q.entity, token, Some(auth_cfg)).await;
+
                             
                             // VALIDACIÓN ESTRICTA: Si no se pudo resolver el token (token inválido o usuario inexistente)
                             if effective_auth_ctx.is_none() {
