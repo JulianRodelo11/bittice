@@ -64,18 +64,27 @@ impl CdcWorker {
     }
 
     fn log_info(&self, msg: String) {
-        info!("{}", msg);
-        if let Some(tx) = &self.log_tx { let _ = tx.try_send(msg); }
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send(msg.clone());
+        } else {
+            info!("{}", msg);
+        }
     }
 
     fn log_warn(&self, msg: String) {
-        warn!("{}", msg);
-        if let Some(tx) = &self.log_tx { let _ = tx.try_send(msg); }
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send(format!("WARN: {}", msg));
+        } else {
+            warn!("{}", msg);
+        }
     }
 
     fn log_error(&self, msg: String) {
-        error!("{}", msg);
-        if let Some(tx) = &self.log_tx { let _ = tx.try_send(format!("CDC_ERROR: {}", msg)); }
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send(format!("CDC_ERROR: {}", msg));
+        } else {
+            error!("{}", msg);
+        }
     }
 
     fn load_state(&self) -> CdcState {
@@ -140,14 +149,11 @@ impl CdcWorker {
                     // If this also fails, we decide what to log. 
                     // If the first error was a permission issue (not syntax), it's more important.
                     if !last_err.is_empty() && !last_err.contains("1064") {
-                        self.log_warn(format!("Access denied or connection error: {}", last_err));
+                        debug!("CDC Binlog check: {}", last_err);
                     } else if !e_msg.contains("1064") {
-                        self.log_warn(format!("Access denied or connection error: {}", e_msg));
+                        debug!("CDC Binlog check: {}", e_msg);
                     } else {
-                        self.log_warn(format!(
-                            "MySQL Binlog status command not supported or access denied. (Tried BINARY LOG STATUS and MASTER STATUS). Last error: {}",
-                            e_msg
-                        ));
+                        debug!("CDC Binlog check: Command not supported or access denied.");
                     }
                     None
                 }
@@ -165,7 +171,7 @@ impl CdcWorker {
                 self.log_info(format!("CDC: Real-time sync enabled. Starting from {} at position {}", state.binlog_file, state.binlog_pos));
             }
         } else {
-            self.log_warn("CDC: Binlog position could not be determined (Access Denied). Real-time updates will be unavailable, but existing data will be accessible.".to_string());
+            self.log_info("CDC: Operating in Static Data mode (Real-time updates not enabled on MySQL).".to_string());
         }
         Ok(())
     }
@@ -290,6 +296,7 @@ impl CdcWorker {
     }
 
     pub async fn run(&self) -> Result<()> {
+        self.log_info(format!("CDC: Connecting to MySQL on DB '{}'...", self.database));
         let mut final_url = self.url.clone();
         
         // Host translation for Docker (macOS/Windows)
@@ -310,13 +317,21 @@ impl CdcWorker {
             }
         };
         let pool = Pool::new(opts);
-        let mut conn = match pool.get_conn().await {
-            Ok(c) => c,
-            Err(e) => {
-                self.log_error(format!("Connection failed: {}", e));
+        self.log_info(format!("CDC: Connecting to MySQL at {}...", final_url.split('@').last().unwrap_or("unknown")));
+        
+        let mut conn = match tokio::time::timeout(std::time::Duration::from_secs(10), pool.get_conn()).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                self.log_error(format!("CDC: Connection failed: {}", e));
                 return Err(e.into());
             }
+            Err(_) => {
+                self.log_error("CDC: Connection timed out after 10 seconds. Check network/firewall.".to_string());
+                return Err(anyhow::anyhow!("Connection timeout"));
+            }
         };
+
+        self.log_info(format!("CDC: Successfully connected to DB '{}'. Checking Binlog status...", self.database));
 
         if let Err(e) = conn.query_drop(format!("USE {}", self.database)).await {
             self.log_error(format!("Database '{}' not found: {}", self.database, e));
@@ -354,7 +369,7 @@ impl CdcWorker {
         self.resolve_binlog_position(&mut conn, &mut state).await?;
 
         if state.binlog_file.is_empty() {
-            self.log_warn("Live sync disabled due to missing Binlog position. Continuing with static data only.".to_string());
+            self.log_info("CDC: Real-time sync inactive. Operating with static data only.".to_string());
             if let Some(tx) = &self.log_tx {
                 let _ = tx.try_send("CDC_DISABLED".to_string());
             }
@@ -363,20 +378,16 @@ impl CdcWorker {
             }
         }
 
+        // Notify UI that bootstrap is complete and we are entering live mode
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send("CDC_READY".to_string());
+        }
+
         let pool = pool.clone();
         let mut last_flush = std::time::Instant::now();
 
         'binlog_retry: loop {
-            self.resolve_binlog_position(&mut conn, &mut state).await?;
-
-            if state.binlog_file.is_empty() {
-                warn!("CDC: Live sync disabled due to missing Binlog position.");
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                }
-            }
-
-            info!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos);
+            self.log_info(format!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos));
 
             let server_id = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

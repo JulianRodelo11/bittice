@@ -1,8 +1,0 @@
-target/
-data/
-.git/
-.DS_Store
-*.tar
-Dockerfile
-docker-compose.yml
-README*

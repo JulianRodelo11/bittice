@@ -24,11 +24,11 @@ where
         let symbol = if *level == Level::ERROR {
             "\x1b[31m▲\x1b[0m"
         } else if *level == Level::WARN {
-            "\x1b[33m⚠\x1b[0m"
+            "\x1b[33m▲\x1b[0m" // Yellow solid triangle for warnings
         } else if *level == Level::DEBUG || *level == Level::TRACE {
             "\x1b[90m◇\x1b[0m"
         } else {
-            "\x1b[32m◆\x1b[0m"
+            "\x1b[32m◆\x1b[0m" // INFO: Green solid diamond to match cliclack prompts
         };
 
         let mut visitor = MessageVisitor::default();
@@ -36,16 +36,16 @@ where
         let msg = visitor.message;
 
         let term = Term::stdout();
-        let width = term.size_checked().map(|(_, w)| w as usize).unwrap_or(100);
+        let width = term.size_checked().map(|(_, w)| w as usize).unwrap_or(120);
         let indent_width = 4;
-        let max_text_width = if width > indent_width + 10 { width - indent_width - 5 } else { 40 };
+        let max_text_width = if width > 20 { width - 10 } else { 100 };
 
         let wrapped = wrap_text(&msg, max_text_width);
         for (i, line) in wrapped.into_iter().enumerate() {
             if i == 0 {
-                write!(writer, "\x1b[34m│\x1b[0m  {} {}", symbol, line)?;
+                write!(writer, "{}  {}", symbol, line)?;
             } else {
-                write!(writer, "\n\x1b[34m│\x1b[0m     {}", line)?;
+                write!(writer, "\n\x1b[34m│\x1b[0m  {}", line)?;
             }
         }
         writeln!(writer)
@@ -91,8 +91,43 @@ fn wrap_text(text: &str, limit: usize) -> Vec<String> {
     lines
 }
 
+struct MultiWriter<W1: std::io::Write, W2: std::io::Write> {
+    w1: W1,
+    w2: W2,
+}
+
+impl<W1: std::io::Write, W2: std::io::Write> std::io::Write for MultiWriter<W1, W2> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.w1.write(buf)?;
+        self.w2.write_all(&buf[..n])?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w1.flush()?;
+        self.w2.flush()?;
+        Ok(())
+    }
+}
+
 pub fn init_logging() {
-    let _ = tracing_subscriber::fmt()
-        .event_format(CliclackFormatter)
-        .try_init();
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("data/server.log");
+
+    let subscriber = tracing_subscriber::fmt()
+        .event_format(CliclackFormatter);
+
+    if let Ok(file) = log_file {
+        let file_for_writer = file.try_clone().expect("Failed to clone log file");
+        let _ = subscriber
+            .with_writer(move || {
+                let stdout = std::io::stdout();
+                let f = file_for_writer.try_clone().expect("Failed to clone log file for writer");
+                MultiWriter { w1: stdout, w2: f }
+            })
+            .try_init();
+    } else {
+        let _ = subscriber.try_init();
+    }
 }

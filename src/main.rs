@@ -10,10 +10,13 @@ use bittice::cli::{Cli, Commands};
 async fn main() -> Result<()> {
     logging::init_logging();
     let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
+    let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
+    let is_pid1 = std::process::id() == 1;
 
     // If there are arguments (beyond the program name) OR we have BITTICE_ENTITY set, we execute server mode.
-    // If not, we enter interactive mode.
-    if std::env::args().len() > 1 || env_entity.is_some() {
+    // In Docker, we only auto-start server mode if we are the main process (PID 1).
+    // Otherwise (manual exec), we enter interactive setup mode.
+    if std::env::args().len() > 1 || env_entity.is_some() || (is_docker && is_pid1) {
         if let Some(ref e) = env_entity {
             info!("Detected BITTICE_ENTITY from environment: '{}'", e);
         }
@@ -21,8 +24,9 @@ async fn main() -> Result<()> {
         let cli = if std::env::args().len() > 1 {
             Cli::parse()
         } else {
-            // Default to 'server' mode if no args but ENV is set
-            info!("No CLI arguments provided, auto-starting server due to BITTICE_ENTITY.");
+            // Default to 'server' mode if no args but in Docker (as PID 1) or ENV is set
+            let mode_msg = if is_docker { "Docker environment (Main Process)" } else { "BITTICE_ENTITY environment variable" };
+            info!("No CLI arguments provided, auto-starting server due to {}.", mode_msg);
             Cli {
                 command: Commands::Server { 
                     port: 50051, 

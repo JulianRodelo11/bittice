@@ -25,43 +25,50 @@ use crate::core::storage::table::Table;
 use crate::server::table_manager::TableManager;
 use tracing::{info, debug, warn, error};
 
-pub fn show_banner() {
-    println!("\x1b[34m┌\x1b[0m  \x1b[1mBittice Query Engine\x1b[0m \x1b[90m----------------------------------┐\x1b[0m");
-    println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  \x1b[32m◆\x1b[0m  \x1b[1mREST API:\x1b[0m    http://0.0.0.0:3000                            \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  \x1b[32m◆\x1b[0m  \x1b[1mgRPC API:\x1b[0m    0.0.0.0:50051                                  \x1b[90m│\x1b[0m");
+pub fn show_banner_with_filter(filter: Option<String>) {
+    println!("\x1b[90m│\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[1mBittice Query Engine\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mThe engine is running and ready for requests.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m  \x1b[1mREST API:\x1b[0m    http://0.0.0.0:3000");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m  \x1b[1mgRPC API:\x1b[0m    0.0.0.0:50051");
 
     // Show saved queries
-    if let Ok(ops) = load_operations() {
+    let ops_res = if let Some(ref f) = filter {
+        crate::core::saved_queries::load_operations_with_filter(Some(f.clone()))
+    } else {
+        load_operations()
+    };
+
+    if let Ok(ops) = ops_res {
         if !ops.is_empty() {
-            println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
-            println!("\x1b[34m│\x1b[0m  \x1b[1mLoaded queries:\x1b[0m                                              \x1b[90m│\x1b[0m");
+            println!("\x1b[90m│\x1b[0m");
+            println!("\x1b[32m◆\x1b[0m  \x1b[1mOperations available{}:\x1b[0m", 
+                filter.as_ref().map(|f| format!(" for '{}'", f)).unwrap_or_default());
             for op in ops {
-                let name = op.name();
-                let padding = " ".repeat(60_usize.saturating_sub(name.len() + 4));
-                println!("\x1b[34m│\x1b[0m    \x1b[32m•\x1b[0m /{}{}\x1b[90m│\x1b[0m", name, padding);
+                println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m /{}", op.name());
             }
         }
     }
 
-    println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  \x1b[1mDynamic configuration:\x1b[0m                                       \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  GET    /_config             (List all)                       \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  GET    /_config?name=...    (View definition)                \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  POST   /_config             (Create)                         \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  PUT    /_config             (Edit)                           \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  DELETE /_config?name=...    (Delete)                         \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m                                                               \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  Press Ctrl+C to stop the server                              \x1b[90m│\x1b[0m");
-    println!("\x1b[34m└\x1b[0m\x1b[90m---------------------------------------------------------------┘\x1b[0m\n");
+    println!("\x1b[90m│\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[1mConfig API (REST):\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_config             (List all)");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_config?name=...    (View definition)");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m POST   /_config             (Create)");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m PUT    /_config             (Edit)");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m DELETE /_config?name=...    (Delete)");
+}
+
+pub fn show_banner() {
+    show_banner_with_filter(None);
 }
 
 pub(crate) async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
-    println!("\n\x1b[34m┌\x1b[0m  \x1b[1mShutting down\x1b[0m \x1b[90m----------------------------------┐\x1b[0m");
-    println!("\x1b[34m│\x1b[0m                                                \x1b[90m│\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  \x1b[33m⚠\x1b[0m  Stopping Bittice engine safely...         \x1b[90m│\x1b[0m");
-    println!("\x1b[34m└\x1b[0m\x1b[90m------------------------------------------------┘\x1b[0m\n");
+    println!("\x1b[34m│\x1b[0m");
+    println!("\x1b[33m▲\x1b[0m  \x1b[1mShutting down\x1b[0m");
+    println!("\x1b[34m│\x1b[0m  \x1b[90mStopping Bittice engine safely...\x1b[0m");
+    println!("\x1b[34m└\x1b[0m\n");
     if let Some(tx) = shutdown_tx {
         let _ = tx.send(());
     }
@@ -131,8 +138,6 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
                             let worker_entity = entity.clone();
                             let worker_db = db.clone();
 
-                            info!("CDC: Initializing worker for '{}' (Host: {}, Port: {}, DB: {})", worker_entity, host, port, worker_db);
-                            
                             std::thread::spawn(move || {
                                 let rt = tokio::runtime::Runtime::new().unwrap();
                                 let db_name_for_log = worker_db.clone();
@@ -166,6 +171,8 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
     });
 
     show_banner();
+    println!("\x1b[34m│\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[90mPress Ctrl+C to stop the server\x1b[0m");
     wait_for_exit(Some(shutdown_tx)).await
 }
 
