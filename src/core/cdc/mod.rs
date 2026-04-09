@@ -71,14 +71,6 @@ impl CdcWorker {
         }
     }
 
-    fn log_warn(&self, msg: String) {
-        if let Some(tx) = &self.log_tx {
-            let _ = tx.try_send(format!("WARN: {}", msg));
-        } else {
-            warn!("{}", msg);
-        }
-    }
-
     fn log_error(&self, msg: String) {
         if let Some(tx) = &self.log_tx {
             let _ = tx.try_send(format!("CDC_ERROR: {}", msg));
@@ -199,7 +191,7 @@ impl CdcWorker {
                 date_cols.push(col_name.clone());
             }
 
-            // Detectar ENUM y extraer valores (Preservando Mayúsculas/Minúsculas)
+            // Detect ENUM and extract values (Preserving Case)
             if col_type_lower.starts_with("enum(") {
                 let values_str = col_type_raw.trim_start_matches(|c| c != '(').trim_start_matches('(').trim_end_matches(')');
                 let values: Vec<String> = values_str
@@ -232,7 +224,7 @@ impl CdcWorker {
         let table_lock = self.table_manager.get_table(&self.entity, table_name)?;
         let mut table = table_lock.write().unwrap();
 
-        // Guardar los campos originales en el manifest
+        // Save the original fields in the manifest
         let _ = table.set_original_fields(cols.clone());
 
         let pk_query = format!(
@@ -275,7 +267,7 @@ impl CdcWorker {
                     }
                 }
                 
-                // Expansión de fecha si aplica
+                // Date expansion if applicable
                 if dates.contains(col_name) && is_date_format(&val_str) {
                     if let Some(d) = extract_day(&val_str) { data.insert(format!("{}_day", col_name), d); }
                     if let Some(m) = extract_month(&val_str) { data.insert(format!("{}_month", col_name), m); }
@@ -584,7 +576,7 @@ impl CdcWorker {
                 }
             }
 
-            // Traducción dinámica de ENUM (MySQL Binlog envía índices numéricos)
+            // Dynamic ENUM translation (MySQL Binlog sends numeric indices)
             if let Some(enums) = table_enums {
                 if let Some(values) = enums.get(&col_name) {
                     if !val_str.is_empty() && val_str.chars().all(|c| c.is_ascii_digit()) {
@@ -597,11 +589,11 @@ impl CdcWorker {
                 }
             }
 
-            // Si es una columna de fecha conocida pero viene como número (TIMESTAMP en binlog),
-            // lo convertimos a formato legible para que la expansión de fecha funcione.
+            // If it is a known date column but comes as a number (TIMESTAMP in binlog),
+            // convert it to a readable format so that the date expansion works.
             if dates.contains(&col_name) && !val_str.is_empty() && val_str.chars().all(|c| c.is_ascii_digit()) {
                 if let Ok(timestamp) = val_str.parse::<i64>() {
-                    // Solo convertimos si parece un timestamp ( > año 2000 aprox )
+                    // Only convert if it seems like a timestamp ( > year 2000 approx )
                     if timestamp > 946684800 {
                         use chrono::{TimeZone, Utc};
                         let dt = Utc.timestamp_opt(timestamp, 0).single();
@@ -612,7 +604,7 @@ impl CdcWorker {
                 }
             }
 
-            // Expansión de fecha
+            // Date expansion
             if dates.contains(&col_name) && is_date_format(&val_str) {
                 if let Some(d) = extract_day(&val_str) { map.insert(format!("{}_day", col_name), d); }
                 if let Some(m) = extract_month(&val_str) { map.insert(format!("{}_month", col_name), m); }

@@ -24,7 +24,7 @@ pub struct Table {
     pub primary_index: HashMap<String, (u64, u32)>,
 }
 
-// Estructuras para el Heap
+// Structures for the Heap
 #[derive(PartialEq)]
 struct HeapItem {
     key: SortKey,
@@ -125,7 +125,7 @@ impl Table {
             self.load_segments()?;
             self.load_primary_index()?;
             
-            // Limpiar el active segment para que se re-cree si es necesario
+            // Clean the active segment so that it is re-created if necessary
             self.active_segment = None;
             self.ensure_active_segment()?;
         }
@@ -460,7 +460,7 @@ impl Table {
                 }
                 aggregation_results.push(crate::core::types::AggregationResult { headers: agg_headers, rows: agg_rows, summary: None });
             }
-            // EARLY RETURN: Si hay agregaciones y NO se pidieron campos específicos, devolver solo los agregados.
+            // EARLY RETURN: If there are aggregations and NO specific fields were requested, return only the aggregates.
             if fields.is_empty() {
                 let total_elapsed = start_time.elapsed().as_micros();
                 let agg_elapsed = agg_start.elapsed().as_micros();

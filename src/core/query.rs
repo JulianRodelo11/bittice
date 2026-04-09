@@ -53,11 +53,11 @@ pub fn execute_query(
     let index_dir = base_path.join("index");
     let stores_dir = base_path.join("stores");
 
-    // 1. Filtros (PARALELIZADOS y con soporte para todos los operadores usando el índice)
+    // 1. Filters (PARALLELIZED and with support for all operators using the index)
     let target_ids = if filters.is_empty() {
         None
     } else {
-        // Obtenemos el total de registros para optimizar operaciones de exclusión (Ne)
+        // We get the total number of records to optimize exclusion operations (Ne)
         let mut total_records = 0;
         if let Ok(entries) = std::fs::read_dir(&stores_dir) {
             if let Some(entry) = entries.flatten().find(|e| e.file_name().to_string_lossy().ends_with(".offsets")) {
@@ -72,7 +72,7 @@ pub fn execute_query(
         for f in filters {
             if f.field == "?" || f.value == "?" { continue; }
             
-            // Cargar bitmaps al cache si no están
+            // Load bitmaps to cache if not present
             if !query_cache.contains_key(&f.field) {
                 if let Ok(file) = File::open(index_dir.join(format!("bitmaps_{}.dat", f.field))) {
                     if let Ok(bitmaps) = bincode::deserialize_from::<_, HashMap<String, RoaringBitmap>>(file) {
@@ -83,7 +83,7 @@ pub fn execute_query(
 
             let mut filter_bitmap = RoaringBitmap::new();
             if let Some(bitmaps) = query_cache.get(&f.field) {
-                // Operación de filtro sobre el índice
+                // Filter operation on the index
                 match f.op {
                     ComparisonOp::Eq => {
                         if let Some(bm) = bitmaps.get(&f.value) {
@@ -91,7 +91,7 @@ pub fn execute_query(
                         }
                     },
                     ComparisonOp::Ne => {
-                        // OPTIMIZACIÓN: Universo - Excluido (AND NOT)
+                        // OPTIMIZATION: Universe - Excluded (AND NOT)
                         filter_bitmap = RoaringBitmap::from_iter(0..total_records as u32);
                         if let Some(bm) = bitmaps.get(&f.value) {
                             filter_bitmap -= bm;
@@ -106,7 +106,7 @@ pub fn execute_query(
                                 } else if is_date_format(k) && is_date_format(filter_val) {
                                     k.as_str() > filter_val.as_str()
                                 } else {
-                                    false // Bloquear comparaciones de texto plano
+                                    false // Block plain text comparisons
                                 }
                             })
                             .for_each(|(_, bm)| filter_bitmap |= bm);
@@ -196,7 +196,7 @@ pub fn execute_query(
         return Ok(res);
     }
 
-    // 3. Sorting (PARALELO)
+    // 3. Sorting (PARALLEL)
     let mut final_ids = ids_to_fetch_all;
     if !order_by.is_empty() {
         let (sort_field, direction) = &order_by[0];
@@ -222,10 +222,10 @@ pub fn execute_query(
         });
     }
 
-    // 4. Paginación
+    // 4. Pagination
     let paged_ids = final_ids.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
-    // 5. Extracción Final (PARALELIZADA con Rayon)
+    // 5. Final Extraction (PARALLELIZED with Rayon)
     let mmaps: Vec<Option<(Mmap, Mmap)>> = fields.iter().map(|f| mmap_field(&stores_dir, f).ok()).collect();
 
     let rows: Vec<Vec<String>> = paged_ids.into_par_iter().map(|id| {
@@ -255,7 +255,7 @@ fn get_raw_bytes<'a>(dat: &'a Mmap, off: &Mmap, id: u32) -> Option<&'a [u8]> {
     } else { dat.len() };
     
     if start_pos + 8 > dat.len() || end_pos > dat.len() { return None; }
-    // Bincode para String guarda 8 bytes de longitud, los saltamos para comparar el contenido real
+    // Bincode for String stores 8 bytes of length, we skip them to compare the actual content
     Some(&dat[start_pos+8..end_pos])
 }
 
@@ -288,7 +288,7 @@ fn handle_aggregations(
                 let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
                 let op = params.get("operation").and_then(|v| v.as_str()).unwrap_or("Count");
                 
-                // 1. Obtener Bitmaps
+                // 1. Get Bitmaps
                 if !query_cache.contains_key(field) {
                     if let Ok(file) = File::open(index_dir.join(format!("bitmaps_{}.dat", field))) {
                         if let Ok(bitmaps) = bincode::deserialize_from::<_, HashMap<String, RoaringBitmap>>(file) {
@@ -313,7 +313,7 @@ fn handle_aggregations(
                 let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("?");
                 let n = params.get("n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                 
-                // 1. Obtener Bitmaps (con Cache)
+                // 1. Get Bitmaps (with Cache)
                 if !query_cache.contains_key(field) {
                     if let Ok(file) = File::open(index_dir.join(format!("bitmaps_{}.dat", field))) {
                         if let Ok(bitmaps) = bincode::deserialize_from::<_, HashMap<String, RoaringBitmap>>(file) {
@@ -323,11 +323,11 @@ fn handle_aggregations(
                 }
                 
                 let results = if let Some(bitmaps) = query_cache.get(field) {
-                    // 2. Procesamiento PARALELO con Rayon
+                    // 2. PARALLEL processing with Rayon
                     let mut counts: Vec<AggEntry> = bitmaps.par_iter()
                         .map(|(val, bm)| {
                             let count = if let Some(filter) = filter_bitmap {
-                                // Intersección rápida y conteo
+                                // Fast intersection and counting
                                 (bm & filter).len()
                             } else {
                                 bm.len()
@@ -337,7 +337,7 @@ fn handle_aggregations(
                         .filter(|e| e.count > 0)
                         .collect();
                     
-                    // 3. Ordenar para obtener los Top N
+                    // 3. Sort to get the Top N
                     counts.par_sort_unstable_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
                     counts.into_iter().take(n).collect::<Vec<_>>()
                 } else {

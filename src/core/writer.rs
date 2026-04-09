@@ -28,11 +28,11 @@ pub fn process_and_write(
     _pb: &ProgressBar,
     cancel_flag: &AtomicBool,
 ) -> Result<()> {
-    // Preparar directorios
+    // Prepare directories
     fs::create_dir_all(output_dir.join("index"))?;
     fs::create_dir_all(output_dir.join("stores"))?;
 
-    // 1. Definir campos a generar (Expansión de fechas)
+    // 1. Define fields to generate (Date expansion)
     let mut fields_to_process: HashMap<String, Vec<String>> = HashMap::new();
     let mut all_target_fields: HashSet<String> = HashSet::new();
 
@@ -51,7 +51,7 @@ pub fn process_and_write(
         fields_to_process.insert(name.clone(), subfields);
     }
 
-    // 2. Guardar config.json
+    // 2. Save config.json
     let mut indexed_fields = Vec::new();
     let mut columnar_fields = Vec::new();
     for (name, stats) in detected_fields {
@@ -70,13 +70,13 @@ pub fn process_and_write(
     let config_file = File::create(output_dir.join("config.json"))?;
     serde_json::to_writer_pretty(config_file, &config)?;
 
-    // 3. Inicializar Writers
+    // 3. Initialize Writers
     let mut writers: HashMap<String, FieldWriters> = HashMap::new();
     for field_name in &all_target_fields {
         writers.insert(field_name.clone(), create_writers(output_dir, field_name)?);
     }
 
-    // 4. Leer y Escribir (Pasada 2)
+    // 4. Read and Write (Pass 2)
     let file = File::open(input_path)?;
     let reader = BufReader::new(file);
 
@@ -98,7 +98,7 @@ pub fn process_and_write(
         for (base_field, derived_names) in &fields_to_process {
             let val_raw = v.get(base_field);
             
-            // Si el campo no existe, escribimos una entrada vacía para mantener el alineamiento de IDs
+            // If the field does not exist, we write an empty entry to maintain ID alignment
             let val_str = match val_raw {
                 Some(Value::String(s)) => std::borrow::Cow::Borrowed(s.as_str()),
                 Some(Value::Number(n)) => std::borrow::Cow::Owned(n.to_string()),
@@ -129,9 +129,9 @@ pub fn process_and_write(
         records_processed += 1;
     }
 
-    // 5. Cerrar y serializar metadatos finales
+    // 5. Close and serialize final metadata
     for (name, mut w) in writers {
-        // Serializar el HashMap de bitmaps por valor
+        // Serialize the HashMap of bitmaps by value
         let encoded = bincode::serialize(&w.value_bitmaps)?;
         w.bitmap_file.write_all(&encoded)?;
 
@@ -159,10 +159,10 @@ fn create_writers(base: &Path, field: &str) -> Result<FieldWriters> {
 }
 
 fn write_record(w: &mut FieldWriters, _field_name: &str, id: u32, val: &str) -> Result<()> {
-    // Guardar offset actual
+    // Save current offset
     w.offsets.write_all(&w.current_offset.to_le_bytes())?;
 
-    // Guardar dato binario
+    // Save binary data
     let binary_val = bincode::serialize(val)?;
     let len = binary_val.len() as u64;
     w.dat.write_all(&binary_val)?;

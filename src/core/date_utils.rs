@@ -1,12 +1,12 @@
 pub fn is_date_format(s: &str) -> bool {
-    // Formato básico YYYY-MM-DD
+    // Basic format YYYY-MM-DD
     if s.len() >= 10 {
         let b = s.as_bytes();
-        // Verificamos que b[4] y b[7] sean '-'
+        // We verify that b[4] and b[7] are '-'
         if b[4] != b'-' || b[7] != b'-' {
             return false;
         }
-        // Verificamos que el resto sean dígitos (YYYY-MM-DD)
+        // We verify that the remaining characters are digits (YYYY-MM-DD)
         let is_digit = |idx: usize| b[idx].is_ascii_digit();
         let ok = is_digit(0) && is_digit(1) && is_digit(2) && is_digit(3) // YYYY
             && is_digit(5) && is_digit(6)                               // MM
@@ -14,7 +14,7 @@ pub fn is_date_format(s: &str) -> bool {
             
         if !ok { return false; }
 
-        // Validaciones numéricas básicas para evitar falsos positivos (como IDs con guiones)
+        // Basic numeric validations to avoid false positives (such as IDs with hyphens)
         if let (Ok(month), Ok(day)) = (s[5..7].parse::<u8>(), s[8..10].parse::<u8>()) {
             return (1..=12).contains(&month) && (1..=31).contains(&day);
         }
@@ -23,7 +23,7 @@ pub fn is_date_format(s: &str) -> bool {
 }
 
 pub fn has_time_component(s: &str) -> bool {
-    // Busca T o : indicando hora
+    // Looks for T or : indicating time
     s.contains('T') || s.contains(':')
 }
 

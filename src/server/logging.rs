@@ -37,7 +37,6 @@ where
 
         let term = Term::stdout();
         let width = term.size_checked().map(|(_, w)| w as usize).unwrap_or(120);
-        let indent_width = 4;
         let max_text_width = if width > 20 { width - 10 } else { 100 };
 
         let wrapped = wrap_text(&msg, max_text_width);

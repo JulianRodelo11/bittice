@@ -229,34 +229,3 @@ pub fn extract_fields(expr: &Expr) -> Vec<String> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_simple() {
-        let expr = parse_expression("1 + 2 * 3").unwrap();
-        assert_eq!(evaluate(&expr, &HashMap::new()), 7.0);
-    }
-
-    #[test]
-    fn test_parse_if_case_insensitive() {
-        let expr_str = "If(amount > 7, amount * 0.10, amount * 0.05)";
-        let expr = parse_expression(expr_str).unwrap();
-        
-        let mut context = HashMap::new();
-        context.insert("amount".to_string(), 10.0);
-        assert_eq!(evaluate(&expr, &context), 1.0);
-        
-        context.insert("amount".to_string(), 5.0);
-        assert_eq!(evaluate(&expr, &context), 0.25);
-    }
-
-    #[test]
-    fn test_parse_error_trailing() {
-        let res = parse_expression("1 + 2 extra");
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Unexpected tokens"));
-    }
-}

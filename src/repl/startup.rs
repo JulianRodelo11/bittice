@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cliclack::{intro, outro, select, input, password, note, spinner};
+use cliclack::{intro, outro, select, input, password, spinner};
 use serde::{Deserialize, Serialize};
 use std::thread;
 use tokio::sync::mpsc;
@@ -45,15 +45,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with('.') && name != "goparking" { 
+                    if !name.starts_with('.') {
                         entities.push(name);
                     }
                 }
             }
-        }
-        
-        if std::path::Path::new("data/goparking").exists() && !entities.contains(&"goparking".to_string()) {
-            entities.push("goparking".to_string());
         }
 
         if entities.is_empty() {
@@ -75,7 +71,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
         let port: String = input("Port").default_input("3306").interact()?;
         let user: String = input("User").default_input("root").interact()?;
         let pass: String = password("Password").mask('*').interact()?;
-        let database: String = input("Database to synchronize").placeholder("sakila").interact()?;
+        let database: String = input("Database to synchronize").placeholder("name").interact()?;
         let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
 
         let cdc_info = CdcInfo {

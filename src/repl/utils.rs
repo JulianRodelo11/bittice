@@ -301,13 +301,13 @@ pub fn get_field_values(entity: &str, table: &str, field: &str) -> Vec<String> {
 }
 
 pub fn get_order_by_fields(entity: &str, table: &str) -> Vec<String> {
-    // Aquí sí devolvemos todo lo disponible para ordenar
+    // Here we do return everything available for sorting
     let all = get_indexed_fields(entity, table);
     all
 }
 
 pub fn get_base_fields(all_fields: &[String]) -> Vec<String> {
-    // ESTO ES PARA LA SECCIÓN "Fields": Filtramos para dejar solo los originales
+    // THIS IS FOR THE "Fields" SECTION: We filter to leave only the original ones
     let mut filtered: Vec<String> = all_fields.iter()
         .filter(|f| {
             !f.ends_with("_day") && !f.ends_with("_month") && 
@@ -319,7 +319,7 @@ pub fn get_base_fields(all_fields: &[String]) -> Vec<String> {
 }
 
 pub fn get_filtered_fields(all_fields: &[String]) -> Vec<String> {
-    // ESTO ES PARA FILTROS/AGGS: Devolvemos todo
+    // THIS IS FOR FILTERS/AGGS: We return everything
     let mut filtered = all_fields.to_vec();
     filtered.sort();
     filtered
