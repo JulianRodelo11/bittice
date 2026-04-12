@@ -311,14 +311,14 @@ impl CdcWorker {
         let pool = Pool::new(opts);
         self.log_info(format!("CDC: Connecting to MySQL at {}...", final_url.split('@').last().unwrap_or("unknown")));
         
-        let mut conn = match tokio::time::timeout(std::time::Duration::from_secs(10), pool.get_conn()).await {
+        let mut conn = match tokio::time::timeout(std::time::Duration::from_secs(30), pool.get_conn()).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 self.log_error(format!("CDC: Connection failed: {}", e));
                 return Err(e.into());
             }
             Err(_) => {
-                self.log_error("CDC: Connection timed out after 10 seconds. Check network/firewall.".to_string());
+                self.log_error("CDC: Connection timed out after 30 seconds. Check network/firewall.".to_string());
                 return Err(anyhow::anyhow!("Connection timeout"));
             }
         };

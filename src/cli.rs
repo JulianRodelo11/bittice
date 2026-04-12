@@ -37,4 +37,6 @@ pub enum Commands {
         #[arg(short, long)]
         database: String,
     },
+    /// Update the bittice binary to the latest version (Manual)
+    Update,
 }

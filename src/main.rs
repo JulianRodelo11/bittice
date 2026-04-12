@@ -66,8 +66,24 @@ async fn main() -> Result<()> {
                 }
             }
             Commands::Cdc { url, entity, database } => {
+                // Check if there's a saved config with VPN for this entity
+                let config_path = format!("data/{}/cdc_config.json", entity);
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(vpn_path) = json.get("vpn_file").and_then(|v| v.as_str()) {
+                            info!("Auto-starting VPN from saved config for entity '{}'...", entity);
+                            if let Ok(prepared) = bittice::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &url.split('@').last().unwrap_or("").split(':').next().unwrap_or("")) {
+                                let _ = bittice::core::vpn::VpnManager::start(&prepared);
+                            }
+                        }
+                    }
+                }
+
                 let worker = bittice::core::cdc::CdcWorker::new(url, entity, database);
                 worker.run().await?;
+            }
+            Commands::Update => {
+                bittice::core::update::perform_update().await?;
             }
         }
     } else {

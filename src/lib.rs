@@ -9,6 +9,8 @@ pub mod core {
     pub mod types;
     pub mod expression;
     pub mod cdc;
+    pub mod update;
+    pub mod vpn;
 }
 
 pub mod commands {}

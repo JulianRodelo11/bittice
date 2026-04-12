@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
+use crate::core::vpn::VpnManager;
+use tracing::info;
 use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
 
@@ -15,6 +17,7 @@ struct CdcInfo {
     pass: String,
     database: String,
     entity: String,
+    vpn_file: Option<String>,
 }
 
 fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
@@ -74,6 +77,100 @@ pub async fn run_startup_cliclack() -> Result<()> {
         let database: String = input("Database to synchronize").placeholder("name").interact()?;
         let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
 
+        // VPN Prompt
+        let use_vpn: bool = select("Use VPN for database connection?")
+            .item(true, "Yes", "Choose a VPN provider")
+            .item(false, "No", "Direct connection")
+            .interact()?;
+
+        let mut vpn_file = None;
+        if use_vpn {
+            let vpn_provider: u8 = select("Select VPN provider")
+                .item(0, "OpenVPN", "Use .ovpn file or content")
+                .item(1, "My provider is not listed", "Request new integration")
+                .interact()?;
+
+            if vpn_provider == 1 {
+                println!("\x1b[90m│\x1b[0m");
+                println!("\x1b[33m▲\x1b[0m  \x1b[1mProvider not yet supported\x1b[0m");
+                println!("\x1b[90m│\x1b[0m  \x1b[90mCurrently we only support OpenVPN. Please contact support to add your provider.\x1b[0m");
+                println!("\x1b[90m│\x1b[0m");
+                return Ok(());
+            }
+
+            // OpenVPN logic
+            let input_val: String = input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path from your PC)")
+                .placeholder("/Users/.../vpn.ovpn or config text")
+                .interact()?;
+
+            let vpn_storage = std::path::Path::new("data/vpn");
+            std::fs::create_dir_all(vpn_storage)?;
+            let final_vpn_path: String;
+
+            // 1. Check if it's a URL
+            if input_val.starts_with("http") {
+                let s = spinner();
+                s.start("Downloading VPN configuration...");
+                let response = reqwest::get(&input_val).await?.bytes().await?;
+                let file_name = input_val.split('/').last().unwrap_or("downloaded.ovpn");
+                let dest_path = vpn_storage.join(file_name);
+                std::fs::write(&dest_path, response)?;
+                final_vpn_path = dest_path.to_string_lossy().to_string();
+                s.stop("✓ Download complete.");
+            } else if input_val.contains("client") && input_val.contains("dev") {
+                // 2. It's the content of the file
+                let dest_path = vpn_storage.join("pasted_config.ovpn");
+                std::fs::write(&dest_path, &input_val)?;
+                final_vpn_path = dest_path.to_string_lossy().to_string();
+                info!("Using pasted VPN configuration.");
+            } else {
+                // 3. Smart Path Translation (Windows/Mac/Linux)
+                let normalized_input = input_val.replace("\\", "/");
+                let parts: Vec<&str> = normalized_input.split('/').filter(|s| !s.is_empty()).collect();
+                
+                let mut found_path = None;
+                if std::path::Path::new(&input_val).exists() {
+                    found_path = Some(input_val.clone());
+                } else {
+                    for i in 0..parts.len() {
+                        let sub_path = parts[i..].join("/");
+                        let candidate = format!("/app/host_home/{}", sub_path);
+                        if std::path::Path::new(&candidate).exists() {
+                            found_path = Some(candidate);
+                            break;
+                        }
+                    }
+                }
+
+                let final_path_to_copy = found_path.ok_or_else(|| {
+                    anyhow::anyhow!("File not found at: {}.\nTips:\n- Make sure the file is inside your PC's Home folder.\n- Or just copy and paste the TEXT of the .ovpn file here.", input_val)
+                })?;
+
+                let path = std::path::Path::new(&final_path_to_copy);
+                let file_name = path.file_name().ok_or(anyhow::anyhow!("Invalid file name"))?;
+                let dest_path = vpn_storage.join(file_name);
+                if path != dest_path { std::fs::copy(&path, &dest_path)?; }
+                final_vpn_path = dest_path.to_string_lossy().to_string();
+            }
+
+            if !VpnManager::is_installed() {
+                let install_vpn: bool = select("OpenVPN is not installed. Install it now?")
+                    .item(true, "Yes", "Try automatic installation (requires sudo)")
+                    .item(false, "No", "Abort")
+                    .interact()?;
+                
+                if install_vpn {
+                    VpnManager::install()?;
+                } else {
+                    return Err(anyhow::anyhow!("OpenVPN is required for this connection."));
+                }
+            }
+
+            let prepared_path = VpnManager::prepare_ovpn_file(&final_vpn_path, &host)?;
+            VpnManager::start(&prepared_path)?;
+            vpn_file = Some(final_vpn_path);
+        }
+
         let cdc_info = CdcInfo {
             host,
             port,
@@ -81,6 +178,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
             pass,
             database,
             entity,
+            vpn_file,
         };
 
         let _ = save_cdc_config(&cdc_info);
@@ -124,7 +222,6 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 s.set_message(format!("\x1b[33m▲\x1b[0m  {}", warn));
                 continue;
             }
-            // Simple message for the spinner
             s.set_message(msg);
         }
     }
@@ -148,7 +245,6 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
     let log_path = "data/server.log";
     if std::path::Path::new(log_path).exists() {
-        // -n 0 starts tailing from the end to avoid cluttering with old logs
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(format!("tail -f -n 0 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Error|Warn'", log_path, selected_entity))

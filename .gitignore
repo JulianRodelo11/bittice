@@ -1,9 +1,13 @@
 /target/
 /data/
+/bittice
+.env
+*.log
 
 # Generated docker-compose files
 docker-compose-bittice-*.yml
 
+# Temporary test/debug files
 input.ndjson
 .bittice_ops.json
 resultado_limpio.ndjson
@@ -11,3 +15,7 @@ resultado_limpio_2.ndjson
 PROMPT_QUERY_BUILDER.md
 PROPOSAL_CRUD.md
 CRUD_ROADMAP.md
+
+# OS specific files
+.DS_Store
+Thumbs.db
