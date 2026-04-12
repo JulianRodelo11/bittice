@@ -1,6 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Dile a tonic-build que use el compilador de Protobuf interno (compilado de fuente)
-    std::env::set_var("PROTOC", protobuf_src::protoc());
+    // Use the embedded Protobuf binary for better speed and compatibility
+    std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
     
     tonic_build::compile_protos("proto/bittice.proto")?;
     Ok(())
