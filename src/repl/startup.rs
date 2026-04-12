@@ -77,11 +77,16 @@ pub async fn run_startup_cliclack() -> Result<()> {
         let database: String = input("Database to synchronize").placeholder("name").interact()?;
         let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
 
-        // VPN Prompt
-        let use_vpn: bool = select("Use VPN for database connection?")
-            .item(true, "Yes", "Choose a VPN provider")
-            .item(false, "No", "Direct connection")
-            .interact()?;
+        // Solo preguntar por VPN si estamos en Docker/Cloud
+        let is_docker = std::path::Path::new("/.dockerenv").exists();
+        let use_vpn: bool = if is_docker {
+            select("Use VPN for database connection?")
+                .item(true, "Yes", "Choose a VPN provider")
+                .item(false, "No", "Direct connection")
+                .interact()?
+        } else {
+            false
+        };
 
         let mut vpn_file = None;
         if use_vpn {

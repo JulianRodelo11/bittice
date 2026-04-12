@@ -11,10 +11,21 @@ pub async fn perform_update() -> Result<()> {
         pb.set_message("Checking for updates...");
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        
+        // Ajustar el nombre del target para que coincida con nuestros artefactos de GitHub
+        let target = if cfg!(windows) {
+            format!("bittice-windows-{}.exe", arch)
+        } else {
+            format!("bittice-{}-{}", os, arch)
+        };
+
         let status = self_update::backends::github::Update::configure()
             .repo_owner("JulianRodelo11")
             .repo_name("bittice")
             .bin_name("bittice")
+            .target(&target)
             .show_download_progress(true)
             .current_version(cargo_crate_version!())
             .build()?
