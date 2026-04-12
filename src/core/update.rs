@@ -37,6 +37,14 @@ pub async fn perform_update() -> Result<()> {
             format!("v{}", latest_release.version)
         };
 
+        let current_version = cargo_crate_version!();
+        let latest_version = latest_release.version.trim_start_matches('v');
+        
+        if current_version == latest_version {
+            pb.finish_and_clear();
+            return Ok::<self_update::Status, anyhow::Error>(self_update::Status::UpToDate(current_version.to_string()));
+        }
+
         // Terminamos nuestra barra de progreso ANTES de que self_update tome el control de la terminal
         pb.finish_and_clear();
 
