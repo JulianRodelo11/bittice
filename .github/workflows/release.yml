@@ -17,13 +17,25 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            artifact_name: bittice-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
+            artifact_name: bittice-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact_name: bittice-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: bittice-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: bittice-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install dependencies
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler musl-tools
@@ -31,29 +43,42 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
 
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Build Binary
+        shell: bash
         run: |
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
-          # Agregamos PROTOC para asegurar que encuentre el compilador de protos
-          export PROTOC=/usr/bin/protoc
+          export PROTOC=$(which protoc)
           cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare Artifact
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          mv bittice bittice-${{ matrix.target }}
+          mkdir -p dist
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            cp target/${{ matrix.target }}/release/bittice.exe dist/${{ matrix.artifact_name }}
+          else
+            cp target/${{ matrix.target }}/release/bittice dist/${{ matrix.artifact_name }}
+          fi
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          files: target/${{ matrix.target }}/release/bittice-${{ matrix.target }}
+          files: dist/*
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -63,25 +88,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Paso CRÍTICO: Convertir el nombre del repositorio a minúsculas
       - name: Lowercase Repo Name
         id: repo_name
         run: echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
-
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:

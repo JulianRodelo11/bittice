@@ -17,38 +17,38 @@ NC='\033[0m' # No Color
 
 echo -e "${BLUE}--- Instalador de Bittice ---${NC}"
 
-# 1. Detectar Sistema Operativo (Tu workflow actual solo genera para Linux Musl)
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-if [ "$OS" != "linux" ]; then
-    echo -e "${RED}Error: Tu workflow de GitHub actualmente solo genera binarios para Linux (musl).${NC}"
-    echo -e "Para otros sistemas, instala desde el código fuente:"
-    echo -e "${BLUE}cargo install --path .${NC}"
-    exit 1
-fi
+# 1. Detectar Sistema Operativo
+OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH_TYPE=$(uname -m)
+
+case "$OS_TYPE" in
+    linux*)     OS="linux" ;;
+    darwin*)    OS="macos" ;;
+    *)          echo -e "${RED}Error: Sistema operativo no soportado por este script: $OS_TYPE${NC}"; exit 1 ;;
+esac
 
 # 2. Detectar Arquitectura
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)     TARGET="x86_64-unknown-linux-musl" ;;
-    arm64|aarch64) TARGET="aarch64-unknown-linux-musl" ;;
-    *)          echo -e "${RED}Error: Arquitectura no soportada: $ARCH${NC}"; exit 1 ;;
+case "$ARCH_TYPE" in
+    x86_64)     ARCH="x86_64" ;;
+    arm64|aarch64) ARCH="aarch64" ;;
+    *)          echo -e "${RED}Error: Arquitectura no soportada: $ARCH_TYPE${NC}"; exit 1 ;;
 esac
+
+TARGET="bittice-${OS}-${ARCH}"
 
 # 3. Obtener la última versión de GitHub
 echo -e "Buscando la última versión en GitHub..."
 LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 
 if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
-    echo -e "${RED}No se encontró ninguna versión publicada (tag) en GitHub.${NC}"
-    echo -e "Una vez que hagas un 'git tag v0.1.0 && git push --tags', este script funcionará."
-    echo -e "Mientras tanto, puedes instalar localmente con: ${BLUE}cargo install --path .${NC}"
+    echo -e "${RED}No se encontró ninguna versión publicada en GitHub.${NC}"
     exit 1
 fi
 
-echo -e "Instalando versión ${GREEN}$LATEST_TAG${NC} para ${GREEN}$TARGET${NC}..."
+echo -e "Instalando versión ${GREEN}$LATEST_TAG${NC} para ${GREEN}$OS ($ARCH)${NC}..."
 
-# 4. Descargar el binario (Tu workflow sube el binario directamente, no comprimido)
-DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/${BINARY_NAME}-${TARGET}"
+# 4. Descargar el binario
+DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$TARGET"
 TEMP_FILE=$(mktemp)
 
 curl -L "$DOWNLOAD_URL" -o "$TEMP_FILE"
