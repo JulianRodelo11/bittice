@@ -455,8 +455,11 @@ impl Segment {
                 let off_mmap = unsafe { Mmap::map(&off_file)? };
 
                 // Advise OS to pre-fetch data as we are about to read it in a wide query
-                let _ = dat_mmap.advise(memmap2::Advice::WillNeed);
-                let _ = off_mmap.advise(memmap2::Advice::WillNeed);
+                #[cfg(not(windows))]
+                {
+                    let _ = dat_mmap.advise(memmap2::Advice::WillNeed);
+                    let _ = off_mmap.advise(memmap2::Advice::WillNeed);
+                }
                 
                 let pair = Arc::new((dat_mmap, off_mmap));
                 
@@ -488,8 +491,11 @@ impl Segment {
             if let Some(pair) = cache.get(field) {
                 let (dat, off) = &**pair;
                 // Safe: advise does not mutate data, only hints kernel
-                let _ = dat.advise(memmap2::Advice::WillNeed);
-                let _ = off.advise(memmap2::Advice::WillNeed);
+                #[cfg(not(windows))]
+                {
+                    let _ = dat.advise(memmap2::Advice::WillNeed);
+                    let _ = off.advise(memmap2::Advice::WillNeed);
+                }
             }
         }
         Ok(())
