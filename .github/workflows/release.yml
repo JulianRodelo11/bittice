@@ -49,6 +49,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Paso para cachear las dependencias de Rust
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Build Binary
         shell: bash
         run: |
