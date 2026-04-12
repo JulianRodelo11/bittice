@@ -1,54 +1,22 @@
-# Stage 1: Build
-FROM rust:bookworm AS builder
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    protobuf-compiler \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# 1. Create a dummy project and build only dependencies (for caching)
-# This layer will only be re-run if Cargo.toml or Cargo.lock change
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && \
-    echo "fn main() {}" > src/main.rs && \
-    cargo build --release && \
-    rm -rf src
-
-# 2. Now copy the actual source code and build the real project
-# This layer will be re-run on every code change, but it will be FAST
-# because dependencies are already compiled in the previous layer.
-COPY . .
-RUN touch src/main.rs && cargo build --release
-
-# Stage 2: Runtime
+# Dockerfile optimizado para Bittice
+# Usa una imagen ligera de Debian para compatibilidad con GNU/Linux
 FROM debian:bookworm-slim
 
+# Instalar dependencias mínimas (Certificados CA para HTTPS y librerías de C)
+RUN apt-get update && apt-get install -y ca-certificates libc6 && rm -rf /var/lib/apt/lists/*
+
+# Argumento para recibir el binario específico de la arquitectura
+ARG TARGETARCH
+ARG BINARY_PATH
+
 WORKDIR /app
 
-# Install necessary runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    sudo \
-    openvpn \
-    && rm -rf /var/lib/apt/lists/*
+# Copiar el binario pre-compilado desde el host al contenedor
+COPY ${BINARY_PATH} /usr/local/bin/bittice
+RUN chmod +x /usr/local/bin/bittice
 
-# Copy the binary from the builder stage
-COPY --from=builder /app/target/release/bittice .
+# Puertos por defecto (REST y gRPC)
+EXPOSE 3000 50051
 
-# Create the data directory
-RUN mkdir -p /app/data
-
-# Set environment variable to allow external access
-ENV BITTICE_HOST=0.0.0.0
-
-# Expose the ports
-EXPOSE 3000
-EXPOSE 50051
-
-# Default command: No args triggers the interactive menu
-CMD ["./bittice"]
+# Ejecutar el servidor de Bittice por defecto
+ENTRYPOINT ["bittice", "server"]

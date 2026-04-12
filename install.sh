@@ -36,9 +36,9 @@ esac
 
 TARGET="bittice-${OS}-${ARCH}"
 
-# 3. Obtener la última versión de GitHub
+# 3. Obtener la última versión de GitHub (incluyendo Betas)
 echo -e "Buscando la última versión en GitHub..."
-LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO/releases" | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
 
 if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
     echo -e "${RED}No se encontró ninguna versión publicada en GitHub.${NC}"

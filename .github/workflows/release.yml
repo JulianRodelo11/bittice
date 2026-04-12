@@ -37,9 +37,7 @@ jobs:
       
       - name: Install Dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler gcc-aarch64-linux-gnu
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler gcc-aarch64-linux-gnu
 
       - name: Setup Protoc
         uses: arduino/setup-protoc@v3
@@ -69,6 +67,12 @@ jobs:
             cp target/${{ matrix.target }}/release/bittice dist/${{ matrix.artifact_name }}
           fi
 
+      - name: Upload Artifacts for Docker
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
@@ -80,28 +84,68 @@ jobs:
 
   docker:
     name: Build & Push Docker Image
+    needs: build-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download Linux Binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Docker Build Context
+        run: |
+          cp artifacts/bittice-linux-x86_64/bittice-linux-x86_64 bittice-linux-amd64
+          cp artifacts/bittice-linux-aarch64/bittice-linux-aarch64 bittice-linux-arm64
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      
       - name: Set Repo Name (Lowercase)
         id: repo
         run: echo "name=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
-      - name: Build and Push
+
+      - name: Build and Push AMD64
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
+          build-args: |
+            BINARY_PATH=bittice-linux-amd64
           tags: |
-            ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}
-            ${{ (!contains(github.ref, 'beta') && !contains(github.ref, 'alpha')) && format('ghcr.io/{0}:latest', steps.repo.outputs.name) || format('ghcr.io/{0}:beta', steps.repo.outputs.name) }}
+            ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-amd64
+
+      - name: Build and Push ARM64
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            BINARY_PATH=bittice-linux-arm64
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-arm64
+
+      - name: Create Multi-Arch Manifest
+        run: |
+          docker buildx imagetools create -t ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }} \
+            ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-amd64 \
+            ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-arm64
+          
+          if [[ ! "${{ github.ref_name }}" =~ (beta|alpha) ]]; then
+            docker buildx imagetools create -t ghcr.io/${{ steps.repo.outputs.name }}:latest \
+              ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-amd64 \
+              ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-arm64
+          fi
