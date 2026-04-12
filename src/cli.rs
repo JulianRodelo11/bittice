@@ -39,4 +39,6 @@ pub enum Commands {
     },
     /// Update the bittice binary to the latest version (Manual)
     Update,
+    /// Uninstall Bittice from your system
+    Uninstall,
 }

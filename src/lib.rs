@@ -10,6 +10,7 @@ pub mod core {
     pub mod expression;
     pub mod cdc;
     pub mod update;
+    pub mod uninstall;
     pub mod vpn;
 }
 

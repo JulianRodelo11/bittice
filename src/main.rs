@@ -85,6 +85,9 @@ async fn main() -> Result<()> {
             Commands::Update => {
                 bittice::core::update::perform_update().await?;
             }
+            Commands::Uninstall => {
+                bittice::core::uninstall::perform_uninstall().await?;
+            }
         }
     } else {
         // Run startup flow with Cliclack
