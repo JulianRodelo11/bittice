@@ -29,8 +29,8 @@ tonic = { version = "0.12", default-features = false, features = ["prost", "code
 prost = "0.13"
 tokio-stream = "0.1"
 chrono = { version = "0.4.44", features = ["serde"] }
-self_update = "0.41"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+self_update = { version = "0.41", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "rustls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 [dev-dependencies]
 tempfile = "3.10"
