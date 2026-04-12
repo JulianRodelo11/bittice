@@ -248,6 +248,15 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for '{}' in real-time.\x1b[0m", selected_entity);
     println!("\x1b[90m│\x1b[0m");
 
+    // Si no es Docker, levantamos los servidores automáticamente
+    if !is_docker {
+        let server_entity = selected_entity.clone();
+        tokio::spawn(async move {
+            let _ = crate::server::start_all_servers(Some(server_entity)).await;
+        });
+    }
+
+
     let log_path = "data/server.log";
     if std::path::Path::new(log_path).exists() {
         let mut child = Command::new("sh")
