@@ -38,11 +38,12 @@ TARGET="bittice-${OS}-${ARCH}"
 
 # 3. Get latest version from GitHub (including Betas)
 echo -e "Checking for latest version on GitHub..."
-# Using a more robust way to extract the tag_name
-LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO/releases" | grep -m 1 '"tag_name":' | cut -d '"' -f 4)
 
-if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
-    echo -e "${RED}Error: No published versions found on GitHub.${NC}"
+# Robust extraction of the first tag_name found in the releases list
+LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO/releases" | grep '"tag_name":' | head -n 1 | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
+
+if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ] || [[ "$LATEST_TAG" == http* ]]; then
+    echo -e "${RED}Error: Could not determine the latest version tag ($LATEST_TAG).${NC}"
     exit 1
 fi
 

@@ -32,13 +32,20 @@ pub async fn perform_update() -> Result<()> {
         let latest_release = releases.first()
             .ok_or_else(|| anyhow!("No releases found in the repository"))?;
 
-        // 2. Configure update targeting the specific latest tag found
+        // 2. Ensure the tag has the 'v' prefix (GitHub needs the EXACT tag name)
+        let tag = if latest_release.version.starts_with('v') {
+            latest_release.version.clone()
+        } else {
+            format!("v{}", latest_release.version)
+        };
+
+        // 3. Configure update targeting the specific latest tag found
         let status = self_update::backends::github::Update::configure()
             .repo_owner("JulianRodelo11")
             .repo_name("bittice")
             .bin_name("bittice")
             .target(&target)
-            .target_version_tag(&latest_release.version)
+            .target_version_tag(&tag)
             .show_download_progress(true)
             .current_version(cargo_crate_version!())
             .build()?
