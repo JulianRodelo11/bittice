@@ -41,6 +41,8 @@ jobs:
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
+          # Agregamos PROTOC para asegurar que encuentre el compilador de protos
+          export PROTOC=/usr/bin/protoc
           cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare Artifact
@@ -75,6 +77,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Paso CRÍTICO: Convertir el nombre del repositorio a minúsculas
+      - name: Lowercase Repo Name
+        id: repo_name
+        run: echo "repo=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:
@@ -82,5 +89,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ${{ (!contains(github.ref, 'beta') && !contains(github.ref, 'alpha')) && format('ghcr.io/{0}:latest', github.repository) || format('ghcr.io/{0}:beta', github.repository) }}
+            ghcr.io/${{ steps.repo_name.outputs.repo }}:${{ github.ref_name }}
+            ${{ (!contains(github.ref, 'beta') && !contains(github.ref, 'alpha')) && format('ghcr.io/{0}:latest', steps.repo_name.outputs.repo) || format('ghcr.io/{0}:beta', steps.repo_name.outputs.repo) }}
