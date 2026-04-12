@@ -13,6 +13,8 @@ jobs:
   build-binaries:
     name: Build Binaries
     strategy:
+      # No cancelar el resto de arquitecturas si una falla, para ver qué funciona
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -38,7 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler musl-tools
+          sudo apt-get install -y protobuf-compiler musl-tools pkg-config libssl-dev
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
@@ -62,8 +64,14 @@ jobs:
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
+          # Configuración crítica para OpenSSL en compilación estática (musl)
+          export OPENSSL_STATIC=1
+          export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
+          export OPENSSL_INCLUDE_DIR=/usr/include/openssl
           export PROTOC=$(which protoc)
-          cargo build --release --target ${{ matrix.target }}
+          
+          # Compilar con verbosidad para depurar si falla
+          cargo build --release --target ${{ matrix.target }} -v
 
       - name: Prepare Artifact
         shell: bash
