@@ -18,5 +18,5 @@ RUN chmod +x /usr/local/bin/bittice
 # Puertos por defecto (REST y gRPC)
 EXPOSE 3000 50051
 
-# Ejecutar el servidor de Bittice por defecto
-ENTRYPOINT ["bittice", "server"]
+# Ejecutar bittice por defecto
+ENTRYPOINT ["bittice"]

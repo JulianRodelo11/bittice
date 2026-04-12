@@ -1,7 +1,7 @@
 use clap::Parser;
 use anyhow::Result;
 use bittice::server::logging;
-use tracing::{info, warn};
+use tracing::info;
 
 // Import modules from the library (package name: bittice)
 use bittice::cli::{Cli, Commands};
@@ -21,50 +21,16 @@ async fn main() -> Result<()> {
             info!("Detected BITTICE_ENTITY from environment: '{}'", e);
         }
 
-        let cli = if std::env::args().len() > 1 {
-            Cli::parse()
-        } else {
-            // Default to 'server' mode if no args but in Docker (as PID 1) or ENV is set
+        if std::env::args().len() == 1 {
+            // Auto-start server if no args but in Docker (as PID 1) or ENV is set
             let mode_msg = if is_docker { "Docker environment (Main Process)" } else { "BITTICE_ENTITY environment variable" };
             info!("No CLI arguments provided, auto-starting server due to {}.", mode_msg);
-            Cli {
-                command: Commands::Server { 
-                    port: 50051, 
-                    r#type: "all".to_string(), 
-                    entity: env_entity.clone() 
-                }
-            }
-        };
+            return bittice::server::start_all_servers(env_entity).await;
+        }
+
+        let cli = Cli::parse();
 
         match cli.command {
-            Commands::Server { port, r#type, entity } => {
-                let final_entity = entity.or(env_entity);
-                
-                if let Some(ref e) = final_entity {
-                    info!("Starting server with entity filter: '{}'", e);
-                } else {
-                    info!("Starting server with NO entity filter (loading all)");
-                }
-
-                if r#type == "all" {
-                    bittice::server::start_all_servers(final_entity).await?;
-                } else if r#type == "grpc" {
-                    bittice::server::grpc::start_grpc_server(port, final_entity).await?;
-                } else {
-                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                    
-                    // Handle Ctrl+C
-                    tokio::spawn(async move {
-                        tokio::signal::ctrl_c().await.unwrap();
-                        warn!("Shutting down server...");
-                        let _ = shutdown_tx.send(());
-                    });
-
-                    info!("Starting HTTP server (Port fixed to 3000 in current impl)...");
-                    let table_manager = std::sync::Arc::new(bittice::server::table_manager::TableManager::new());
-                    bittice::server::start_server(table_manager, final_entity, shutdown_rx).await;
-                }
-            }
             Commands::Cdc { url, entity, database } => {
                 // Check if there's a saved config with VPN for this entity
                 let config_path = format!("data/{}/cdc_config.json", entity);
@@ -78,6 +44,12 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+
+                // Iniciar servidor automáticamente para CDC
+                let server_entity = entity.clone();
+                tokio::spawn(async move {
+                    let _ = bittice::server::start_all_servers(Some(server_entity)).await;
+                });
 
                 let worker = bittice::core::cdc::CdcWorker::new(url, entity, database);
                 worker.run().await?;

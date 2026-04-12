@@ -9,20 +9,19 @@ pub async fn perform_update() -> Result<()> {
         pb.set_style(ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
             .unwrap());
-        pb.set_message("Checking for updates (including betas)...");
+        pb.set_message("Checking for updates...");
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
         
-        // Match our GitHub artifact naming convention
         let target = if cfg!(windows) {
             format!("bittice-windows-{}.exe", arch)
         } else {
             format!("bittice-{}-{}", os, arch)
         };
 
-        // 1. Fetch all releases to include Pre-releases (Betas)
+        // 1. Fetch releases
         let releases = ReleaseList::configure()
             .repo_owner("JulianRodelo11")
             .repo_name("bittice")
@@ -32,14 +31,16 @@ pub async fn perform_update() -> Result<()> {
         let latest_release = releases.first()
             .ok_or_else(|| anyhow!("No releases found in the repository"))?;
 
-        // 2. Ensure the tag has the 'v' prefix (GitHub needs the EXACT tag name)
         let tag = if latest_release.version.starts_with('v') {
             latest_release.version.clone()
         } else {
             format!("v{}", latest_release.version)
         };
 
-        // 3. Configure update targeting the specific latest tag found
+        // Terminamos nuestra barra de progreso ANTES de que self_update tome el control de la terminal
+        pb.finish_and_clear();
+
+        // 2. Configure and perform update
         let status = self_update::backends::github::Update::configure()
             .repo_owner("JulianRodelo11")
             .repo_name("bittice")
@@ -51,14 +52,13 @@ pub async fn perform_update() -> Result<()> {
             .build()?
             .update()?;
         
-        pb.finish_and_clear();
         Ok::<self_update::Status, anyhow::Error>(status)
     }).await??;
 
     if status.updated() {
-        println!("Successfully updated to version: {}", status.version());
+        println!("✓ Successfully updated to version: {}", status.version());
     } else {
-        println!("Already at the latest version: {}", status.version());
+        println!("✓ Already at the latest version: {}", status.version());
     }
 
     Ok(())
