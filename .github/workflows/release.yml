@@ -13,7 +13,6 @@ jobs:
   build-binaries:
     name: Build Binaries
     strategy:
-      # No cancelar el resto de arquitecturas si una falla, para ver qué funciona
       fail-fast: false
       matrix:
         include:
@@ -36,20 +35,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install dependencies (Linux)
+      - name: Install Protoc (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler musl-tools pkg-config libssl-dev
-          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
 
-      - name: Install dependencies (macOS)
+      - name: Install Protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Install dependencies (Windows)
+      - name: Install Protoc (Windows)
         if: runner.os == 'Windows'
         run: choco install protoc
 
@@ -61,23 +55,14 @@ jobs:
       - name: Build Binary
         shell: bash
         run: |
-          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-          fi
-          # Configuración crítica para OpenSSL en compilación estática (musl)
-          export OPENSSL_STATIC=1
-          export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
-          export OPENSSL_INCLUDE_DIR=/usr/include/openssl
           export PROTOC=$(which protoc)
-          
-          # Compilar con verbosidad para depurar si falla
-          cargo build --release --target ${{ matrix.target }} -v
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare Artifact
         shell: bash
         run: |
           mkdir -p dist
-          if [ "${{ runner.os }}" == "Windows" ]; then
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
             cp target/${{ matrix.target }}/release/bittice.exe dist/${{ matrix.artifact_name }}
           else
             cp target/${{ matrix.target }}/release/bittice dist/${{ matrix.artifact_name }}
