@@ -25,11 +25,11 @@ rayon = "1.10"
 uuid = { version = "1.21.0", features = ["v4"] }
 mysql_async = { version = "0.34", default-features = false, features = ["minimal", "rustls-tls", "binlog"] }
 mysql_common = "0.32"
-tonic = { version = "0.12", default-features = false, features = ["prost", "codegen", "tls-rustls"] }
+tonic = { version = "0.12", default-features = false, features = ["prost", "codegen", "tls", "tls-roots", "server"] }
 prost = "0.13"
 tokio-stream = "0.1"
 chrono = { version = "0.4.44", features = ["serde"] }
-self_update = { version = "0.41", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "rustls"] }
+self_update = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
