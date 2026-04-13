@@ -69,23 +69,33 @@ impl VpnManager {
 
         let mut content = fs::read_to_string(path)?;
 
-        // 1. Add route-nopull if not present
-        if !content.contains("route-nopull") {
-            info!("Adding 'route-nopull' to the VPN configuration.");
-            if !content.ends_with('\n') { content.push('\n'); }
-            content.push_str("route-nopull\n");
+        // 1. Add defensive routing options
+        let defensive_options = [
+            "route-nopull",
+            "pull-filter ignore redirect-gateway",
+            "pull-filter ignore \"route-gateway\"",
+            "client",
+            "dev tun",
+        ];
+
+        for opt in &defensive_options {
+            if !content.contains(opt) {
+                info!("Adding defensive option to VPN config: {}", opt);
+                if !content.ends_with('\n') { content.push('\n'); }
+                content.push_str(opt);
+                content.push('\n');
+            }
         }
 
         // 2. Add specific route for the DB host
-        // We try to resolve the hostname to an IP if it's not already one
         use std::net::ToSocketAddrs;
-        let addr_str = format!("{}:3306", db_host); // dummy port for resolution
+        let addr_str = format!("{}:3306", db_host); 
         if let Ok(mut addrs) = addr_str.to_socket_addrs() {
             if let Some(addr) = addrs.next() {
                 let ip = addr.ip();
                 let route_line = format!("route {} 255.255.255.255 vpn_gateway", ip);
                 if !content.contains(&route_line) {
-                    info!("Adding specific route for DB host: {}", route_line);
+                    info!("Adding specific route for DB host: {} (IP: {})", db_host, ip);
                     content.push_str(&route_line);
                     content.push('\n');
                 }
