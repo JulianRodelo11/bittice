@@ -77,6 +77,7 @@ pub(crate) async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> a
 pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let table_manager = Arc::new(TableManager::new());
+    let active_workers = Arc::new(TokioRwLock::new(HashSet::new()));
     
     // Convert entity_filter to lowercase and trim it
     let entity_filter = entity_filter.map(|e| e.trim().to_lowercase());
@@ -88,6 +89,42 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
     }
     
     // --- AUTO-START CDC WORKERS ---
+    scan_and_start_cdc(table_manager.clone(), entity_filter.clone(), active_workers.clone());
+
+    let http_tm = table_manager.clone();
+    let http_filter = entity_filter.clone();
+    let http_active = active_workers.clone();
+    tokio::spawn(async move {
+        start_server(http_tm, http_filter, http_active, shutdown_rx).await;
+    });
+
+    let grpc_tm = table_manager.clone();
+    let grpc_filter = entity_filter.clone();
+    tokio::spawn(async move {
+        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter, None).await;
+    });
+
+    show_banner();
+    println!("\x1b[34m│\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[90mPress Ctrl+C to stop the server\x1b[0m");
+    wait_for_exit(Some(shutdown_tx)).await
+}
+
+use std::collections::HashSet;
+
+pub struct ServerState {
+    pub table_manager: Arc<TableManager>,
+    pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
+    pub entity_filter: Option<String>,
+    pub auth_service: crate::core::auth::AuthService,
+    pub active_workers: Arc<TokioRwLock<HashSet<String>>>,
+}
+
+pub fn scan_and_start_cdc(
+    table_manager: Arc<TableManager>, 
+    entity_filter: Option<String>,
+    active_workers: Arc<TokioRwLock<HashSet<String>>>
+) {
     let data_dir = std::path::Path::new("data");
     
     if let Ok(entries) = std::fs::read_dir(data_dir) {
@@ -113,6 +150,15 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
                             let db = config["database"].as_str().unwrap_or_default().to_string();
                             let entity = config["entity"].as_str().unwrap_or(&entity_folder_name).to_string();
                             
+                            // Check if worker is already active
+                            let entity_key = entity.clone();
+                            {
+                                let active = active_workers.blocking_read();
+                                if active.contains(&entity_key) {
+                                    continue;
+                                }
+                            }
+
                             // If a filter is provided, also check against the 'entity' field in JSON
                             if let Some(ref filter) = entity_filter {
                                 if entity.to_lowercase() != *filter {
@@ -138,6 +184,12 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
                             let worker_entity = entity.clone();
                             let worker_db = db.clone();
 
+                            // Mark as active
+                            {
+                                let mut active = active_workers.blocking_write();
+                                active.insert(entity_key);
+                            }
+
                             std::thread::spawn(move || {
                                 let rt = tokio::runtime::Runtime::new().unwrap();
                                 let db_name_for_log = worker_db.clone();
@@ -157,38 +209,20 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
             }
         }
     }
-
-    let http_tm = table_manager.clone();
-    let http_filter = entity_filter.clone();
-    tokio::spawn(async move {
-        start_server(http_tm, http_filter, shutdown_rx).await;
-    });
-
-    let grpc_tm = table_manager.clone();
-    let grpc_filter = entity_filter.clone();
-    tokio::spawn(async move {
-        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter, None).await;
-    });
-
-    show_banner();
-    println!("\x1b[34m│\x1b[0m");
-    println!("\x1b[32m◆\x1b[0m  \x1b[90mPress Ctrl+C to stop the server\x1b[0m");
-    wait_for_exit(Some(shutdown_tx)).await
 }
 
-pub struct ServerState {
-    pub table_manager: Arc<TableManager>,
-    pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
-    pub entity_filter: Option<String>,
-    pub auth_service: crate::core::auth::AuthService,
-}
-
-pub async fn start_server(table_manager: Arc<TableManager>, entity_filter: Option<String>, shutdown_rx: oneshot::Receiver<()>) {
+pub async fn start_server(
+    table_manager: Arc<TableManager>, 
+    entity_filter: Option<String>, 
+    active_workers: Arc<TokioRwLock<HashSet<String>>>,
+    shutdown_rx: oneshot::Receiver<()>
+) {
     let state = Arc::new(ServerState {
         table_manager: table_manager.clone(),
         ops_cache: Arc::new(TokioRwLock::new(None)),
         entity_filter: entity_filter.clone(),
         auth_service: crate::core::auth::AuthService::new(table_manager),
+        active_workers,
     });
 
     // Middleware de autenticación
@@ -374,6 +408,12 @@ async fn handle_request(
             }
         }
         return (StatusCode::OK, Json(serde_json::Value::Object(catalog))).into_response();
+    }
+
+    if path == "/_config/reload" {
+        info!("Hot-reloading configuration from disk...");
+        scan_and_start_cdc(state.table_manager.clone(), state.entity_filter.clone(), state.active_workers.clone());
+        return (StatusCode::OK, Json(serde_json::json!({ "status": "success", "message": "Configuration reloaded" }))).into_response();
     }
 
     if path == "/_config" {

@@ -383,12 +383,16 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for '{}' in real-time.\x1b[0m", selected_entity);
     println!("\x1b[90m│\x1b[0m");
 
-    // En Docker, salimos después de configurar y sugerimos reiniciar para aplicar
+    // En Docker, notificamos al motor local para que cargue la nueva configuración al instante
     if is_docker {
+        let client = reqwest::Client::new();
+        let _ = client.post("http://localhost:3000/_config/reload")
+            .send()
+            .await;
+        
         println!("\x1b[90m│\x1b[0m");
-        println!("\x1b[32m◆\x1b[0m  \x1b[1mSetup Complete!\x1b[0m");
-        println!("\x1b[90m│\x1b[0m  \x1b[90mTo apply these changes and start the background engine, run:\x1b[0m");
-        println!("\x1b[90m│\x1b[0m  \x1b[1m  docker-compose restart bittice\x1b[0m");
+        println!("\x1b[32m◆\x1b[0m  \x1b[1mBittice Engine Updated!\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[90mThe background engine has automatically loaded the new entity.\x1b[0m");
         println!("\x1b[90m│\x1b[0m");
         return Ok(());
     }
