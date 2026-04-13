@@ -235,6 +235,7 @@ services:
         restart: always
         environment:
             - BITTICE_HOST=0.0.0.0
+            - BITTICE_VPN_DIR=/app/vpn
         ports:
             - "3000:3000"
             - "50051:50051"
@@ -257,6 +258,7 @@ services:
         restart: always
         environment:
             - BITTICE_HOST=0.0.0.0
+            - BITTICE_VPN_DIR=/app/vpn
         ports:
             - "3000:3000"
             - "50051:50051"

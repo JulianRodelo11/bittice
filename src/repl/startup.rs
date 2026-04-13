@@ -151,8 +151,8 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
             }
 
-            let vpn_storage = std::path::Path::new("data/vpn");
-            std::fs::create_dir_all(vpn_storage)?;
+            let vpn_storage = crate::core::vpn::VpnManager::storage_dir();
+            std::fs::create_dir_all(&vpn_storage)?;
             let final_vpn_path: String;
 
             // 1. Check if it's a URL

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::process::{Command, Stdio};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 pub struct VpnManager;
@@ -11,6 +11,48 @@ fn is_docker() -> bool {
 }
 
 impl VpnManager {
+    pub fn storage_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("BITTICE_VPN_DIR") {
+            if !dir.trim().is_empty() {
+                return PathBuf::from(dir);
+            }
+        }
+
+        let app_vpn = PathBuf::from("/app/vpn");
+        if app_vpn.exists() || is_docker() {
+            return app_vpn;
+        }
+
+        PathBuf::from("data/vpn")
+    }
+
+    fn resolve_ovpn_path(original_path: &str) -> PathBuf {
+        let given = PathBuf::from(original_path);
+        if given.exists() {
+            return given;
+        }
+
+        let file_name = Path::new(original_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| original_path.to_string());
+
+        let candidates = [
+            Self::storage_dir().join(&file_name),
+            PathBuf::from("data/vpn").join(&file_name),
+            PathBuf::from("/app/vpn").join(&file_name),
+            PathBuf::from("/app/data/vpn").join(&file_name),
+        ];
+
+        for candidate in candidates {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+
+        given
+    }
+
     /// Checks if OpenVPN is installed on the system
     pub fn is_installed() -> bool {
         Command::new("openvpn")
@@ -62,12 +104,12 @@ impl VpnManager {
 
     /// Prepares the .ovpn file by adding route-nopull and a specific route for the DB host
     pub fn prepare_ovpn_file(original_path: &str, db_host: &str) -> Result<String> {
-        let path = Path::new(original_path);
+        let path = Self::resolve_ovpn_path(original_path);
         if !path.exists() {
-            return Err(anyhow::anyhow!("The file {} does not exist", original_path));
+            return Err(anyhow::anyhow!("The file {} does not exist", path.display()));
         }
 
-        let mut content = fs::read_to_string(path)?;
+        let mut content = fs::read_to_string(&path)?;
 
         // 1. Add defensive routing options
         let defensive_options = [
@@ -102,10 +144,10 @@ impl VpnManager {
             }
         }
 
-        // Save to specialized location
-        let vpn_dir = Path::new("data/vpn");
-        fs::create_dir_all(vpn_dir)?;
-        
+        // Save to specialized persistent location
+        let vpn_dir = Self::storage_dir();
+        fs::create_dir_all(&vpn_dir)?;
+
         let new_file_name = format!("prepared_{}", path.file_name().unwrap().to_string_lossy());
         let new_path = vpn_dir.join(new_file_name);
         fs::write(&new_path, content)?;
@@ -116,9 +158,17 @@ impl VpnManager {
     /// Starts OpenVPN in the background
     pub fn start(ovpn_path: &str) -> Result<()> {
         info!("Starting OpenVPN with config: {}", ovpn_path);
-        
-        // We use sudo because openvpn usually requires it to create the tun device
-        // Unless we are in Docker, where we run as root by default
+
+        let log_path = Self::storage_dir().join("openvpn.log");
+        let _ = fs::create_dir_all(Self::storage_dir());
+
+        // Stop any previous OpenVPN process to avoid duplicate tunnels
+        let _ = if is_docker() {
+            Command::new("sh").arg("-c").arg("pkill -f openvpn || true").status()
+        } else {
+            Command::new("sh").arg("-c").arg("sudo pkill -f openvpn || true").status()
+        };
+
         let mut cmd = if is_docker() {
             Command::new("openvpn")
         } else {
@@ -127,18 +177,38 @@ impl VpnManager {
             c
         };
 
-        cmd.args(["--config", ovpn_path, "--daemon"]);
+        cmd.args([
+            "--config",
+            ovpn_path,
+            "--daemon",
+            "--log-append",
+            log_path.to_string_lossy().as_ref(),
+            "--writepid",
+            "/tmp/bittice-openvpn.pid",
+        ]);
 
         let child = cmd.stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
 
-        info!("OpenVPN started in background (PID: {}).", child.id());
-        
-        // Wait a bit to allow the interface to initialize
+        info!("OpenVPN launch command started (PID: {}).", child.id());
         info!("Waiting for VPN interface to initialize...");
         std::thread::sleep(std::time::Duration::from_secs(8));
-        
-        Ok(())
+
+        let running = Command::new("sh")
+            .arg("-c")
+            .arg("test -f /tmp/bittice-openvpn.pid && kill -0 $(cat /tmp/bittice-openvpn.pid) 2>/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if running {
+            info!("OpenVPN is running.");
+            Ok(())
+        } else {
+            let tail = fs::read_to_string(&log_path).unwrap_or_default();
+            let excerpt = tail.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+            Err(anyhow::anyhow!("OpenVPN failed to stay running. Log: {}", excerpt))
+        }
     }
 }
