@@ -133,8 +133,13 @@ EOF
             IMAGE_NAME="bittice:local"
         fi
 
-        # 2. Create docker-compose.yml (Permanent Service)
-        if [ ! -f "docker-compose.yml" ]; then
+        # 2. Create or Update docker-compose.yml (Permanent Service)
+        # Force container_name to be 'bittice' for the wrapper to work
+        if [ -f "docker-compose.yml" ]; then
+            # If it exists, ensure it uses the 'bittice' container name and latest image
+            sed -i 's/container_name: .*/container_name: bittice/' docker-compose.yml
+            sed -i "s|image: .*|image: $IMAGE_NAME|" docker-compose.yml
+        else
             cat > docker-compose.yml <<EOF
 services:
   bittice:
@@ -152,12 +157,12 @@ EOF
             echo -e "${GREEN}Created docker-compose.yml.${NC}"
         fi
 
-        # 3. Start Bittice Service immediately
+        # 3. Start/Restart Bittice Service immediately
         echo -e "${BLUE}Starting Bittice Engine...${NC}"
         if command -v docker-compose &> /dev/null; then
-            docker-compose up -d
+            docker-compose up -d --remove-orphans
         else
-            docker compose up -d
+            docker compose up -d --remove-orphans
         fi
 
         # 4. Create the 'bittice' command wrapper on the host
