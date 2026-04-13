@@ -102,7 +102,8 @@ impl VpnManager {
         }
     }
 
-    /// Prepares the .ovpn file by adding route-nopull and a specific route for the DB host
+    /// Prepares the .ovpn file while preserving server-pushed routes by default.
+    /// Split tunnel can be enabled explicitly with BITTICE_VPN_SPLIT_TUNNEL=true.
     pub fn prepare_ovpn_file(original_path: &str, db_host: &str) -> Result<String> {
         let path = Self::resolve_ovpn_path(original_path);
         if !path.exists() {
@@ -110,41 +111,60 @@ impl VpnManager {
         }
 
         let mut content = fs::read_to_string(&path)?;
+        let split_tunnel = std::env::var("BITTICE_VPN_SPLIT_TUNNEL")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
 
-        // 1. Add defensive routing options
-        let defensive_options = [
-            "route-nopull",
-            "pull-filter ignore redirect-gateway",
-            "pull-filter ignore \"route-gateway\"",
+        // 1. Add baseline compatibility options only.
+        let baseline_options = [
             "client",
             "dev tun",
+            "data-ciphers AES-256-GCM:AES-128-GCM:BF-CBC",
+            "data-ciphers-fallback BF-CBC",
         ];
 
-        for opt in &defensive_options {
+        for opt in &baseline_options {
             if !content.contains(opt) {
-                info!("Adding defensive option to VPN config: {}", opt);
+                info!("Adding VPN compatibility option: {}", opt);
                 if !content.ends_with('\n') { content.push('\n'); }
                 content.push_str(opt);
                 content.push('\n');
             }
         }
 
-        // 2. Add specific route for the DB host
-        use std::net::ToSocketAddrs;
-        let addr_str = format!("{}:3306", db_host); 
-        if let Ok(mut addrs) = addr_str.to_socket_addrs() {
-            if let Some(addr) = addrs.next() {
-                let ip = addr.ip();
-                let route_line = format!("route {} 255.255.255.255 vpn_gateway", ip);
-                if !content.contains(&route_line) {
-                    info!("Adding specific route for DB host: {} (IP: {})", db_host, ip);
-                    content.push_str(&route_line);
+        // 2. Only enable split tunnel when explicitly requested.
+        if split_tunnel {
+            let split_options = [
+                "route-nopull",
+                "pull-filter ignore redirect-gateway",
+            ];
+
+            for opt in &split_options {
+                if !content.contains(opt) {
+                    info!("Adding split-tunnel option to VPN config: {}", opt);
+                    if !content.ends_with('\n') { content.push('\n'); }
+                    content.push_str(opt);
                     content.push('\n');
                 }
             }
+
+            use std::net::ToSocketAddrs;
+            let addr_str = format!("{}:3306", db_host);
+            if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+                if let Some(addr) = addrs.next() {
+                    let ip = addr.ip();
+                    let route_line = format!("route {} 255.255.255.255 vpn_gateway", ip);
+                    if !content.contains(&route_line) {
+                        info!("Adding specific split-tunnel route for DB host: {} (IP: {})", db_host, ip);
+                        content.push_str(&route_line);
+                        content.push('\n');
+                    }
+                }
+            }
+        } else {
+            info!("VPN: Preserving server-pushed routes (full tunnel mode).");
         }
 
-        // Save to specialized persistent location
         let vpn_dir = Self::storage_dir();
         fs::create_dir_all(&vpn_dir)?;
 
@@ -163,11 +183,12 @@ impl VpnManager {
         let _ = fs::create_dir_all(Self::storage_dir());
 
         // Stop any previous OpenVPN process to avoid duplicate tunnels
-        let _ = if is_docker() {
-            Command::new("sh").arg("-c").arg("pkill -f openvpn || true").status()
+        let stop_cmd = if is_docker() {
+            "if [ -f /tmp/bittice-openvpn.pid ]; then kill $(cat /tmp/bittice-openvpn.pid) 2>/dev/null || true; fi; command -v pkill >/dev/null 2>&1 && pkill -f openvpn || true"
         } else {
-            Command::new("sh").arg("-c").arg("sudo pkill -f openvpn || true").status()
+            "if [ -f /tmp/bittice-openvpn.pid ]; then sudo kill $(cat /tmp/bittice-openvpn.pid) 2>/dev/null || true; fi; command -v pkill >/dev/null 2>&1 && sudo pkill -f openvpn || true"
         };
+        let _ = Command::new("sh").arg("-c").arg(stop_cmd).status();
 
         let mut cmd = if is_docker() {
             Command::new("openvpn")
