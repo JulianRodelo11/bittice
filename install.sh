@@ -156,12 +156,12 @@ EOF
         echo -e "Let's configure your first database connection now (running inside Docker)..."
         
         # Ejecutar el asistente de configuración DENTRO de Docker
-        # Montamos ./data para persistir la config y $HOME para que pueda buscar archivos .ovpn si el usuario quiere
+        # Redireccionamos /dev/tty para permitir interactividad en scripts pipeados (curl | bash)
         if docker run -it --rm \
             -v "$(pwd)/data:/app/data" \
             -v "$HOME:/app/host_home:ro" \
             -e "BITTICE_HOST=0.0.0.0" \
-            "$IMAGE_NAME"; then
+            "$IMAGE_NAME" < /dev/tty; then
             
             echo -e "\n${BLUE}Starting Bittice engine in the background...${NC}"
             if command -v docker-compose &> /dev/null; then
