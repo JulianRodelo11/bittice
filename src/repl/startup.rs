@@ -77,15 +77,23 @@ pub async fn run_startup_cliclack() -> Result<()> {
         let database: String = input("Database to synchronize").placeholder("name").interact()?;
         let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
 
-        // Solo preguntar por VPN si estamos en Docker/Cloud
-        let is_docker = std::path::Path::new("/.dockerenv").exists();
-        let use_vpn: bool = if is_docker {
+        // Detectar si estamos en un entorno que podría necesitar VPN o Docker
+        let is_docker_container = std::path::Path::new("/.dockerenv").exists();
+        let is_cloud_env = std::env::var("BITTICE_HOST").is_ok() || 
+                           std::env::var("BITTICE_ENTITY").is_ok() ||
+                           is_docker_container;
+
+        // Preguntar por VPN si estamos en Cloud o si el usuario lo solicita
+        let use_vpn: bool = if is_cloud_env {
             select("Use VPN for database connection?")
                 .item(true, "Yes", "Choose a VPN provider")
                 .item(false, "No", "Direct connection")
                 .interact()?
         } else {
-            false
+            select("Database connection type")
+                .item(false, "Direct Connection", "Local or reachable network")
+                .item(true, "VPN Connection", "OpenVPN tunnel required")
+                .interact()?
         };
 
         let mut vpn_file = None;
@@ -212,6 +220,42 @@ pub async fn run_startup_cliclack() -> Result<()> {
         while let Some(msg) = log_rx.recv().await {
             if msg == "CDC_READY" { 
                 s.stop("✓ Sync established.");
+                
+                // --- DOCKER FLOW ---
+                if !is_docker_container {
+                    let setup_docker: bool = select("Configure this entity to run in a background Docker container?")
+                        .item(true, "Yes", "Generate docker-compose.yml and instructions")
+                        .item(false, "No", "Continue running manually")
+                        .interact()?;
+                    
+                    if setup_docker {
+                        println!("\x1b[90m│\x1b[0m");
+                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDocker Setup Assistant\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[90mGenerating docker-compose.yml for '{}'... \x1b[0m", selected_entity);
+                        
+                        let compose_content = format!(r#"services:
+  bittice-{entity}:
+    image: julianrodelo/bittice:latest
+    container_name: bittice-{entity}
+    restart: always
+    environment:
+      - BITTICE_ENTITY={entity}
+      - BITTICE_HOST=0.0.0.0
+    ports:
+      - "3000:3000"
+      - "50051:50051"
+    volumes:
+      - ./data:/app/data
+"#, entity = selected_entity);
+
+                        std::fs::write("docker-compose.yml", compose_content)?;
+                        
+                        println!("\x1b[90m│\x1b[0m");
+                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDone!\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[90mTo start your background engine, run:\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[1m  docker-compose up -d\x1b[0m");
+                    }
+                }
                 break; 
             }
             if msg == "CDC_DISABLED" {
