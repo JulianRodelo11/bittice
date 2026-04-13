@@ -153,8 +153,22 @@ EOF
         fi
 
         echo -e "\n${GREEN}Instance Setup Complete!${NC}"
-        echo -e "1. Type '${BLUE}bittice${NC}' to configure your first entity."
-        echo -e "2. Then run '${BLUE}docker-compose up -d${NC}' to start the background engine."
+        echo -e "Let's configure your first database connection now."
+        
+        # Ejecutar el asistente de configuración inmediatamente
+        if bittice; then
+            echo -e "\n${BLUE}Starting Bittice engine in the background...${NC}"
+            if command -v docker-compose &> /dev/null; then
+                docker-compose up -d
+            elif docker compose version &> /dev/null; then
+                docker compose up -d
+            fi
+            echo -e "${GREEN}✓ Bittice is now running in the background!${NC}"
+            echo -e "You can see the logs with: ${BLUE}docker-compose logs -f${NC}"
+        else
+            echo -e "${RED}Configuration cancelled or failed.${NC}"
+            echo -e "You can try again later by typing '${BLUE}bittice${NC}' and then running '${BLUE}docker-compose up -d${NC}'"
+        fi
     fi
 fi
 
