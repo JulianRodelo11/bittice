@@ -261,7 +261,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
         while let Some(msg) = log_rx.recv().await {
             if msg == "CDC_READY" { 
-                s.stop("✓ Sync established.");
+                s.stop("✓ Sync established (Real-time enabled).");
                 
                 // --- DOCKER FLOW ---
                 if !is_docker_container {
@@ -275,6 +275,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
                         println!("\x1b[32m◆\x1b[0m  \x1b[1mDocker Setup Assistant\x1b[0m");
                         println!("\x1b[90m│\x1b[0m  \x1b[90mGenerating docker-compose.yml for '{}'... \x1b[0m", selected_entity);
                         
+                        let version = env!("CARGO_PKG_VERSION");
                         let compose_content = format!(r#"services:
   bittice-{entity}:
     image: ghcr.io/julianrodelo11/bittice:v{version}
@@ -288,7 +289,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
       - "50051:50051"
     volumes:
       - ./data:/app/data
-"#, entity = selected_entity, version = env!("CARGO_PKG_VERSION"));
+"#, entity = selected_entity, version = version);
 
                         std::fs::write("docker-compose.yml", compose_content)?;
                         
@@ -298,10 +299,48 @@ pub async fn run_startup_cliclack() -> Result<()> {
                         println!("\x1b[90m│\x1b[0m  \x1b[1m  docker-compose up -d\x1b[0m");
                     }
                 }
-                break; 
+                break;
             }
-            if msg == "CDC_DISABLED" {
-                s.stop("\x1b[32m◆\x1b[0m  Static data sync established (Real-time updates inactive).");
+            if msg == "CDC_DISABLED" || msg.contains("Connection timed out") || msg.contains("Access denied") {
+                let reason = if msg == "CDC_DISABLED" { "CDC is not enabled on server" } else { "Could not connect to Binlog" };
+                s.stop(format!("\x1b[32m◆\x1b[0m  Static data sync established ({}. Real-time updates inactive).", reason));
+                
+                if !is_docker_container {
+                    // --- DOCKER FLOW REPEATED HERE FOR STATIC CASE ---
+                    let setup_docker: bool = select("Configure this entity to run in a background Docker container?")
+                        .item(true, "Yes", "Generate docker-compose.yml and instructions")
+                        .item(false, "No", "Continue running manually")
+                        .interact()?;
+                    
+                    if setup_docker {
+                        println!("\x1b[90m│\x1b[0m");
+                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDocker Setup Assistant\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[90mGenerating docker-compose.yml for '{}'... \x1b[0m", selected_entity);
+                        
+                        let version = env!("CARGO_PKG_VERSION");
+                        let compose_content = format!(r#"services:
+  bittice-{entity}:
+    image: ghcr.io/julianrodelo11/bittice:v{version}
+    container_name: bittice-{entity}
+    restart: always
+    environment:
+      - BITTICE_ENTITY={entity}
+      - BITTICE_HOST=0.0.0.0
+    ports:
+      - "3000:3000"
+      - "50051:50051"
+    volumes:
+      - ./data:/app/data
+"#, entity = selected_entity, version = version);
+
+                        std::fs::write("docker-compose.yml", compose_content)?;
+                        
+                        println!("\x1b[90m│\x1b[0m");
+                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDone!\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[90mTo start your background engine, run:\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[1m  docker-compose up -d\x1b[0m");
+                    }
+                }
                 break;
             }
             if let Some(err) = msg.strip_prefix("CDC_ERROR: ") {
@@ -313,7 +352,10 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 s.set_message(format!("\x1b[33m▲\x1b[0m  {}", warn));
                 continue;
             }
-            s.set_message(msg);
+            // Evitar imprimir líneas que contengan secretos o configuraciones sensibles
+            if !msg.contains("-----") && !msg.contains("key") && !msg.contains("pass") {
+                s.set_message(msg);
+            }
         }
     }
 
