@@ -6,6 +6,10 @@ use tracing::{info, warn};
 
 pub struct VpnManager;
 
+fn is_docker() -> bool {
+    std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok()
+}
+
 impl VpnManager {
     /// Checks if OpenVPN is installed on the system
     pub fn is_installed() -> bool {
@@ -21,17 +25,32 @@ impl VpnManager {
     /// Attempts to install OpenVPN using apt-get (Debian/Ubuntu)
     pub fn install() -> Result<()> {
         info!("Installing OpenVPN...");
-        let status = Command::new("sudo")
-            .args(["apt-get", "update"])
-            .status()?;
+        
+        let mut cmd_update = if is_docker() {
+            Command::new("apt-get")
+        } else {
+            Command::new("sudo")
+        };
+        
+        if !is_docker() { cmd_update.arg("apt-get"); }
+        cmd_update.arg("update");
+
+        let status = cmd_update.status()?;
         
         if !status.success() {
             warn!("Failed to update package list.");
         }
 
-        let status = Command::new("sudo")
-            .args(["apt-get", "install", "-y", "openvpn"])
-            .status()?;
+        let mut cmd_install = if is_docker() {
+            Command::new("apt-get")
+        } else {
+            Command::new("sudo")
+        };
+
+        if !is_docker() { cmd_install.arg("apt-get"); }
+        cmd_install.args(["install", "-y", "openvpn"]);
+
+        let status = cmd_install.status()?;
 
         if status.success() {
             info!("OpenVPN installed successfully.");
@@ -89,9 +108,18 @@ impl VpnManager {
         info!("Starting OpenVPN with config: {}", ovpn_path);
         
         // We use sudo because openvpn usually requires it to create the tun device
-        let child = Command::new("sudo")
-            .args(["openvpn", "--config", ovpn_path, "--daemon"])
-            .stdout(Stdio::null())
+        // Unless we are in Docker, where we run as root by default
+        let mut cmd = if is_docker() {
+            Command::new("openvpn")
+        } else {
+            let mut c = Command::new("sudo");
+            c.arg("openvpn");
+            c
+        };
+
+        cmd.args(["--config", ovpn_path, "--daemon"]);
+
+        let child = cmd.stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
 
