@@ -121,8 +121,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
                 let mut buffer = String::new();
                 
-                // Deshabilitar el eco de la terminal para privacidad
+                // Deshabilitar el eco de la terminal para privacidad absoluta
                 let term = console::Term::stdout();
+                
+                // Intentar desactivar el echo usando el comando stty (estándar en Linux/macOS)
+                let _ = std::process::Command::new("stty").arg("-echo").status();
                 
                 loop {
                     let line = term.read_line()?;
@@ -138,7 +141,10 @@ pub async fn run_startup_cliclack() -> Result<()> {
                         break;
                     }
                 }
-                println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and hidden.\x1b[0m");
+                // Reactivar el echo
+                let _ = std::process::Command::new("stty").arg("echo").status();
+                
+                println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and protected.\x1b[0m");
                 buffer.trim().to_string()
             } else {
                 input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
@@ -394,7 +400,8 @@ pub async fn run_startup_cliclack() -> Result<()> {
         println!("\x1b[32m◆\x1b[0m  \x1b[1mBittice Engine Updated!\x1b[0m");
         println!("\x1b[90m│\x1b[0m  \x1b[90mThe background engine has automatically loaded the new entity.\x1b[0m");
         println!("\x1b[90m│\x1b[0m");
-        return Ok(());
+        // Esperamos un momento para que el motor de fondo empiece a loguear la sincronización
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
 
     // Levantamos los servidores automáticamente SOLO si no estamos en Docker
@@ -405,7 +412,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
     if std::path::Path::new(log_path).exists() {
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(format!("tail -f -n 0 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Error|Warn'", log_path, selected_entity))
+            .arg(format!("tail -f -n 50 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Error|Warn|Sync'", log_path, selected_entity))
             .stdout(Stdio::piped())
             .spawn()?;
 
