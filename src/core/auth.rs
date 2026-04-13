@@ -27,18 +27,25 @@ impl AuthService {
         debug!("AUTH: Resolving identity for entity '{}' in table '{}' using col '{}'",
             entity, c.table, c.token_col);
 
-        // Decodificar JWT (muy simplificado, asumiendo que el token es el valor o un JWT con 'sub')
+        // Decodificar JWT (robusto, cayendo al token original si falla o no tiene campos esperados)
         let token_val = if token.contains('.') {
-            // Intento de decodificar el payload de un JWT sin verificar firma (solo para extraer identidad)
             let parts: Vec<&str> = token.split('.').collect();
             if parts.len() > 1 {
                 if let Ok(decoded) = URL_SAFE_NO_PAD.decode(parts[1]) {
                     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&decoded) {
                         let extracted = json.get("sub").and_then(|v| v.as_str())
-                            .or_else(|| json.get("username").and_then(|v| v.as_str()))
-                            .unwrap_or(token);
-                        debug!("AUTH: JWT payload decoded: sub/username = {}", extracted);
-                        extracted.to_string()
+                            .or_else(|| json.get("username").and_then(|v| v.as_str()));
+                        
+                        match extracted {
+                            Some(e) => {
+                                debug!("AUTH: JWT payload decoded: sub/username = {}", e);
+                                e.to_string()
+                            },
+                            None => {
+                                debug!("AUTH: JWT detected but no 'sub'/'username' found. Using full token.");
+                                token.to_string()
+                            }
+                        }
                     } else { token.to_string() }
                 } else { token.to_string() }
             } else { token.to_string() }

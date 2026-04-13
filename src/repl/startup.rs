@@ -123,14 +123,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 
                 // Deshabilitar el eco de la terminal para privacidad absoluta
                 let term = console::Term::stdout();
-                
-                // Intentar desactivar el echo usando el comando stty (estándar en Linux/macOS)
                 let _ = std::process::Command::new("stty").arg("-echo").status();
                 
                 loop {
                     let line = term.read_line()?;
-                    if line.trim() == "END" { break; }
-                    if line.is_empty() { break; }
+                    if line.trim() == "END" || line.is_empty() { break; }
                     buffer.push_str(&line);
                     buffer.push('\n');
                     
@@ -141,10 +138,14 @@ pub async fn run_startup_cliclack() -> Result<()> {
                         break;
                     }
                 }
-                // Reactivar el echo
-                let _ = std::process::Command::new("stty").arg("echo").status();
                 
-                println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and protected.\x1b[0m");
+                // Reactivar el echo y LIMPIAR las líneas pegadas de la terminal
+                let _ = std::process::Command::new("stty").arg("echo").status();
+                for _ in 0..buffer.lines().count() + 5 {
+                    let _ = term.clear_last_line();
+                }
+                
+                println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and protected (Sensitive data cleared from terminal).\x1b[0m");
                 buffer.trim().to_string()
             } else {
                 input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
@@ -412,7 +413,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
     if std::path::Path::new(log_path).exists() {
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(format!("tail -f -n 50 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Error|Warn|Sync'", log_path, selected_entity))
+            .arg(format!("tail -f -n 50 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Syncing|Dump|Rows|Error|Warn'", log_path, selected_entity))
             .stdout(Stdio::piped())
             .spawn()?;
 
