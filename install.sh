@@ -205,45 +205,16 @@ EOF
         cat <<EOF | sudo tee /usr/local/bin/bittice > /dev/null
 #!/bin/bash
 # Bittice Docker Wrapper
+# If no arguments are provided, launch the interactive setup/monitor
 docker exec -it bittice bittice "\$@"
 EOF
         sudo chmod +x /usr/local/bin/bittice
 
-        echo -e "\n${GREEN}Bittice is now running in the background!${NC}"
-        
-        # Wait for container to be ready
-        echo -e "Waiting for Bittice Engine to initialize..."
-        MAX_RETRIES=10
-        COUNT=0
-        while [ $COUNT -lt $MAX_RETRIES ]; do
-            if [ "$(docker inspect -f '{{.State.Running}}' bittice 2>/dev/null)" == "true" ]; then
-                break
-            fi
-            echo -n "."
-            sleep 1
-            COUNT=$((COUNT + 1))
-        done
-        echo -e "\n"
-
-        echo -e "Launching setup wizard...\n"
-        
-        # 5. Launch Setup Wizard (Ensuring TTY for piped installs)
-        # We use 'docker exec -it' and redirect /dev/tty (or stdin if terminal) to ensure interaction works
-        if eval "docker exec -it bittice bittice setup $TTY_RED"; then
-            echo -e "\n${BLUE}Reloading Bittice Engine to activate new configuration...${NC}"
-            if command -v docker-compose &> /dev/null; then
-                docker-compose restart bittice
-            else
-                docker compose restart bittice
-            fi
-            echo -e "${GREEN}✓ Bittice is now running and your database is synchronized!${NC}"
-            echo -e "Try it: ${BLUE}curl http://localhost:3000/_config${NC}"
-        else
-            echo -e "${RED}Setup was not completed.${NC}"
-        fi
+        echo -e "\n${GREEN}Bittice Engine is now running in the background!${NC}"
+        echo -e "To configure your database or monitor events, simply type: ${BLUE}bittice${NC}"
     fi
 fi
 
 # 7. Finalize
 echo -e "\n${GREEN}Bittice ($LATEST_TAG) installed successfully!${NC}"
-echo -e "Type '${BLUE}bittice --help${NC}' to get started."
+echo -e "Type '${BLUE}bittice${NC}' to get started."

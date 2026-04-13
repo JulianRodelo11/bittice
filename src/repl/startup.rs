@@ -261,6 +261,12 @@ pub async fn run_startup_cliclack() -> Result<()> {
         });
 
         while let Some(msg) = log_rx.recv().await {
+            // Mostrar progreso de tablas mientras esperamos el READY final
+            if msg.contains("Syncing table") || msg.contains("Table sync") || msg.contains("rows") {
+                 s.set_message(format!("\x1b[34m→\x1b[0m  {}", msg));
+                 continue;
+            }
+
             if msg == "CDC_READY" { 
                 s.stop("✓ Sync established (Real-time enabled).");
                 
@@ -377,11 +383,18 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for '{}' in real-time.\x1b[0m", selected_entity);
     println!("\x1b[90m│\x1b[0m");
 
-    // Levantamos los servidores automáticamente para que el usuario pueda probar la API inmediatamente
-    let server_entity = selected_entity.clone();
-    tokio::spawn(async move {
-        let _ = crate::server::start_all_servers(Some(server_entity)).await;
-    });
+    // En Docker, salimos después de configurar y sugerimos reiniciar para aplicar
+    if is_docker {
+        println!("\x1b[90m│\x1b[0m");
+        println!("\x1b[32m◆\x1b[0m  \x1b[1mSetup Complete!\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[90mTo apply these changes and start the background engine, run:\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[1m  docker-compose restart bittice\x1b[0m");
+        println!("\x1b[90m│\x1b[0m");
+        return Ok(());
+    }
+
+    // Levantamos los servidores automáticamente SOLO si no estamos en Docker
+    // ... rest of the code ...
 
 
     let log_path = "data/server.log";
