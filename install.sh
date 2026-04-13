@@ -118,7 +118,7 @@ if is_cloud_instance; then
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates libc6 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY bittice /usr/local/bin/bittice
+COPY bittice_bin /usr/local/bin/bittice
 RUN chmod +x /usr/local/bin/bittice
 EXPOSE 3000 50051
 ENTRYPOINT ["bittice"]
@@ -126,10 +126,10 @@ EOF
 
         # 2. Build local image
         echo -e "${BLUE}Building Bittice Docker image locally...${NC}"
-        # We need the binary in the current directory for the Docker build context
-        cp "$INSTALL_DIR/$BINARY_NAME" .
+        # Use a unique name for the binary to avoid collision with a 'bittice' directory
+        cp "$INSTALL_DIR/$BINARY_NAME" ./bittice_bin
         docker build -t bittice:local -f Dockerfile.local .
-        rm bittice Dockerfile.local
+        rm bittice_bin Dockerfile.local
 
         # 3. Create docker-compose.yml
         if [ ! -f "docker-compose.yml" ]; then
