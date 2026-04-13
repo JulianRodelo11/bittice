@@ -113,31 +113,33 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
             // OpenVPN logic
             let input_val = if is_cloud_env {
-                cliclack::note(
-                    "OpenVPN Configuration",
-                    "1. Copy your .ovpn content\n2. Paste it here\n3. Type 'END' on its own line and press Enter to save"
-                )?;
+                println!("\x1b[34m│\x1b[0m");
+                println!("\x1b[32m◆\x1b[0m  \x1b[1mProvide OpenVPN configuration\x1b[0m");
+                println!("\x1b[90m│\x1b[0m  \x1b[90mPaste your .ovpn content below.\x1b[0m");
+                println!("\x1b[90m│\x1b[0m  \x1b[90m(Your input will be hidden for privacy. Type 'END' + Enter when finished)\x1b[0m");
+                println!("\x1b[90m│\x1b[0m");
 
                 let mut buffer = String::new();
-                use std::io::{self, BufRead};
-                let stdin = io::stdin();
-                let mut handle = stdin.lock();
+                use std::io::{self, Write};
+                
+                // Deshabilitar el eco de la terminal para privacidad
+                let mut term = console::Term::stdout();
                 
                 loop {
-                    let mut line = String::new();
-                    handle.read_line(&mut line)?;
+                    let line = term.read_line()?;
                     if line.trim() == "END" { break; }
-                    if line.is_empty() { break; } // EOF
+                    if line.is_empty() { break; }
                     buffer.push_str(&line);
+                    buffer.push('\n');
                     
-                    // Auto-detection of standard OVPN endings to avoid manual 'END'
+                    // Auto-detección del final del archivo
                     if line.contains("-----END OpenVPN Static key V1-----") || 
                        line.contains("</ca>") || 
                        line.contains("</tls-auth>") {
-                        println!("\x1b[90m│\x1b[0m  \x1b[32mEnd of certificate detected.\x1b[0m");
                         break;
                     }
                 }
+                println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and hidden.\x1b[0m");
                 buffer.trim().to_string()
             } else {
                 input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
@@ -376,13 +378,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for '{}' in real-time.\x1b[0m", selected_entity);
     println!("\x1b[90m│\x1b[0m");
 
-    // Si no es Docker, levantamos los servidores automáticamente
-    if !is_docker {
-        let server_entity = selected_entity.clone();
-        tokio::spawn(async move {
-            let _ = crate::server::start_all_servers(Some(server_entity)).await;
-        });
-    }
+    // Levantamos los servidores automáticamente para que el usuario pueda probar la API inmediatamente
+    let server_entity = selected_entity.clone();
+    tokio::spawn(async move {
+        let _ = crate::server::start_all_servers(Some(server_entity)).await;
+    });
 
 
     let log_path = "data/server.log";

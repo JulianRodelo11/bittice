@@ -211,7 +211,7 @@ impl CdcWorker {
     }
 
     async fn bootstrap_table(&self, conn: &mut Conn, table_name: &str, state: &mut CdcState) -> Result<()> {
-        info!("CDC: Bootstrapping table '{}'...", table_name);
+        self.log_info(format!("CDC: Bootstrapping table '{}'...", table_name));
         
         let (cols, dates) = self.fetch_column_info(conn, table_name).await?;
         {
@@ -283,7 +283,7 @@ impl CdcWorker {
         }
 
         table.flush_active_segment()?;
-        info!("CDC: Table '{}' bootstrapped successfully ({} rows).", table_name, count);
+        self.log_info(format!("CDC: Table '{}' synchronized ({} rows).", table_name, count));
         Ok(())
     }
 

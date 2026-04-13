@@ -133,13 +133,13 @@ EOF
             IMAGE_NAME="bittice:local"
         fi
 
-        # 2. Create docker-compose.yml
+        # 2. Create docker-compose.yml (Permanent Service)
         if [ ! -f "docker-compose.yml" ]; then
             cat > docker-compose.yml <<EOF
 services:
   bittice:
     image: $IMAGE_NAME
-    container_name: bittice-engine
+    container_name: bittice
     restart: always
     environment:
       - BITTICE_HOST=0.0.0.0
@@ -152,29 +152,28 @@ EOF
             echo -e "${GREEN}Created docker-compose.yml.${NC}"
         fi
 
-        echo -e "\n${GREEN}Instance Setup Complete!${NC}"
-        echo -e "Let's configure your first database connection now (running inside Docker)..."
-        
-        # Ejecutar el asistente de configuración DENTRO de Docker
-        # Redireccionamos /dev/tty para permitir interactividad en scripts pipeados (curl | bash)
-        if docker run -it --rm \
-            -v "$(pwd)/data:/app/data" \
-            -v "$HOME:/app/host_home:ro" \
-            -e "BITTICE_HOST=0.0.0.0" \
-            "$IMAGE_NAME" < /dev/tty; then
-            
-            echo -e "\n${BLUE}Starting Bittice engine in the background...${NC}"
-            if command -v docker-compose &> /dev/null; then
-                docker-compose up -d
-            elif docker compose version &> /dev/null; then
-                docker compose up -d
-            fi
-            echo -e "${GREEN}✓ Bittice is now running in the background!${NC}"
-            echo -e "You can see the logs with: ${BLUE}docker-compose logs -f${NC}"
+        # 3. Start Bittice Service immediately
+        echo -e "${BLUE}Starting Bittice Engine...${NC}"
+        if command -v docker-compose &> /dev/null; then
+            docker-compose up -d
         else
-            echo -e "${RED}Configuration cancelled or failed.${NC}"
-            echo -e "You can try again later by running: ${BLUE}docker-compose run --rm bittice${NC}"
+            docker compose up -d
         fi
+
+        # 4. Create the 'bittice' command wrapper on the host
+        echo -e "${BLUE}Creating bittice command wrapper...${NC}"
+        cat <<EOF | sudo tee /usr/local/bin/bittice > /dev/null
+#!/bin/bash
+# Bittice Docker Wrapper
+docker exec -it bittice bittice "\$@"
+EOF
+        sudo chmod +x /usr/local/bin/bittice
+
+        echo -e "\n${GREEN}Bittice is now running in the background!${NC}"
+        echo -e "Launching setup wizard...\n"
+        
+        # 5. Launch Setup Wizard (Now through the wrapper)
+        bittice setup
     fi
 fi
 

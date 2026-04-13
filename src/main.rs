@@ -14,32 +14,28 @@ async fn main() -> Result<()> {
     let is_pid1 = std::process::id() == 1;
 
     // Flow decision:
-    // 1. If we have BITTICE_ENTITY or CLI arguments, we run in command/server mode.
-    // 2. If we are PID 1 in Docker and have NO arguments, we auto-start the server for all entities.
+    // 1. If we are PID 1 in Docker, we ALWAYS start the servers in background first.
+    // 2. If we have BITTICE_ENTITY or CLI arguments, we run in command mode.
     // 3. Otherwise, we run the interactive setup (REPL).
-    if std::env::args().len() > 1 || env_entity.is_some() || (is_docker && is_pid1) {
-        if std::env::args().len() == 1 && env_entity.is_none() && is_docker && is_pid1 {
-            // Check if there are any configured entities
-            let has_entities = std::fs::read_dir("data").map(|d| d.flatten().any(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))).unwrap_or(false);
-            
-            if !has_entities {
-                // No entities to serve, run the wizard even if PID 1
-                return bittice::repl::startup::run_startup_cliclack().await;
-            }
-
-            info!("No CLI arguments provided, auto-starting server in Docker (PID 1).");
-            return bittice::server::start_all_servers(None).await;
+    
+    if is_docker && is_pid1 {
+        info!("Docker Environment (PID 1): Auto-starting Query Engine in background...");
+        // Start servers in background immediately
+        tokio::spawn(async move {
+            let _ = bittice::server::start_all_servers(None).await;
+        });
+        
+        // If we have no arguments, we still drop into the REPL so the user can configure it
+        if std::env::args().len() == 1 && env_entity.is_none() {
+            return bittice::repl::startup::run_startup_cliclack().await;
         }
+    }
 
+    if std::env::args().len() > 1 || env_entity.is_some() {
         if let Some(ref e) = env_entity {
             info!("Detected BITTICE_ENTITY from environment: '{}'", e);
         }
-
-        // If no args but env_entity is set, we use start_all_servers with that entity
-        if std::env::args().len() == 1 && env_entity.is_some() {
-            return bittice::server::start_all_servers(env_entity).await;
-        }
-
+        
         let cli = Cli::parse();
         match cli.command {
             Commands::Setup => {
