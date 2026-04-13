@@ -112,8 +112,14 @@ pub async fn run_startup_cliclack() -> Result<()> {
             }
 
             // OpenVPN logic
-            let input_val: String = input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path from your PC)")
-                .placeholder("/Users/.../vpn.ovpn or config text")
+            let prompt_msg = if is_cloud_env {
+                "Provide OpenVPN configuration (PASTE the .ovpn file content here)"
+            } else {
+                "Provide OpenVPN configuration (Paste .ovpn content OR enter Path)"
+            };
+
+            let input_val: String = input(prompt_msg)
+                .placeholder("client\ndev tun\n...")
                 .interact()?;
 
             let vpn_storage = std::path::Path::new("data/vpn");
