@@ -120,10 +120,9 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 println!("\x1b[90m│\x1b[0m");
 
                 let mut buffer = String::new();
-                use std::io::{self, Write};
                 
                 // Deshabilitar el eco de la terminal para privacidad
-                let mut term = console::Term::stdout();
+                let term = console::Term::stdout();
                 
                 loop {
                     let line = term.read_line()?;

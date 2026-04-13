@@ -93,8 +93,19 @@ fi
 if is_cloud_instance; then
     echo -e "\n${BLUE}--- Cloud Instance Detected ---${NC}"
     echo -e "This system looks like a cloud server (AWS, GCP, or Azure)."
+    # Detect if we are in an interactive terminal
+    if [ -t 0 ]; then
+        TTY_RED="<&0"
+    else
+        TTY_RED="< /dev/tty"
+    fi
+
     echo -ne "Would you like to set up Docker for background execution? [Y/n]: "
-    read -r setup_docker
+    if [ -e /dev/tty ]; then
+        read -r setup_docker < /dev/tty
+    else
+        read -r setup_docker
+    fi
     
     if [[ ! "$setup_docker" =~ ^([nN][oO]|[nN])$ ]]; then
         # Install Docker if missing
@@ -120,7 +131,7 @@ if is_cloud_instance; then
             # Fallback to local build if tag is not yet available in GHCR
             cat > Dockerfile.local <<EOF
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates libc6 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates libc6 openvpn iproute2 curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY bittice_bin /usr/local/bin/bittice
 RUN chmod +x /usr/local/bin/bittice
@@ -175,10 +186,18 @@ EOF
         # Stop everything first to ensure a clean state
         if command -v docker-compose &> /dev/null; then
             docker-compose down &> /dev/null || true
-            docker-compose up -d --remove-orphans
+            if ! docker-compose up -d --remove-orphans; then
+                echo -e "${RED}Error: Failed to start Bittice Engine with docker-compose.${NC}"
+                echo -e "Please check if ports 3000 or 50051 are already in use."
+                exit 1
+            fi
         else
             docker compose down &> /dev/null || true
-            docker compose up -d --remove-orphans
+            if ! docker compose up -d --remove-orphans; then
+                echo -e "${RED}Error: Failed to start Bittice Engine with docker compose.${NC}"
+                echo -e "Please check if ports 3000 or 50051 are already in use."
+                exit 1
+            fi
         fi
 
         # 4. Create the 'bittice' command wrapper on the host
@@ -191,10 +210,37 @@ EOF
         sudo chmod +x /usr/local/bin/bittice
 
         echo -e "\n${GREEN}Bittice is now running in the background!${NC}"
+        
+        # Wait for container to be ready
+        echo -e "Waiting for Bittice Engine to initialize..."
+        MAX_RETRIES=10
+        COUNT=0
+        while [ $COUNT -lt $MAX_RETRIES ]; do
+            if [ "$(docker inspect -f '{{.State.Running}}' bittice 2>/dev/null)" == "true" ]; then
+                break
+            fi
+            echo -n "."
+            sleep 1
+            COUNT=$((COUNT + 1))
+        done
+        echo -e "\n"
+
         echo -e "Launching setup wizard...\n"
         
         # 5. Launch Setup Wizard (Ensuring TTY for piped installs)
-        docker exec -it bittice bittice setup < /dev/tty
+        # We use 'docker exec -it' and redirect /dev/tty (or stdin if terminal) to ensure interaction works
+        if eval "docker exec -it bittice bittice setup $TTY_RED"; then
+            echo -e "\n${BLUE}Reloading Bittice Engine to activate new configuration...${NC}"
+            if command -v docker-compose &> /dev/null; then
+                docker-compose restart bittice
+            else
+                docker compose restart bittice
+            fi
+            echo -e "${GREEN}✓ Bittice is now running and your database is synchronized!${NC}"
+            echo -e "Try it: ${BLUE}curl http://localhost:3000/_config${NC}"
+        else
+            echo -e "${RED}Setup was not completed.${NC}"
+        fi
     fi
 fi
 
