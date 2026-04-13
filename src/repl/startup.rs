@@ -141,9 +141,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 
                 // Reactivar el echo y LIMPIAR las líneas pegadas de la terminal
                 let _ = std::process::Command::new("stty").arg("echo").status();
-                for _ in 0..buffer.lines().count() + 5 {
-                    let _ = term.clear_last_line();
-                }
+                let _ = term.clear_last_lines(buffer.lines().count() + 5);
                 
                 println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and protected (Sensitive data cleared from terminal).\x1b[0m");
                 buffer.trim().to_string()
