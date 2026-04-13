@@ -235,7 +235,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
                         
                         let compose_content = format!(r#"services:
   bittice-{entity}:
-    image: bittice:local
+    image: ghcr.io/julianrodelo11/bittice:v{version}
     container_name: bittice-{entity}
     restart: always
     environment:
@@ -246,7 +246,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
       - "50051:50051"
     volumes:
       - ./data:/app/data
-"#, entity = selected_entity);
+"#, entity = selected_entity, version = env!("CARGO_PKG_VERSION"));
 
                         std::fs::write("docker-compose.yml", compose_content)?;
                         

@@ -112,9 +112,13 @@ if is_cloud_instance; then
              sudo chmod +x /usr/local/bin/docker-compose
         fi
 
-        # 1. Prepare Local Dockerfile
-        echo -e "${BLUE}Preparing local Docker image...${NC}"
-        cat > Dockerfile.local <<EOF
+        # 1. Pull official image from GHCR
+        IMAGE_NAME="ghcr.io/julianrodelo11/bittice:${LATEST_TAG}"
+        echo -e "${BLUE}Pulling official Bittice image: $IMAGE_NAME...${NC}"
+        if ! docker pull "$IMAGE_NAME"; then
+            echo -e "${RED}Error: Could not pull image $IMAGE_NAME. Using local build as fallback...${NC}"
+            # Fallback to local build if tag is not yet available in GHCR
+            cat > Dockerfile.local <<EOF
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates libc6 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
@@ -123,20 +127,18 @@ RUN chmod +x /usr/local/bin/bittice
 EXPOSE 3000 50051
 ENTRYPOINT ["bittice"]
 EOF
+            cp "$INSTALL_DIR/$BINARY_NAME" ./bittice_bin
+            docker build -t bittice:local -f Dockerfile.local .
+            rm bittice_bin Dockerfile.local
+            IMAGE_NAME="bittice:local"
+        fi
 
-        # 2. Build local image
-        echo -e "${BLUE}Building Bittice Docker image locally...${NC}"
-        # Use a unique name for the binary to avoid collision with a 'bittice' directory
-        cp "$INSTALL_DIR/$BINARY_NAME" ./bittice_bin
-        docker build -t bittice:local -f Dockerfile.local .
-        rm bittice_bin Dockerfile.local
-
-        # 3. Create docker-compose.yml
+        # 2. Create docker-compose.yml
         if [ ! -f "docker-compose.yml" ]; then
             cat > docker-compose.yml <<EOF
 services:
   bittice:
-    image: bittice:local
+    image: $IMAGE_NAME
     container_name: bittice-engine
     restart: always
     environment:
@@ -147,7 +149,7 @@ services:
     volumes:
       - ./data:/app/data
 EOF
-            echo -e "${GREEN}Created docker-compose.yml using local image.${NC}"
+            echo -e "${GREEN}Created docker-compose.yml.${NC}"
         fi
 
         echo -e "\n${GREEN}Instance Setup Complete!${NC}"
