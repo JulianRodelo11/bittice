@@ -77,23 +77,19 @@ pub async fn run_startup_cliclack() -> Result<()> {
         let database: String = input("Database to synchronize").placeholder("name").interact()?;
         let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
 
-        // Detectar si estamos en un entorno que podría necesitar VPN o Docker
+        // Detect environment
         let is_docker_container = std::path::Path::new("/.dockerenv").exists();
-        let is_cloud_env = std::env::var("BITTICE_HOST").is_ok() || 
-                           std::env::var("BITTICE_ENTITY").is_ok() ||
-                           is_docker_container;
+        let is_cloud_env = is_docker_container;
 
-        // Preguntar por VPN si estamos en Cloud o si el usuario lo solicita
-        let use_vpn: bool = if is_cloud_env {
-            select("Use VPN for database connection?")
+        // Preguntar por VPN SOLO si estamos en Docker (donde bittice gestiona el túnel)
+        // En local, el usuario usa su propia VPN.
+        let use_vpn: bool = if is_docker_container {
+            select("Use internal VPN for database connection?")
                 .item(true, "Yes", "Choose a VPN provider")
                 .item(false, "No", "Direct connection")
                 .interact()?
         } else {
-            select("Database connection type")
-                .item(false, "Direct Connection", "Local or reachable network")
-                .item(true, "VPN Connection", "OpenVPN tunnel required")
-                .interact()?
+            false
         };
 
         let mut vpn_file = None;
@@ -163,10 +159,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
             if input_val.starts_with("http") {
                 let s = spinner();
                 s.start("Downloading VPN configuration...");
-                let response = reqwest::get(&input_val).await?.bytes().await?;
+                let response = reqwest::get(&input_val).await?;
+                let bytes = response.bytes().await?;
                 let file_name = input_val.split('/').last().unwrap_or("downloaded.ovpn");
                 let dest_path = vpn_storage.join(file_name);
-                std::fs::write(&dest_path, response)?;
+                std::fs::write(&dest_path, bytes)?;
                 final_vpn_path = dest_path.to_string_lossy().to_string();
                 s.stop("✓ Download complete.");
             } else if input_val.contains("client") && input_val.contains("dev") {
@@ -178,7 +175,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
             } else {
                 // 3. Smart Path Translation (Windows/Mac/Linux)
                 let normalized_input = input_val.replace("\\", "/");
-                let parts: Vec<&str> = normalized_input.split('/').filter(|s| !s.is_empty()).collect();
+                let parts: Vec<&str> = normalized_input.split('/').filter(|s: &&str| !s.is_empty()).collect();
                 
                 let mut found_path = None;
                 if std::path::Path::new(&input_val).exists() {
@@ -274,87 +271,14 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
             if msg == "CDC_READY" { 
                 s.stop("✓ Sync established (Real-time enabled).");
-                
-                // --- DOCKER FLOW ---
-                if !is_docker_container {
-                    let setup_docker: bool = select("Configure this entity to run in a background Docker container?")
-                        .item(true, "Yes", "Generate docker-compose.yml and instructions")
-                        .item(false, "No", "Continue running manually")
-                        .interact()?;
-                    
-                    if setup_docker {
-                        println!("\x1b[90m│\x1b[0m");
-                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDocker Setup Assistant\x1b[0m");
-                        println!("\x1b[90m│\x1b[0m  \x1b[90mGenerating docker-compose.yml for '{}'... \x1b[0m", selected_entity);
-                        
-                        let version = env!("CARGO_PKG_VERSION");
-                        let compose_content = format!(r#"services:
-  bittice-{entity}:
-    image: ghcr.io/julianrodelo11/bittice:v{version}
-    container_name: bittice-{entity}
-    restart: always
-    environment:
-      - BITTICE_ENTITY={entity}
-      - BITTICE_HOST=0.0.0.0
-    ports:
-      - "3000:3000"
-      - "50051:50051"
-    volumes:
-      - ./data:/app/data
-"#, entity = selected_entity, version = version);
-
-                        std::fs::write("docker-compose.yml", compose_content)?;
-                        
-                        println!("\x1b[90m│\x1b[0m");
-                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDone!\x1b[0m");
-                        println!("\x1b[90m│\x1b[0m  \x1b[90mTo start your background engine, run:\x1b[0m");
-                        println!("\x1b[90m│\x1b[0m  \x1b[1m  docker-compose up -d\x1b[0m");
-                    }
-                }
                 break;
             }
             if msg == "CDC_DISABLED" || msg.contains("Connection timed out") || msg.contains("Access denied") {
                 let reason = if msg == "CDC_DISABLED" { "CDC is not enabled on server" } else { "Could not connect to Binlog" };
                 s.stop(format!("\x1b[32m◆\x1b[0m  Static data sync established ({}. Real-time updates inactive).", reason));
-                
-                if !is_docker_container {
-                    // --- DOCKER FLOW REPEATED HERE FOR STATIC CASE ---
-                    let setup_docker: bool = select("Configure this entity to run in a background Docker container?")
-                        .item(true, "Yes", "Generate docker-compose.yml and instructions")
-                        .item(false, "No", "Continue running manually")
-                        .interact()?;
-                    
-                    if setup_docker {
-                        println!("\x1b[90m│\x1b[0m");
-                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDocker Setup Assistant\x1b[0m");
-                        println!("\x1b[90m│\x1b[0m  \x1b[90mGenerating docker-compose.yml for '{}'... \x1b[0m", selected_entity);
-                        
-                        let version = env!("CARGO_PKG_VERSION");
-                        let compose_content = format!(r#"services:
-  bittice-{entity}:
-    image: ghcr.io/julianrodelo11/bittice:v{version}
-    container_name: bittice-{entity}
-    restart: always
-    environment:
-      - BITTICE_ENTITY={entity}
-      - BITTICE_HOST=0.0.0.0
-    ports:
-      - "3000:3000"
-      - "50051:50051"
-    volumes:
-      - ./data:/app/data
-"#, entity = selected_entity, version = version);
-
-                        std::fs::write("docker-compose.yml", compose_content)?;
-                        
-                        println!("\x1b[90m│\x1b[0m");
-                        println!("\x1b[32m◆\x1b[0m  \x1b[1mDone!\x1b[0m");
-                        println!("\x1b[90m│\x1b[0m  \x1b[90mTo start your background engine, run:\x1b[0m");
-                        println!("\x1b[90m│\x1b[0m  \x1b[1m  docker-compose up -d\x1b[0m");
-                    }
-                }
                 break;
             }
+            // ... rest of log handling ...
             if let Some(err) = msg.strip_prefix("CDC_ERROR: ") {
                 let err_str = err.to_string();
                 s.stop(format!("✗ Error: {}", err_str));
@@ -388,8 +312,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for '{}' in real-time.\x1b[0m", selected_entity);
     println!("\x1b[90m│\x1b[0m");
 
-    // En Docker, notificamos al motor local para que cargue la nueva configuración al instante
+    // Flow separation for Setup Completion
+    let is_docker = std::path::Path::new("/.dockerenv").exists();
+
     if is_docker {
+        // --- DOCKER FLOW: NOTIFY BACKGROUND ENGINE ---
         let client = reqwest::Client::new();
         let _ = client.post("http://localhost:3000/_config/reload")
             .send()
@@ -401,17 +328,22 @@ pub async fn run_startup_cliclack() -> Result<()> {
         println!("\x1b[90m│\x1b[0m");
         // Esperamos un momento para que el motor de fondo empiece a loguear la sincronización
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    } else {
+        // --- LOCAL FLOW: START SERVER IN-PROCESS ---
+        let server_entity = selected_entity.clone();
+        tokio::spawn(async move {
+            let _ = crate::server::start_all_servers(Some(server_entity)).await;
+        });
+        // Dar tiempo al servidor local para arrancar antes de mostrar el monitor
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
-
-    // Levantamos los servidores automáticamente SOLO si no estamos en Docker
-    // ... rest of the code ...
 
 
     let log_path = "data/server.log";
     if std::path::Path::new(log_path).exists() {
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(format!("tail -f -n 50 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Syncing|Dump|Rows|Error|Warn'", log_path, selected_entity))
+            .arg(format!("tail -f -n 0 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Error|Warn|AUTH'", log_path, selected_entity))
             .stdout(Stdio::piped())
             .spawn()?;
 

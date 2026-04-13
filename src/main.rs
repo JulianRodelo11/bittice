@@ -10,31 +10,26 @@ use bittice::cli::{Cli, Commands};
 async fn main() -> Result<()> {
     logging::init_logging();
     let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
-    let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
+    let is_docker_env = std::path::Path::new("/.dockerenv").exists();
     let is_pid1 = std::process::id() == 1;
 
     // Flow decision:
-    // 1. If we are PID 1 in Docker, we ALWAYS start the servers.
-    // 2. If we have CLI arguments or BITTICE_ENTITY, we run in command mode.
-    // 3. Otherwise, we run the REPL.
-
-    if is_docker && is_pid1 {
+    // 1. Docker Background Engine: PID 1 in Docker always starts servers.
+    if is_docker_env && is_pid1 {
         if std::env::args().len() == 1 && env_entity.is_none() {
-            info!("Docker Environment: Starting Bittice Engine (Config API available on port 3000)...");
+            info!("Docker Engine: Starting Bittice (PID 1)...");
             return bittice::server::start_all_servers(None).await;
         }
     }
 
+    // 2. CLI / Command mode
     if std::env::args().len() > 1 || env_entity.is_some() {
-        if let Some(ref e) = env_entity {
-            info!("Detected BITTICE_ENTITY from environment: '{}'", e);
-        }
-
         let cli = Cli::parse();
         match cli.command {
             Commands::Setup => {
                 let _ = bittice::repl::startup::run_startup_cliclack().await?;
             }
+            // ... rest of commands ...
 
             Commands::Cdc { url, entity, database } => {
                 // Check if there's a saved config with VPN for this entity

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use crate::server::table_manager::TableManager;
 use crate::core::types::{AuthContext, Filter, ComparisonOp};
 use crate::core::saved_queries::SavedAuthConfig;
-use tracing::{debug, warn};
+use tracing::{debug, warn, error};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 pub struct AuthService {
@@ -65,22 +65,42 @@ impl AuthService {
         let val = token_val.clone();
 
         let user_id = tokio::task::spawn_blocking(move || {
-            if let Ok(table_lock) = tm.get_table(&e_name, &t_name) {
-                let table = table_lock.read().unwrap();
-                let filter = Filter {
-                    field: t_col,
-                    op: ComparisonOp::Eq,
-                    value: val,
-                    value_options: vec![],
-                    field_type: None,
-                };
-                
-                let results = table.search(&[i_col], &[filter], &crate::core::types::LogicalOp::And, &[], &[], 1, 0, None).ok()?;
-                if !results.rows.is_empty() {
-                    return results.rows[0].get(0).cloned();
+            match tm.get_table(&e_name, &t_name) {
+                Ok(table_lock) => {
+                    let table = table_lock.read().unwrap();
+                    let filter = Filter {
+                        field: t_col.clone(),
+                        op: ComparisonOp::Eq,
+                        value: val.clone(),
+                        value_options: vec![],
+                        field_type: None,
+                    };
+                    
+                    debug!("AUTH: Searching in table '{}' for {} = '{}'...", t_name, t_col, val);
+                    match table.search(&[i_col], &[filter], &crate::core::types::LogicalOp::And, &[], &[], 1, 0, None) {
+                        Ok(results) => {
+                            if !results.rows.is_empty() {
+                                let found_id = results.rows[0].get(0).cloned();
+                                debug!("AUTH: Match found! user_id = {:?}", found_id);
+                                found_id
+                            } else {
+                                let total_rows: u64 = table.manifest.segments.iter().map(|s| s.record_count).sum();
+                                warn!("AUTH: No record found in table '{}' for {} = '{}'. Total rows in table: {}", 
+                                    t_name, t_col, val, total_rows);
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            error!("AUTH: Search error in table '{}': {}", t_name, e);
+                            None
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("AUTH: Could not open table '{}' for entity '{}': {}", t_name, e_name, e);
+                    None
                 }
             }
-            None
         }).await.ok().flatten();
 
         if let Some(uid) = user_id {
