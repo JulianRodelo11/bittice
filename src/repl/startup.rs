@@ -151,6 +151,15 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 if std::path::Path::new(&input_val).exists() {
                     found_path = Some(input_val.clone());
                 } else {
+                    // Smart detection of "Local Path on Remote Instance" mistake
+                    let is_linux = cfg!(target_os = "linux");
+                    if is_linux && (input_val.starts_with("/Users/") || input_val.starts_with("C:\\") || input_val.starts_with("/home/")) {
+                         return Err(anyhow::anyhow!(
+                            "Path Error: You are providing a LOCAL path from your PC ('{}'),\nbut Bittice is running on a REMOTE Cloud Instance.\n\nTips:\n1. Open the .ovpn file on your computer.\n2. COPY all its text content.\n3. PASTE it here directly.",
+                            input_val
+                        ));
+                    }
+
                     for i in 0..parts.len() {
                         let sub_path = parts[i..].join("/");
                         let candidate = format!("/app/host_home/{}", sub_path);
