@@ -27,4 +27,6 @@ pub enum Commands {
     Update,
     /// Uninstall Bittice from your system
     Uninstall,
+    /// Run the interactive configuration wizard
+    Setup,
 }

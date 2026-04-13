@@ -113,23 +113,28 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
             // OpenVPN logic
             let input_val = if is_cloud_env {
-                println!("\x1b[34m│\x1b[0m");
-                println!("\x1b[32m◆\x1b[0m  \x1b[1mProvide OpenVPN configuration\x1b[0m");
-                println!("\x1b[90m│\x1b[0m  \x1b[90m1. Copy the entire content of your .ovpn file\x1b[0m");
-                println!("\x1b[90m│\x1b[0m  \x1b[90m2. Paste it here\x1b[0m");
-                println!("\x1b[90m│\x1b[0m  \x1b[90m3. Type 'END' on a new line and press Enter to finish\x1b[0m");
-                println!("\x1b[90m│\x1b[0m");
+                cliclack::note(
+                    "OpenVPN Configuration",
+                    "1. Copy your .ovpn content\n2. Paste it here\n3. Type 'END' on its own line and press Enter to save"
+                )?;
 
                 let mut buffer = String::new();
-                let stdin = std::io::stdin();
-                for line in std::io::BufRead::lines(stdin.lock()) {
-                    let l = line?;
-                    if l.trim() == "END" { break; }
-                    buffer.push_str(&l);
-                    buffer.push('\n');
-                    // Stop automatically if we see the end of a standard OVPN block
-                    if l.contains("-----END OpenVPN Static key V1-----") || l.contains("</ca>") || l.contains("</tls-auth>") {
-                        println!("\x1b[90m│\x1b[0m  \x1b[32mEnd of file detected.\x1b[0m");
+                use std::io::{self, BufRead};
+                let stdin = io::stdin();
+                let mut handle = stdin.lock();
+                
+                loop {
+                    let mut line = String::new();
+                    handle.read_line(&mut line)?;
+                    if line.trim() == "END" { break; }
+                    if line.is_empty() { break; } // EOF
+                    buffer.push_str(&line);
+                    
+                    // Auto-detection of standard OVPN endings to avoid manual 'END'
+                    if line.contains("-----END OpenVPN Static key V1-----") || 
+                       line.contains("</ca>") || 
+                       line.contains("</tls-auth>") {
+                        println!("\x1b[90m│\x1b[0m  \x1b[32mEnd of certificate detected.\x1b[0m");
                         break;
                     }
                 }
