@@ -112,16 +112,31 @@ if is_cloud_instance; then
              sudo chmod +x /usr/local/bin/docker-compose
         fi
 
-        # Pull image
-        echo -e "${BLUE}Pulling Bittice Docker image...${NC}"
-        docker pull julianrodelo/bittice:latest
+        # 1. Prepare Local Dockerfile
+        echo -e "${BLUE}Preparing local Docker image...${NC}"
+        cat > Dockerfile.local <<EOF
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates libc6 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY bittice /usr/local/bin/bittice
+RUN chmod +x /usr/local/bin/bittice
+EXPOSE 3000 50051
+ENTRYPOINT ["bittice"]
+EOF
 
-        # Create docker-compose.yml
+        # 2. Build local image
+        echo -e "${BLUE}Building Bittice Docker image locally...${NC}"
+        # We need the binary in the current directory for the Docker build context
+        cp "$INSTALL_DIR/$BINARY_NAME" .
+        docker build -t bittice:local -f Dockerfile.local .
+        rm bittice Dockerfile.local
+
+        # 3. Create docker-compose.yml
         if [ ! -f "docker-compose.yml" ]; then
             cat > docker-compose.yml <<EOF
 services:
   bittice:
-    image: julianrodelo/bittice:latest
+    image: bittice:local
     container_name: bittice-engine
     restart: always
     environment:
@@ -132,7 +147,7 @@ services:
     volumes:
       - ./data:/app/data
 EOF
-            echo -e "${GREEN}Created docker-compose.yml.${NC}"
+            echo -e "${GREEN}Created docker-compose.yml using local image.${NC}"
         fi
 
         echo -e "\n${GREEN}Instance Setup Complete!${NC}"

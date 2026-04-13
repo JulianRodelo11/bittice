@@ -235,7 +235,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
                         
                         let compose_content = format!(r#"services:
   bittice-{entity}:
-    image: julianrodelo/bittice:latest
+    image: bittice:local
     container_name: bittice-{entity}
     restart: always
     environment:
