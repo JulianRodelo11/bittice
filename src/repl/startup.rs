@@ -112,15 +112,37 @@ pub async fn run_startup_cliclack() -> Result<()> {
             }
 
             // OpenVPN logic
-            let prompt_msg = if is_cloud_env {
-                "Provide OpenVPN configuration (PASTE the .ovpn file content here)"
+            let input_val = if is_cloud_env {
+                println!("\x1b[34m│\x1b[0m");
+                println!("\x1b[32m◆\x1b[0m  \x1b[1mProvide OpenVPN configuration\x1b[0m");
+                println!("\x1b[90m│\x1b[0m  \x1b[90m1. Copy the entire content of your .ovpn file\x1b[0m");
+                println!("\x1b[90m│\x1b[0m  \x1b[90m2. Paste it here\x1b[0m");
+                println!("\x1b[90m│\x1b[0m  \x1b[90m3. Type 'END' on a new line and press Enter to finish\x1b[0m");
+                println!("\x1b[90m│\x1b[0m");
+
+                let mut buffer = String::new();
+                let stdin = std::io::stdin();
+                for line in std::io::BufRead::lines(stdin.lock()) {
+                    let l = line?;
+                    if l.trim() == "END" { break; }
+                    buffer.push_str(&l);
+                    buffer.push('\n');
+                    // Stop automatically if we see the end of a standard OVPN block
+                    if l.contains("-----END OpenVPN Static key V1-----") || l.contains("</ca>") || l.contains("</tls-auth>") {
+                        println!("\x1b[90m│\x1b[0m  \x1b[32mEnd of file detected.\x1b[0m");
+                        break;
+                    }
+                }
+                buffer.trim().to_string()
             } else {
-                "Provide OpenVPN configuration (Paste .ovpn content OR enter Path)"
+                input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
+                    .placeholder("/Users/.../vpn.ovpn or config text")
+                    .interact()?
             };
 
-            let input_val: String = input(prompt_msg)
-                .placeholder("client\ndev tun\n...")
-                .interact()?;
+            if input_val.is_empty() {
+                return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
+            }
 
             let vpn_storage = std::path::Path::new("data/vpn");
             std::fs::create_dir_all(vpn_storage)?;
