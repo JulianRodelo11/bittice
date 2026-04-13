@@ -30,6 +30,22 @@ fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn list_available_ovpn_configs(vpn_storage: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(vpn_storage) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".ovpn") {
+                    files.push(name);
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 pub async fn run_startup_cliclack() -> Result<()> {
     intro("Bittice")?;
 
@@ -108,39 +124,69 @@ pub async fn run_startup_cliclack() -> Result<()> {
             }
 
             // OpenVPN logic
-            let input_val = if is_cloud_env {
-                println!("\x1b[34m│\x1b[0m");
-                println!("\x1b[32m◆\x1b[0m  \x1b[1mProvide OpenVPN configuration\x1b[0m");
-                println!("\x1b[90m│\x1b[0m  \x1b[90mPaste your .ovpn content below.\x1b[0m");
-                println!("\x1b[90m│\x1b[0m  \x1b[90m(Your input will be hidden for privacy. Type 'END' + Enter when finished)\x1b[0m");
-                println!("\x1b[90m│\x1b[0m");
+            let vpn_storage = crate::core::vpn::VpnManager::storage_dir();
+            std::fs::create_dir_all(&vpn_storage)?;
+            let available_configs = list_available_ovpn_configs(&vpn_storage);
 
-                let mut buffer = String::new();
-                
-                // Deshabilitar el eco de la terminal para privacidad absoluta
-                let term = console::Term::stdout();
-                let _ = std::process::Command::new("stty").arg("-echo").status();
-                
-                loop {
-                    let line = term.read_line()?;
-                    if line.trim() == "END" || line.is_empty() { break; }
-                    buffer.push_str(&line);
-                    buffer.push('\n');
-                    
-                    // Auto-detección del final del archivo
-                    if line.contains("-----END OpenVPN Static key V1-----") || 
-                       line.contains("</ca>") || 
-                       line.contains("</tls-auth>") {
-                        break;
+            let input_val = if is_cloud_env {
+                let source_mode: u8 = if available_configs.is_empty() {
+                    println!("\x1b[34m│\x1b[0m");
+                    println!("\x1b[33m▲\x1b[0m  \x1b[1mNo uploaded VPN configs found\x1b[0m");
+                    println!("\x1b[90m│\x1b[0m  \x1b[90mUpload your .ovpn file to {} and run setup again, or paste it now.\x1b[0m", vpn_storage.display());
+                    1
+                } else {
+                    select("How do you want to provide the OpenVPN config?")
+                        .item(0, "Use uploaded config", "Choose an .ovpn file already stored on this instance")
+                        .item(1, "Paste config now", "Paste the OpenVPN content directly")
+                        .item(2, "Use URL or path", "Download from URL or copy from an accessible path")
+                        .interact()?
+                };
+
+                match source_mode {
+                    0 => {
+                        let mut picker = select("Select the uploaded OpenVPN config");
+                        for (i, file) in available_configs.iter().enumerate() {
+                            picker = picker.item(i, file, "Stored in persistent VPN folder");
+                        }
+                        let chosen_idx = picker.interact()?;
+                        vpn_storage.join(&available_configs[chosen_idx]).to_string_lossy().to_string()
+                    }
+                    2 => {
+                        input("Provide OpenVPN URL or file path")
+                            .placeholder("https://.../vpn.ovpn or /app/vpn/my-vpn.ovpn")
+                            .interact()?
+                    }
+                    _ => {
+                        println!("\x1b[34m│\x1b[0m");
+                        println!("\x1b[32m◆\x1b[0m  \x1b[1mProvide OpenVPN configuration\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[90mPaste your .ovpn content below.\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m  \x1b[90m(Your input will be hidden for privacy. Type 'END' + Enter when finished)\x1b[0m");
+                        println!("\x1b[90m│\x1b[0m");
+
+                        let mut buffer = String::new();
+                        let term = console::Term::stdout();
+                        let _ = std::process::Command::new("stty").arg("-echo").status();
+
+                        loop {
+                            let line = term.read_line()?;
+                            if line.trim() == "END" || line.is_empty() { break; }
+                            buffer.push_str(&line);
+                            buffer.push('\n');
+
+                            if line.contains("-----END OpenVPN Static key V1-----") ||
+                               line.contains("</ca>") ||
+                               line.contains("</tls-auth>") {
+                                break;
+                            }
+                        }
+
+                        let _ = std::process::Command::new("stty").arg("echo").status();
+                        let _ = term.clear_last_lines(buffer.lines().count() + 5);
+
+                        println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and protected (Sensitive data cleared from terminal).\x1b[0m");
+                        buffer.trim().to_string()
                     }
                 }
-                
-                // Reactivar el echo y LIMPIAR las líneas pegadas de la terminal
-                let _ = std::process::Command::new("stty").arg("echo").status();
-                let _ = term.clear_last_lines(buffer.lines().count() + 5);
-                
-                println!("\x1b[90m│\x1b[0m  \x1b[32m✓ Configuration received and protected (Sensitive data cleared from terminal).\x1b[0m");
-                buffer.trim().to_string()
             } else {
                 input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
                     .placeholder("/Users/.../vpn.ovpn or config text")
@@ -151,8 +197,6 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
             }
 
-            let vpn_storage = crate::core::vpn::VpnManager::storage_dir();
-            std::fs::create_dir_all(&vpn_storage)?;
             let final_vpn_path: String;
 
             // 1. Check if it's a URL
