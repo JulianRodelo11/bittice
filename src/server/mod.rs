@@ -77,7 +77,7 @@ pub(crate) async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> a
 pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let table_manager = Arc::new(TableManager::new());
-    let active_workers = Arc::new(TokioRwLock::new(HashSet::new()));
+    let active_workers = Arc::new(StdRwLock::new(HashSet::new()));
     
     // Convert entity_filter to lowercase and trim it
     let entity_filter = entity_filter.map(|e| e.trim().to_lowercase());
@@ -111,19 +111,20 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
 }
 
 use std::collections::HashSet;
+use std::sync::RwLock as StdRwLock;
 
 pub struct ServerState {
     pub table_manager: Arc<TableManager>,
     pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
     pub entity_filter: Option<String>,
     pub auth_service: crate::core::auth::AuthService,
-    pub active_workers: Arc<TokioRwLock<HashSet<String>>>,
+    pub active_workers: Arc<StdRwLock<HashSet<String>>>,
 }
 
 pub fn scan_and_start_cdc(
     table_manager: Arc<TableManager>, 
     entity_filter: Option<String>,
-    active_workers: Arc<TokioRwLock<HashSet<String>>>
+    active_workers: Arc<StdRwLock<HashSet<String>>>
 ) {
     let data_dir = std::path::Path::new("data");
     
@@ -153,7 +154,7 @@ pub fn scan_and_start_cdc(
                             // Check if worker is already active
                             let entity_key = entity.clone();
                             {
-                                let active = active_workers.blocking_read();
+                                let active = active_workers.read().unwrap();
                                 if active.contains(&entity_key) {
                                     continue;
                                 }
@@ -186,7 +187,7 @@ pub fn scan_and_start_cdc(
 
                             // Mark as active
                             {
-                                let mut active = active_workers.blocking_write();
+                                let mut active = active_workers.write().unwrap();
                                 active.insert(entity_key);
                             }
 
@@ -214,7 +215,7 @@ pub fn scan_and_start_cdc(
 pub async fn start_server(
     table_manager: Arc<TableManager>, 
     entity_filter: Option<String>, 
-    active_workers: Arc<TokioRwLock<HashSet<String>>>,
+    active_workers: Arc<StdRwLock<HashSet<String>>>,
     shutdown_rx: oneshot::Receiver<()>
 ) {
     let state = Arc::new(ServerState {
