@@ -175,6 +175,22 @@ pub fn scan_and_start_cdc(
                                 "3306".to_string()
                             };
 
+                            if let Some(vpn_path) = config["vpn_file"].as_str() {
+                                if !vpn_path.trim().is_empty() {
+                                    info!("CDC: Auto-starting VPN from saved config for entity '{}'...", entity);
+                                    match crate::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &host) {
+                                        Ok(prepared) => {
+                                            if let Err(e) = crate::core::vpn::VpnManager::start(&prepared) {
+                                                warn!("CDC: Failed to start VPN for entity '{}': {}", entity, e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("CDC: Failed to prepare VPN file for entity '{}': {}", entity, e);
+                                        }
+                                    }
+                                }
+                            }
+
                             let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
                             if (host == "localhost" || host == "0.0.0.0") && is_docker {
                                 host = "host.docker.internal".to_string();

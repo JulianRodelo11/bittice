@@ -15,7 +15,7 @@ DEFAULT_CLOUD_APP_DIR="${HOME}/.bittice"
 # - BITTICE_SETUP_DOCKER: true/false (forces docker setup decision on cloud)
 # - BITTICE_CLOUD_AUTO: true/false (if true, skips prompts on cloud)
 # - BITTICE_APP_DIR: cloud working directory (compose/data). Default: ~/.bittice
-# - BITTICE_VPN_MODE: host|container (default: host)
+# - BITTICE_VPN_MODE: host|container (default on cloud: container)
 # - BITTICE_VERSION: install a specific release tag (e.g. v0.1.56)
 
 # Terminal colors
@@ -215,7 +215,7 @@ EOF
 
                 # 2. Create or Update cloud docker-compose.yml (Permanent Service)
                 APP_DIR="${BITTICE_APP_DIR:-$DEFAULT_CLOUD_APP_DIR}"
-                VPN_MODE_RAW="${BITTICE_VPN_MODE:-host}"
+                VPN_MODE_RAW="${BITTICE_VPN_MODE:-container}"
                 VPN_MODE=$(echo "$VPN_MODE_RAW" | tr '[:upper:]' '[:lower:]')
                 if [ "$VPN_MODE" != "container" ]; then
                         VPN_MODE="host"
