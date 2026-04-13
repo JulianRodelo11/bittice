@@ -134,11 +134,24 @@ EOF
         fi
 
         # 2. Create or Update docker-compose.yml (Permanent Service)
-        # Force container_name to be 'bittice' for the wrapper to work
         if [ -f "docker-compose.yml" ]; then
-            # If it exists, ensure it uses the 'bittice' container name and latest image
-            sed -i 's/container_name: .*/container_name: bittice/' docker-compose.yml
-            sed -i "s|image: .*|image: $IMAGE_NAME|" docker-compose.yml
+            # Heavy cleaning: ensure we have a clean service definition named 'bittice'
+            # We recreate it to avoid naming conflicts in service keys vs container names
+            cat > docker-compose.yml <<EOF
+services:
+  bittice:
+    image: $IMAGE_NAME
+    container_name: bittice
+    restart: always
+    environment:
+      - BITTICE_HOST=0.0.0.0
+    ports:
+      - "3000:3000"
+      - "50051:50051"
+    volumes:
+      - ./data:/app/data
+EOF
+            echo -e "${GREEN}Updated docker-compose.yml to use unified 'bittice' service.${NC}"
         else
             cat > docker-compose.yml <<EOF
 services:
@@ -159,9 +172,12 @@ EOF
 
         # 3. Start/Restart Bittice Service immediately
         echo -e "${BLUE}Starting Bittice Engine...${NC}"
+        # Stop everything first to ensure a clean state
         if command -v docker-compose &> /dev/null; then
+            docker-compose down &> /dev/null || true
             docker-compose up -d --remove-orphans
         else
+            docker compose down &> /dev/null || true
             docker compose up -d --remove-orphans
         fi
 
@@ -177,8 +193,8 @@ EOF
         echo -e "\n${GREEN}Bittice is now running in the background!${NC}"
         echo -e "Launching setup wizard...\n"
         
-        # 5. Launch Setup Wizard (Now through the wrapper)
-        bittice setup
+        # 5. Launch Setup Wizard (Ensuring TTY for piped installs)
+        docker exec -it bittice bittice setup < /dev/tty
     fi
 fi
 
