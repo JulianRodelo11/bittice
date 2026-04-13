@@ -119,8 +119,7 @@ impl VpnManager {
         let baseline_options = [
             "client",
             "dev tun",
-            "data-ciphers AES-256-GCM:AES-128-GCM:BF-CBC",
-            "data-ciphers-fallback BF-CBC",
+            "data-ciphers AES-256-GCM:AES-128-GCM",
         ];
 
         for opt in &baseline_options {
