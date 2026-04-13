@@ -33,7 +33,14 @@ impl AuthService {
             return None;
         }
 
-        let resolved_table_name = resolve_table_name_case_insensitive(entity, &c.table);
+        let Some(resolved_table_name) = resolve_table_name_case_insensitive(entity, &c.table) else {
+            warn!(
+                "AUTH: Auth table '{}' not found on disk for entity '{}'. Skipping identity resolution.",
+                c.table,
+                entity
+            );
+            return None;
+        };
         debug!(
             "AUTH: Using resolved auth table '{}' (configured '{}'), {} token candidate(s)",
             resolved_table_name,
@@ -139,18 +146,54 @@ fn build_token_candidates(token: &str) -> Vec<String> {
     candidates
 }
 
-fn resolve_table_name_case_insensitive(entity: &str, configured_table: &str) -> String {
+fn resolve_table_name_case_insensitive(entity: &str, configured_table: &str) -> Option<String> {
     let path = Path::new("data").join(entity);
     let configured_lower = configured_table.to_lowercase();
+
+    if path.join(configured_table).is_dir() {
+        return Some(configured_table.to_string());
+    }
+
+    let mut candidates: Vec<(String, u64)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.to_lowercase() == configured_lower {
-                    return name;
+                    let records = read_table_record_count(&entry.path());
+                    candidates.push((name, records));
                 }
             }
         }
     }
-    configured_table.to_string()
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some((exact, _)) = candidates.iter().find(|(name, _)| name == configured_table) {
+        return Some(exact.clone());
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Some(candidates[0].0.clone())
+}
+
+fn read_table_record_count(table_path: &Path) -> u64 {
+    let manifest_path = table_path.join("manifest.json");
+    let Ok(content) = std::fs::read_to_string(manifest_path) else {
+        return 0;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return 0;
+    };
+    json.get("segments")
+        .and_then(|v| v.as_array())
+        .map(|segments| {
+            segments
+                .iter()
+                .map(|s| s.get("record_count").and_then(|v| v.as_u64()).unwrap_or(0))
+                .sum::<u64>()
+        })
+        .unwrap_or(0)
 }
