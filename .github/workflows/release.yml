@@ -16,11 +16,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact_name: bittice-linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             artifact_name: bittice-linux-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -37,7 +37,9 @@ jobs:
       
       - name: Install Compilers (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
