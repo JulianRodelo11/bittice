@@ -222,11 +222,13 @@ impl VpnManager {
             .map(|s| s.success())
             .unwrap_or(false);
 
-        if running {
+        let tail = fs::read_to_string(&log_path).unwrap_or_default();
+        let initialized = tail.contains("Initialization Sequence Completed");
+
+        if running || initialized {
             info!("OpenVPN is running.");
             Ok(())
         } else {
-            let tail = fs::read_to_string(&log_path).unwrap_or_default();
             let excerpt = tail.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
             Err(anyhow::anyhow!("OpenVPN failed to stay running. Log: {}", excerpt))
         }
