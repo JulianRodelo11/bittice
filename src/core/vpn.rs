@@ -113,7 +113,7 @@ impl VpnManager {
         let mut content = fs::read_to_string(&path)?;
         let split_tunnel = std::env::var("BITTICE_VPN_SPLIT_TUNNEL")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
+            .unwrap_or_else(|_| is_docker());
 
         // 1. Add baseline compatibility options only.
         let baseline_options = [

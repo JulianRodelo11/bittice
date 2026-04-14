@@ -236,6 +236,7 @@ services:
         environment:
             - BITTICE_HOST=0.0.0.0
             - BITTICE_VPN_DIR=/app/vpn
+            - BITTICE_VPN_SPLIT_TUNNEL=true
         ports:
             - "3000:3000"
             - "50051:50051"
@@ -259,6 +260,7 @@ services:
         environment:
             - BITTICE_HOST=0.0.0.0
             - BITTICE_VPN_DIR=/app/vpn
+            - BITTICE_VPN_SPLIT_TUNNEL=true
         ports:
             - "3000:3000"
             - "50051:50051"
