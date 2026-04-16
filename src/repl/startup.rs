@@ -340,7 +340,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
 
 
     let log_path = "data/server.log";
-    if std::path::Path::new(log_path).exists() {
+    if is_docker && std::path::Path::new(log_path).exists() {
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(format!("tail -f -n 0 {} | grep --line-buffered -i -E '{}|GET|POST|PUT|DELETE|CDC|Error|Warn|AUTH'", log_path, selected_entity))

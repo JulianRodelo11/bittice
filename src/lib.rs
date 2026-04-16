@@ -2,6 +2,7 @@ pub mod core {
     pub mod auth;
     pub mod config;
     pub mod date_utils;
+    pub mod join_query;
     pub mod writer;
     pub mod query;
     pub mod saved_queries;

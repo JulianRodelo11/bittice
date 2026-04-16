@@ -30,6 +30,10 @@ pub struct SavedQuery {
     pub entity: String,
     pub table: String,
     #[serde(default)]
+    pub table_alias: Option<String>,
+    #[serde(default)]
+    pub joins: Vec<SavedJoin>,
+    #[serde(default)]
     pub filters: Vec<SavedFilter>,
     #[serde(default = "default_filters_op")]
     pub filters_op: String, // "And" or "Or"
@@ -43,9 +47,48 @@ pub struct SavedQuery {
     pub limit_param: Option<String>,
     #[serde(default)]
     pub selected_fields: Vec<String>,
+    #[serde(default)]
+    pub select: Vec<SavedSelectField>,
+    #[serde(default)]
+    pub response_grouping: Option<SavedResponseGrouping>,
     /// Configuration for Row-Level Security via Bearer Token
     #[serde(default)]
     pub auth_config: Option<SavedAuthConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedResponseGrouping {
+    pub field: String,
+    #[serde(default = "default_group_items_as")]
+    pub items_as: String,
+    #[serde(default)]
+    pub include_group_field_in_items: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedJoin {
+    #[serde(rename = "type", default = "default_join_type")]
+    pub join_type: String,
+    pub table: String,
+    #[serde(default)]
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub on: Vec<SavedJoinCondition>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedJoinCondition {
+    pub left: String,
+    #[serde(default = "default_join_op")]
+    pub op: String,
+    pub right: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedSelectField {
+    pub field: String,
+    #[serde(rename = "as", default)]
+    pub output_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -59,6 +102,18 @@ pub struct SavedAuthConfig {
 
 fn default_filters_op() -> String {
     "And".to_string()
+}
+
+fn default_join_type() -> String {
+    "Inner".to_string()
+}
+
+fn default_join_op() -> String {
+    "Eq".to_string()
+}
+
+fn default_group_items_as() -> String {
+    "items".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -131,6 +186,21 @@ impl SavedOperation {
             SavedOperation::Delete(d) => &d.name,
             SavedOperation::Batch(b) => &b.name,
         }
+    }
+}
+
+impl SavedQuery {
+    pub fn is_multi_table(&self) -> bool {
+        !self.joins.is_empty()
+    }
+
+    pub fn base_alias(&self) -> String {
+        self.table_alias
+            .as_ref()
+            .map(|alias| alias.trim())
+            .filter(|alias| !alias.is_empty())
+            .unwrap_or(self.table.as_str())
+            .to_string()
     }
 }
 

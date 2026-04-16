@@ -113,6 +113,130 @@ Envía una solicitud `POST` a `http://localhost:3000/_config` con la definición
 ### Eliminar una Consulta (DELETE)
 `DELETE http://localhost:3000/_config?name=ventas_recientes`
 
+### Crear una Consulta Multi-Tabla (POST)
+Las operaciones `read` ahora pueden unir varias tablas sin cambiar el formato actual de una sola tabla. La consulta multi-tabla mantiene `table` como tabla base y añade `table_alias`, `joins` y `select`.
+
+```json
+{
+  "type": "read",
+  "details": {
+    "name": "sesiones_con_usuarios",
+    "entity": "goparking",
+    "table": "Sessions",
+    "table_alias": "s",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "Users",
+        "alias": "u",
+        "on": [
+          { "left": "s.userId", "op": "Eq", "right": "u.id" }
+        ]
+      }
+    ],
+    "filters": [
+      { "field": "s.status", "op": "Eq", "value": "OPEN" },
+      { "field": "u.document", "op": "Eq", "value": "$document" }
+    ],
+    "select": [
+      { "field": "s.id", "as": "session_id" },
+      { "field": "s.plate", "as": "plate" },
+      { "field": "u.name", "as": "user_name" }
+    ],
+    "order_by": [{ "field": "s.createdAt", "direction": "Desc" }],
+    "limit": 50
+  }
+}
+```
+
+Alcance actual para operaciones multi-tabla:
+
+- Solo `INNER` y `LEFT JOIN`.
+- Solo joins por igualdad (`Eq` dentro de `on`).
+- Queries guardadas por REST y `ExecuteSavedQuery` / `ExecuteSavedQueryUnary` en gRPC.
+- `Search` / `SearchUnary` directos siguen siendo de una sola tabla para preservar el contrato actual.
+
+### Agrupar la Respuesta REST por una Clave
+Si quieres que la respuesta REST no llegue plana, sino agrupada por una clave, puedes usar `response_grouping`. Esto es útil para obtener estructuras como `parqueaderoId -> horarios_por_dia`.
+
+```json
+{
+  "type": "read",
+  "details": {
+    "name": "horarios_agrupados_parqueaderos",
+    "entity": "inside",
+    "table": "ParqueaderoHorario",
+    "table_alias": "ph",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "Dia",
+        "alias": "d",
+        "on": [
+          { "left": "ph.diaId", "op": "Eq", "right": "d.diaId" }
+        ]
+      }
+    ],
+    "filters": [
+      { "field": "d.esActivo", "op": "Eq", "value": "1" }
+    ],
+    "filters_op": "And",
+    "order_by": [
+      { "field": "ph.parqueaderoId", "direction": "Asc" },
+      { "field": "ph.diaId", "direction": "Asc" }
+    ],
+    "select": [
+      { "field": "ph.parqueaderoId", "as": "parqueaderoId" },
+      { "field": "ph.diaId", "as": "diaId" },
+      { "field": "ph.horaApertura", "as": "horaApertura" },
+      { "field": "ph.horaCierre", "as": "horaCierre" },
+      { "field": "d.nombre", "as": "diaNombre" },
+      { "field": "d.abreviatura", "as": "diaAbreviatura" }
+    ],
+    "response_grouping": {
+      "field": "parqueaderoId",
+      "items_as": "horarios_por_dia"
+    }
+  }
+}
+```
+
+La respuesta REST quedará así:
+
+```json
+{
+  "data": [
+    {
+      "parqueaderoId": 5,
+      "horarios_por_dia": [
+        {
+          "diaId": 2,
+          "horaApertura": "05:43",
+          "horaCierre": "08:43",
+          "diaNombre": "Lunes",
+          "diaAbreviatura": "L"
+        },
+        {
+          "diaId": 3,
+          "horaApertura": "05:43",
+          "horaCierre": "08:43",
+          "diaNombre": "Martes",
+          "diaAbreviatura": "M"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notas sobre `response_grouping`:
+
+- Solo aplica a respuestas REST de operaciones guardadas.
+- Agrupa usando el nombre de campo ya proyectado en `select` o `selected_fields`.
+- Por defecto elimina el campo de agrupación de cada item interno.
+- Cuando se usa, Bittice intenta reunir todas las filas necesarias para devolver la respuesta agrupada y omite `pagination`.
+- Por seguridad, la respuesta agrupada está limitada a `10000` filas fuente.
+
 ---
 
 ## 🌐 Referencia de la API
@@ -128,7 +252,7 @@ Envía una solicitud `POST` a `http://localhost:3000/_config` con la definición
 
 Bittice proporciona una interfaz gRPC de alto rendimiento definida en `proto/bittice.proto`.
 
-- **`Search` / `SearchUnary`:** Búsqueda ad-hoc directa.
+- **`Search` / `SearchUnary`:** Búsqueda ad-hoc directa sobre una sola tabla.
 - **`ExecuteSavedQuery`:** Ejecuta una operación preconfigurada por nombre.
 - **`SubscribeUpdates` (Tiempo real):** Transmisión de actualizaciones para una tabla específica. Recibe notificaciones instantáneas cuando los datos cambian.
 

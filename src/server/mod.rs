@@ -25,6 +25,8 @@ use crate::core::storage::table::Table;
 use crate::server::table_manager::TableManager;
 use tracing::{info, debug, warn, error};
 
+const MAX_GROUPED_RESPONSE_ROWS: usize = 10_000;
+
 pub fn show_banner_with_filter(filter: Option<String>) {
     println!("\x1b[90m│\x1b[0m");
     println!("\x1b[32m◆\x1b[0m  \x1b[1mBittice Query Engine\x1b[0m");
@@ -274,18 +276,58 @@ pub async fn start_server(
                 let mut targets: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
                 for op in ops {
                     if let SavedOperation::Read(q) = op {
-                        let entry = targets.entry((q.entity.clone(), q.table.clone())).or_default();
-                        for f in &q.selected_fields { if f != "*" { entry.insert(f.clone()); } }
-                        for f in &q.filters { if f.field != "?" { entry.insert(f.field.clone()); } }
-                        for o in &q.order_by { entry.insert(o.field.clone()); }
-                        for agg in &q.aggregations {
-                            if let Some(obj) = agg.as_object() {
-                                for val in obj.values() {
-                                    if let Some(inner) = val.as_object() {
-                                        if let Some(f) = inner.get("field").and_then(|v| v.as_str()) {
-                                             if f != "?" { entry.insert(f.to_string()); }
-                                        }
+                        let base_alias = q.base_alias();
+                        for f in &q.selected_fields {
+                            if f != "*" {
+                                if let Some((alias, field)) = split_alias_field(f, &base_alias) {
+                                    if alias == base_alias {
+                                        targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
                                     }
+                                }
+                            }
+                        }
+                        for s in &q.select {
+                            if let Some((alias, field)) = split_alias_field(&s.field, &base_alias) {
+                                if alias == base_alias {
+                                    targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
+                                }
+                            }
+                        }
+                        for f in &q.filters {
+                            if f.field != "?" {
+                                if let Some((alias, field)) = split_alias_field(&f.field, &base_alias) {
+                                    let target_table = if alias == base_alias {
+                                        Some((q.entity.clone(), q.table.clone()))
+                                    } else {
+                                        q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
+                                    };
+                                    if let Some(key) = target_table {
+                                        targets.entry(key).or_default().insert(field);
+                                    }
+                                }
+                            }
+                        }
+                        for o in &q.order_by {
+                            if let Some((alias, field)) = split_alias_field(&o.field, &base_alias) {
+                                let target_table = if alias == base_alias {
+                                    Some((q.entity.clone(), q.table.clone()))
+                                } else {
+                                    q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
+                                };
+                                if let Some(key) = target_table {
+                                    targets.entry(key).or_default().insert(field);
+                                }
+                            }
+                        }
+                        for join in &q.joins {
+                            let join_alias = join.alias.as_deref().unwrap_or(join.table.as_str()).to_string();
+                            let join_entry = targets.entry((q.entity.clone(), join.table.clone())).or_default();
+                            for cond in &join.on {
+                                if let Some((alias, field)) = split_alias_field(&cond.left, &base_alias) {
+                                    if alias == join_alias { join_entry.insert(field); }
+                                }
+                                if let Some((alias, field)) = split_alias_field(&cond.right, &base_alias) {
+                                    if alias == join_alias { join_entry.insert(field); }
                                 }
                             }
                         }
@@ -675,8 +717,6 @@ async fn execute_read_operation(
     let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
     let offset = (page - 1) * limit;
 
-    let query_entity = query.entity.clone();
-    let query_table = query.table.clone();
     let state_search = state.clone();
     let sel_fields = query.selected_fields.clone();
     let aggs_query = query.aggregations.clone();
@@ -684,8 +724,158 @@ async fn execute_read_operation(
     let setup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let engine_start = std::time::Instant::now();
     let auth_ctx_clone = auth_context.cloned();
+    let result = run_query_page(
+        query.clone(),
+        params.clone(),
+        state_search,
+        auth_ctx_clone,
+        filters.clone(),
+        filters_op,
+        order_by.clone(),
+        aggs_query.clone(),
+        param_fields.clone(),
+        sel_fields.clone(),
+        limit,
+        offset,
+    ).await;
 
-    let result = tokio::task::spawn_blocking(move || {
+    let engine_total_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok(query_result) => {
+            let mapping_start = std::time::Instant::now();
+            let headers = query_result.headers.clone();
+            let source_total_found = query_result.total_found;
+            let mut rows = materialize_query_rows(&query_result, state.clone(), query, &headers).await;
+
+            if query.response_grouping.is_some() {
+                if source_total_found > rows.len() {
+                    if source_total_found > MAX_GROUPED_RESPONSE_ROWS {
+                        return Err((StatusCode::BAD_REQUEST, serde_json::json!({
+                            "error": "Grouped response too large",
+                            "details": format!("Grouped responses are limited to {} source rows", MAX_GROUPED_RESPONSE_ROWS)
+                        })));
+                    }
+
+                    let mut next_offset = offset + rows.len();
+                    while next_offset < source_total_found {
+                        let page_result = run_query_page(
+                            query.clone(),
+                            params.clone(),
+                            state.clone(),
+                            auth_context.cloned(),
+                            filters.clone(),
+                            filters_op,
+                            order_by.clone(),
+                            aggs_query.clone(),
+                            param_fields.clone(),
+                            sel_fields.clone(),
+                            limit,
+                            next_offset,
+                        ).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e.to_string() })))?;
+                        let page_rows = materialize_query_rows(&page_result, state.clone(), query, &headers).await;
+                        if page_rows.is_empty() {
+                            break;
+                        }
+                        next_offset += page_rows.len();
+                        rows.extend(page_rows);
+                        if rows.len() > MAX_GROUPED_RESPONSE_ROWS {
+                            return Err((StatusCode::BAD_REQUEST, serde_json::json!({
+                                "error": "Grouped response too large",
+                                "details": format!("Grouped responses are limited to {} source rows", MAX_GROUPED_RESPONSE_ROWS)
+                            })));
+                        }
+                    }
+                }
+            }
+
+            let row_to_json = |h: &[String], r: &Vec<String>| {
+                let mut m = serde_json::Map::new();
+                for (i, head) in h.iter().enumerate() {
+                    if let Some(val) = r.get(i) {
+                        let first = if val.is_empty() { b'\0' } else { val.as_bytes()[0] };
+                        let json_val = if !val.is_empty() && (first.is_ascii_digit() || first == b'-') {
+                            if let Ok(n) = val.parse::<i64>() { serde_json::Value::Number(n.into()) }
+                            else if let Ok(f) = val.parse::<f64>() { serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::String(val.clone())) }
+                            else { serde_json::Value::String(val.clone()) }
+                        } else { serde_json::Value::String(val.clone()) };
+                        m.insert(head.clone(), json_val);
+                    }
+                }
+                m
+            };
+
+            let data: Vec<_> = rows.into_par_iter().map(|r| row_to_json(&headers, &r)).collect();
+            let grouped_data = if let Some(grouping) = &query.response_grouping {
+                Some(group_rows_by_field(&data, grouping).map_err(|e| (StatusCode::BAD_REQUEST, serde_json::json!({ "error": e })))?)
+            } else {
+                None
+            };
+            let aggregations_data: Option<Vec<_>> = query_result.aggregations.map(|aggs| {
+                aggs.into_iter().map(|agg| {
+                    let agg_h = agg.headers;
+                    let rows_j: Vec<_> = agg.rows.into_iter().map(|r| row_to_json(&agg_h, &r)).collect();
+                    serde_json::json!({ "data": rows_j, "summary": agg.summary })
+                }).collect()
+            });
+
+            let mut response = serde_json::Map::new();
+            response.insert("data".to_string(), grouped_data.unwrap_or_else(|| serde_json::json!(data)));
+            if let Some(aggs) = aggregations_data { response.insert("aggregations".to_string(), serde_json::json!(aggs)); }
+            response.insert("meta".to_string(), serde_json::json!({ "engine_time_ms": query_result.execution_time_micros as f64 / 1000.0, "engine_total_ms": engine_total_ms, "ops_load_ms": ops_load_ms, "setup_ms": setup_ms, "mapping_ms": mapping_start.elapsed().as_secs_f64()*1000.0, "total_server_ms": start_time.elapsed().as_secs_f64()*1000.0, "total_found": query_result.total_found, "fields_count": headers.len(), "debug_info": query_result.debug_info }));
+            if query.response_grouping.is_none() && query_result.total_found > 0 && !headers.is_empty() {
+                response.insert("pagination".to_string(), serde_json::json!({ "page": page, "per_page": limit, "total_pages": (query_result.total_found + limit - 1) / limit, "total_items": query_result.total_found }));
+            }
+            Ok(serde_json::Value::Object(response))
+        },
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e.to_string() })))
+    }
+}
+
+fn split_alias_field(value: &str, base_alias: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return None;
+    }
+
+    let mut parts = trimmed.splitn(2, '.');
+    let first = parts.next()?.trim();
+    match parts.next().map(str::trim) {
+        Some(field) if !field.is_empty() => Some((first.to_string(), field.to_string())),
+        _ => Some((base_alias.to_string(), first.to_string())),
+    }
+}
+
+async fn run_query_page(
+    query: crate::core::saved_queries::SavedQuery,
+    params: HashMap<String, String>,
+    state_search: Arc<ServerState>,
+    auth_ctx_clone: Option<AuthContext>,
+    filters: Vec<Filter>,
+    filters_op: LogicalOp,
+    order_by: Vec<OrderBy>,
+    aggs_query: Vec<serde_json::Value>,
+    param_fields: Vec<String>,
+    sel_fields: Vec<String>,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<crate::core::types::QueryResult> {
+    let query_entity = query.entity.clone();
+    let query_table = query.table.clone();
+    let query_owned = query.clone();
+
+    tokio::task::spawn_blocking(move || {
+        if query_owned.is_multi_table() {
+            return crate::core::join_query::execute_join_query(
+                &query_owned,
+                &params,
+                state_search.table_manager.clone(),
+                if param_fields.is_empty() { None } else { Some(param_fields.clone()) },
+                limit,
+                offset,
+                auth_ctx_clone.as_ref(),
+            );
+        }
+
         let t0 = std::time::Instant::now();
         let table_res = state_search.table_manager.get_table(&query_entity, &query_table);
         let t1 = std::time::Instant::now();
@@ -706,10 +896,16 @@ async fn execute_read_operation(
                         all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
                         if !all_cols.is_empty() { let _ = table.set_original_fields(all_cols.clone()); }
                     }
-                    let mut new_f = Vec::new(); let mut seen = std::collections::HashSet::new();
+                    let mut new_f = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
                     for f in f_search {
-                        if f == "*" { for c in &all_cols { if seen.insert(c.clone()) { new_f.push(c.clone()); } } }
-                        else { if seen.insert(f.clone()) { new_f.push(f); } }
+                        if f == "*" {
+                            for c in &all_cols {
+                                if seen.insert(c.clone()) { new_f.push(c.clone()); }
+                            }
+                        } else if seen.insert(f.clone()) {
+                            new_f.push(f);
+                        }
                     }
                     f_search = new_f;
                 }
@@ -721,64 +917,68 @@ async fn execute_read_operation(
                 let extra = format!(" | Open: {:.2}ms, Lock: {:.2}ms", open_ms, lock_ms);
                 if let Some(ref mut d) = res.debug_info { d.push_str(&extra); } else { res.debug_info = Some(extra); }
                 Ok(res)
-            },
+            }
             Err(e) => Err(e)
         }
-    }).await.unwrap();
+    }).await.unwrap()
+}
 
-    let engine_total_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
-    match result {
-        Ok(query_result) => {
-            let mapping_start = std::time::Instant::now();
-            let headers = query_result.headers.clone();
-            let rows = if query_result.rows.is_empty() && query_result.row_ids.is_some() {
-                let ids = query_result.row_ids.as_ref().unwrap().clone();
-                let tm = state.table_manager.clone();
-                let entity = query.entity.clone(); let table = query.table.clone();
-                let h_inner = headers.clone();
-                tokio::task::spawn_blocking(move || {
-                    let t_lock = tm.get_table(&entity, &table).unwrap();
-                    let t = t_lock.read().unwrap();
-                    t.get_rows_batch(&h_inner, &ids)
-                }).await.unwrap().unwrap_or_default()
-            } else { query_result.rows };
-
-            let row_to_json = |h: &[String], r: &Vec<String>| {
-                let mut m = serde_json::Map::new();
-                for (i, head) in h.iter().enumerate() {
-                    if let Some(val) = r.get(i) {
-                        let first = if val.is_empty() { b'\0' } else { val.as_bytes()[0] };
-                        let json_val = if !val.is_empty() && (first.is_ascii_digit() || first == b'-') {
-                            if let Ok(n) = val.parse::<i64>() { serde_json::Value::Number(n.into()) }
-                            else if let Ok(f) = val.parse::<f64>() { serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::String(val.clone())) }
-                            else { serde_json::Value::String(val.clone()) }
-                        } else { serde_json::Value::String(val.clone()) };
-                        m.insert(head.clone(), json_val);
-                    }
-                }
-                m
-            };
-
-            let data: Vec<_> = rows.into_par_iter().map(|r| row_to_json(&headers, &r)).collect();
-            let aggregations_data: Option<Vec<_>> = query_result.aggregations.map(|aggs| {
-                aggs.into_iter().map(|agg| {
-                    let agg_h = agg.headers;
-                    let rows_j: Vec<_> = agg.rows.into_iter().map(|r| row_to_json(&agg_h, &r)).collect();
-                    serde_json::json!({ "data": rows_j, "summary": agg.summary })
-                }).collect()
-            });
-
-            let mut response = serde_json::Map::new();
-            response.insert("data".to_string(), serde_json::json!(data));
-            if let Some(aggs) = aggregations_data { response.insert("aggregations".to_string(), serde_json::json!(aggs)); }
-            response.insert("meta".to_string(), serde_json::json!({ "engine_time_ms": query_result.execution_time_micros as f64 / 1000.0, "engine_total_ms": engine_total_ms, "ops_load_ms": ops_load_ms, "setup_ms": setup_ms, "mapping_ms": mapping_start.elapsed().as_secs_f64()*1000.0, "total_server_ms": start_time.elapsed().as_secs_f64()*1000.0, "total_found": query_result.total_found, "fields_count": headers.len(), "debug_info": query_result.debug_info }));
-            if query_result.total_found > 0 && !headers.is_empty() {
-                response.insert("pagination".to_string(), serde_json::json!({ "page": page, "per_page": limit, "total_pages": (query_result.total_found + limit - 1) / limit, "total_items": query_result.total_found }));
-            }
-            Ok(serde_json::Value::Object(response))
-        },
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e.to_string() })))
+async fn materialize_query_rows(
+    query_result: &crate::core::types::QueryResult,
+    state: Arc<ServerState>,
+    query: &crate::core::saved_queries::SavedQuery,
+    headers: &[String],
+) -> Vec<Vec<String>> {
+    if query_result.rows.is_empty() && query_result.row_ids.is_some() {
+        let ids = query_result.row_ids.as_ref().unwrap().clone();
+        let tm = state.table_manager.clone();
+        let entity = query.entity.clone();
+        let table = query.table.clone();
+        let h_inner = headers.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let t_lock = tm.get_table(&entity, &table).unwrap();
+            let t = t_lock.read().unwrap();
+            t.get_rows_batch(&h_inner, &ids)
+        }).await.unwrap().unwrap_or_default()
+    } else {
+        query_result.rows.clone()
     }
+}
+
+fn group_rows_by_field(
+    data: &[serde_json::Map<String, serde_json::Value>],
+    grouping: &crate::core::saved_queries::SavedResponseGrouping,
+) -> Result<serde_json::Value, String> {
+    let mut grouped = Vec::<serde_json::Map<String, serde_json::Value>>::new();
+    let mut index = std::collections::HashMap::<String, usize>::new();
+
+    for row in data {
+        let mut row = row.clone();
+        let key_value = row.get(&grouping.field)
+            .cloned()
+            .ok_or_else(|| format!("Grouping field '{}' was not found in the response fields", grouping.field))?;
+        let key = key_value.to_string();
+        let item = if grouping.include_group_field_in_items {
+            serde_json::Value::Object(row)
+        } else {
+            row.remove(&grouping.field);
+            serde_json::Value::Object(row)
+        };
+
+        if let Some(existing_index) = index.get(&key).copied() {
+            let group = grouped.get_mut(existing_index).unwrap();
+            let items = group.get_mut(&grouping.items_as).and_then(|value| value.as_array_mut()).ok_or_else(|| "Invalid grouped response state".to_string())?;
+            items.push(item);
+        } else {
+            let mut group = serde_json::Map::new();
+            group.insert(grouping.field.clone(), key_value);
+            group.insert(grouping.items_as.clone(), serde_json::Value::Array(vec![item]));
+            index.insert(key, grouped.len());
+            grouped.push(group);
+        }
+    }
+
+    Ok(serde_json::Value::Array(grouped.into_iter().map(serde_json::Value::Object).collect()))
 }
 
 async fn handle_insert(def: &crate::core::saved_queries::SavedInsert, payload: HashMap<String, String>, state: Arc<ServerState>) -> impl IntoResponse {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use crate::server::table_manager::TableManager;
 use crate::core::storage::table::Table;
-use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, FieldType};
+use crate::core::types::{Filter as CoreFilter, ComparisonOp, LogicalOp, SortDirection, OrderBy as CoreOrderBy, FieldType, QueryResult};
 use crate::core::saved_queries::{SavedOperation, SavedQuery};
 use std::collections::HashMap;
 use tracing::{info, debug, warn};
@@ -118,6 +118,55 @@ async fn execute_query_unary_internal(
     offset_override: u32,
     auth_context: Option<crate::core::types::AuthContext>,
 ) -> Result<SearchUnaryResponse, Status> {
+    match execute_query_result_internal(
+        query,
+        params_map,
+        table_manager,
+        limit_override,
+        offset_override,
+        auth_context,
+    ).await {
+        Ok(query_result) => {
+            let mut proto_rows = Vec::new();
+            for row in query_result.rows {
+                proto_rows.push(ProtoRow { values: row });
+            }
+
+            let mut proto_aggs = Vec::new();
+            if let Some(aggs) = query_result.aggregations {
+                for agg in aggs {
+                    let mut rows = Vec::new();
+                    for r in agg.rows { rows.push(ProtoRow { values: r }); }
+                    proto_aggs.push(ProtoAggregationResult {
+                        headers: agg.headers,
+                        rows,
+                        summary: agg.summary.unwrap_or(0.0),
+                    });
+                }
+            }
+
+            Ok(SearchUnaryResponse {
+                headers: query_result.headers,
+                rows: proto_rows,
+                total_found: query_result.total_found as u64,
+                execution_time_micros: query_result.execution_time_micros as u64,
+                debug_info: "".to_string(),
+                aggregations: proto_aggs,
+                pagination: None,
+            })
+        }
+        Err(status) => Err(status),
+    }
+}
+
+async fn execute_query_result_internal(
+    query: SavedQuery,
+    params_map: HashMap<String, String>,
+    table_manager: Arc<TableManager>,
+    limit_override: u32,
+    offset_override: u32,
+    auth_context: Option<crate::core::types::AuthContext>,
+) -> Result<QueryResult, Status> {
     let entity = query.entity.clone();
     let table_name = query.table.clone();
 
@@ -162,16 +211,36 @@ async fn execute_query_unary_internal(
     } else { query.limit }.unwrap_or(100).min(100);
 
     if limit_override > 0 { limit = limit_override as usize; }
-    
+
     let page = params_map.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
     let mut offset = (page - 1) * limit;
     if offset_override > 0 { offset = offset_override as usize; }
 
-    let res = tokio::task::spawn_blocking(move || {
+    if query.is_multi_table() {
+        let query_clone = query.clone();
+        let params_clone = params_map.clone();
+        let auth_clone = auth_context.clone();
+        return tokio::task::spawn_blocking(move || {
+            crate::core::join_query::execute_join_query(
+                &query_clone,
+                &params_clone,
+                table_manager,
+                None,
+                limit,
+                offset,
+                auth_clone.as_ref(),
+            )
+        })
+        .await
+        .unwrap()
+        .map_err(|e| Status::internal(e.to_string()));
+    }
+
+    tokio::task::spawn_blocking(move || {
         if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
             let mut table = table_arc.write().unwrap();
             let _ = table.reload_if_needed();
-            
+
             let mut f_search = query.selected_fields.clone();
             if f_search.iter().any(|f| f == "*") {
                 let mut all_cols = table.manifest.original_fields.clone();
@@ -184,8 +253,8 @@ async fn execute_query_unary_internal(
                 for f in f_search {
                     if f == "*" {
                         for c in &all_cols { if seen.insert(c.clone()) { new_f.push(c.clone()); } }
-                    } else {
-                        if seen.insert(f.clone()) { new_f.push(f); }
+                    } else if seen.insert(f.clone()) {
+                        new_f.push(f);
                     }
                 }
                 f_search = new_f;
@@ -195,40 +264,10 @@ async fn execute_query_unary_internal(
         } else {
             Err(anyhow::anyhow!("Table not found"))
         }
-    }).await.unwrap();
-
-    match res {
-        Ok(query_result) => {
-            let mut proto_rows = Vec::new();
-            for row in query_result.rows {
-                proto_rows.push(ProtoRow { values: row });
-            }
-
-            let mut proto_aggs = Vec::new();
-            if let Some(aggs) = query_result.aggregations {
-                for agg in aggs {
-                    let mut rows = Vec::new();
-                    for r in agg.rows { rows.push(ProtoRow { values: r }); }
-                    proto_aggs.push(ProtoAggregationResult {
-                        headers: agg.headers,
-                        rows,
-                        summary: agg.summary.unwrap_or(0.0),
-                    });
-                }
-            }
-
-            Ok(SearchUnaryResponse {
-                headers: query_result.headers,
-                rows: proto_rows,
-                total_found: query_result.total_found as u64,
-                execution_time_micros: query_result.execution_time_micros as u64,
-                debug_info: "".to_string(),
-                aggregations: proto_aggs,
-                pagination: None,
-            })
-        }
-        Err(e) => Err(Status::internal(e.to_string())),
-    }
+    })
+    .await
+    .unwrap()
+    .map_err(|e| Status::internal(e.to_string()))
 }
 
 #[tonic::async_trait]
@@ -330,6 +369,8 @@ impl Database for MyDatabase {
             name: "ad-hoc".to_string(),
             entity: req.entity,
             table: req.table,
+            table_alias: None,
+            joins: Vec::new(),
             filters: req.filters.into_iter().map(|f| crate::core::saved_queries::SavedFilter {
                 field: f.field,
                 op: proto_comparison_op_to_str(f.op),
@@ -345,6 +386,8 @@ impl Database for MyDatabase {
             limit: Some(req.limit as usize),
             limit_param: None,
             selected_fields: req.selected_fields,
+            select: Vec::new(),
+            response_grouping: None,
             auth_config: None,
         };
 
@@ -372,6 +415,9 @@ impl Database for MyDatabase {
         
         let query = if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
             if let SavedOperation::Read(q) = op {
+                if q.response_grouping.is_some() {
+                    return Err(Status::invalid_argument("response_grouping is currently supported only by the REST API"));
+                }
                 q.clone()
             } else {
                 return Err(Status::invalid_argument("Not a read operation"));
@@ -382,49 +428,18 @@ impl Database for MyDatabase {
 
         let auth_ctx = self.extract_auth_context(&metadata, query.auth_config.as_ref()).await;
 
-        // Reconstruct SearchRequest to reuse search logic or just implement here
-        let entity = query.entity.clone();
-        let table_name = query.table.clone();
-        let params = req.params.clone();
-        
-        let mut filters = Vec::new();
-        for sf in query.filters {
-            let mut val = sf.value.clone();
-            if val.starts_with('$') {
-                if let Some(param_val) = params.get(&val[1..]) { val = param_val.clone(); }
-            }
-            filters.push(CoreFilter {
-                field: sf.field.clone(),
-                op: ComparisonOp::from_str(&sf.op),
-                value: val,
-                value_options: vec![],
-                field_type: sf.field_type,
-            });
-        }
-
-        let filters_op = match query.filters_op.as_str() { "Or" => LogicalOp::Or, _ => LogicalOp::And };
-        let order_by: Vec<CoreOrderBy> = query.order_by.iter().map(|so| {
-            CoreOrderBy { field: so.field.clone(), direction: if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc } }
-        }).collect();
-
-        let limit = if req.limit_override > 0 { req.limit_override as usize } 
-                    else { query.limit.unwrap_or(100) };
-        let offset = req.offset_override as usize;
-        let fields = query.selected_fields.clone();
-
         let table_manager = Arc::clone(&self.table_manager);
         let (tx, rx) = mpsc::channel(10);
 
         tokio::spawn(async move {
-            let res = tokio::task::spawn_blocking(move || {
-                if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
-                    let mut table = table_arc.write().unwrap();
-                    let _ = table.reload_if_needed();
-                    table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset, auth_ctx.as_ref())
-                } else {
-                    Err(anyhow::anyhow!("Table not found"))
-                }
-            }).await.unwrap();
+            let res = execute_query_result_internal(
+                query,
+                req.params,
+                table_manager,
+                req.limit_override,
+                req.offset_override,
+                auth_ctx,
+            ).await;
 
             match res {
                 Ok(query_result) => {
@@ -468,6 +483,9 @@ impl Database for MyDatabase {
         
         if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
             if let SavedOperation::Read(q) = op {
+                if q.response_grouping.is_some() {
+                    return Err(Status::invalid_argument("response_grouping is currently supported only by the REST API"));
+                }
                 let auth_ctx = self.extract_auth_context(&metadata, q.auth_config.as_ref()).await;
                 let resp = execute_query_unary_internal(
                     q.clone(), 
@@ -502,6 +520,9 @@ impl Database for MyDatabase {
         
         let (entity, table_name, filters, auth_cfg) = if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
             if let SavedOperation::Read(q) = op {
+                if q.is_multi_table() {
+                    return Err(Status::invalid_argument("SubscribeUpdates does not support multi-table queries yet"));
+                }
                 let mut resolved_filters = Vec::new();
                 for sf in &q.filters {
                     let mut val = sf.value.clone();

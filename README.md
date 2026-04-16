@@ -114,6 +114,130 @@ Send a `POST` request to `http://localhost:3000/_config` with the query definiti
 ### Delete a Query (DELETE)
 `DELETE http://localhost:3000/_config?name=recent_sales`
 
+### Create a Multi-Table Query (POST)
+Read operations can now join multiple tables without changing the existing single-table format. Multi-table queries keep `table` as the base table and add `table_alias`, `joins`, and `select`.
+
+```json
+{
+  "type": "read",
+  "details": {
+    "name": "sessions_with_users",
+    "entity": "goparking",
+    "table": "Sessions",
+    "table_alias": "s",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "Users",
+        "alias": "u",
+        "on": [
+          { "left": "s.userId", "op": "Eq", "right": "u.id" }
+        ]
+      }
+    ],
+    "filters": [
+      { "field": "s.status", "op": "Eq", "value": "OPEN" },
+      { "field": "u.document", "op": "Eq", "value": "$document" }
+    ],
+    "select": [
+      { "field": "s.id", "as": "session_id" },
+      { "field": "s.plate", "as": "plate" },
+      { "field": "u.name", "as": "user_name" }
+    ],
+    "order_by": [{ "field": "s.createdAt", "direction": "Desc" }],
+    "limit": 50
+  }
+}
+```
+
+Current scope for multi-table operations:
+
+- `INNER` and `LEFT` joins only.
+- Equality joins only (`Eq` in `on`).
+- Saved queries over REST and `ExecuteSavedQuery` / `ExecuteSavedQueryUnary` in gRPC.
+- Direct `Search` / `SearchUnary` remain single-table to preserve the existing contract.
+
+### Group REST Responses by a Key
+If you do not want a flat REST response, you can use `response_grouping` to group rows under a key. This is useful for shapes like `parkingId -> daily_schedules`.
+
+```json
+{
+  "type": "read",
+  "details": {
+    "name": "grouped_parking_schedules",
+    "entity": "inside",
+    "table": "ParqueaderoHorario",
+    "table_alias": "ph",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "Dia",
+        "alias": "d",
+        "on": [
+          { "left": "ph.diaId", "op": "Eq", "right": "d.diaId" }
+        ]
+      }
+    ],
+    "filters": [
+      { "field": "d.esActivo", "op": "Eq", "value": "1" }
+    ],
+    "filters_op": "And",
+    "order_by": [
+      { "field": "ph.parqueaderoId", "direction": "Asc" },
+      { "field": "ph.diaId", "direction": "Asc" }
+    ],
+    "select": [
+      { "field": "ph.parqueaderoId", "as": "parqueaderoId" },
+      { "field": "ph.diaId", "as": "diaId" },
+      { "field": "ph.horaApertura", "as": "horaApertura" },
+      { "field": "ph.horaCierre", "as": "horaCierre" },
+      { "field": "d.nombre", "as": "diaNombre" },
+      { "field": "d.abreviatura", "as": "diaAbreviatura" }
+    ],
+    "response_grouping": {
+      "field": "parqueaderoId",
+      "items_as": "horarios_por_dia"
+    }
+  }
+}
+```
+
+The REST response becomes:
+
+```json
+{
+  "data": [
+    {
+      "parqueaderoId": 5,
+      "horarios_por_dia": [
+        {
+          "diaId": 2,
+          "horaApertura": "05:43",
+          "horaCierre": "08:43",
+          "diaNombre": "Monday",
+          "diaAbreviatura": "M"
+        },
+        {
+          "diaId": 3,
+          "horaApertura": "05:43",
+          "horaCierre": "08:43",
+          "diaNombre": "Tuesday",
+          "diaAbreviatura": "T"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notes about `response_grouping`:
+
+- It currently applies only to REST responses for saved operations.
+- It groups by the projected field name from `select` or `selected_fields`.
+- By default it removes the grouping field from each nested item.
+- When enabled, Bittice gathers all required rows for the grouped response and omits `pagination`.
+- Grouped responses are capped at `10000` source rows for safety.
+
 ---
 
 ## 🌐 API Reference
@@ -129,7 +253,7 @@ Send a `POST` request to `http://localhost:3000/_config` with the query definiti
 
 Bittice provides a high-performance gRPC interface defined in `proto/bittice.proto`.
 
-- **`Search` / `SearchUnary`:** Direct ad-hoc searching.
+- **`Search` / `SearchUnary`:** Direct ad-hoc searching on a single table.
 - **`ExecuteSavedQuery`:** Run a pre-configured operation by name.
 - **`SubscribeUpdates` (Real-time):** Stream updates for a specific table. Get notified instantly when data changes.
 
