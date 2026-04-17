@@ -234,9 +234,19 @@ Notes about `response_grouping`:
 
 - It currently applies only to REST responses for saved operations.
 - It groups by the projected field name from `select` or `selected_fields`.
-- By default it removes the grouping field from each nested item.
+- It supports `field` for a single parent field or `fields` to promote multiple projected fields to the parent object.
+- By default it removes the grouping field or fields from each nested item.
 - When enabled, Bittice gathers all required rows for the grouped response and omits `pagination`.
 - Grouped responses are capped at `10000` source rows for safety.
+
+Example with multiple parent fields:
+
+```json
+"response_grouping": {
+  "fields": ["parqueaderoId", "parqueaderoNombre"],
+  "items_as": "horarios_por_dia"
+}
+```
 
 ---
 

@@ -233,9 +233,19 @@ Notas sobre `response_grouping`:
 
 - Solo aplica a respuestas REST de operaciones guardadas.
 - Agrupa usando el nombre de campo ya proyectado en `select` o `selected_fields`.
-- Por defecto elimina el campo de agrupación de cada item interno.
+- Soporta `field` para un solo campo o `fields` para promover varios campos al objeto padre.
+- Por defecto elimina el campo o los campos de agrupación de cada item interno.
 - Cuando se usa, Bittice intenta reunir todas las filas necesarias para devolver la respuesta agrupada y omite `pagination`.
 - Por seguridad, la respuesta agrupada está limitada a `10000` filas fuente.
+
+Ejemplo con varios campos en el padre:
+
+```json
+"response_grouping": {
+  "fields": ["parqueaderoId", "parqueaderoNombre"],
+  "items_as": "horarios_por_dia"
+}
+```
 
 ---
 

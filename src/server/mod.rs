@@ -949,19 +949,33 @@ fn group_rows_by_field(
     data: &[serde_json::Map<String, serde_json::Value>],
     grouping: &crate::core::saved_queries::SavedResponseGrouping,
 ) -> Result<serde_json::Value, String> {
+    let group_fields = grouping.group_fields();
+    if group_fields.is_empty() {
+        return Err("response_grouping requires 'field' or 'fields'".to_string());
+    }
+
     let mut grouped = Vec::<serde_json::Map<String, serde_json::Value>>::new();
     let mut index = std::collections::HashMap::<String, usize>::new();
 
     for row in data {
         let mut row = row.clone();
-        let key_value = row.get(&grouping.field)
-            .cloned()
-            .ok_or_else(|| format!("Grouping field '{}' was not found in the response fields", grouping.field))?;
-        let key = key_value.to_string();
-        let item = if grouping.include_group_field_in_items {
+        let mut parent_fields = Vec::with_capacity(group_fields.len());
+        let mut key_parts = Vec::with_capacity(group_fields.len());
+        for field in &group_fields {
+            let value = row.get(field)
+                .cloned()
+                .ok_or_else(|| format!("Grouping field '{}' was not found in the response fields", field))?;
+            key_parts.push(value.to_string());
+            parent_fields.push((field.clone(), value));
+        }
+
+        let key = key_parts.join("\u{1f}");
+        let item = if grouping.include_group_fields_in_items {
             serde_json::Value::Object(row)
         } else {
-            row.remove(&grouping.field);
+            for field in &group_fields {
+                row.remove(field);
+            }
             serde_json::Value::Object(row)
         };
 
@@ -971,7 +985,9 @@ fn group_rows_by_field(
             items.push(item);
         } else {
             let mut group = serde_json::Map::new();
-            group.insert(grouping.field.clone(), key_value);
+            for (field, value) in parent_fields {
+                group.insert(field, value);
+            }
             group.insert(grouping.items_as.clone(), serde_json::Value::Array(vec![item]));
             index.insert(key, grouped.len());
             grouped.push(group);

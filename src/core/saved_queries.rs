@@ -58,11 +58,14 @@ pub struct SavedQuery {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SavedResponseGrouping {
-    pub field: String,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<String>,
     #[serde(default = "default_group_items_as")]
     pub items_as: String,
-    #[serde(default)]
-    pub include_group_field_in_items: bool,
+    #[serde(default, alias = "include_group_field_in_items")]
+    pub include_group_fields_in_items: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -201,6 +204,16 @@ impl SavedQuery {
             .filter(|alias| !alias.is_empty())
             .unwrap_or(self.table.as_str())
             .to_string()
+    }
+}
+
+impl SavedResponseGrouping {
+    pub fn group_fields(&self) -> Vec<String> {
+        if !self.fields.is_empty() {
+            self.fields.clone()
+        } else {
+            self.field.clone().into_iter().collect()
+        }
     }
 }
 
