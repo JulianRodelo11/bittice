@@ -5,8 +5,7 @@ use anyhow::{Result, Context};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use crate::core::storage::manifest::SegmentMeta;
-use crate::core::types::{Filter, ComparisonOp, LogicalOp, FieldType};
-use crate::core::date_utils::is_date_format;
+use crate::core::types::{compare_filter_value, compare_values, Filter, ComparisonOp, LogicalOp};
 use memmap2::Mmap;
 use std::sync::{Arc, RwLock};
 
@@ -19,6 +18,8 @@ pub struct Segment {
     pub record_count: u64,
     /// Cache of memory-mapped files: Field -> (Data, Offsets)
     pub mmap_cache: RwLock<HashMap<String, Arc<(Mmap, Mmap)>>>,
+    /// Cache of immutable field bitmap indexes: Field -> value bitmap map
+    pub bitmap_cache: RwLock<HashMap<String, Arc<HashMap<String, RoaringBitmap>>>>,
 }
 
 impl std::fmt::Debug for Segment {
@@ -42,6 +43,7 @@ impl Segment {
             deleted_bitmap: RoaringBitmap::new(),
             record_count: 0,
             mmap_cache: RwLock::new(HashMap::new()),
+            bitmap_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -114,7 +116,28 @@ impl Segment {
             deleted_bitmap,
             record_count,
             mmap_cache: RwLock::new(HashMap::new()),
+            bitmap_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    fn get_bitmaps_cached(&self, field: &str) -> Result<Arc<HashMap<String, RoaringBitmap>>> {
+        if let Some(cached) = self.bitmap_cache.read().unwrap().get(field) {
+            return Ok(cached.clone());
+        }
+
+        let bitmap_path = self.path.join(format!("bitmaps_{}.dat", field));
+        let bitmaps = if bitmap_path.exists() {
+            let file = File::open(bitmap_path)?;
+            let reader = BufReader::new(file);
+            bincode::deserialize_from(reader)?
+        } else {
+            HashMap::new()
+        };
+
+        let cached = Arc::new(bitmaps);
+        let mut cache = self.bitmap_cache.write().unwrap();
+        let entry = cache.entry(field.to_string()).or_insert_with(|| cached.clone());
+        Ok(entry.clone())
     }
 
     pub fn mark_deleted(&mut self, local_id: u32) -> Result<()> {
@@ -186,7 +209,8 @@ impl Segment {
         let bitmap_path = self.path.join(format!("bitmaps_{}.dat", field));
         let bitmaps: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
             let file = File::open(bitmap_path)?;
-            bincode::deserialize_from(file)?
+            let reader = BufReader::new(file);
+            bincode::deserialize_from(reader)?
         } else {
             HashMap::new()
         };
@@ -224,6 +248,14 @@ impl Segment {
                     ComparisonOp::Gte => val > max,
                     ComparisonOp::Lt => val <= min,
                     ComparisonOp::Lte => val < min,
+                    ComparisonOp::Between => {
+                        if let Some(upper) = f.value_to.as_ref() {
+                            compare_values(max, val, f.field_type).is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+                                || compare_values(min, upper, f.field_type).is_some_and(|ordering| ordering == std::cmp::Ordering::Greater)
+                        } else {
+                            false
+                        }
+                    }
                     _ => false,
                 };
                 if skip { return Ok(RoaringBitmap::new()); }
@@ -234,95 +266,8 @@ impl Segment {
         let mut first = true;
 
         for f in &valid_filters {
-            let bitmap_path = self.path.join(format!("bitmaps_{}.dat", f.field));
-            let bitmaps: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
-                let file = File::open(bitmap_path)?;
-                bincode::deserialize_from(file)?
-            } else {
-                HashMap::new()
-            };
-
-            let mut filter_bitmap = RoaringBitmap::new();
-            match f.op {
-                ComparisonOp::Eq => {
-                    if let Some(t) = f.field_type {
-                        match t {
-                            FieldType::Int | FieldType::Float => {
-                                let target = f.value.parse::<f64>().unwrap_or(0.0);
-                                for (k, bm) in &bitmaps {
-                                    if let Ok(n_k) = k.parse::<f64>() {
-                                        if (n_k - target).abs() < f64::EPSILON { filter_bitmap |= bm; }
-                                    }
-                                }
-                            }
-                            _ => { if let Some(bm) = bitmaps.get(&f.value) { filter_bitmap = bm.clone(); } }
-                        }
-                    } else if let Some(bm) = bitmaps.get(&f.value) {
-                        filter_bitmap = bm.clone();
-                    }
-                },
-                ComparisonOp::Ne => {
-                    if let Some(t) = f.field_type {
-                        match t {
-                            FieldType::Int | FieldType::Float => {
-                                let target = f.value.parse::<f64>().unwrap_or(0.0);
-                                for (k, bm) in &bitmaps {
-                                    if let Ok(n_k) = k.parse::<f64>() {
-                                        if (n_k - target).abs() >= f64::EPSILON { filter_bitmap |= bm; }
-                                    } else { filter_bitmap |= bm; }
-                                }
-                            }
-                            _ => { for (k, bm) in &bitmaps { if k != &f.value { filter_bitmap |= bm; } } }
-                        }
-                    } else {
-                        for (k, bm) in &bitmaps { if k != &f.value { filter_bitmap |= bm; } }
-                    }
-                },
-                ComparisonOp::Gt => {
-                    let filter_val = &f.value;
-                    for (k, bm) in &bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k > n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() > filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::Gte => {
-                    let filter_val = &f.value;
-                    for (k, bm) in &bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k >= n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() >= filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::Lt => {
-                    let filter_val = &f.value;
-                    for (k, bm) in &bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k < n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() < filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::Lte => {
-                    let filter_val = &f.value;
-                    for (k, bm) in &bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k <= n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() <= filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::In => {
-                    let vals: Vec<&str> = f.value.split(';').map(|s| s.trim()).collect();
-                    for (k, bm) in &bitmaps { if vals.contains(&k.as_str()) { filter_bitmap |= bm; } }
-                }
-            }
+            let bitmaps = self.get_bitmaps_cached(&f.field)?;
+            let filter_bitmap = bitmap_matches_for_filter(bitmaps.as_ref(), f);
             
             if first { result_bitmap = filter_bitmap; first = false; }
             else {
@@ -504,13 +449,7 @@ impl Segment {
     /// Selective loading of bitmap indexes to memory.
     pub fn warm_up_indices(&self, fields: &[String]) -> Result<()> {
         for field in fields {
-            let bitmap_path = self.path.join(format!("bitmaps_{}.dat", field));
-            if bitmap_path.exists() {
-                let file = File::open(bitmap_path)?;
-                // Simplemente lo leemos para que el SO lo suba al Page Cache.
-                // No guardamos el resultado en la RAM privada de Rust.
-                let _bitmaps: HashMap<String, RoaringBitmap> = bincode::deserialize_from(file)?;
-            }
+            let _ = self.get_bitmaps_cached(field)?;
         }
         Ok(())
     }
@@ -586,6 +525,14 @@ impl SegmentWriter {
                     ComparisonOp::Gte => val > max,
                     ComparisonOp::Lt => val <= min,
                     ComparisonOp::Lte => val < min,
+                    ComparisonOp::Between => {
+                        if let Some(upper) = f.value_to.as_ref() {
+                            compare_values(max, val, f.field_type).is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+                                || compare_values(min, upper, f.field_type).is_some_and(|ordering| ordering == std::cmp::Ordering::Greater)
+                        } else {
+                            false
+                        }
+                    }
                     _ => false,
                 };
                 if skip { return Ok(RoaringBitmap::new()); }
@@ -596,55 +543,7 @@ impl SegmentWriter {
         for f in &valid_filters {
             let empty_map = HashMap::new();
             let bitmaps = self.bitmaps.get(&f.field).unwrap_or(&empty_map);
-            let mut filter_bitmap = RoaringBitmap::new();
-            match f.op {
-                ComparisonOp::Eq => { if let Some(bm) = bitmaps.get(&f.value) { filter_bitmap = bm.clone(); } },
-                ComparisonOp::Ne => { for (k, bm) in bitmaps { if k != &f.value { filter_bitmap |= bm; } } },
-                ComparisonOp::Gt => {
-                    let filter_val = &f.value;
-                    for (k, bm) in bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k > n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() > filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::Gte => {
-                    let filter_val = &f.value;
-                    for (k, bm) in bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k >= n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() >= filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::Lt => {
-                    let filter_val = &f.value;
-                    for (k, bm) in bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k < n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() < filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::Lte => {
-                    let filter_val = &f.value;
-                    for (k, bm) in bitmaps {
-                        if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                            if n_k <= n_f { filter_bitmap |= bm; }
-                        } else if is_date_format(k) && is_date_format(filter_val) {
-                            if k.as_str() <= filter_val.as_str() { filter_bitmap |= bm; }
-                        }
-                    }
-                },
-                ComparisonOp::In => {
-                    let vals: Vec<&str> = f.value.split(';').map(|s| s.trim()).collect();
-                    for (k, bm) in bitmaps { if vals.contains(&k.as_str()) { filter_bitmap |= bm; } }
-                }
-            }
+            let filter_bitmap = bitmap_matches_for_filter(bitmaps, f);
             if first { result_bitmap = filter_bitmap; first = false; }
             else {
                 match filters_op {
@@ -667,4 +566,27 @@ impl SegmentWriter {
         }
         Ok(counts)
     }
+}
+
+fn bitmap_matches_for_filter(bitmaps: &HashMap<String, RoaringBitmap>, filter: &Filter) -> RoaringBitmap {
+    if filter.op == ComparisonOp::Eq {
+        if let Some(bitmap) = bitmaps.get(&filter.value) {
+            return bitmap.clone();
+        }
+    }
+
+    let mut filter_bitmap = RoaringBitmap::new();
+    for (key, bitmap) in bitmaps {
+        if compare_filter_value(
+            key,
+            filter.op,
+            &filter.value,
+            filter.value_to.as_deref(),
+            &filter.value_options,
+            filter.field_type,
+        ) {
+            filter_bitmap |= bitmap;
+        }
+    }
+    filter_bitmap
 }

@@ -65,6 +65,7 @@ impl AuthService {
                             field: t_col.clone(),
                             op: ComparisonOp::Eq,
                             value: val.clone(),
+                            value_to: None,
                             value_options: vec![],
                             field_type: None,
                         };

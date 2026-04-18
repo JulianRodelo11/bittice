@@ -1,17 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::fs;
-use std::sync::Arc;
+use std::io::BufReader;
+use std::sync::{Arc, RwLock as StdRwLock};
 use memmap2::Mmap;
 use anyhow::{Result, Context};
 use roaring::RoaringBitmap;
 use crate::core::storage::manifest::Manifest;
 use crate::core::storage::segment::{Segment, SegmentWriter};
 use crate::core::storage::wal::{Wal, WalOperation};
-use crate::core::types::{Filter, LogicalOp, OrderBy, QueryResult, SortDirection};
+use crate::core::types::{compare_filter_value, Filter, LogicalOp, OrderBy, QueryResult, SortDirection};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use tracing::{info, debug};
+
+type ExactIndex = HashMap<String, Vec<(u64, RoaringBitmap)>>;
 
 pub struct Table {
     pub name: String,
@@ -22,6 +25,7 @@ pub struct Table {
     wal: Wal,
     /// External ID -> (Segment ID, Local ID)
     pub primary_index: HashMap<String, (u64, u32)>,
+    exact_index_cache: StdRwLock<HashMap<String, Arc<ExactIndex>>>,
 }
 
 // Structures for the Heap
@@ -98,6 +102,7 @@ impl Table {
             immutable_segments: Vec::new(),
             wal,
             primary_index: HashMap::new(),
+            exact_index_cache: StdRwLock::new(HashMap::new()),
         };
         table.load_segments()?;
         table.ensure_active_segment()?;
@@ -237,6 +242,7 @@ impl Table {
     pub fn flush_active_segment(&mut self) -> Result<()> {
         if let Some(mut writer) = self.active_segment.take() {
             writer.flush()?;
+            self.merge_exact_indexes_for_segment(writer.segment.id, &writer.bitmaps)?;
             let meta = writer.segment.to_meta();
             self.manifest.add_segment(meta);
             self.manifest.active_segment_id += 1;
@@ -253,6 +259,9 @@ impl Table {
     }
 
     pub fn warm_up(&self, fields: &[String]) -> Result<()> {
+        for field in fields {
+            let _ = self.load_exact_index(field);
+        }
         self.immutable_segments.par_iter().for_each(|seg| {
             let _ = seg.prefetch_fields(fields);
             let _ = seg.warm_up_indices(fields);
@@ -345,6 +354,7 @@ impl Table {
                     field: filter_col,
                     op: crate::core::types::ComparisonOp::Eq,
                     value: ctx.user_id.clone(),
+                    value_to: None,
                     field_type: None,
                     value_options: vec![],
                 });
@@ -362,11 +372,31 @@ impl Table {
             let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
             if use_index {
                 if let Some((seg_id, local_id)) = self.primary_index.get(&f.value) {
-                    let mut bm = RoaringBitmap::new();
-                    bm.insert(*local_id);
-                    vec![(*seg_id, bm)]
+                    let candidate = (*seg_id, *local_id);
+                    if self.candidate_matches_filters(candidate, &final_filters, &final_filters_op)? {
+                        let mut bm = RoaringBitmap::new();
+                        bm.insert(*local_id);
+                        vec![(*seg_id, bm)]
+                    } else {
+                        vec![]
+                    }
                 } else { vec![] }
             } else { self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)? }
+        } else if final_filters_op == LogicalOp::And {
+            if let Some(exact_matches) = self.exact_matches_for_eq_filters(&final_filters, pk_field)? {
+                let remaining_filters: Vec<Filter> = final_filters.iter()
+                    .filter(|filter| !(filter.op == crate::core::types::ComparisonOp::Eq && filter.field != pk_field))
+                    .cloned()
+                    .collect();
+                if remaining_filters.is_empty() {
+                    exact_matches
+                } else {
+                    let scanned = self.scan_segments_parallel(&segment_tasks, &remaining_filters, &LogicalOp::And)?;
+                    intersect_segment_matches(exact_matches, scanned)
+                }
+            } else {
+                self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)?
+            }
         } else { self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)? };
         let mut total_found = 0;
         for (seg_id, bitmap) in &segment_matches { 
@@ -555,6 +585,247 @@ impl Table {
         Ok(QueryResult { headers: fields.to_vec(), rows: final_rows, row_ids: Some(final_ids), total_found: total_found as usize, execution_time_micros: total_elapsed, debug_info: Some(debug), aggregations: if aggregation_results.is_empty() { None } else { Some(aggregation_results) } })
     }
 
+    fn candidate_matches_filters(
+        &self,
+        candidate: (u64, u32),
+        filters: &[Filter],
+        filters_op: &LogicalOp,
+    ) -> Result<bool> {
+        let valid_filters: Vec<&Filter> = filters.iter().filter(|f| f.field != "?" && f.value != "?").collect();
+        if valid_filters.is_empty() {
+            return Ok(true);
+        }
+
+        let mut field_positions: HashMap<String, usize> = HashMap::new();
+        let mut filter_fields = Vec::new();
+        for filter in &valid_filters {
+            if !field_positions.contains_key(&filter.field) {
+                field_positions.insert(filter.field.clone(), filter_fields.len());
+                filter_fields.push(filter.field.clone());
+            }
+        }
+
+        let candidate_rows = self.get_rows_batch(&filter_fields, &[candidate])?;
+        let Some(candidate_row) = candidate_rows.first() else {
+            return Ok(false);
+        };
+
+        let mut matches = valid_filters.iter().map(|filter| {
+            let actual = field_positions
+                .get(&filter.field)
+                .and_then(|index| candidate_row.get(*index))
+                .map(String::as_str)
+                .unwrap_or("");
+            compare_filter_value(
+                actual,
+                filter.op,
+                &filter.value,
+                filter.value_to.as_deref(),
+                &filter.value_options,
+                filter.field_type,
+            )
+        });
+
+        Ok(match filters_op {
+            LogicalOp::And => matches.all(|matched| matched),
+            LogicalOp::Or => matches.any(|matched| matched),
+        })
+    }
+
+    fn exact_index_dir(&self) -> PathBuf {
+        self.base_path.join("secondary_exact")
+    }
+
+    fn exact_index_path(&self, field: &str) -> PathBuf {
+        self.exact_index_dir().join(format!("exact_{}.idx", field))
+    }
+
+    fn load_exact_index(&self, field: &str) -> Result<Arc<ExactIndex>> {
+        if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
+            return Ok(cached.clone());
+        }
+
+        let path = self.exact_index_path(field);
+        let index = if path.exists() {
+            let file = fs::File::open(&path)?;
+            let reader = BufReader::new(file);
+            bincode::deserialize_from(reader)?
+        } else {
+            let built = self.build_exact_index(field)?;
+            self.save_exact_index(field, &built)?;
+            built
+        };
+
+        let cached = Arc::new(index);
+        let mut cache = self.exact_index_cache.write().unwrap();
+        let entry = cache.entry(field.to_string()).or_insert_with(|| cached.clone());
+        Ok(entry.clone())
+    }
+
+    fn build_exact_index(&self, field: &str) -> Result<ExactIndex> {
+        let mut index = HashMap::new();
+        for segment in &self.immutable_segments {
+            let bitmap_path = segment.path.join(format!("bitmaps_{}.dat", field));
+            if !bitmap_path.exists() {
+                continue;
+            }
+            let file = fs::File::open(bitmap_path)?;
+            let reader = BufReader::new(file);
+            let bitmaps: HashMap<String, RoaringBitmap> = bincode::deserialize_from(reader)?;
+            for (value, bitmap) in bitmaps {
+                if !bitmap.is_empty() {
+                    index.entry(value).or_insert_with(Vec::new).push((segment.id, bitmap));
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    fn save_exact_index(&self, field: &str, index: &ExactIndex) -> Result<()> {
+        let dir = self.exact_index_dir();
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+        let path = self.exact_index_path(field);
+        let tmp_path = dir.join(format!("exact_{}.tmp", field));
+        let file = fs::File::create(&tmp_path)?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, index)?;
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    fn merge_exact_indexes_for_segment(
+        &self,
+        segment_id: u64,
+        segment_bitmaps: &HashMap<String, HashMap<String, RoaringBitmap>>,
+    ) -> Result<()> {
+        for (field, values) in segment_bitmaps {
+            let path = self.exact_index_path(field);
+            let mut index = if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
+                (**cached).clone()
+            } else if path.exists() {
+                let file = fs::File::open(&path)?;
+                let reader = BufReader::new(file);
+                bincode::deserialize_from(reader)?
+            } else {
+                HashMap::new()
+            };
+
+            for (value, bitmap) in values {
+                if !bitmap.is_empty() {
+                    index.entry(value.clone()).or_insert_with(Vec::new).push((segment_id, bitmap.clone()));
+                }
+            }
+
+            self.save_exact_index(field, &index)?;
+            self.exact_index_cache.write().unwrap().insert(field.clone(), Arc::new(index));
+        }
+
+        Ok(())
+    }
+
+    fn exact_matches_for_eq_filters(&self, filters: &[Filter], pk_field: &str) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
+        let eq_filters: Vec<&Filter> = filters.iter()
+            .filter(|filter| {
+                filter.op == crate::core::types::ComparisonOp::Eq
+                    && filter.field != pk_field
+                    && filter.field != "?"
+                    && filter.value != "?"
+            })
+            .collect();
+
+        if eq_filters.is_empty() {
+            return Ok(None);
+        }
+
+        let mut exact_matches: Option<Vec<(u64, RoaringBitmap)>> = None;
+
+        for filter in eq_filters {
+            let Some(current_matches) = self.exact_matches_for_field_value(filter)? else {
+                return Ok(None);
+            };
+
+            exact_matches = Some(match exact_matches {
+                None => current_matches,
+                Some(existing) => intersect_segment_matches(existing, current_matches),
+            });
+
+            if exact_matches.as_ref().is_some_and(|matches| matches.is_empty()) {
+                break;
+            }
+        }
+
+        Ok(exact_matches)
+    }
+
+    fn exact_matches_for_field_value(&self, filter: &Filter) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
+        let has_persisted_index = self.exact_index_path(&filter.field).exists();
+        let has_active_index = self.active_segment
+            .as_ref()
+            .is_some_and(|writer| writer.bitmaps.contains_key(&filter.field));
+        let immutable_index = self.load_exact_index(&filter.field)?;
+        let mut matches = Vec::new();
+        let mut field_is_indexed = has_persisted_index || has_active_index || !immutable_index.is_empty();
+        let mut found_exact_key = false;
+
+        if let Some(entries) = immutable_index.get(&filter.value) {
+            found_exact_key = true;
+            for (segment_id, bitmap) in entries {
+                let live_bitmap = self.live_bitmap_for_segment(*segment_id, bitmap);
+                if !live_bitmap.is_empty() {
+                    matches.push((*segment_id, live_bitmap));
+                }
+            }
+        }
+
+        if let Some(writer) = &self.active_segment {
+            if let Some(field_bitmaps) = writer.bitmaps.get(&filter.field) {
+                field_is_indexed = true;
+                if let Some(bitmap) = field_bitmaps.get(&filter.value) {
+                    found_exact_key = true;
+                    let mut live_bitmap = bitmap.clone();
+                    if !writer.segment.deleted_bitmap.is_empty() {
+                        live_bitmap -= &writer.segment.deleted_bitmap;
+                    }
+                    if !live_bitmap.is_empty() {
+                        matches.push((writer.segment.id, live_bitmap));
+                    }
+                }
+            }
+        }
+
+        if found_exact_key {
+            Ok(Some(matches))
+        } else if field_is_indexed {
+            Ok(Some(Vec::new()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn live_bitmap_for_segment(&self, segment_id: u64, bitmap: &RoaringBitmap) -> RoaringBitmap {
+        if let Some(writer) = &self.active_segment {
+            if writer.segment.id == segment_id {
+                let mut live = bitmap.clone();
+                if !writer.segment.deleted_bitmap.is_empty() {
+                    live -= &writer.segment.deleted_bitmap;
+                }
+                return live;
+            }
+        }
+
+        if let Some(segment) = self.immutable_segments.iter().find(|segment| segment.id == segment_id) {
+            let mut live = bitmap.clone();
+            if !segment.deleted_bitmap.is_empty() {
+                live -= &segment.deleted_bitmap;
+            }
+            return live;
+        }
+
+        bitmap.clone()
+    }
+
     fn scan_segments_parallel(
         &self,
         segment_tasks: &[&Segment],
@@ -679,4 +950,23 @@ impl Table {
             .unwrap_or("unknown");
         Self::get_indexed_fields_static(entity, &self.name)
     }
+}
+
+fn intersect_segment_matches(
+    left: Vec<(u64, RoaringBitmap)>,
+    right: Vec<(u64, RoaringBitmap)>,
+) -> Vec<(u64, RoaringBitmap)> {
+    let right_map: HashMap<u64, RoaringBitmap> = right.into_iter().collect();
+    let mut matches = Vec::new();
+
+    for (segment_id, left_bitmap) in left {
+        if let Some(right_bitmap) = right_map.get(&segment_id) {
+            let intersection = &left_bitmap & right_bitmap;
+            if !intersection.is_empty() {
+                matches.push((segment_id, intersection));
+            }
+        }
+    }
+
+    matches
 }

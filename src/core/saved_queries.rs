@@ -35,6 +35,8 @@ pub struct SavedQuery {
     pub joins: Vec<SavedJoin>,
     #[serde(default)]
     pub filters: Vec<SavedFilter>,
+    #[serde(default)]
+    pub filter_tree: Option<SavedFilterTreeNode>,
     #[serde(default = "default_filters_op")]
     pub filters_op: String, // "And" or "Or"
     #[serde(default)]
@@ -66,6 +68,28 @@ pub struct SavedResponseGrouping {
     pub items_as: String,
     #[serde(default, alias = "include_group_field_in_items")]
     pub include_group_fields_in_items: bool,
+    #[serde(default)]
+    pub children: Vec<SavedResponseGrouping>,
+    #[serde(default)]
+    pub limit_grouping: Option<usize>,
+    #[serde(default)]
+    pub offset_grouping: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedCollectAggregation {
+    #[serde(default, alias = "field")]
+    pub group_by: Option<String>,
+    #[serde(default, alias = "fields")]
+    pub group_by_fields: Vec<String>,
+    #[serde(default = "default_group_items_as")]
+    pub items_as: String,
+    #[serde(default)]
+    pub item_fields: Vec<String>,
+    #[serde(default)]
+    pub order_by: Vec<SavedOrderBy>,
+    #[serde(default, alias = "include_group_field_in_items")]
+    pub include_group_fields_in_items: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -89,7 +113,10 @@ pub struct SavedJoinCondition {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SavedSelectField {
+    #[serde(default)]
     pub field: String,
+    #[serde(default)]
+    pub expression: Option<String>,
     #[serde(rename = "as", default)]
     pub output_name: Option<String>,
 }
@@ -151,7 +178,26 @@ pub struct SavedFilter {
     pub field: String,
     pub op: String,
     pub value: String,
+    #[serde(default)]
+    pub value_to: Option<String>,
+    #[serde(default)]
+    pub values: Vec<String>,
     pub field_type: Option<FieldType>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum SavedFilterTreeNode {
+    Condition(SavedFilter),
+    Group(SavedFilterGroup),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedFilterGroup {
+    #[serde(default = "default_filters_op")]
+    pub op: String,
+    #[serde(default)]
+    pub filters: Vec<SavedFilterTreeNode>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -166,6 +212,8 @@ impl From<&Filter> for SavedFilter {
             field: f.field.clone(),
             op: f.op.as_str().to_string(),
             value: f.value.clone(),
+            value_to: f.value_to.clone(),
+            values: f.value_options.clone(),
             field_type: f.field_type,
         }
     }
@@ -213,6 +261,24 @@ impl SavedResponseGrouping {
             self.fields.clone()
         } else {
             self.field.clone().into_iter().collect()
+        }
+    }
+}
+
+impl SavedCollectAggregation {
+    pub fn from_aggregation(value: &serde_json::Value) -> Result<Option<Self>, serde_json::Error> {
+        let Some(params) = value.as_object().and_then(|object| object.get("Collect")) else {
+            return Ok(None);
+        };
+
+        serde_json::from_value(params.clone()).map(Some)
+    }
+
+    pub fn group_fields(&self) -> Vec<String> {
+        if !self.group_by_fields.is_empty() {
+            self.group_by_fields.clone()
+        } else {
+            self.group_by.clone().into_iter().collect()
         }
     }
 }

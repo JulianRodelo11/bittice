@@ -17,7 +17,7 @@ use std::time::Instant;
 use tokio::sync::{oneshot, RwLock as TokioRwLock};
 use tower_http::trace::TraceLayer;
 use tower_http::catch_panic::CatchPanicLayer;
-use crate::core::saved_queries::{load_operations, SavedOperation};
+use crate::core::saved_queries::{load_operations, SavedCollectAggregation, SavedOperation};
 use crate::core::types::{Filter, LogicalOp, ComparisonOp, SortDirection, OrderBy, AuthContext};
 use std::collections::HashMap;
 use rayon::prelude::*;
@@ -266,94 +266,21 @@ pub async fn start_server(
         }
     };
     info!("Server started on http://{}", addr);
+
+    let initial_warmed = warm_saved_query_targets(state.clone()).await;
+    if initial_warmed > 0 {
+        debug!("Startup: Warmed {} tables before serving requests", initial_warmed);
+    }
     
     // --- CACHE WARMING & MAINTENANCE ---
     let warm_state = state.clone();
     tokio::spawn(async move {
         loop {
             let start = std::time::Instant::now();
-            if let Ok(ops) = crate::core::saved_queries::load_operations_with_filter(warm_state.entity_filter.clone()) {
-                let mut targets: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
-                for op in ops {
-                    if let SavedOperation::Read(q) = op {
-                        let base_alias = q.base_alias();
-                        for f in &q.selected_fields {
-                            if f != "*" {
-                                if let Some((alias, field)) = split_alias_field(f, &base_alias) {
-                                    if alias == base_alias {
-                                        targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
-                                    }
-                                }
-                            }
-                        }
-                        for s in &q.select {
-                            if let Some((alias, field)) = split_alias_field(&s.field, &base_alias) {
-                                if alias == base_alias {
-                                    targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
-                                }
-                            }
-                        }
-                        for f in &q.filters {
-                            if f.field != "?" {
-                                if let Some((alias, field)) = split_alias_field(&f.field, &base_alias) {
-                                    let target_table = if alias == base_alias {
-                                        Some((q.entity.clone(), q.table.clone()))
-                                    } else {
-                                        q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
-                                    };
-                                    if let Some(key) = target_table {
-                                        targets.entry(key).or_default().insert(field);
-                                    }
-                                }
-                            }
-                        }
-                        for o in &q.order_by {
-                            if let Some((alias, field)) = split_alias_field(&o.field, &base_alias) {
-                                let target_table = if alias == base_alias {
-                                    Some((q.entity.clone(), q.table.clone()))
-                                } else {
-                                    q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
-                                };
-                                if let Some(key) = target_table {
-                                    targets.entry(key).or_default().insert(field);
-                                }
-                            }
-                        }
-                        for join in &q.joins {
-                            let join_alias = join.alias.as_deref().unwrap_or(join.table.as_str()).to_string();
-                            let join_entry = targets.entry((q.entity.clone(), join.table.clone())).or_default();
-                            for cond in &join.on {
-                                if let Some((alias, field)) = split_alias_field(&cond.left, &base_alias) {
-                                    if alias == join_alias { join_entry.insert(field); }
-                                }
-                                if let Some((alias, field)) = split_alias_field(&cond.right, &base_alias) {
-                                    if alias == join_alias { join_entry.insert(field); }
-                                }
-                            }
-                        }
-                    }
-                }
-                if !targets.is_empty() {
-                    let warm_state_inner = warm_state.clone();
-                    let res = tokio::task::spawn_blocking(move || {
-                        let mut warmed_count = 0;
-                        for ((entity, table_name), fields_set) in targets {
-                            if let Ok(table_lock) = warm_state_inner.table_manager.get_table(&entity, &table_name) {
-                                let fields: Vec<String> = fields_set.into_iter().collect();
-                                let table = table_lock.read().unwrap();
-                                let _ = table.warm_up(&fields);
-                                warmed_count += 1;
-                            }
-                        }
-                        warmed_count
-                    }).await;
-                    if let Ok(c) = res {
-                        let elapsed = start.elapsed().as_millis();
-                        if elapsed > 100 { 
-                            debug!("Maintenance: Warmed {} tables in {}ms", c, elapsed);
-                        }
-                    }
-                }
+            let warmed = warm_saved_query_targets(warm_state.clone()).await;
+            let elapsed = start.elapsed().as_millis();
+            if warmed > 0 && elapsed > 100 {
+                debug!("Maintenance: Warmed {} tables in {}ms", warmed, elapsed);
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
         }
@@ -680,7 +607,21 @@ async fn execute_read_operation(
             if let Some(param_val) = params.get(key) { val = param_val.clone(); }
             else { missing_params.push(key.to_string()); }
         }
-        Filter { field: sf.field.clone(), op: ComparisonOp::from_str(&sf.op), value: val, value_options: vec![], field_type: sf.field_type }
+        let value_to = sf.value_to.as_ref().map(|raw| {
+            if let Some(key) = raw.strip_prefix('$') {
+                params.get(key).cloned().unwrap_or_else(|| raw.clone())
+            } else {
+                raw.clone()
+            }
+        });
+        let value_options = sf.values.iter().map(|raw| {
+            if let Some(key) = raw.strip_prefix('$') {
+                params.get(key).cloned().unwrap_or_else(|| raw.clone())
+            } else {
+                raw.clone()
+            }
+        }).collect();
+        Filter { field: sf.field.clone(), op: ComparisonOp::from_str(&sf.op), value: val, value_to, value_options, field_type: sf.field_type }
     }).collect();
     
     let mut aggregations = query.aggregations.clone();
@@ -704,6 +645,32 @@ async fn execute_read_operation(
          return Err((StatusCode::BAD_REQUEST, serde_json::json!({ "error": "Missing params", "missing": missing_params })));
     }
 
+    let (engine_aggregations, collect_aggregations) = split_rest_collect_aggregations(&aggregations)
+        .map_err(|error| (StatusCode::BAD_REQUEST, serde_json::json!({ "error": error })))?;
+
+    let runtime_grouping = query.response_grouping.as_ref().map(|grouping| {
+        let mut grouping = grouping.clone();
+        let grouping_limit = params
+            .get("grouping_limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .or(grouping.limit_grouping)
+            .unwrap_or(100)
+            .min(100);
+        let grouping_page = params
+            .get("grouping_page")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let grouping_offset = params
+            .get("grouping_offset")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or((grouping_page - 1) * grouping_limit);
+
+        grouping.limit_grouping = Some(grouping_limit);
+        grouping.offset_grouping = Some(grouping_offset);
+        grouping
+    });
+
     let filters_op = match query.filters_op.as_str() { "Or" => LogicalOp::Or, _ => LogicalOp::And };
     let order_by: Vec<OrderBy> = query.order_by.iter().map(|so| {
         OrderBy { field: so.field.clone(), direction: if so.direction == "Desc" { SortDirection::Desc } else { SortDirection::Asc } }
@@ -719,7 +686,10 @@ async fn execute_read_operation(
 
     let state_search = state.clone();
     let sel_fields = query.selected_fields.clone();
-    let aggs_query = query.aggregations.clone();
+    let aggs_query = engine_aggregations.clone();
+    let uses_response_grouping = runtime_grouping.is_some();
+    let engine_limit = if uses_response_grouping { 100 } else { limit };
+    let engine_offset = if uses_response_grouping { 0 } else { offset };
 
     let setup_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let engine_start = std::time::Instant::now();
@@ -735,8 +705,8 @@ async fn execute_read_operation(
         aggs_query.clone(),
         param_fields.clone(),
         sel_fields.clone(),
-        limit,
-        offset,
+        engine_limit,
+        engine_offset,
     ).await;
 
     let engine_total_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
@@ -745,18 +715,20 @@ async fn execute_read_operation(
             let mapping_start = std::time::Instant::now();
             let headers = query_result.headers.clone();
             let source_total_found = query_result.total_found;
-            let mut rows = materialize_query_rows(&query_result, state.clone(), query, &headers).await;
+            let rows = materialize_query_rows(&query_result, state.clone(), query, &headers).await;
+            let needs_full_source_rows = !collect_aggregations.is_empty() || uses_response_grouping;
+            let mut source_rows = if needs_full_source_rows { Some(rows.clone()) } else { None };
 
-            if query.response_grouping.is_some() {
-                if source_total_found > rows.len() {
+            if let Some(ref mut all_rows) = source_rows {
+                if source_total_found > all_rows.len() {
                     if source_total_found > MAX_GROUPED_RESPONSE_ROWS {
                         return Err((StatusCode::BAD_REQUEST, serde_json::json!({
-                            "error": "Grouped response too large",
-                            "details": format!("Grouped responses are limited to {} source rows", MAX_GROUPED_RESPONSE_ROWS)
+                            "error": "Shaped response too large",
+                            "details": format!("REST response shaping is limited to {} source rows", MAX_GROUPED_RESPONSE_ROWS)
                         })));
                     }
 
-                    let mut next_offset = offset + rows.len();
+                    let mut next_offset = engine_offset + all_rows.len();
                     while next_offset < source_total_found {
                         let page_result = run_query_page(
                             query.clone(),
@@ -769,7 +741,7 @@ async fn execute_read_operation(
                             aggs_query.clone(),
                             param_fields.clone(),
                             sel_fields.clone(),
-                            limit,
+                            engine_limit,
                             next_offset,
                         ).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e.to_string() })))?;
                         let page_rows = materialize_query_rows(&page_result, state.clone(), query, &headers).await;
@@ -777,11 +749,11 @@ async fn execute_read_operation(
                             break;
                         }
                         next_offset += page_rows.len();
-                        rows.extend(page_rows);
-                        if rows.len() > MAX_GROUPED_RESPONSE_ROWS {
+                        all_rows.extend(page_rows);
+                        if all_rows.len() > MAX_GROUPED_RESPONSE_ROWS {
                             return Err((StatusCode::BAD_REQUEST, serde_json::json!({
-                                "error": "Grouped response too large",
-                                "details": format!("Grouped responses are limited to {} source rows", MAX_GROUPED_RESPONSE_ROWS)
+                                "error": "Shaped response too large",
+                                "details": format!("REST response shaping is limited to {} source rows", MAX_GROUPED_RESPONSE_ROWS)
                             })));
                         }
                     }
@@ -805,25 +777,62 @@ async fn execute_read_operation(
             };
 
             let data: Vec<_> = rows.into_par_iter().map(|r| row_to_json(&headers, &r)).collect();
-            let grouped_data = if let Some(grouping) = &query.response_grouping {
-                Some(group_rows_by_field(&data, grouping).map_err(|e| (StatusCode::BAD_REQUEST, serde_json::json!({ "error": e })))?)
+            let shaped_data: Option<Vec<_>> = source_rows
+                .map(|rows| rows.into_par_iter().map(|r| row_to_json(&headers, &r)).collect());
+            let source_data = shaped_data.as_deref().unwrap_or(&data);
+            let grouped_data = if let Some(grouping) = &runtime_grouping {
+                Some(group_rows_by_field(source_data, grouping, Some(source_total_found)).map_err(|e| (StatusCode::BAD_REQUEST, serde_json::json!({ "error": e })))?)
             } else {
                 None
             };
-            let aggregations_data: Option<Vec<_>> = query_result.aggregations.map(|aggs| {
+            let mut aggregations_data: Vec<serde_json::Value> = query_result.aggregations.map(|aggs| {
                 aggs.into_iter().map(|agg| {
                     let agg_h = agg.headers;
                     let rows_j: Vec<_> = agg.rows.into_iter().map(|r| row_to_json(&agg_h, &r)).collect();
                     serde_json::json!({ "data": rows_j, "summary": agg.summary })
                 }).collect()
+            }).unwrap_or_default();
+
+            for collect in &collect_aggregations {
+                aggregations_data.push(
+                    build_collect_aggregation(source_data, collect)
+                        .map_err(|e| (StatusCode::BAD_REQUEST, serde_json::json!({ "error": e })))?
+                );
+            }
+
+            let grouped_total_items = grouped_data
+                .as_ref()
+                .and_then(|value| value.as_array().map(|items| items.len()));
+            let paged_grouped_data = grouped_data.and_then(|value| {
+                value.as_array().map(|items| {
+                    serde_json::Value::Array(
+                        items
+                            .iter()
+                            .skip(offset)
+                            .take(limit)
+                            .cloned()
+                            .collect(),
+                    )
+                })
             });
 
             let mut response = serde_json::Map::new();
-            response.insert("data".to_string(), grouped_data.unwrap_or_else(|| serde_json::json!(data)));
-            if let Some(aggs) = aggregations_data { response.insert("aggregations".to_string(), serde_json::json!(aggs)); }
+            response.insert("data".to_string(), paged_grouped_data.unwrap_or_else(|| serde_json::json!(data)));
+            if !aggregations_data.is_empty() { response.insert("aggregations".to_string(), serde_json::json!(aggregations_data)); }
             response.insert("meta".to_string(), serde_json::json!({ "engine_time_ms": query_result.execution_time_micros as f64 / 1000.0, "engine_total_ms": engine_total_ms, "ops_load_ms": ops_load_ms, "setup_ms": setup_ms, "mapping_ms": mapping_start.elapsed().as_secs_f64()*1000.0, "total_server_ms": start_time.elapsed().as_secs_f64()*1000.0, "total_found": query_result.total_found, "fields_count": headers.len(), "debug_info": query_result.debug_info }));
-            if query.response_grouping.is_none() && query_result.total_found > 0 && !headers.is_empty() {
-                response.insert("pagination".to_string(), serde_json::json!({ "page": page, "per_page": limit, "total_pages": (query_result.total_found + limit - 1) / limit, "total_items": query_result.total_found }));
+            if query_result.total_found > 0 && !headers.is_empty() {
+                let total_items = if let Some(grouped_total_items) = grouped_total_items {
+                    grouped_total_items
+                } else {
+                    query_result.total_found.min(query.limit.unwrap_or(limit))
+                };
+                let total_pages = if total_items == 0 { 1 } else { (total_items + limit - 1) / limit };
+                response.insert("pagination".to_string(), serde_json::json!({
+                    "page": page,
+                    "per_page": limit,
+                    "total_pages": total_pages,
+                    "total_items": total_items
+                }));
             }
             Ok(serde_json::Value::Object(response))
         },
@@ -843,6 +852,99 @@ fn split_alias_field(value: &str, base_alias: &str) -> Option<(String, String)> 
         Some(field) if !field.is_empty() => Some((first.to_string(), field.to_string())),
         _ => Some((base_alias.to_string(), first.to_string())),
     }
+}
+
+fn collect_warm_targets(ops: &[SavedOperation]) -> HashMap<(String, String), std::collections::HashSet<String>> {
+    let mut targets: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
+
+    for op in ops {
+        if let SavedOperation::Read(q) = op {
+            let base_alias = q.base_alias();
+            for f in &q.selected_fields {
+                if f != "*" {
+                    if let Some((alias, field)) = split_alias_field(f, &base_alias) {
+                        if alias == base_alias {
+                            targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
+                        }
+                    }
+                }
+            }
+            for s in &q.select {
+                if let Some((alias, field)) = split_alias_field(&s.field, &base_alias) {
+                    if alias == base_alias {
+                        targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
+                    }
+                }
+            }
+            for f in &q.filters {
+                if f.field != "?" {
+                    if let Some((alias, field)) = split_alias_field(&f.field, &base_alias) {
+                        let target_table = if alias == base_alias {
+                            Some((q.entity.clone(), q.table.clone()))
+                        } else {
+                            q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
+                        };
+                        if let Some(key) = target_table {
+                            targets.entry(key).or_default().insert(field);
+                        }
+                    }
+                }
+            }
+            for o in &q.order_by {
+                if let Some((alias, field)) = split_alias_field(&o.field, &base_alias) {
+                    let target_table = if alias == base_alias {
+                        Some((q.entity.clone(), q.table.clone()))
+                    } else {
+                        q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
+                    };
+                    if let Some(key) = target_table {
+                        targets.entry(key).or_default().insert(field);
+                    }
+                }
+            }
+            for join in &q.joins {
+                let join_alias = join.alias.as_deref().unwrap_or(join.table.as_str()).to_string();
+                let join_entry = targets.entry((q.entity.clone(), join.table.clone())).or_default();
+                for cond in &join.on {
+                    if let Some((alias, field)) = split_alias_field(&cond.left, &base_alias) {
+                        if alias == join_alias {
+                            join_entry.insert(field);
+                        }
+                    }
+                    if let Some((alias, field)) = split_alias_field(&cond.right, &base_alias) {
+                        if alias == join_alias {
+                            join_entry.insert(field);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+async fn warm_saved_query_targets(state: Arc<ServerState>) -> usize {
+    let Ok(ops) = crate::core::saved_queries::load_operations_with_filter(state.entity_filter.clone()) else {
+        return 0;
+    };
+    let targets = collect_warm_targets(&ops);
+    if targets.is_empty() {
+        return 0;
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let mut warmed_count = 0;
+        for ((entity, table_name), fields_set) in targets {
+            if let Ok(table_lock) = state.table_manager.get_table(&entity, &table_name) {
+                let fields: Vec<String> = fields_set.into_iter().collect();
+                let table = table_lock.read().unwrap();
+                let _ = table.warm_up(&fields);
+                warmed_count += 1;
+            }
+        }
+        warmed_count
+    }).await.unwrap_or(0)
 }
 
 async fn run_query_page(
@@ -948,6 +1050,7 @@ async fn materialize_query_rows(
 fn group_rows_by_field(
     data: &[serde_json::Map<String, serde_json::Value>],
     grouping: &crate::core::saved_queries::SavedResponseGrouping,
+    source_total_override: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     let group_fields = grouping.group_fields();
     if group_fields.is_empty() {
@@ -956,6 +1059,7 @@ fn group_rows_by_field(
 
     let mut grouped = Vec::<serde_json::Map<String, serde_json::Value>>::new();
     let mut index = std::collections::HashMap::<String, usize>::new();
+    let child_grouping = grouping.children.first();
 
     for row in data {
         let mut row = row.clone();
@@ -970,14 +1074,15 @@ fn group_rows_by_field(
         }
 
         let key = key_parts.join("\u{1f}");
-        let item = if grouping.include_group_fields_in_items {
-            serde_json::Value::Object(row)
+        let item_row = if grouping.include_group_fields_in_items {
+            row
         } else {
             for field in &group_fields {
                 row.remove(field);
             }
-            serde_json::Value::Object(row)
+            row
         };
+        let item = serde_json::Value::Object(item_row);
 
         if let Some(existing_index) = index.get(&key).copied() {
             let group = grouped.get_mut(existing_index).unwrap();
@@ -994,7 +1099,240 @@ fn group_rows_by_field(
         }
     }
 
+    // Aplicar paginación a los items agrupados
+    let limit = grouping.limit_grouping.unwrap_or(100).min(100);
+    let offset = grouping.offset_grouping.unwrap_or(0);
+    let use_source_total_override = source_total_override.filter(|_| grouped.len() == 1);
+    for group in &mut grouped {
+        if let Some(items) = group.get_mut(&grouping.items_as).and_then(|value| value.as_array_mut()) {
+            let total_items = use_source_total_override.unwrap_or(items.len());
+            let paged: Vec<_> = if limit == 0 {
+                Vec::new()
+            } else {
+                items.iter().skip(offset).take(limit).cloned().collect()
+            };
+            let page = if limit == 0 { 1 } else { (offset / limit) + 1 };
+            let total_pages = if limit == 0 { 1 } else { (total_items + limit - 1) / limit };
+            *items = paged;
+            group.insert(format!("{}_pagination", grouping.items_as), serde_json::json!({
+                "page": page,
+                "per_page": limit,
+                "total_pages": total_pages,
+                "total_items": total_items
+            }));
+        }
+    }
+
+    if let Some(child) = child_grouping {
+        for group in &mut grouped {
+            let items_value = group.get_mut(&grouping.items_as).ok_or_else(|| "Invalid grouped response state".to_string())?;
+            let child_rows = items_value
+                .as_array()
+                .ok_or_else(|| "Invalid grouped response state".to_string())?
+                .iter()
+                .map(|value| value.as_object().cloned().ok_or_else(|| "Invalid grouped response item state".to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            *items_value = group_rows_by_field(&child_rows, child, None)?;
+        }
+    }
+
     Ok(serde_json::Value::Array(grouped.into_iter().map(serde_json::Value::Object).collect()))
+}
+
+fn split_rest_collect_aggregations(
+    aggregations: &[serde_json::Value],
+) -> Result<(Vec<serde_json::Value>, Vec<SavedCollectAggregation>), String> {
+    let mut engine_aggregations = Vec::new();
+    let mut collect_aggregations = Vec::new();
+
+    for aggregation in aggregations {
+        match SavedCollectAggregation::from_aggregation(aggregation) {
+            Ok(Some(collect)) => collect_aggregations.push(collect),
+            Ok(None) => engine_aggregations.push(aggregation.clone()),
+            Err(error) => {
+                return Err(format!("Invalid Collect aggregation: {}", error));
+            }
+        }
+    }
+
+    Ok((engine_aggregations, collect_aggregations))
+}
+
+fn build_collect_aggregation(
+    data: &[serde_json::Map<String, serde_json::Value>],
+    collect: &SavedCollectAggregation,
+) -> Result<serde_json::Value, String> {
+    let group_fields = collect.group_fields();
+    if group_fields.is_empty() {
+        return Err("Collect requires 'group_by' or 'group_by_fields'".to_string());
+    }
+    if data.is_empty() {
+        return Ok(serde_json::json!({
+            "kind": "Collect",
+            "items_as": collect.items_as,
+            "data": [],
+            "summary": 0
+        }));
+    }
+
+    let item_fields = resolve_collect_item_fields(data, collect, &group_fields)?;
+    let mut grouped = Vec::<serde_json::Map<String, serde_json::Value>>::new();
+    let mut index = std::collections::HashMap::<String, usize>::new();
+    let mut total_items = 0usize;
+
+    for row in data {
+        let mut parent_fields = Vec::with_capacity(group_fields.len());
+        let mut key_parts = Vec::with_capacity(group_fields.len());
+        for field in &group_fields {
+            let value = row
+                .get(field)
+                .cloned()
+                .ok_or_else(|| format!("Collect group field '{}' was not found in the projected response", field))?;
+            key_parts.push(value.to_string());
+            parent_fields.push((field.clone(), value));
+        }
+
+        let item = build_collect_item(row, &item_fields, collect.include_group_fields_in_items)?;
+        let key = key_parts.join("\u{1f}");
+
+        if let Some(existing_index) = index.get(&key).copied() {
+            let group = grouped.get_mut(existing_index).unwrap();
+            let items = group
+                .get_mut(&collect.items_as)
+                .and_then(|value| value.as_array_mut())
+                .ok_or_else(|| "Invalid Collect aggregation state".to_string())?;
+            items.push(item);
+        } else {
+            let mut group = serde_json::Map::new();
+            for (field, value) in parent_fields {
+                group.insert(field, value);
+            }
+            group.insert(collect.items_as.clone(), serde_json::Value::Array(vec![item]));
+            index.insert(key, grouped.len());
+            grouped.push(group);
+        }
+
+        total_items += 1;
+    }
+
+    if !collect.order_by.is_empty() {
+        for group in &mut grouped {
+            let Some(items) = group.get_mut(&collect.items_as).and_then(|value| value.as_array_mut()) else {
+                continue;
+            };
+            items.sort_by(|left, right| compare_collect_values(left, right, &collect.order_by));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "kind": "Collect",
+        "items_as": collect.items_as,
+        "data": grouped.into_iter().map(serde_json::Value::Object).collect::<Vec<_>>(),
+        "summary": total_items
+    }))
+}
+
+fn resolve_collect_item_fields(
+    data: &[serde_json::Map<String, serde_json::Value>],
+    collect: &SavedCollectAggregation,
+    group_fields: &[String],
+) -> Result<Vec<String>, String> {
+    let available_fields = data
+        .first()
+        .map(|row| row.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let item_fields = if collect.item_fields.is_empty() {
+        available_fields
+            .into_iter()
+            .filter(|field| collect.include_group_fields_in_items || !group_fields.contains(field))
+            .collect::<Vec<_>>()
+    } else {
+        collect.item_fields.clone()
+    };
+
+    if item_fields.is_empty() {
+        return Err("Collect requires projected item fields or a non-empty row shape".to_string());
+    }
+
+    for field in &item_fields {
+        if !data.iter().all(|row| row.contains_key(field)) {
+            return Err(format!("Collect item field '{}' was not found in the projected response", field));
+        }
+    }
+
+    for order in &collect.order_by {
+        if !item_fields.iter().any(|field| field == &order.field) {
+            return Err(format!("Collect order_by field '{}' must also be present in item_fields", order.field));
+        }
+    }
+
+    Ok(item_fields)
+}
+
+fn build_collect_item(
+    row: &serde_json::Map<String, serde_json::Value>,
+    item_fields: &[String],
+    include_group_fields_in_items: bool,
+) -> Result<serde_json::Value, String> {
+    let mut item = serde_json::Map::new();
+
+    for field in item_fields {
+        let value = row
+            .get(field)
+            .cloned()
+            .ok_or_else(|| format!("Collect item field '{}' was not found in the projected response", field))?;
+        item.insert(field.clone(), value);
+    }
+
+    if include_group_fields_in_items {
+        for (field, value) in row {
+            item.entry(field.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    Ok(serde_json::Value::Object(item))
+}
+
+fn compare_collect_values(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    order_by: &[crate::core::saved_queries::SavedOrderBy],
+) -> std::cmp::Ordering {
+    let left_object = left.as_object();
+    let right_object = right.as_object();
+
+    for order in order_by {
+        let left_value = left_object.and_then(|object| object.get(&order.field));
+        let right_value = right_object.and_then(|object| object.get(&order.field));
+        let ordering = compare_collect_scalar(left_value, right_value);
+        if ordering != std::cmp::Ordering::Equal {
+            return if order.direction == "Desc" {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
+
+fn compare_collect_scalar(
+    left: Option<&serde_json::Value>,
+    right: Option<&serde_json::Value>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(serde_json::Value::Number(left_number)), Some(serde_json::Value::Number(right_number))) => left_number
+            .as_f64()
+            .and_then(|left_float| right_number.as_f64().and_then(|right_float| left_float.partial_cmp(&right_float)))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(serde_json::Value::String(left_string)), Some(serde_json::Value::String(right_string))) => left_string.cmp(right_string),
+        (Some(left_value), Some(right_value)) => left_value.to_string().cmp(&right_value.to_string()),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 async fn handle_insert(def: &crate::core::saved_queries::SavedInsert, payload: HashMap<String, String>, state: Arc<ServerState>) -> impl IntoResponse {

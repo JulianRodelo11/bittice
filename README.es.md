@@ -234,6 +234,7 @@ Notas sobre `response_grouping`:
 - Solo aplica a respuestas REST de operaciones guardadas.
 - Agrupa usando el nombre de campo ya proyectado en `select` o `selected_fields`.
 - Soporta `field` para un solo campo o `fields` para promover varios campos al objeto padre.
+- Soporta `children` para agrupación jerárquica de varios niveles.
 - Por defecto elimina el campo o los campos de agrupación de cada item interno.
 - Cuando se usa, Bittice intenta reunir todas las filas necesarias para devolver la respuesta agrupada y omite `pagination`.
 - Por seguridad, la respuesta agrupada está limitada a `10000` filas fuente.
@@ -246,6 +247,231 @@ Ejemplo con varios campos en el padre:
   "items_as": "horarios_por_dia"
 }
 ```
+
+Ejemplo con dos niveles de agrupación:
+
+```json
+"response_grouping": {
+  "fields": ["clienteId", "clienteNombre"],
+  "items_as": "cuentas",
+  "children": [
+    {
+      "fields": ["cuentaId", "cuentaNumero"],
+      "items_as": "movimientos"
+    }
+  ]
+}
+```
+
+Eso permite que una proyección plana como `clienteId, clienteNombre, cuentaId, cuentaNumero, movimientoId, fecha, valor` vuelva por REST como `cliente -> cuentas -> movimientos`.
+
+### Agregación Collect para Arreglos Anidados
+Si quieres mantener la respuesta principal REST plana o paginada, pero además devolver una estructura agrupada y anidada como agregación, usa `Collect`.
+
+Por ahora `Collect` es solo REST. Opera sobre la forma ya proyectada de la respuesta, así que `group_by`, `group_by_fields`, `item_fields` y su `order_by` interno deben referirse a nombres de salida definidos en `select` o `selected_fields`.
+
+```json
+{
+  "type": "read",
+  "details": {
+    "name": "parking_schedules_collect",
+    "entity": "inside",
+    "table": "ParqueaderoHorario",
+    "table_alias": "ph",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "Dia",
+        "alias": "d",
+        "on": [
+          { "left": "ph.diaId", "op": "Eq", "right": "d.diaId" }
+        ]
+      }
+    ],
+    "select": [
+      { "field": "ph.parqueaderoId", "as": "parqueaderoId" },
+      { "field": "ph.diaId", "as": "diaId" },
+      { "field": "ph.horaApertura", "as": "horaApertura" },
+      { "field": "ph.horaCierre", "as": "horaCierre" },
+      { "field": "d.nombre", "as": "diaNombre" },
+      { "field": "d.abreviatura", "as": "diaAbreviatura" }
+    ],
+    "aggregations": [
+      {
+        "Collect": {
+          "group_by": "parqueaderoId",
+          "items_as": "horarios_por_dia",
+          "item_fields": ["diaId", "horaApertura", "horaCierre", "diaNombre", "diaAbreviatura"],
+          "order_by": [
+            { "field": "diaId", "direction": "Asc" }
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+La carga agregada se devuelve dentro de `aggregations`:
+
+```json
+{
+  "aggregations": [
+    {
+      "kind": "Collect",
+      "items_as": "horarios_por_dia",
+      "summary": 2,
+      "data": [
+        {
+          "parqueaderoId": 5,
+          "horarios_por_dia": [
+            {
+              "diaId": 2,
+              "horaApertura": "05:43",
+              "horaCierre": "08:43",
+              "diaNombre": "Lunes",
+              "diaAbreviatura": "L"
+            },
+            {
+              "diaId": 3,
+              "horaApertura": "05:43",
+              "horaCierre": "08:43",
+              "diaNombre": "Martes",
+              "diaAbreviatura": "M"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notas sobre `Collect`:
+
+- Es opt-in y no cambia la respuesta principal `data` salvo que también uses `response_grouping`.
+- Actualmente funciona solo en queries guardadas vía REST.
+- Recupera todas las filas fuente necesarias para construir la agregación y usa el mismo límite de seguridad de `10000` filas fuente que `response_grouping`.
+- Usa `group_by_fields` cuando necesites más de un campo padre.
+- Si omites `item_fields`, Bittice incluye todos los campos proyectados excepto los campos padre de agrupación.
+
+### Filtros Avanzados
+Las queries guardadas ahora soportan operadores más expresivos en `filters`, además de un `filter_tree` opcional para queries guardadas multi-tabla.
+
+Operadores soportados en queries guardadas:
+
+- `Between`
+- `NotIn`
+- `IsNull`
+- `IsNotNull`
+- `Contains`
+- `StartsWith`
+- `EndsWith`
+- Los operadores existentes como `Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte` e `In`
+
+Ejemplo usando operadores avanzados en una lista plana de filtros:
+
+```json
+"filters": [
+  { "field": "estado", "op": "Eq", "value": "ACTIVO" },
+  { "field": "fecha", "op": "Between", "value": "2026-04-01", "value_to": "2026-04-30" },
+  { "field": "canal", "op": "NotIn", "values": ["LEGACY", "BATCH"] },
+  { "field": "nombre", "op": "Contains", "value": "premium" },
+  { "field": "deletedAt", "op": "IsNull", "value": "" }
+],
+"filters_op": "And"
+```
+
+Ejemplo usando grupos lógicos anidados con `filter_tree`:
+
+```json
+"filter_tree": {
+  "op": "Or",
+  "filters": [
+    {
+      "op": "And",
+      "filters": [
+        { "field": "c.estado", "op": "Eq", "value": "ACTIVO" },
+        { "field": "m.fecha", "op": "Between", "value": "2026-04-01", "value_to": "2026-04-30" }
+      ]
+    },
+    {
+      "op": "And",
+      "filters": [
+        { "field": "c.esVip", "op": "Eq", "value": "1" },
+        { "field": "m.saldo", "op": "Gt", "value": "100000" }
+      ]
+    }
+  ]
+}
+```
+
+Notas sobre filtros avanzados:
+
+- Los operadores avanzados en `filters` quedan soportados en los paths actuales de ejecución de queries guardadas single-table y multi-table.
+- `filter_tree` es opt-in y por ahora se evalúa en el executor multi-table de queries guardadas.
+- `Search` y `SearchUnary` ad-hoc por gRPC siguen usando el enum actual del proto, así que estos operadores nuevos todavía no se exponen allí.
+
+### Campos Calculados en Select
+Las queries guardadas multi-tabla ahora soportan proyecciones calculadas directamente dentro de `select` usando `expression`.
+
+Ejemplo:
+
+```json
+"select": [
+  { "field": "m.cargo", "as": "cargo" },
+  { "field": "m.abono", "as": "abono" },
+  { "expression": "m.cargo - m.abono", "as": "saldo" },
+  { "expression": "IF(m.cargo > m.abono, 1, 0)", "as": "enDeuda" }
+],
+"order_by": [
+  { "field": "saldo", "direction": "Desc" }
+]
+```
+
+Notas sobre campos calculados:
+
+- Este primer corte queda soportado en el executor multi-tabla de queries guardadas.
+- Las expresiones reutilizan el parser actual de expresiones aritméticas y `IF(...)` de Bittice.
+- Hoy las expresiones son numéricas, así que cubren bien saldos, diferencias, razones y banderas condicionales simples.
+- Puedes ordenar por el alias calculado en `order_by`.
+
+### Agregaciones Analíticas
+Las queries guardadas multi-tabla ahora también soportan `Avg`, `Min`, `Max` y `CountDistinct`, además de una cláusula opcional `having` para filtrar la salida agrupada.
+
+Ejemplo:
+
+```json
+"aggregations": [
+  {
+    "Avg": {
+      "expression": "m.cargo - m.abono",
+      "group_by": "c.ciudad",
+      "having": { "op": "Gt", "value": "1000" }
+    }
+  },
+  {
+    "CountDistinct": {
+      "field": "m.facturaId",
+      "group_by": "c.ciudad",
+      "having": { "op": "Gte", "value": "3" }
+    }
+  },
+  {
+    "Max": {
+      "field": "m.saldo"
+    }
+  }
+]
+```
+
+Notas sobre agregaciones analíticas:
+
+- `Avg`, `Min` y `Max` aceptan `field` o `expression`.
+- `CountDistinct` por ahora requiere `field`.
+- `having` es opcional y solo aplica a salidas agrupadas como `GroupBy`, `TopN`, `Sum`, `Avg`, `Min`, `Max` y `CountDistinct`.
+- `having` reutiliza los operadores de comparación ya soportados en saved queries como `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between` e `In`.
+- Este primer corte queda implementado en el executor multi-tabla de queries guardadas.
 
 ---
 

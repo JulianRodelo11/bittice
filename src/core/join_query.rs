@@ -4,10 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::core::date_utils::is_date_format;
 use crate::core::expression::{evaluate, extract_fields, parse_expression};
-use crate::core::saved_queries::{SavedJoin, SavedOrderBy, SavedQuery, SavedSelectField};
-use crate::core::types::{AggregationResult, AuthContext, ComparisonOp, FieldType, Filter, LogicalOp, QueryResult, SortDirection};
+use crate::core::saved_queries::{SavedFilterTreeNode, SavedJoin, SavedOrderBy, SavedQuery, SavedSelectField};
+use crate::core::types::{compare_filter_value, compare_values, AggregationResult, AuthContext, ComparisonOp, FieldType, Filter, LogicalOp, QueryResult, SortDirection};
 use crate::server::table_manager::TableManager;
 
 const FETCH_PAGE_SIZE: usize = 100;
@@ -23,8 +22,18 @@ struct QualifiedField {
 
 #[derive(Clone, Debug)]
 struct Projection {
-    source: QualifiedField,
     header: String,
+    kind: ProjectionKind,
+}
+
+#[derive(Clone, Debug)]
+enum ProjectionKind {
+    Source(QualifiedField),
+    Computed {
+        qualified: String,
+        expr: crate::core::expression::Expr,
+        fields: Vec<QualifiedField>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -32,7 +41,26 @@ struct ResolvedFilter {
     field: QualifiedField,
     op: ComparisonOp,
     value: String,
+    value_to: Option<String>,
+    value_options: Vec<String>,
     field_type: Option<FieldType>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedFilterTreeNode {
+    Condition(ResolvedFilter),
+    Group {
+        op: LogicalOp,
+        filters: Vec<ResolvedFilterTreeNode>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedHaving {
+    op: ComparisonOp,
+    value: String,
+    value_to: Option<String>,
+    value_options: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,7 +112,15 @@ pub fn execute_join_query(
     };
     let projections = resolve_projections(query, selected_fields_override, &base_alias)?;
     let resolved_filters = resolve_filters(query, params_map, &base_alias)?;
-    let resolved_order_by = resolve_order_by(&query.order_by, &base_alias)?;
+    let resolved_filter_tree = resolve_filter_tree(query.filter_tree.as_ref(), params_map, &base_alias)?;
+    let computed_headers = projections
+        .iter()
+        .filter_map(|projection| match &projection.kind {
+            ProjectionKind::Computed { .. } => Some(projection.header.clone()),
+            ProjectionKind::Source(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let resolved_order_by = resolve_order_by(&query.order_by, &base_alias, &computed_headers)?;
     let resolved_aggregations = resolve_aggregations(&query.aggregations, params_map)?;
     let joins = resolve_joins(query, &base_alias)?;
 
@@ -92,20 +128,10 @@ pub fn execute_join_query(
         bail!("multi-table queries require selected fields, select projections, or aggregations");
     }
 
-    let mut needed_fields = collect_needed_fields(&base_alias, &projections, &resolved_filters, &resolved_order_by, &joins, &resolved_aggregations);
+    let mut needed_fields = collect_needed_fields(&base_alias, &projections, &resolved_filters, resolved_filter_tree.as_ref(), &resolved_order_by, &joins, &resolved_aggregations);
     ensure_required_field(&mut needed_fields, &base_alias, "PK");
 
-    let base_pushdown_filters: Vec<Filter> = resolved_filters
-        .iter()
-        .filter(|filter| filter.field.alias == base_alias)
-        .map(|filter| Filter {
-            field: filter.field.field.clone(),
-            op: filter.op,
-            value: filter.value.clone(),
-            field_type: filter.field_type,
-            value_options: vec![],
-        })
-        .collect();
+    let base_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &base_alias);
 
     let base_fields = sorted_fields(needed_fields.get(&base_alias), &base_alias)?;
     let mut current_rows = fetch_table_rows(
@@ -120,21 +146,26 @@ pub fn execute_join_query(
 
     for join in &joins {
         let join_fields = sorted_fields(needed_fields.get(&join.alias), &join.alias)?;
-        let join_rows = fetch_table_rows(
+        let join_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &join.alias);
+        let join_rows = fetch_join_rows(
             &query.entity,
-            &join.table,
-            &join.alias,
+            join,
             &join_fields,
-            &[],
+            &current_rows,
+            &join_pushdown_filters,
             table_manager.clone(),
-            None,
         )?;
-
         let join_index = build_join_index(&join_rows, &join.conditions);
         current_rows = apply_join(current_rows, join, &join_index)?;
     }
 
     current_rows = apply_filters(current_rows, &resolved_filters, &filters_op);
+    if let Some(filter_tree) = &resolved_filter_tree {
+        current_rows = apply_filter_tree(current_rows, filter_tree);
+    }
+    if projections.iter().any(|projection| matches!(projection.kind, ProjectionKind::Computed { .. })) {
+        enrich_rows_with_computed(&mut current_rows, &projections);
+    }
     let total_found = current_rows.len();
     let aggregation_results = if resolved_aggregations.is_empty() {
         None
@@ -159,7 +190,10 @@ pub fn execute_join_query(
         .map(|row| {
             projections
                 .iter()
-                .map(|projection| row.get(&projection.source.qualified).cloned().unwrap_or_default())
+                .map(|projection| match &projection.kind {
+                    ProjectionKind::Source(source) => row.get(&source.qualified).cloned().unwrap_or_default(),
+                    ProjectionKind::Computed { qualified, .. } => row.get(qualified).cloned().unwrap_or_default(),
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -194,7 +228,7 @@ fn resolve_projections(
                 let qualified = parse_qualified_field(&field, base_alias)?;
                 Ok(Projection {
                     header: field,
-                    source: qualified,
+                    kind: ProjectionKind::Source(qualified),
                 })
             })
             .collect();
@@ -215,17 +249,38 @@ fn resolve_projections(
             let qualified = parse_qualified_field(field, base_alias)?;
             Ok(Projection {
                 header: field.clone(),
-                source: qualified,
+                kind: ProjectionKind::Source(qualified),
             })
         })
         .collect()
 }
 
 fn projection_from_select(select: &SavedSelectField, base_alias: &str) -> Result<Projection> {
+    let header = select.output_name.clone().unwrap_or_else(|| {
+        select.expression.clone().unwrap_or_else(|| select.field.clone())
+    });
+
+    if let Some(expression) = &select.expression {
+        let expr = parse_expression(expression)?;
+        let fields = extract_fields(&expr)
+            .into_iter()
+            .map(|field| parse_qualified_field(&field, base_alias))
+            .collect::<Result<Vec<_>>>()?;
+
+        return Ok(Projection {
+            header: header.clone(),
+            kind: ProjectionKind::Computed {
+                qualified: computed_qualified(&header),
+                expr,
+                fields,
+            },
+        });
+    }
+
     let source = parse_qualified_field(&select.field, base_alias)?;
     Ok(Projection {
-        header: select.output_name.clone().unwrap_or_else(|| select.field.clone()),
-        source,
+        header,
+        kind: ProjectionKind::Source(source),
     })
 }
 
@@ -240,18 +295,66 @@ fn resolve_filters(query: &SavedQuery, params_map: &HashMap<String, String>, bas
                 field,
                 op: ComparisonOp::from_str(&filter.op),
                 value,
+                value_to: resolve_optional_param(filter.value_to.as_deref(), params_map)?,
+                value_options: resolve_param_list(&filter.values, params_map),
                 field_type: filter.field_type,
             })
         })
         .collect()
 }
 
-fn resolve_order_by(order_by: &[SavedOrderBy], base_alias: &str) -> Result<Vec<ResolvedOrderBy>> {
+fn resolve_filter_tree(
+    filter_tree: Option<&SavedFilterTreeNode>,
+    params_map: &HashMap<String, String>,
+    base_alias: &str,
+) -> Result<Option<ResolvedFilterTreeNode>> {
+    filter_tree
+        .map(|node| resolve_filter_tree_node(node, params_map, base_alias))
+        .transpose()
+}
+
+fn resolve_filter_tree_node(
+    node: &SavedFilterTreeNode,
+    params_map: &HashMap<String, String>,
+    base_alias: &str,
+) -> Result<ResolvedFilterTreeNode> {
+    match node {
+        SavedFilterTreeNode::Condition(filter) => {
+            let field = parse_qualified_field(&filter.field, base_alias)?;
+            Ok(ResolvedFilterTreeNode::Condition(ResolvedFilter {
+                field,
+                op: ComparisonOp::from_str(&filter.op),
+                value: resolve_param(&filter.value, params_map)?,
+                value_to: resolve_optional_param(filter.value_to.as_deref(), params_map)?,
+                value_options: resolve_param_list(&filter.values, params_map),
+                field_type: filter.field_type,
+            }))
+        }
+        SavedFilterTreeNode::Group(group) => Ok(ResolvedFilterTreeNode::Group {
+            op: parse_logical_op(&group.op),
+            filters: group
+                .filters
+                .iter()
+                .map(|child| resolve_filter_tree_node(child, params_map, base_alias))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+    }
+}
+
+fn resolve_order_by(order_by: &[SavedOrderBy], base_alias: &str, computed_headers: &[String]) -> Result<Vec<ResolvedOrderBy>> {
     order_by
         .iter()
         .map(|order| {
             Ok(ResolvedOrderBy {
-                field: parse_qualified_field(&order.field, base_alias)?,
+                field: if computed_headers.iter().any(|header| header == &order.field) {
+                    QualifiedField {
+                        alias: "__computed".to_string(),
+                        field: order.field.clone(),
+                        qualified: computed_qualified(&order.field),
+                    }
+                } else {
+                    parse_qualified_field(&order.field, base_alias)?
+                },
                 direction: if order.direction == "Desc" {
                     SortDirection::Desc
                 } else {
@@ -358,6 +461,7 @@ fn collect_needed_fields(
     base_alias: &str,
     projections: &[Projection],
     filters: &[ResolvedFilter],
+    filter_tree: Option<&ResolvedFilterTreeNode>,
     order_by: &[ResolvedOrderBy],
     joins: &[ResolvedJoin],
     aggregations: &[serde_json::Value],
@@ -366,10 +470,22 @@ fn collect_needed_fields(
     needed.entry(base_alias.to_string()).or_default();
 
     for projection in projections {
-        ensure_required_field(&mut needed, &projection.source.alias, &projection.source.field);
+        match &projection.kind {
+            ProjectionKind::Source(source) => {
+                ensure_required_field(&mut needed, &source.alias, &source.field);
+            }
+            ProjectionKind::Computed { fields, .. } => {
+                for field in fields {
+                    ensure_required_field(&mut needed, &field.alias, &field.field);
+                }
+            }
+        }
     }
     for filter in filters {
         ensure_required_field(&mut needed, &filter.field.alias, &filter.field.field);
+    }
+    if let Some(filter_tree) = filter_tree {
+        collect_filter_tree_fields(&mut needed, filter_tree);
     }
     for order in order_by {
         ensure_required_field(&mut needed, &order.field.alias, &order.field.field);
@@ -384,6 +500,19 @@ fn collect_needed_fields(
     collect_aggregation_fields(&mut needed, aggregations, base_alias);
 
     needed
+}
+
+fn collect_filter_tree_fields(needed: &mut HashMap<String, HashSet<String>>, node: &ResolvedFilterTreeNode) {
+    match node {
+        ResolvedFilterTreeNode::Condition(filter) => {
+            ensure_required_field(needed, &filter.field.alias, &filter.field.field);
+        }
+        ResolvedFilterTreeNode::Group { filters, .. } => {
+            for child in filters {
+                collect_filter_tree_fields(needed, child);
+            }
+        }
+    }
 }
 
 fn collect_aggregation_fields(needed: &mut HashMap<String, HashSet<String>>, aggregations: &[serde_json::Value], base_alias: &str) {
@@ -419,6 +548,39 @@ fn collect_aggregation_fields(needed: &mut HashMap<String, HashSet<String>>, agg
                             }
                         }
                     }
+                    "Avg" | "Min" | "Max" => {
+                        if let Some(group_by) = params.get("group_by").and_then(|value| value.as_str()) {
+                            if let Ok(qualified) = parse_qualified_field(group_by, base_alias) {
+                                ensure_required_field(needed, &qualified.alias, &qualified.field);
+                            }
+                        }
+                        if let Some(field) = params.get("field").and_then(|value| value.as_str()) {
+                            if let Ok(qualified) = parse_qualified_field(field, base_alias) {
+                                ensure_required_field(needed, &qualified.alias, &qualified.field);
+                            }
+                        }
+                        if let Some(expression) = params.get("expression").and_then(|value| value.as_str()) {
+                            if let Ok(parsed) = parse_expression(expression) {
+                                for field in extract_fields(&parsed) {
+                                    if let Ok(qualified) = parse_qualified_field(&field, base_alias) {
+                                        ensure_required_field(needed, &qualified.alias, &qualified.field);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "CountDistinct" => {
+                        if let Some(group_by) = params.get("group_by").and_then(|value| value.as_str()) {
+                            if let Ok(qualified) = parse_qualified_field(group_by, base_alias) {
+                                ensure_required_field(needed, &qualified.alias, &qualified.field);
+                            }
+                        }
+                        if let Some(field) = params.get("field").and_then(|value| value.as_str()) {
+                            if let Ok(qualified) = parse_qualified_field(field, base_alias) {
+                                ensure_required_field(needed, &qualified.alias, &qualified.field);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -441,6 +603,104 @@ fn sorted_fields(fields: Option<&HashSet<String>>, alias: &str) -> Result<Vec<St
     }
     sorted.sort();
     Ok(sorted)
+}
+
+fn collect_pushdown_filters(
+    resolved_filters: &[ResolvedFilter],
+    resolved_filter_tree: Option<&ResolvedFilterTreeNode>,
+    alias: &str,
+) -> Vec<Filter> {
+    resolved_filters
+        .iter()
+        .filter(|_| resolved_filter_tree.is_none())
+        .filter(|filter| filter.field.alias == alias)
+        .map(|filter| Filter {
+            field: filter.field.field.clone(),
+            op: filter.op,
+            value: filter.value.clone(),
+            value_to: filter.value_to.clone(),
+            field_type: filter.field_type,
+            value_options: filter.value_options.clone(),
+        })
+        .collect()
+}
+
+fn fetch_join_rows(
+    entity: &str,
+    join: &ResolvedJoin,
+    fields: &[String],
+    current_rows: &[FlatRow],
+    pushdown_filters: &[Filter],
+    table_manager: Arc<TableManager>,
+) -> Result<Vec<FlatRow>> {
+    let lookup_filters = build_join_lookup_filters(current_rows, join, pushdown_filters);
+
+    if let Some(filter_sets) = lookup_filters {
+        let mut rows = Vec::new();
+        for filters in filter_sets {
+            let mut batch = fetch_table_rows(
+                entity,
+                &join.table,
+                &join.alias,
+                fields,
+                &filters,
+                table_manager.clone(),
+                None,
+            )?;
+            rows.append(&mut batch);
+        }
+        Ok(rows)
+    } else {
+        fetch_table_rows(
+            entity,
+            &join.table,
+            &join.alias,
+            fields,
+            pushdown_filters,
+            table_manager,
+            None,
+        )
+    }
+}
+
+fn build_join_lookup_filters(
+    current_rows: &[FlatRow],
+    join: &ResolvedJoin,
+    pushdown_filters: &[Filter],
+) -> Option<Vec<Vec<Filter>>> {
+    if join.conditions.is_empty() {
+        return None;
+    }
+
+    let mut seen = HashSet::new();
+    let mut filter_sets = Vec::new();
+
+    for row in current_rows {
+        let mut filters = Vec::with_capacity(join.conditions.len() + pushdown_filters.len());
+        let mut key_parts = Vec::with_capacity(join.conditions.len());
+
+        for condition in &join.conditions {
+            let value = row.get(&condition.existing_side.qualified)?.clone();
+            key_parts.push(format!("{}={}", condition.joining_side.field, value));
+            filters.push(Filter {
+                field: condition.joining_side.field.clone(),
+                op: ComparisonOp::Eq,
+                value,
+                value_to: None,
+                field_type: None,
+                value_options: vec![],
+            });
+        }
+
+        filters.extend_from_slice(pushdown_filters);
+
+        let dedupe_key = key_parts.join("\u{1f}");
+        if seen.insert(dedupe_key) {
+            filter_sets.push(filters);
+        }
+    }
+
+    Some(filter_sets)
 }
 
 fn fetch_table_rows(
@@ -541,20 +801,28 @@ fn apply_filters(rows: Vec<FlatRow>, filters: &[ResolvedFilter], filters_op: &Lo
         .collect()
 }
 
+fn apply_filter_tree(rows: Vec<FlatRow>, node: &ResolvedFilterTreeNode) -> Vec<FlatRow> {
+    rows.into_iter()
+        .filter(|row| evaluate_filter_tree(row, node))
+        .collect()
+}
+
+fn evaluate_filter_tree(row: &FlatRow, node: &ResolvedFilterTreeNode) -> bool {
+    match node {
+        ResolvedFilterTreeNode::Condition(filter) => evaluate_filter(row, filter),
+        ResolvedFilterTreeNode::Group { op, filters } => match op {
+            LogicalOp::And => filters.iter().all(|child| evaluate_filter_tree(row, child)),
+            LogicalOp::Or => filters.iter().any(|child| evaluate_filter_tree(row, child)),
+        },
+    }
+}
+
 fn evaluate_filter(row: &FlatRow, filter: &ResolvedFilter) -> bool {
     let Some(actual) = row.get(&filter.field.qualified) else {
         return false;
     };
 
-    match filter.op {
-        ComparisonOp::Eq => actual == &filter.value,
-        ComparisonOp::Ne => actual != &filter.value,
-        ComparisonOp::Gt => compare_values(actual, &filter.value, filter.field_type) == Some(Ordering::Greater),
-        ComparisonOp::Gte => matches!(compare_values(actual, &filter.value, filter.field_type), Some(Ordering::Greater) | Some(Ordering::Equal)),
-        ComparisonOp::Lt => compare_values(actual, &filter.value, filter.field_type) == Some(Ordering::Less),
-        ComparisonOp::Lte => matches!(compare_values(actual, &filter.value, filter.field_type), Some(Ordering::Less) | Some(Ordering::Equal)),
-        ComparisonOp::In => filter.value.split(',').map(|value| value.trim()).any(|value| value == actual),
-    }
+    compare_filter_value(actual, filter.op, &filter.value, filter.value_to.as_deref(), &filter.value_options, filter.field_type)
 }
 
 fn compare_rows(left: &FlatRow, right: &FlatRow, order_by: &[ResolvedOrderBy]) -> Ordering {
@@ -573,28 +841,42 @@ fn compare_rows(left: &FlatRow, right: &FlatRow, order_by: &[ResolvedOrderBy]) -
     Ordering::Equal
 }
 
-fn compare_values(left: &str, right: &str, field_type: Option<FieldType>) -> Option<Ordering> {
-    match field_type {
-        Some(FieldType::Int) | Some(FieldType::Float) => compare_numeric(left, right),
-        Some(FieldType::Date) => compare_dates(left, right),
-        _ => compare_numeric(left, right)
-            .or_else(|| compare_dates(left, right))
-            .or_else(|| Some(left.cmp(right))),
+fn enrich_rows_with_computed(rows: &mut [FlatRow], projections: &[Projection]) {
+    for row in rows {
+        let context = numeric_context_from_row(row);
+
+        for projection in projections {
+            if let ProjectionKind::Computed { qualified, expr, .. } = &projection.kind {
+                row.insert(qualified.clone(), format_computed_value(evaluate(expr, &context)));
+            }
+        }
     }
 }
 
-fn compare_numeric(left: &str, right: &str) -> Option<Ordering> {
-    let left_num = left.parse::<f64>().ok()?;
-    let right_num = right.parse::<f64>().ok()?;
-    left_num.partial_cmp(&right_num)
-}
-
-fn compare_dates(left: &str, right: &str) -> Option<Ordering> {
-    if is_date_format(left) && is_date_format(right) {
-        Some(left.cmp(right))
+fn format_computed_value(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{}", value as i64)
     } else {
-        None
+        let formatted = format!("{:.6}", value);
+        formatted.trim_end_matches('0').trim_end_matches('.').to_string()
     }
+}
+
+fn computed_qualified(header: &str) -> String {
+    format!("__computed.{}", header)
+}
+
+fn numeric_context_from_row(row: &FlatRow) -> HashMap<String, f64> {
+    let mut context = HashMap::new();
+    for (field, value) in row {
+        if let Ok(number) = value.parse::<f64>() {
+            context.insert(field.clone(), number);
+            if let Some((_, unqualified)) = field.split_once('.') {
+                context.entry(unqualified.to_string()).or_insert(number);
+            }
+        }
+    }
+    context
 }
 
 fn run_aggregations(rows: &[FlatRow], aggregations: &[serde_json::Value], base_alias: &str) -> Result<Vec<AggregationResult>> {
@@ -635,11 +917,17 @@ fn run_aggregations(rows: &[FlatRow], aggregations: &[serde_json::Value], base_a
                 }
 
                 let total = entries.iter().map(|(_, count)| *count).sum::<u64>() as f64;
+                let having = resolve_having(params)?;
+                let metric_rows = entries
+                    .into_iter()
+                    .map(|(value, count)| (value, count as f64))
+                    .collect::<Vec<_>>();
+                let metric_rows = apply_having(metric_rows, having.as_ref());
                 results.push(AggregationResult {
                     headers: vec![field.to_string(), "count".to_string()],
-                    rows: entries
+                    rows: metric_rows
                         .into_iter()
-                        .map(|(value, count)| vec![value, count.to_string()])
+                        .map(|(value, count)| vec![value, format_metric_value(count)])
                         .collect(),
                     summary: Some(total),
                 });
@@ -654,12 +942,10 @@ fn run_aggregations(rows: &[FlatRow], aggregations: &[serde_json::Value], base_a
                 let parsed = parse_expression(expression)?;
                 let mut grouped = HashMap::<String, f64>::new();
                 let mut total = 0.0;
+                let having = resolve_having(params)?;
 
                 for row in rows {
-                    let context = row
-                        .iter()
-                        .filter_map(|(field, value)| value.parse::<f64>().ok().map(|number| (field.clone(), number)))
-                        .collect::<HashMap<_, _>>();
+                    let context = numeric_context_from_row(row);
                     let value = evaluate(&parsed, &context);
                     total += value;
 
@@ -673,11 +959,12 @@ fn run_aggregations(rows: &[FlatRow], aggregations: &[serde_json::Value], base_a
                 if let Some(group_field) = group_by {
                     let mut entries = grouped.into_iter().collect::<Vec<_>>();
                     entries.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                    let entries = apply_having(entries, having.as_ref());
                     results.push(AggregationResult {
                         headers: vec![group_field.to_string(), "sum".to_string()],
                         rows: entries
                             .into_iter()
-                            .map(|(group, sum)| vec![group, format!("{:.2}", sum)])
+                            .map(|(group, sum)| vec![group, format_metric_value(sum)])
                             .collect(),
                         summary: Some(total),
                     });
@@ -689,11 +976,173 @@ fn run_aggregations(rows: &[FlatRow], aggregations: &[serde_json::Value], base_a
                     });
                 }
             }
+            "Avg" | "Min" | "Max" => {
+                let group_by = params.get("group_by").and_then(|value| value.as_str());
+                let expression = params
+                    .get("expression")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| params.get("field").and_then(|value| value.as_str()))
+                    .ok_or_else(|| anyhow!("{} aggregation requires 'field' or 'expression'", agg_type))?;
+                let parsed = parse_expression(expression)?;
+                let having = resolve_having(params)?;
+
+                if let Some(group_field) = group_by {
+                    let group = parse_qualified_field(group_field, base_alias)?;
+                    let mut grouped = HashMap::<String, Vec<f64>>::new();
+                    for row in rows {
+                        let context = numeric_context_from_row(row);
+                        let value = evaluate(&parsed, &context);
+                        let group_value = row.get(&group.qualified).cloned().unwrap_or_default();
+                        grouped.entry(group_value).or_default().push(value);
+                    }
+
+                    let mut entries = grouped
+                        .into_iter()
+                        .map(|(group_value, values)| (group_value, aggregate_numeric_values(agg_type, &values)))
+                        .collect::<Vec<_>>();
+                    entries.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                    let entries = apply_having(entries, having.as_ref());
+                    results.push(AggregationResult {
+                        headers: vec![group_field.to_string(), agg_type.to_lowercase()],
+                        rows: entries
+                            .into_iter()
+                            .map(|(group_value, metric)| vec![group_value, format_metric_value(metric)])
+                            .collect(),
+                        summary: Some(aggregate_numeric_values(agg_type, &rows.iter().map(|row| evaluate(&parsed, &numeric_context_from_row(row))).collect::<Vec<_>>())),
+                    });
+                } else {
+                    let values = rows
+                        .iter()
+                        .map(|row| evaluate(&parsed, &numeric_context_from_row(row)))
+                        .collect::<Vec<_>>();
+                    results.push(AggregationResult {
+                        headers: vec![],
+                        rows: vec![],
+                        summary: Some(aggregate_numeric_values(agg_type, &values)),
+                    });
+                }
+            }
+            "CountDistinct" => {
+                let field = params
+                    .get("field")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow!("CountDistinct aggregation requires 'field'"))?;
+                let qualified = parse_qualified_field(field, base_alias)?;
+                let group_by = params.get("group_by").and_then(|value| value.as_str());
+                let having = resolve_having(params)?;
+
+                if let Some(group_field) = group_by {
+                    let group = parse_qualified_field(group_field, base_alias)?;
+                    let mut grouped = HashMap::<String, HashSet<String>>::new();
+                    for row in rows {
+                        let group_value = row.get(&group.qualified).cloned().unwrap_or_default();
+                        let distinct_value = row.get(&qualified.qualified).cloned().unwrap_or_default();
+                        grouped.entry(group_value).or_default().insert(distinct_value);
+                    }
+
+                    let mut entries = grouped
+                        .into_iter()
+                        .map(|(group_value, values)| (group_value, values.len() as f64))
+                        .collect::<Vec<_>>();
+                    entries.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+                    let total = entries.iter().map(|(_, count)| *count).sum::<f64>();
+                    let entries = apply_having(entries, having.as_ref());
+                    results.push(AggregationResult {
+                        headers: vec![group_field.to_string(), "count_distinct".to_string()],
+                        rows: entries
+                            .into_iter()
+                            .map(|(group_value, count)| vec![group_value, format_metric_value(count)])
+                            .collect(),
+                        summary: Some(total),
+                    });
+                } else {
+                    let count = rows
+                        .iter()
+                        .filter_map(|row| row.get(&qualified.qualified).cloned())
+                        .collect::<HashSet<_>>()
+                        .len() as f64;
+                    results.push(AggregationResult {
+                        headers: vec![],
+                        rows: vec![],
+                        summary: Some(count),
+                    });
+                }
+            }
             other => bail!("unsupported aggregation '{}' for multi-table query", other),
         }
     }
 
     Ok(results)
+}
+
+fn aggregate_numeric_values(kind: &str, values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    match kind {
+        "Avg" => values.iter().sum::<f64>() / values.len() as f64,
+        "Min" => values.iter().copied().reduce(f64::min).unwrap_or(0.0),
+        "Max" => values.iter().copied().reduce(f64::max).unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+fn format_metric_value(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{}", value as i64)
+    } else {
+        format!("{:.2}", value)
+    }
+}
+
+fn resolve_having(params: &serde_json::Value) -> Result<Option<ResolvedHaving>> {
+    let Some(having) = params.get("having").and_then(|value| value.as_object()) else {
+        return Ok(None);
+    };
+
+    let op = having
+        .get("op")
+        .and_then(|value| value.as_str())
+        .map(ComparisonOp::from_str)
+        .unwrap_or(ComparisonOp::Eq);
+    let value = having
+        .get("value")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let value_to = having.get("value_to").and_then(|value| value.as_str()).map(str::to_string);
+    let value_options = having
+        .get("values")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(ResolvedHaving { op, value, value_to, value_options }))
+}
+
+fn apply_having(entries: Vec<(String, f64)>, having: Option<&ResolvedHaving>) -> Vec<(String, f64)> {
+    match having {
+        Some(having) => entries
+            .into_iter()
+            .filter(|(_, metric)| {
+                compare_filter_value(
+                    &metric.to_string(),
+                    having.op,
+                    &having.value,
+                    having.value_to.as_deref(),
+                    &having.value_options,
+                    Some(FieldType::Float),
+                )
+            })
+            .collect(),
+        None => entries,
+    }
 }
 
 fn resolve_param(raw: &str, params_map: &HashMap<String, String>) -> Result<String> {
@@ -704,6 +1153,31 @@ fn resolve_param(raw: &str, params_map: &HashMap<String, String>) -> Result<Stri
             .ok_or_else(|| anyhow!("missing param '{}'", key))
     } else {
         Ok(raw.to_string())
+    }
+}
+
+fn resolve_optional_param(raw: Option<&str>, params_map: &HashMap<String, String>) -> Result<Option<String>> {
+    raw.map(|value| resolve_param(value, params_map)).transpose()
+}
+
+fn resolve_param_list(values: &[String], params_map: &HashMap<String, String>) -> Vec<String> {
+    values
+        .iter()
+        .map(|raw| {
+            if let Some(key) = raw.strip_prefix('$') {
+                params_map.get(key).cloned().unwrap_or_else(|| raw.clone())
+            } else {
+                raw.clone()
+            }
+        })
+        .collect()
+}
+
+fn parse_logical_op(value: &str) -> LogicalOp {
+    if value.eq_ignore_ascii_case("Or") {
+        LogicalOp::Or
+    } else {
+        LogicalOp::And
     }
 }
 

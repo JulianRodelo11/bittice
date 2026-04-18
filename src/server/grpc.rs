@@ -11,6 +11,18 @@ use crate::core::saved_queries::{SavedOperation, SavedQuery};
 use std::collections::HashMap;
 use tracing::{info, debug, warn};
 
+fn query_uses_rest_only_aggregations(query: &SavedQuery) -> Result<bool, String> {
+    for aggregation in &query.aggregations {
+        match crate::core::saved_queries::SavedCollectAggregation::from_aggregation(aggregation) {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(error) => return Err(format!("Invalid Collect aggregation: {}", error)),
+        }
+    }
+
+    Ok(false)
+}
+
 pub mod bittice_proto {
     tonic::include_proto!("bittice");
 }
@@ -179,7 +191,20 @@ async fn execute_query_result_internal(
             field: sf.field.clone(),
             op: ComparisonOp::from_str(&sf.op),
             value: val,
-            value_options: vec![],
+            value_to: sf.value_to.as_ref().map(|raw| {
+                if let Some(key) = raw.strip_prefix('$') {
+                    params_map.get(key).cloned().unwrap_or_else(|| raw.clone())
+                } else {
+                    raw.clone()
+                }
+            }),
+            value_options: sf.values.iter().map(|raw| {
+                if let Some(key) = raw.strip_prefix('$') {
+                    params_map.get(key).cloned().unwrap_or_else(|| raw.clone())
+                } else {
+                    raw.clone()
+                }
+            }).collect(),
             field_type: sf.field_type,
         }
     }).collect();
@@ -290,6 +315,7 @@ impl Database for MyDatabase {
                 field: f.field,
                 op: ComparisonOp::from_str(&proto_comparison_op_to_str(f.op)),
                 value: f.value,
+                value_to: None,
                 value_options: vec![],
                 field_type: proto_field_type_to_core(f.field_type),
             });
@@ -375,8 +401,11 @@ impl Database for MyDatabase {
                 field: f.field,
                 op: proto_comparison_op_to_str(f.op),
                 value: f.value,
+                value_to: None,
+                values: Vec::new(),
                 field_type: proto_field_type_to_core(f.field_type),
             }).collect(),
+            filter_tree: None,
             filters_op: proto_logical_op_to_str(req.filters_op),
             aggregations: Vec::new(),
             order_by: req.order_by.into_iter().map(|o| crate::core::saved_queries::SavedOrderBy {
@@ -417,6 +446,9 @@ impl Database for MyDatabase {
             if let SavedOperation::Read(q) = op {
                 if q.response_grouping.is_some() {
                     return Err(Status::invalid_argument("response_grouping is currently supported only by the REST API"));
+                }
+                if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
+                    return Err(Status::invalid_argument("Collect aggregation is currently supported only by the REST API"));
                 }
                 q.clone()
             } else {
@@ -486,6 +518,9 @@ impl Database for MyDatabase {
                 if q.response_grouping.is_some() {
                     return Err(Status::invalid_argument("response_grouping is currently supported only by the REST API"));
                 }
+                if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
+                    return Err(Status::invalid_argument("Collect aggregation is currently supported only by the REST API"));
+                }
                 let auth_ctx = self.extract_auth_context(&metadata, q.auth_config.as_ref()).await;
                 let resp = execute_query_unary_internal(
                     q.clone(), 
@@ -533,7 +568,8 @@ impl Database for MyDatabase {
                         field: sf.field.clone(),
                         op: ComparisonOp::from_str(&sf.op),
                         value: val,
-                        value_options: vec![],
+                        value_to: sf.value_to.clone(),
+                        value_options: sf.values.clone(),
                         field_type: sf.field_type,
                     });
                 }
@@ -570,6 +606,7 @@ impl Database for MyDatabase {
                     field: filter_col,
                     op: ComparisonOp::Eq,
                     value: ctx.user_id,
+                    value_to: None,
                     value_options: vec![],
                     field_type: None,
                 });
@@ -607,57 +644,14 @@ impl Database for MyDatabase {
                                         let actual_trimmed = actual_val.trim();
                                         let filter_trimmed = f.value.trim();
                                         
-                                        let matched = match f.op {
-                                            ComparisonOp::Eq => {
-                                                if let Some(t) = f.field_type {
-                                                    match t {
-                                                        FieldType::Int | FieldType::Float => {
-                                                            let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                            let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                            (n_actual - n_target).abs() < f64::EPSILON
-                                                        }
-                                                        _ => actual_trimmed.to_lowercase() == filter_trimmed.to_lowercase()
-                                                    }
-                                                } else {
-                                                    actual_trimmed.to_lowercase() == filter_trimmed.to_lowercase()
-                                                }
-                                            },
-                                            ComparisonOp::Ne => {
-                                                if let Some(t) = f.field_type {
-                                                    match t {
-                                                        FieldType::Int | FieldType::Float => {
-                                                            let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                            let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                            (n_actual - n_target).abs() >= f64::EPSILON
-                                                        }
-                                                        _ => actual_trimmed.to_lowercase() != filter_trimmed.to_lowercase()
-                                                    }
-                                                } else {
-                                                    actual_trimmed.to_lowercase() != filter_trimmed.to_lowercase()
-                                                }
-                                            },
-                                            ComparisonOp::Gt => {
-                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                n_actual > n_target
-                                            },
-                                            ComparisonOp::Gte => {
-                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                n_actual >= n_target
-                                            },
-                                            ComparisonOp::Lt => {
-                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                n_actual < n_target
-                                            },
-                                            ComparisonOp::Lte => {
-                                                let n_target = filter_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                let n_actual = actual_trimmed.parse::<f64>().unwrap_or(0.0);
-                                                n_actual <= n_target
-                                            },
-                                            _ => true,
-                                        };
+                                        let matched = crate::core::types::compare_filter_value(
+                                            actual_trimmed,
+                                            f.op,
+                                            filter_trimmed,
+                                            f.value_to.as_deref(),
+                                            &f.value_options,
+                                            f.field_type,
+                                        );
 
                                         if !matched {
                                             is_match = false;

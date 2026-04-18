@@ -7,8 +7,7 @@ use roaring::RoaringBitmap;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use crate::core::types::{Filter, ComparisonOp, LogicalOp, SortDirection};
-use crate::core::date_utils::is_date_format;
+use crate::core::types::{compare_filter_value, Filter, LogicalOp, SortDirection};
 pub use crate::core::types::QueryResult;
 
 #[derive(Eq, PartialEq)]
@@ -57,16 +56,6 @@ pub fn execute_query(
     let target_ids = if filters.is_empty() {
         None
     } else {
-        // We get the total number of records to optimize exclusion operations (Ne)
-        let mut total_records = 0;
-        if let Ok(entries) = std::fs::read_dir(&stores_dir) {
-            if let Some(entry) = entries.flatten().find(|e| e.file_name().to_string_lossy().ends_with(".offsets")) {
-                if let Ok(meta) = entry.metadata() {
-                    total_records = (meta.len() >> 3) as usize;
-                }
-            }
-        }
-
         let mut result_bitmap = RoaringBitmap::new();
         let mut first = true;
         for f in filters {
@@ -83,83 +72,19 @@ pub fn execute_query(
 
             let mut filter_bitmap = RoaringBitmap::new();
             if let Some(bitmaps) = query_cache.get(&f.field) {
-                // Filter operation on the index
-                match f.op {
-                    ComparisonOp::Eq => {
-                        if let Some(bm) = bitmaps.get(&f.value) {
-                            filter_bitmap = bm.clone();
-                        }
-                    },
-                    ComparisonOp::Ne => {
-                        // OPTIMIZATION: Universe - Excluded (AND NOT)
-                        filter_bitmap = RoaringBitmap::from_iter(0..total_records as u32);
-                        if let Some(bm) = bitmaps.get(&f.value) {
-                            filter_bitmap -= bm;
-                        }
-                    },
-                    ComparisonOp::Gt => {
-                        let filter_val = &f.value;
+                if f.op == crate::core::types::ComparisonOp::Eq {
+                    if let Some(bitmap) = bitmaps.get(&f.value) {
+                        filter_bitmap = bitmap.clone();
+                    } else {
                         bitmaps.iter()
-                            .filter(|(k, _)| {
-                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                                    n_k > n_f
-                                } else if is_date_format(k) && is_date_format(filter_val) {
-                                    k.as_str() > filter_val.as_str()
-                                } else {
-                                    false // Block plain text comparisons
-                                }
-                            })
-                            .for_each(|(_, bm)| filter_bitmap |= bm);
-                    },
-                    ComparisonOp::Gte => {
-                        let filter_val = &f.value;
-                        bitmaps.iter()
-                            .filter(|(k, _)| {
-                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                                    n_k >= n_f
-                                } else if is_date_format(k) && is_date_format(filter_val) {
-                                    k.as_str() >= filter_val.as_str()
-                                } else {
-                                    false
-                                }
-                            })
-                            .for_each(|(_, bm)| filter_bitmap |= bm);
-                    },
-                    ComparisonOp::Lt => {
-                        let filter_val = &f.value;
-                        bitmaps.iter()
-                            .filter(|(k, _)| {
-                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                                    n_k < n_f
-                                } else if is_date_format(k) && is_date_format(filter_val) {
-                                    k.as_str() < filter_val.as_str()
-                                } else {
-                                    false
-                                }
-                            })
-                            .for_each(|(_, bm)| filter_bitmap |= bm);
-                    },
-                    ComparisonOp::Lte => {
-                        let filter_val = &f.value;
-                        bitmaps.iter()
-                            .filter(|(k, _)| {
-                                if let (Ok(n_k), Ok(n_f)) = (k.parse::<f64>(), filter_val.parse::<f64>()) {
-                                    n_k <= n_f
-                                } else if is_date_format(k) && is_date_format(filter_val) {
-                                    k.as_str() <= filter_val.as_str()
-                                } else {
-                                    false
-                                }
-                            })
-                            .for_each(|(_, bm)| filter_bitmap |= bm);
-                    },
-                    ComparisonOp::In => {
-                        let vals: Vec<&str> = f.value.split(',').map(|s| s.trim()).collect();
-                        bitmaps.iter()
-                            .filter(|(k, _)| vals.contains(&k.as_str()))
+                            .filter(|(k, _)| compare_filter_value(k, f.op, &f.value, f.value_to.as_deref(), &f.value_options, f.field_type))
                             .for_each(|(_, bm)| filter_bitmap |= bm);
                     }
-                };
+                } else {
+                    bitmaps.iter()
+                        .filter(|(k, _)| compare_filter_value(k, f.op, &f.value, f.value_to.as_deref(), &f.value_options, f.field_type))
+                        .for_each(|(_, bm)| filter_bitmap |= bm);
+                }
             }
 
             if first { result_bitmap = filter_bitmap; first = false; }

@@ -235,6 +235,7 @@ Notes about `response_grouping`:
 - It currently applies only to REST responses for saved operations.
 - It groups by the projected field name from `select` or `selected_fields`.
 - It supports `field` for a single parent field or `fields` to promote multiple projected fields to the parent object.
+- It supports `children` for multi-level hierarchical grouping.
 - By default it removes the grouping field or fields from each nested item.
 - When enabled, Bittice gathers all required rows for the grouped response and omits `pagination`.
 - Grouped responses are capped at `10000` source rows for safety.
@@ -247,6 +248,231 @@ Example with multiple parent fields:
   "items_as": "horarios_por_dia"
 }
 ```
+
+Example with two grouping levels:
+
+```json
+"response_grouping": {
+  "fields": ["clienteId", "clienteNombre"],
+  "items_as": "cuentas",
+  "children": [
+    {
+      "fields": ["cuentaId", "cuentaNumero"],
+      "items_as": "movimientos"
+    }
+  ]
+}
+```
+
+That lets a flat projection like `clienteId, clienteNombre, cuentaId, cuentaNumero, movimientoId, fecha, valor` come back as `cliente -> cuentas -> movimientos` in REST.
+
+### Collect Aggregation for Nested Arrays
+If you want to keep the main REST response flat or paginated, but also return a grouped nested structure as an aggregation, use `Collect`.
+
+`Collect` is REST-only for now. It works over the projected response shape, so its `group_by`, `group_by_fields`, `item_fields`, and nested `order_by` should reference output field names from `select` or `selected_fields`.
+
+```json
+{
+  "type": "read",
+  "details": {
+    "name": "parking_schedules_collect",
+    "entity": "inside",
+    "table": "ParqueaderoHorario",
+    "table_alias": "ph",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "Dia",
+        "alias": "d",
+        "on": [
+          { "left": "ph.diaId", "op": "Eq", "right": "d.diaId" }
+        ]
+      }
+    ],
+    "select": [
+      { "field": "ph.parqueaderoId", "as": "parqueaderoId" },
+      { "field": "ph.diaId", "as": "diaId" },
+      { "field": "ph.horaApertura", "as": "horaApertura" },
+      { "field": "ph.horaCierre", "as": "horaCierre" },
+      { "field": "d.nombre", "as": "diaNombre" },
+      { "field": "d.abreviatura", "as": "diaAbreviatura" }
+    ],
+    "aggregations": [
+      {
+        "Collect": {
+          "group_by": "parqueaderoId",
+          "items_as": "horarios_por_dia",
+          "item_fields": ["diaId", "horaApertura", "horaCierre", "diaNombre", "diaAbreviatura"],
+          "order_by": [
+            { "field": "diaId", "direction": "Asc" }
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+The aggregation payload is returned under `aggregations`:
+
+```json
+{
+  "aggregations": [
+    {
+      "kind": "Collect",
+      "items_as": "horarios_por_dia",
+      "summary": 2,
+      "data": [
+        {
+          "parqueaderoId": 5,
+          "horarios_por_dia": [
+            {
+              "diaId": 2,
+              "horaApertura": "05:43",
+              "horaCierre": "08:43",
+              "diaNombre": "Monday",
+              "diaAbreviatura": "M"
+            },
+            {
+              "diaId": 3,
+              "horaApertura": "05:43",
+              "horaCierre": "08:43",
+              "diaNombre": "Tuesday",
+              "diaAbreviatura": "T"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notes about `Collect`:
+
+- It is opt-in and does not change the main `data` response unless you also use `response_grouping`.
+- It currently runs only in REST saved queries.
+- It fetches all required source rows for the grouped aggregation and uses the same `10000` source-row safety cap as grouped REST responses.
+- Use `group_by_fields` when you need more than one parent field.
+- If `item_fields` is omitted, Bittice includes all projected fields except the parent grouping fields.
+
+### Advanced Filters
+Saved queries now support richer operators in `filters`, plus an optional nested `filter_tree` for multi-table saved queries.
+
+Supported operators in saved queries:
+
+- `Between`
+- `NotIn`
+- `IsNull`
+- `IsNotNull`
+- `Contains`
+- `StartsWith`
+- `EndsWith`
+- Existing operators like `Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`, and `In`
+
+Example using advanced operators in a flat filter list:
+
+```json
+"filters": [
+  { "field": "estado", "op": "Eq", "value": "ACTIVO" },
+  { "field": "fecha", "op": "Between", "value": "2026-04-01", "value_to": "2026-04-30" },
+  { "field": "canal", "op": "NotIn", "values": ["LEGACY", "BATCH"] },
+  { "field": "nombre", "op": "Contains", "value": "premium" },
+  { "field": "deletedAt", "op": "IsNull", "value": "" }
+],
+"filters_op": "And"
+```
+
+Example using nested logical groups with `filter_tree`:
+
+```json
+"filter_tree": {
+  "op": "Or",
+  "filters": [
+    {
+      "op": "And",
+      "filters": [
+        { "field": "c.estado", "op": "Eq", "value": "ACTIVO" },
+        { "field": "m.fecha", "op": "Between", "value": "2026-04-01", "value_to": "2026-04-30" }
+      ]
+    },
+    {
+      "op": "And",
+      "filters": [
+        { "field": "c.esVip", "op": "Eq", "value": "1" },
+        { "field": "m.saldo", "op": "Gt", "value": "100000" }
+      ]
+    }
+  ]
+}
+```
+
+Notes about advanced filters:
+
+- Advanced operators in `filters` are supported by the current single-table and multi-table saved-query execution paths.
+- `filter_tree` is opt-in and currently evaluated in the multi-table saved-query executor.
+- Direct ad-hoc gRPC `Search` and `SearchUnary` still use the existing proto enum, so the new operators are not exposed there yet.
+
+### Computed Select Fields
+Multi-table saved queries now support computed projections directly inside `select` using `expression`.
+
+Example:
+
+```json
+"select": [
+  { "field": "m.cargo", "as": "cargo" },
+  { "field": "m.abono", "as": "abono" },
+  { "expression": "m.cargo - m.abono", "as": "saldo" },
+  { "expression": "IF(m.cargo > m.abono, 1, 0)", "as": "enDeuda" }
+],
+"order_by": [
+  { "field": "saldo", "direction": "Desc" }
+]
+```
+
+Notes about computed fields:
+
+- This first cut is supported in the multi-table saved-query executor.
+- Expressions reuse Bittice's current arithmetic and `IF(...)` expression parser.
+- Expressions are numeric today, so this covers cases like balances, differences, ratios, and simple conditional business flags.
+- You can order by the computed alias in `order_by`.
+
+### Analytical Aggregations
+Multi-table saved queries now also support `Avg`, `Min`, `Max`, and `CountDistinct`, plus an optional `having` clause for grouped aggregation output.
+
+Example:
+
+```json
+"aggregations": [
+  {
+    "Avg": {
+      "expression": "m.cargo - m.abono",
+      "group_by": "c.ciudad",
+      "having": { "op": "Gt", "value": "1000" }
+    }
+  },
+  {
+    "CountDistinct": {
+      "field": "m.facturaId",
+      "group_by": "c.ciudad",
+      "having": { "op": "Gte", "value": "3" }
+    }
+  },
+  {
+    "Max": {
+      "field": "m.saldo"
+    }
+  }
+]
+```
+
+Notes about analytical aggregations:
+
+- `Avg`, `Min`, and `Max` accept either `field` or `expression`.
+- `CountDistinct` currently requires `field`.
+- `having` is optional and only applies to grouped outputs such as `GroupBy`, `TopN`, `Sum`, `Avg`, `Min`, `Max`, and `CountDistinct`.
+- `having` reuses the saved-query comparison operators such as `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, and `In`.
+- This first cut is implemented in the multi-table saved-query executor.
 
 ---
 
