@@ -650,6 +650,7 @@ async fn execute_read_operation(
 
     let runtime_grouping = query.response_grouping.as_ref().map(|grouping| {
         let mut grouping = grouping.clone();
+        let grouping_page_param = format!("{}_pagination", grouping.items_as);
         let grouping_limit = params
             .get("grouping_limit")
             .and_then(|value| value.parse::<usize>().ok())
@@ -658,6 +659,7 @@ async fn execute_read_operation(
             .min(100);
         let grouping_page = params
             .get("grouping_page")
+            .or_else(|| params.get(&grouping_page_param))
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
@@ -681,7 +683,12 @@ async fn execute_read_operation(
         let key = param.strip_prefix('$').unwrap_or(param);
         params.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
     } else { query.limit }.unwrap_or(100).min(100);
-    let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
+    let page = params
+        .get("page")
+        .or_else(|| params.get("pagination"))
+        .and_then(|p| p.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
     let offset = (page - 1) * limit;
 
     let state_search = state.clone();
