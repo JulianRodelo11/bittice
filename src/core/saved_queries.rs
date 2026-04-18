@@ -22,6 +22,18 @@ pub enum SavedOperation {
 pub struct SavedBatch {
     pub name: String,
     pub operations: Vec<String>, // Names of other saved operations
+    #[serde(default)]
+    pub computed_fields: Vec<SavedBatchComputedField>,
+    #[serde(default)]
+    pub response_mode: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedBatchComputedField {
+    pub name: String,
+    #[serde(default)]
+    pub inputs: std::collections::HashMap<String, String>,
+    pub expression: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

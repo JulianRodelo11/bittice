@@ -585,10 +585,132 @@ async fn handle_batch(
         }
     }
 
+    let computed = match build_batch_computed_fields(&results, batch) {
+        Ok(values) => values,
+        Err(error) => {
+            return Json(serde_json::json!({
+                "error": error,
+                "results": results,
+                "batch_meta": {
+                    "max_pages": max_pages,
+                    "total_items_combined": total_items_sum,
+                    "total_engine_time_ms": execution_time_sum,
+                    "queries_count": batch.operations.len()
+                }
+            }));
+        }
+    };
+
+    match batch.response_mode.as_deref() {
+        Some("computed_only") => {
+            return Json(serde_json::Value::Object(computed));
+        }
+        Some("merge_first_data") => {
+            let Some(first_operation) = batch.operations.first() else {
+                return Json(serde_json::json!({ "error": "batch has no operations" }));
+            };
+            let Some(source_result) = results.get(first_operation) else {
+                return Json(serde_json::json!({ "error": format!("batch result '{}' not found", first_operation) }));
+            };
+            let merged = match merge_computed_into_result(source_result, &computed) {
+                Ok(value) => value,
+                Err(error) => return Json(serde_json::json!({ "error": error })),
+            };
+            return Json(merged);
+        }
+        _ => {}
+    }
+
     Json(serde_json::json!({
         "results": results,
+        "computed": computed,
         "batch_meta": { "max_pages": max_pages, "total_items_combined": total_items_sum, "total_engine_time_ms": execution_time_sum, "queries_count": batch.operations.len() }
     }))
+}
+
+fn merge_computed_into_result(
+    source_result: &serde_json::Value,
+    computed: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut merged = source_result.clone();
+    let Some(object) = merged.as_object_mut() else {
+        return Err("batch merge source must be an object response".to_string());
+    };
+
+    let Some(data) = object.get_mut("data") else {
+        return Err("batch merge source has no data field".to_string());
+    };
+
+    let Some(items) = data.as_array_mut() else {
+        return Err("batch merge source data must be an array".to_string());
+    };
+
+    for item in items {
+        let Some(item_object) = item.as_object_mut() else {
+            return Err("batch merge source data items must be objects".to_string());
+        };
+        for (key, value) in computed {
+            item_object.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(merged)
+}
+
+fn build_batch_computed_fields(
+    results: &serde_json::Map<String, serde_json::Value>,
+    batch: &crate::core::saved_queries::SavedBatch,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut computed = serde_json::Map::new();
+
+    for field in &batch.computed_fields {
+        let parsed = crate::core::expression::parse_expression(&field.expression)
+            .map_err(|error| format!("invalid batch computed expression '{}': {}", field.name, error))?;
+        let mut context = HashMap::new();
+
+        for (input_name, source) in &field.inputs {
+            let value = resolve_batch_input(results, source)?;
+            context.insert(input_name.clone(), value);
+        }
+
+        let value = crate::core::expression::evaluate(&parsed, &context);
+        computed.insert(field.name.clone(), serde_json::json!(value));
+    }
+
+    Ok(computed)
+}
+
+fn resolve_batch_input(
+    results: &serde_json::Map<String, serde_json::Value>,
+    source: &str,
+) -> Result<f64, String> {
+    let (op_name, path) = source
+        .split_once('.')
+        .ok_or_else(|| format!("invalid computed input source '{}'", source))?;
+    let result = results
+        .get(op_name)
+        .ok_or_else(|| format!("batch result '{}' not found", op_name))?;
+
+    match path {
+        "summary" => extract_aggregation_summary(result, 0),
+        _ if path.starts_with("summary[") && path.ends_with(']') => {
+            let index = path[8..path.len() - 1]
+                .parse::<usize>()
+                .map_err(|_| format!("invalid aggregation index in '{}'", source))?;
+            extract_aggregation_summary(result, index)
+        }
+        _ => Err(format!("unsupported computed input path '{}'", source)),
+    }
+}
+
+fn extract_aggregation_summary(result: &serde_json::Value, index: usize) -> Result<f64, String> {
+    result
+        .get("aggregations")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.get(index))
+        .and_then(|value| value.get("summary"))
+        .and_then(|value| value.as_f64())
+        .ok_or_else(|| format!("aggregation summary at index {} not found", index))
 }
 
 async fn execute_read_operation(
