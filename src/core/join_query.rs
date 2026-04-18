@@ -83,6 +83,7 @@ enum JoinKind {
 
 #[derive(Clone, Debug)]
 struct ResolvedJoin {
+    entity: String,
     table: String,
     alias: String,
     kind: JoinKind,
@@ -148,7 +149,6 @@ pub fn execute_join_query(
         let join_fields = sorted_fields(needed_fields.get(&join.alias), &join.alias)?;
         let join_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &join.alias);
         let join_rows = fetch_join_rows(
-            &query.entity,
             join,
             &join_fields,
             &current_rows,
@@ -393,11 +393,11 @@ fn resolve_joins(query: &SavedQuery, base_alias: &str) -> Result<Vec<ResolvedJoi
     query
         .joins
         .iter()
-        .map(|join| resolve_join(join, base_alias, &mut bound_aliases))
+        .map(|join| resolve_join(join, base_alias, &mut bound_aliases, &query.entity))
         .collect()
 }
 
-fn resolve_join(join: &SavedJoin, base_alias: &str, bound_aliases: &mut HashSet<String>) -> Result<ResolvedJoin> {
+fn resolve_join(join: &SavedJoin, base_alias: &str, bound_aliases: &mut HashSet<String>, base_entity: &str) -> Result<ResolvedJoin> {
     let alias = join
         .alias
         .as_ref()
@@ -450,6 +450,7 @@ fn resolve_join(join: &SavedJoin, base_alias: &str, bound_aliases: &mut HashSet<
 
     bound_aliases.insert(alias.clone());
     Ok(ResolvedJoin {
+        entity: join.entity.clone().unwrap_or_else(|| base_entity.to_string()),
         table: join.table.clone(),
         alias,
         kind,
@@ -626,7 +627,6 @@ fn collect_pushdown_filters(
 }
 
 fn fetch_join_rows(
-    entity: &str,
     join: &ResolvedJoin,
     fields: &[String],
     current_rows: &[FlatRow],
@@ -639,7 +639,7 @@ fn fetch_join_rows(
         let mut rows = Vec::new();
         for filters in filter_sets {
             let mut batch = fetch_table_rows(
-                entity,
+                &join.entity,
                 &join.table,
                 &join.alias,
                 fields,
@@ -652,7 +652,7 @@ fn fetch_join_rows(
         Ok(rows)
     } else {
         fetch_table_rows(
-            entity,
+            &join.entity,
             &join.table,
             &join.alias,
             fields,

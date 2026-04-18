@@ -889,7 +889,7 @@ fn collect_warm_targets(ops: &[SavedOperation]) -> HashMap<(String, String), std
                         let target_table = if alias == base_alias {
                             Some((q.entity.clone(), q.table.clone()))
                         } else {
-                            q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
+                            q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (join.entity.clone().unwrap_or_else(|| q.entity.clone()), join.table.clone()))
                         };
                         if let Some(key) = target_table {
                             targets.entry(key).or_default().insert(field);
@@ -902,7 +902,7 @@ fn collect_warm_targets(ops: &[SavedOperation]) -> HashMap<(String, String), std
                     let target_table = if alias == base_alias {
                         Some((q.entity.clone(), q.table.clone()))
                     } else {
-                        q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (q.entity.clone(), join.table.clone()))
+                        q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (join.entity.clone().unwrap_or_else(|| q.entity.clone()), join.table.clone()))
                     };
                     if let Some(key) = target_table {
                         targets.entry(key).or_default().insert(field);
@@ -911,7 +911,8 @@ fn collect_warm_targets(ops: &[SavedOperation]) -> HashMap<(String, String), std
             }
             for join in &q.joins {
                 let join_alias = join.alias.as_deref().unwrap_or(join.table.as_str()).to_string();
-                let join_entry = targets.entry((q.entity.clone(), join.table.clone())).or_default();
+                let join_entity = join.entity.clone().unwrap_or_else(|| q.entity.clone());
+                let join_entry = targets.entry((join_entity, join.table.clone())).or_default();
                 for cond in &join.on {
                     if let Some((alias, field)) = split_alias_field(&cond.left, &base_alias) {
                         if alias == join_alias {

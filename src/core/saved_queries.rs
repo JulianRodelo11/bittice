@@ -96,6 +96,8 @@ pub struct SavedCollectAggregation {
 pub struct SavedJoin {
     #[serde(rename = "type", default = "default_join_type")]
     pub join_type: String,
+    #[serde(default)]
+    pub entity: Option<String>,
     pub table: String,
     #[serde(default)]
     pub alias: Option<String>,
