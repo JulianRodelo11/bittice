@@ -831,7 +831,7 @@ async fn execute_read_operation(
                 let total_items = if let Some(grouped_total_items) = grouped_total_items {
                     grouped_total_items
                 } else {
-                    query_result.total_found.min(query.limit.unwrap_or(limit))
+                    query_result.total_found
                 };
                 let total_pages = if total_items == 0 { 1 } else { (total_items + limit - 1) / limit };
                 response.insert("pagination".to_string(), serde_json::json!({
