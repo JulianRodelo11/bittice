@@ -79,6 +79,25 @@ impl CdcWorker {
         }
     }
 
+    fn log_warn(&self, msg: String) {
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send(format!("WARN: {}", msg));
+        } else {
+            warn!("{}", msg);
+        }
+    }
+
+    async fn enter_static_mode(&self, reason: String) -> Result<()> {
+        self.log_warn(reason);
+        self.log_info("CDC: Real-time sync inactive. Operating with static data only.".to_string());
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send("CDC_DISABLED".to_string());
+        }
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    }
+
     fn load_state(&self) -> CdcState {
         if let Ok(file) = std::fs::File::open(&self.state_path) {
             serde_json::from_reader(file).unwrap_or(CdcState {
@@ -342,13 +361,23 @@ impl CdcWorker {
         for table_name in &tables {
             if !state.bootstrapped_tables.contains(table_name) {
                 if let Err(e) = self.bootstrap_table(&mut conn, table_name, &mut state).await {
-                    self.log_error(format!("Bootstrap failed for '{}': {}", table_name, e));
-                    return Err(e);
+                    return self.enter_static_mode(format!(
+                        "Bootstrap failed for '{}': {}. Falling back to static data mode.",
+                        table_name, e
+                    )).await;
                 }
                 state.bootstrapped_tables.push(table_name.clone());
                 self.save_state(&state)?;
             } else {
-                let (cols, dates) = self.fetch_column_info(&mut conn, table_name).await?;
+                let (cols, dates) = match self.fetch_column_info(&mut conn, table_name).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        return self.enter_static_mode(format!(
+                            "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
+                            table_name, e
+                        )).await;
+                    }
+                };
                 {
                     let mut maps = self.column_maps.write().unwrap();
                     maps.insert(table_name.to_string(), cols);
@@ -361,13 +390,7 @@ impl CdcWorker {
         self.resolve_binlog_position(&mut conn, &mut state).await?;
 
         if state.binlog_file.is_empty() {
-            self.log_info("CDC: Real-time sync inactive. Operating with static data only.".to_string());
-            if let Some(tx) = &self.log_tx {
-                let _ = tx.try_send("CDC_DISABLED".to_string());
-            }
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
+            return self.enter_static_mode("CDC is not enabled on server.".to_string()).await;
         }
 
         // Notify UI that bootstrap is complete and we are entering live mode
@@ -403,7 +426,10 @@ impl CdcWorker {
                         conn.query_drop(format!("USE {}", self.database)).await?;
                         continue 'binlog_retry;
                     }
-                    return Err(e.into());
+                    return self.enter_static_mode(format!(
+                        "Binlog stream unavailable: {}. Falling back to static data mode.",
+                        msg
+                    )).await;
                 }
             };
 
@@ -421,7 +447,10 @@ impl CdcWorker {
                             conn.query_drop(format!("USE {}", self.database)).await?;
                             continue 'binlog_retry;
                         }
-                        return Err(e.into());
+                        return self.enter_static_mode(format!(
+                            "Binlog stream error: {}. Falling back to static data mode.",
+                            msg
+                        )).await;
                     }
                 };
                 let header = event.header();
