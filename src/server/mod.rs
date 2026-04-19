@@ -649,9 +649,27 @@ fn merge_computed_into_result(
         let Some(item_object) = item.as_object_mut() else {
             return Err("batch merge source data items must be objects".to_string());
         };
-        for (key, value) in computed {
-            item_object.insert(key.clone(), value.clone());
+        let original = std::mem::take(item_object);
+        let mut reordered = serde_json::Map::new();
+        let mut inserted = false;
+
+        for (key, value) in original {
+            if key == "categoria" && !inserted {
+                for (computed_key, computed_value) in computed {
+                    reordered.insert(computed_key.clone(), computed_value.clone());
+                }
+                inserted = true;
+            }
+            reordered.insert(key, value);
         }
+
+        if !inserted {
+            for (computed_key, computed_value) in computed {
+                reordered.insert(computed_key.clone(), computed_value.clone());
+            }
+        }
+
+        *item_object = reordered;
     }
 
     Ok(merged)
