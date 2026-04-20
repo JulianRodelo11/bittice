@@ -120,6 +120,244 @@ impl MyDatabase {
         *cache = Some((Instant::now(), Arc::clone(&ops_arc)));
         ops_arc
     }
+
+    async fn execute_batch_unary_internal(
+        &self,
+        batch: &crate::core::saved_queries::SavedBatch,
+        params: HashMap<String, String>,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<SearchUnaryResponse, Status> {
+        let mut results = HashMap::new();
+        let ops = self.get_operations().await;
+        
+        let mut total_found: u64 = 0;
+        let mut execution_time_micros: u64 = 0;
+
+        for op_name in &batch.operations {
+            if let Some(op) = ops.iter().find(|o| o.name() == op_name) {
+                if let SavedOperation::Read(q) = op {
+                    let mut targeted_params = params.clone();
+                    let prefix = format!("{}:", op_name);
+                    for (k, v) in &params {
+                        if let Some(stripped) = k.strip_prefix(&prefix) {
+                            targeted_params.insert(stripped.to_string(), v.clone());
+                        }
+                    }
+
+                    let auth_ctx = self.extract_auth_context(metadata, q.auth_config.as_ref()).await;
+                    match execute_query_result_internal(
+                        q.clone(),
+                        targeted_params,
+                        Arc::clone(&self.table_manager),
+                        0,
+                        0,
+                        auth_ctx
+                    ).await {
+                        Ok(res) => {
+                            total_found = total_found.saturating_add(res.total_found as u64);
+                            execution_time_micros = execution_time_micros.saturating_add(res.execution_time_micros as u64);
+                            results.insert(op_name.clone(), res);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+
+        // Build computed fields
+        let mut json_results = serde_json::Map::new();
+        for (name, res) in &results {
+            // Simplify QueryResult to JSON for expressions
+            let mut rows_json = Vec::new();
+            for row in &res.rows {
+                let mut row_map = serde_json::Map::new();
+                for (i, header) in res.headers.iter().enumerate() {
+                    if let Some(val) = row.get(i) {
+                        row_map.insert(header.clone(), serde_json::Value::String(val.clone()));
+                    }
+                }
+                rows_json.push(serde_json::Value::Object(row_map));
+            }
+            
+            let mut res_json = serde_json::json!({
+                "headers": res.headers,
+                "data": rows_json,
+                "total_found": res.total_found,
+            });
+
+            if let Some(aggs) = &res.aggregations {
+                if let Some(first) = aggs.first() {
+                    res_json.as_object_mut().unwrap().insert("summary".to_string(), serde_json::json!(first.summary.unwrap_or(0.0)));
+                }
+            }
+
+            json_results.insert(name.clone(), res_json);
+        }
+
+        let computed = self.build_batch_computed_fields_internal(&json_results, batch)?;
+
+        // Handle response modes
+        match batch.response_mode.as_deref() {
+            Some("computed_only") => {
+                let mut rows = Vec::new();
+                let mut headers = Vec::new();
+                let mut values = Vec::new();
+                
+                let mut sorted_keys: Vec<_> = computed.keys().collect();
+                sorted_keys.sort();
+
+                for key in sorted_keys {
+                    headers.push(key.clone());
+                    let val = computed.get(key).unwrap();
+                    values.push(match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => val.to_string(),
+                    });
+                }
+                rows.push(ProtoRow { values });
+
+                Ok(SearchUnaryResponse {
+                    headers,
+                    rows,
+                    total_found: 1,
+                    execution_time_micros,
+                    debug_info: "mode: computed_only".to_string(),
+                    aggregations: Vec::new(),
+                    pagination: None,
+                })
+            }
+            Some("merge_first_data") => {
+                let Some(first_op_name) = batch.operations.first() else {
+                    return Err(Status::internal("Batch has no operations"));
+                };
+                let Some(source_res) = results.get(first_op_name) else {
+                    return Err(Status::internal(format!("First operation '{}' result not found", first_op_name)));
+                };
+
+                let mut final_headers = source_res.headers.clone();
+                let mut computed_headers: Vec<_> = computed.keys().collect();
+                computed_headers.sort();
+                
+                for h in &computed_headers {
+                    if !final_headers.contains(h) {
+                        final_headers.push((*h).clone());
+                    }
+                }
+
+                let mut final_rows = Vec::new();
+                for row in &source_res.rows {
+                    let mut values = row.clone();
+                    // Pad if needed (though merge usually adds columns)
+                    for h in &computed_headers {
+                        let val = computed.get(*h).unwrap();
+                        values.push(match val {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => val.to_string(),
+                        });
+                    }
+                    final_rows.push(ProtoRow { values });
+                }
+
+                Ok(SearchUnaryResponse {
+                    headers: final_headers,
+                    rows: final_rows,
+                    total_found: source_res.total_found as u64,
+                    execution_time_micros,
+                    debug_info: "mode: merge_first_data".to_string(),
+                    aggregations: Vec::new(),
+                    pagination: None,
+                })
+            }
+            _ => {
+                // Default: just return the first one for now or a combined view?
+                // The proto SearchUnaryResponse doesn't easily support multiple results.
+                // For now, let's return the first one with a warning.
+                if let Some(first_op_name) = batch.operations.first() {
+                    if let Some(source_res) = results.get(first_op_name) {
+                         let mut proto_rows = Vec::new();
+                         for row in &source_res.rows {
+                             proto_rows.push(ProtoRow { values: row.clone() });
+                         }
+                         return Ok(SearchUnaryResponse {
+                            headers: source_res.headers.clone(),
+                            rows: proto_rows,
+                            total_found: source_res.total_found as u64,
+                            execution_time_micros,
+                            debug_info: "default batch mode (first op only)".to_string(),
+                            aggregations: Vec::new(),
+                            pagination: None,
+                        });
+                    }
+                }
+                Err(Status::unimplemented("Generic batch response not yet implemented in gRPC"))
+            }
+        }
+    }
+
+    fn build_batch_computed_fields_internal(
+        &self,
+        results: &serde_json::Map<String, serde_json::Value>,
+        batch: &crate::core::saved_queries::SavedBatch,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, Status> {
+        let mut computed = serde_json::Map::new();
+        for field in &batch.computed_fields {
+            let mut context = evalexpr::HashMapContext::new();
+            for (var_name, source) in &field.inputs {
+                let value = self.resolve_batch_input_internal(results, source)
+                    .map_err(|e| Status::internal(e))?;
+                
+                let eval_val = match value {
+                    serde_json::Value::Number(n) => {
+                        if let Some(f) = n.as_f64() { evalexpr::Value::Float(f) }
+                        else if let Some(i) = n.as_i64() { evalexpr::Value::Int(i) }
+                        else { evalexpr::Value::Float(0.0) }
+                    }
+                    serde_json::Value::String(s) => evalexpr::Value::String(s.clone()),
+                    serde_json::Value::Bool(b) => evalexpr::Value::Boolean(b),
+                    _ => evalexpr::Value::String(value.to_string()),
+                };
+                evalexpr::ContextWithMutableVariables::set_value(&mut context, var_name.clone().into(), eval_val).ok();
+            }
+
+            let result_val = evalexpr::eval_with_context(&field.expression, &context)
+                .map_err(|e| Status::invalid_argument(format!("Error evaluating expression '{}': {}", field.expression, e)))?;
+            
+            computed.insert(field.name.clone(), match result_val {
+                evalexpr::Value::Float(f) => serde_json::json!(f),
+                evalexpr::Value::Int(i) => serde_json::json!(i),
+                evalexpr::Value::Boolean(b) => serde_json::json!(b),
+                evalexpr::Value::String(s) => serde_json::json!(s),
+                _ => serde_json::json!(null),
+            });
+        }
+        Ok(computed)
+    }
+
+    fn resolve_batch_input_internal(
+        &self,
+        results: &serde_json::Map<String, serde_json::Value>,
+        source: &str,
+    ) -> Result<serde_json::Value, String> {
+        let parts: Vec<&str> = source.split('.').collect();
+        if parts.len() < 2 { return Err(format!("Invalid input source: {}", source)); }
+
+        let op_name = parts[0];
+        let field_path = &parts[1..];
+
+        let op_result = results.get(op_name)
+            .ok_or_else(|| format!("Batch result '{}' not found", op_name))?;
+
+        let mut current = op_result;
+        for &part in field_path {
+            if let Some(next) = current.get(part) {
+                current = next;
+            } else {
+                return Ok(serde_json::Value::Number(serde_json::Number::from(0)));
+            }
+        }
+
+        Ok(current.clone())
+    }
 }
 
 async fn execute_query_unary_internal(
@@ -514,27 +752,38 @@ impl Database for MyDatabase {
         let ops = self.get_operations().await;
         
         if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
-            if let SavedOperation::Read(q) = op {
-                if q.response_grouping.is_some() {
-                    return Err(Status::invalid_argument("response_grouping is currently supported only by the REST API"));
+            match op {
+                SavedOperation::Read(q) => {
+                    if q.response_grouping.is_some() {
+                        return Err(Status::invalid_argument("response_grouping is currently supported only by the REST API"));
+                    }
+                    if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
+                        return Err(Status::invalid_argument("Collect aggregation is currently supported only by the REST API"));
+                    }
+                    let auth_ctx = self.extract_auth_context(&metadata, q.auth_config.as_ref()).await;
+                    let resp = execute_query_unary_internal(
+                        q.clone(), 
+                        req.params, 
+                        Arc::clone(&self.table_manager),
+                        req.limit_override,
+                        req.offset_override,
+                        auth_ctx,
+                    ).await?;
+                    return Ok(Response::new(resp));
                 }
-                if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
-                    return Err(Status::invalid_argument("Collect aggregation is currently supported only by the REST API"));
+                SavedOperation::Batch(b) => {
+                    let resp = self.execute_batch_unary_internal(
+                        b,
+                        req.params,
+                        &metadata
+                    ).await?;
+                    return Ok(Response::new(resp));
                 }
-                let auth_ctx = self.extract_auth_context(&metadata, q.auth_config.as_ref()).await;
-                let resp = execute_query_unary_internal(
-                    q.clone(), 
-                    req.params, 
-                    Arc::clone(&self.table_manager),
-                    req.limit_override,
-                    req.offset_override,
-                    auth_ctx,
-                ).await?;
-                return Ok(Response::new(resp));
+                _ => return Err(Status::invalid_argument(format!("Operation '{}' is not a read or batch operation and cannot be executed via this endpoint", req.query_name))),
             }
         }
         
-        Err(Status::not_found("Query not found"))
+        Err(Status::not_found(format!("Query '{}' not found", req.query_name)))
     }
 
     type SubscribeUpdatesStream = ReceiverStream<Result<bittice_proto::UpdateEvent, Status>>;
