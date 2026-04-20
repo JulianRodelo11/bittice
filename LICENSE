@@ -1,44 +1,71 @@
-ELASTIC LICENSE v2.0
+Business Source License 1.1
 
-### ACCEPTANCE
-By using the software, you agree to all of the terms and conditions below.
+Licensor: Julian Rodelo
+Licensed Software: Bittice
+Version of the Licensed Software: 1.0
+Change Date: 2030-01-01
+Additional Use Grant: None
+Change License: Apache-2.0
 
-### COPYRIGHT LICENSE
-The licensor grants you a non-exclusive, royalty-free, worldwide, non-sublicensable, non-transferable license to use, copy, distribute, make available, and prepare derivative works of the software, in each case subject to the limitations and conditions below.
+-----------------------------------------------------------------------------
 
-### LIMITATIONS
-You may not provide the software to third parties as a hosted or managed service, where the service provides users with access to any substantial set of the features or functionality of the software.
+TERMS AND CONDITIONS
 
-You may not move, change, disable, or circumvent the license key functionality in the software, and you may not remove or obscure any functionality in the software that is protected by the license key.
+1. DEFINITIONS
 
-You may not alter, remove, or obscure any licensing, copyright, or other notices of the licensor in the software. Any use of the licensor’s trademarks is subject to applicable law.
+"Bittice" refers to the data synchronization and extraction engine developed 
+by Julian Rodelo, including its proprietary algorithm for real-time data 
+storage and retrieval.
 
-### PATENTS
-The licensor grants you a license, under any patent claims the licensor can license, or becomes able to license, to make, have made, use, sell, offer for sale, import and have imported the software, in each case subject to the limitations and conditions in this license. This license does not cover any patent claims that you cause to be infringed by modifications or additions to the software. If you or your company make any written claim that the software infringes or contributes to infringement of any patent, your patent license for the software granted under these terms ends immediately. If your company makes such a claim, your patent license ends immediately for work on behalf of your company.
+"Production Use" means the deployment of Bittice to process real data 
+in an operational environment.
 
-### NOTICES
-You must ensure that anyone who gets a copy of any part of the software from you also gets a copy of these terms.
+"Non-Permitted Commercial Use" means offering Bittice or any derivative 
+product as a paid service to third parties, either directly or indirectly.
 
-If you modify the software, you must include in any modified copies of the software prominent notices stating that you have modified the software.
+2. RIGHTS GRANTED
 
-### NO OTHER RIGHTS
-These terms do not imply any licenses other than those expressly granted in these terms.
+You are permitted, free of charge, to:
 
-### TERMINATION
-If you use the software in violation of these terms, such use is not licensed, and your licenses will automatically terminate. If the licensor provides you with a notice of your violation, and you cease all violation of this license no later than 30 days after you receive that notice, your licenses will be reinstated retroactively. However, if you violate these terms after such reinstatement, any additional violation of these terms will cause your licenses to terminate automatically and permanently.
+  a) Use Bittice internally within your organization.
+  b) Copy and modify Bittice for internal use.
+  c) Redistribute Bittice without modifications for non-commercial purposes.
+  d) Integrate Bittice into your own applications for internal use.
 
-### NO LIABILITY
-As far as the law allows, the software comes as is, without any warranty or condition, and the licensor will not be liable to you for any damages arising out of these terms or the use or nature of the software, under any kind of legal claim.
+3. RESTRICTIONS
 
-### DEFINITIONS
-**The licensor** is the entity offering these terms, and the software is the software the licensor makes available under these terms, including any portion of it.
+The following are expressly prohibited without written authorization from 
+the Licensor:
 
-**you** refers to the individual or entity agreeing to these terms.
+  a) Offering Bittice as a managed or cloud service to third parties.
+  b) Selling, sublicensing, or commercializing Bittice or derivative works.
+  c) Using Bittice as the main component of a paid product or service 
+     offered to third parties.
+  d) Reproducing or re-implementing Bittice's proprietary synchronization 
+     and data extraction algorithm.
 
-**your company** is any legal entity, sole proprietorship, or other kind of organization that you work for, plus all organizations that have control over, are under the control of, or are under common control with that organization. **control** means ownership of substantially all the assets of an entity, or the power to direct its management and policies by vote, contract, or otherwise. Control can be direct or indirect.
+4. CHANGE DATE
 
-**your licenses** are all the licenses granted to you for the software under these terms.
+Starting on 2030-01-01, the Licensed Software will be governed by the 
+terms of the Apache License 2.0, available at: 
+https://www.apache.org/licenses/LICENSE-2.0
 
-**use** means anything you do with the software requiring one of your licenses.
+5. INTELLECTUAL PROPERTY
 
-**trademark** means trademarks, service marks, and similar rights.
+The synchronization and data extraction method and algorithm implemented 
+in Bittice is the original invention of the Licensor. All rights to said 
+invention are reserved, regardless of the rights granted in this license.
+
+6. NO WARRANTY
+
+Bittice is provided "as is", without warranty of any kind, express or implied.
+
+7. CONTACT AND AUTHORIZATIONS
+
+To request permissions for commercial use or special licenses:
+
+  Email: julianrodelo@gmail.com
+
+-----------------------------------------------------------------------------
+
+Copyright (c) 2026 Julian Rodelo. All rights reserved.

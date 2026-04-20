@@ -4,7 +4,7 @@
 
 **Bittice** es un motor de datos local de alto rendimiento diseñado para sincronizarse directamente con bases de datos MySQL, sirviendo datos de forma instantánea a través de una CLI interactiva y APIs locales (REST y gRPC). Está diseñado para desarrolladores y empresas que necesitan capas de lectura ultra rápidas para ahorrar costos en la nube y mejorar el rendimiento sin sobrecargar sus bases de datos de producción.
 
-> **Nota:** Bittice es **Source Available** bajo la **Licencia Elastic v2.0**. Es gratuito para uso personal, interno y comercial (ej. para ahorrar costos de infraestructura). Sin embargo, no puedes ofrecerlo a terceros como un servicio gestionado.
+> **Nota:** Bittice está bajo la licencia **Business Source License 1.1**. Es gratuito para uso interno y no comercial. El **1 de enero de 2030**, la licencia se convertirá automáticamente en **Apache 2.0**.
 
 ## ⚡ Características Clave
 
@@ -94,10 +94,11 @@ Bittice soporta:
 
 ## 📜 Licencia
 
-Bittice está bajo la **Licencia Elastic v2.0**.
+Bittice está bajo la licencia **Business Source License 1.1 (BSL)**.
 
-*   **Permitido:** Gratuito para uso personal, uso interno en empresas y uso comercial para ahorrar en costos de infraestructura. Puedes modificar y redistribuir el código.
-*   **Prohibido:** No puedes ofrecer Bittice a terceros como un servicio alojado o gestionado (SaaS), y no puedes eliminar los avisos de licencia o derechos de autor.
+*   **Permitido:** Gratuito para uso interno dentro de tu organización, estudio personal y redistribución no comercial. Puedes modificar el código para uso interno.
+*   **Prohibido:** No puedes ofrecer Bittice como un servicio gestionado, venderlo o usarlo como componente principal de un producto de pago para terceros. También se prohíbe la reimplementación del algoritmo propietario de sincronización.
+*   **Futuro Open Source:** El **1 de enero de 2030**, esta versión de Bittice pasará automáticamente a ser de código abierto bajo la **Licencia Apache 2.0**.
 
  Para ver los términos completos, consulta el archivo [LICENSE](LICENSE).
 

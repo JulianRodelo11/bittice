@@ -4,7 +4,7 @@
 
 **Bittice** is a high-performance local data engine designed to synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC). It is designed for developers and companies that need ultra-fast read-layers to save cloud costs and improve performance without overloading production databases.
 
-> **Note:** Bittice is **Source Available** under the **Elastic License v2.0**. It is free to use for personal, internal, and commercial purposes (e.g., to save infrastructure costs). However, you may not provide it to others as a managed service.
+> **Note:** Bittice is licensed under the **Business Source License 1.1**. It is free for internal and non-commercial use. On **January 1st, 2030**, the license will automatically convert to **Apache 2.0**.
 
 ## ⚡ Key Features
 
@@ -94,10 +94,11 @@ Bittice supports:
 
 ## 📜 License
 
-Bittice is licensed under the **Elastic License v2.0**.
+Bittice is licensed under the **Business Source License 1.1 (BSL)**.
 
-*   **Permitted:** Free for personal use, internal use within companies, and commercial use to save on infrastructure costs. You can modify and redistribute the code.
-*   **Prohibited:** You may not provide Bittice to third parties as a hosted or managed service (SaaS), and you may not remove licensing/copyright notices.
+*   **Permitted:** Free for internal use within your organization, personal study, and non-commercial redistribution. You can modify the code for internal use.
+*   **Prohibited:** You may not offer Bittice as a managed service, sell it, or use it as the main component of a paid product for third parties. Reimplementing the proprietary synchronization algorithm is also prohibited.
+*   **Future Open Source:** On **January 1st, 2030**, this version of Bittice will automatically become open source under the **Apache License 2.0**.
 
 For the full terms, see the [LICENSE](LICENSE) file.
 
