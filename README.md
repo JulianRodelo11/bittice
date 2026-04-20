@@ -2,9 +2,9 @@
 
 [Read in English](README.md) | [Leer en Español](README.es.md)
 
-**Bittice** is a high-performance local data engine designed to synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC). It is designed for developers who need ultra-fast read-layers without overloading their production databases.
+**Bittice** is a high-performance local data engine designed to synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC). It is designed for developers and companies that need ultra-fast read-layers to save cloud costs and improve performance without overloading production databases.
 
-> **Note:** Bittice is **Source Available** under the Polyform Noncommercial License. It is free for personal and non-commercial use.
+> **Note:** Bittice is **Source Available** under the **Elastic License v2.0**. It is free to use for personal, internal, and commercial purposes (e.g., to save infrastructure costs). However, you may not provide it to others as a managed service.
 
 ## ⚡ Key Features
 
@@ -94,10 +94,10 @@ Bittice supports:
 
 ## 📜 License
 
-Bittice is licensed under the **Polyform Noncommercial License 1.0.0**.
+Bittice is licensed under the **Elastic License v2.0**.
 
-*   **Permitted:** Personal use, research, hobby projects, and use by non-commercial organizations (charities, schools, etc.).
-*   **Prohibited:** Any commercial use or application intended to generate profit.
+*   **Permitted:** Free for personal use, internal use within companies, and commercial use to save on infrastructure costs. You can modify and redistribute the code.
+*   **Prohibited:** You may not provide Bittice to third parties as a hosted or managed service (SaaS), and you may not remove licensing/copyright notices.
 
 For the full terms, see the [LICENSE](LICENSE) file.
 

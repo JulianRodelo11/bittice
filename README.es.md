@@ -2,9 +2,9 @@
 
 [Read in English](README.md) | [Leer en Español](README.es.md)
 
-**Bittice** es un motor de datos local de alto rendimiento diseñado para sincronizarse directamente con bases de datos MySQL, sirviendo datos de forma instantánea a través de una CLI interactiva y APIs locales (REST y gRPC). Está diseñado para desarrolladores que necesitan capas de lectura ultra rápidas sin sobrecargar sus bases de datos de producción.
+**Bittice** es un motor de datos local de alto rendimiento diseñado para sincronizarse directamente con bases de datos MySQL, sirviendo datos de forma instantánea a través de una CLI interactiva y APIs locales (REST y gRPC). Está diseñado para desarrolladores y empresas que necesitan capas de lectura ultra rápidas para ahorrar costos en la nube y mejorar el rendimiento sin sobrecargar sus bases de datos de producción.
 
-> **Nota:** Bittice es **Source Available** bajo la Licencia Polyform Noncommercial. Es gratuito para uso personal y no comercial.
+> **Nota:** Bittice es **Source Available** bajo la **Licencia Elastic v2.0**. Es gratuito para uso personal, interno y comercial (ej. para ahorrar costos de infraestructura). Sin embargo, no puedes ofrecerlo a terceros como un servicio gestionado.
 
 ## ⚡ Características Clave
 
@@ -94,10 +94,10 @@ Bittice soporta:
 
 ## 📜 Licencia
 
-Bittice está bajo la **Licencia Polyform Noncommercial 1.0.0**.
+Bittice está bajo la **Licencia Elastic v2.0**.
 
-*   **Permitido:** Uso personal, investigación, proyectos hobby y uso por organizaciones no comerciales (ONGs, escuelas, etc.).
-*   **Prohibido:** Cualquier uso comercial o aplicación destinada a generar ganancias.
+*   **Permitido:** Gratuito para uso personal, uso interno en empresas y uso comercial para ahorrar en costos de infraestructura. Puedes modificar y redistribuir el código.
+*   **Prohibido:** No puedes ofrecer Bittice a terceros como un servicio alojado o gestionado (SaaS), y no puedes eliminar los avisos de licencia o derechos de autor.
 
  Para ver los términos completos, consulta el archivo [LICENSE](LICENSE).
 
