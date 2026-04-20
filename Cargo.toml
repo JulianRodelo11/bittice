@@ -1,8 +1,8 @@
 [package]
 name = "bittice"
 version = "0.1.55"
-
 edition = "2021"
+license-file = "LICENSE"
 
 
 

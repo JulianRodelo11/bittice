@@ -2,94 +2,55 @@
 
 [Read in English](README.md) | [Leer en Español](README.es.md)
 
-**Bittice** is a high-performance local data engine designed to synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC).
+**Bittice** is a high-performance local data engine designed to synchronize directly with MySQL databases, serving data instantly through an interactive CLI and local APIs (REST & gRPC). It is designed for developers who need ultra-fast read-layers without overloading their production databases.
 
-## ⚡ Why Bittice? (Performance vs. Traditional DBs)
+> **Note:** Bittice is **Source Available** under the Polyform Noncommercial License. It is free for personal and non-commercial use.
 
-Bittice is not a replacement for your primary transactional database; it is a **high-performance read-layer** designed to handle massive search and analysis workloads that would otherwise slow down your production environment.
+## ⚡ Key Features
 
-### 1. Dynamic Bitmaps vs. Static Indexes
-In traditional SQL databases, you need specific composite indexes (e.g., `INDEX(a, b)`) for every combination of filters. 
-**Bittice uses Roaring Bitmaps** for every unique value. This allows the engine to perform ultra-fast logical `AND`/`OR` operations between filters dynamically, providing total flexibility without the overhead of maintaining hundreds of traditional indexes.
-
-### 2. Columnar Efficiency
-Traditional databases (Row-Oriented) must read entire rows from disk even if you only need one or two fields.
-**Bittice is Column-Oriented.** It only touches the specific data requested. This drastically reduces I/O pressure and allows it to process millions of records in milliseconds.
-
-### 3. Production Isolation (via CDC)
-Running heavy analytical queries (GroupBys, deep filters) on your production database can cause locks and slow down users.
-**Bittice uses Change Data Capture (CDC)** to act as an isolated, real-time replica. You can run intensive search workloads on Bittice with **zero impact** on your main database's performance.
-
-### 4. Native Time-Series Enrichment
-Instead of calculating year, month, or day during query time (which is slow), **Bittice automatically expands date fields** into sub-columns during ingestion. This transforms expensive date calculations into simple, instant index lookups.
-
----
-
-## 🦀 Built with Rust
-
-Bittice is written entirely in **Rust**, which is crucial for its performance and reliability:
-
-- **Zero-Cost Abstractions:** High-level code that compiles down to efficient machine instructions without the overhead of a Garbage Collector (GC).
-- **Memory Safety:** Rust's ownership model ensures memory safety and prevents common bugs like null pointers or data races, critical for a multi-threaded data engine.
-- **High Concurrency:** Leveraging `Tokio` and `Rayon`, Bittice parallelizes searches and data materialization across all CPU cores with minimal overhead.
-- **Direct System Access:** Rust allows fine-grained control over memory-mapped files (`mmap`), enabling the engine to handle datasets much larger than available RAM by letting the OS manage page caching.
-
----
-
-## 🛠 Prerequisites
-
-Before starting, ensure you have the following installed:
-- **Docker & Docker Desktop:** Mandatory. Bittice uses Docker to containerize the engine and the synchronization worker.
-- **Rust (Cargo):** To run the project locally.
+*   **Dynamic Bitmaps:** Uses Roaring Bitmaps for ultra-fast logical operations (`AND`/`OR`) across all fields dynamically.
+*   **Columnar Storage:** Only reads the data you need, drastically reducing I/O pressure.
+*   **Real-time Sync (CDC):** Acts as a real-time replica of your MySQL database using Binlog, with zero impact on production performance.
+*   **Time-Series Ready:** Automatically expands date fields into sub-columns (year, month, day, etc.) for instant lookups.
+*   **Multi-Table Joins:** Supports `INNER` and `LEFT` joins in saved operations.
+*   **Advanced Aggregations:** Includes `GroupBy`, `TopN`, `Avg`, `Min`, `Max`, and `CountDistinct` with `HAVING` support.
+*   **Flexible APIs:** High-performance REST and gRPC interfaces.
 
 ---
 
 ## 🚀 Getting Started
 
-To start Bittice, simply run the project. The interactive wizard will guide you through the setup:
+### 🛠 Prerequisites
+*   **Docker & Docker Desktop:** Required for containerizing the engine and sync worker.
+*   **Rust (Cargo):** To build and run the interactive CLI.
+
+### 🏃 Quick Start
+To start Bittice, run the interactive wizard:
 
 ```bash
 cargo run
 ```
 
-This single command gives you two clear paths:
-1. **Connect and synchronize:** Configure a new MySQL connection to start a real-time CDC sync.
-2. **Use existing data:** Jump directly to the query engine using data already synchronized.
+The wizard will guide you through:
+1.  **Connecting to MySQL:** Just provide your host, port, and credentials.
+2.  **Entity Configuration:** Choose the database and tables you want to index.
+3.  **Deployment:** Bittice will generate a `docker-compose.yml` to run the Engine and Sync worker.
 
 ---
 
-## 🔄 Step-by-Step: Connecting to MySQL
+## 🔄 How it Works
 
-When you choose **"Connect and synchronize"**, follow these steps:
-
-1.  **MySQL Host:** Enter the address of your database (e.g., `localhost` or `192.168.1.100`).
-2.  **Port:** The port where MySQL is listening (usually `3306`).
-3.  **User & Password:** Your database credentials.
-4.  **Database to synchronize:** The name of the specific database you want to index.
-5.  **Entity Name:** A nickname for this connection in Bittice (used in your API paths).
-6.  **Initial Sync:** Bittice will start a "Bootstrap" to clone your existing data into local indices.
-7.  **Docker Image Build:** The wizard will ask to build a custom Docker image for your entity. **This is highly recommended.**
-8.  **Docker Compose Stack:** Finally, it will offer to generate and start a `docker-compose.yml`. This creates two containers:
-    -   `engine`: The query server (REST/gRPC).
-    -   `sync`: The worker that keeps data updated in real-time using the MySQL Binlog.
+1.  **Bootstrap:** Bittice clones your existing MySQL data into highly optimized local columnar indices.
+2.  **CDC (Change Data Capture):** It listens to the MySQL Binlog to reflect `INSERT`, `UPDATE`, and `DELETE` operations instantly.
+3.  **Querying:** You define "Operations" (queries) via REST or use the interactive REPL to fetch data.
 
 ---
 
-## 🔄 MySQL Synchronization (CDC)
+## 🛠 Query Management (Operations)
 
-Bittice acts as a real-time replica of your MySQL database. Once the initial sync is complete, it listens to the MySQL binary log (Binlog) to reflect `INSERT`, `UPDATE`, and `DELETE` operations instantly in your local indices. 
+Queries in Bittice are called **Operations**. You manage them via the REST API at `/_config`.
 
-**Offline Support:** If the sync stops, it resumes from the last known state upon restart.
-
----
-
-## 🛠 Query Management
-
-Queries in Bittice are called **Operations**. You can manage them using the REST API at the `/_config` endpoint.
-
-### Create a Query (POST)
-Send a `POST` request to `http://localhost:3000/_config` with the query definition:
-
+### Example: Creating a Saved Query
 ```json
 {
   "type": "read",
@@ -100,407 +61,45 @@ Send a `POST` request to `http://localhost:3000/_config` with the query definiti
     "filters": [
       { "field": "amount", "op": ">", "value": "5.00" }
     ],
-    "filters_op": "And",
-    "order_by": [{ "field": "payment_date", "direction": "Desc" }],
     "limit": 10,
     "selected_fields": ["*"]
   }
 }
 ```
 
-### List Queries (GET)
-`GET http://localhost:3000/_config`
-
-### Delete a Query (DELETE)
-`DELETE http://localhost:3000/_config?name=recent_sales`
-
-### Create a Multi-Table Query (POST)
-Read operations can now join multiple tables without changing the existing single-table format. Multi-table queries keep `table` as the base table and add `table_alias`, `joins`, and `select`.
-
-```json
-{
-  "type": "read",
-  "details": {
-    "name": "sessions_with_users",
-    "entity": "goparking",
-    "table": "Sessions",
-    "table_alias": "s",
-    "joins": [
-      {
-        "type": "Inner",
-        "table": "Users",
-        "alias": "u",
-        "on": [
-          { "left": "s.userId", "op": "Eq", "right": "u.id" }
-        ]
-      }
-    ],
-    "filters": [
-      { "field": "s.status", "op": "Eq", "value": "OPEN" },
-      { "field": "u.document", "op": "Eq", "value": "$document" }
-    ],
-    "select": [
-      { "field": "s.id", "as": "session_id" },
-      { "field": "s.plate", "as": "plate" },
-      { "field": "u.name", "as": "user_name" }
-    ],
-    "order_by": [{ "field": "s.createdAt", "direction": "Desc" }],
-    "limit": 50
-  }
-}
-```
-
-Current scope for multi-table operations:
-
-- `INNER` and `LEFT` joins only.
-- Equality joins only (`Eq` in `on`).
-- Saved queries over REST and `ExecuteSavedQuery` / `ExecuteSavedQueryUnary` in gRPC.
-- Direct `Search` / `SearchUnary` remain single-table to preserve the existing contract.
-
-### Group REST Responses by a Key
-If you do not want a flat REST response, you can use `response_grouping` to group rows under a key. This is useful for shapes like `parkingId -> daily_schedules`.
-
-```json
-{
-  "type": "read",
-  "details": {
-    "name": "grouped_parking_schedules",
-    "entity": "inside",
-    "table": "ParqueaderoHorario",
-    "table_alias": "ph",
-    "joins": [
-      {
-        "type": "Inner",
-        "table": "Dia",
-        "alias": "d",
-        "on": [
-          { "left": "ph.diaId", "op": "Eq", "right": "d.diaId" }
-        ]
-      }
-    ],
-    "filters": [
-      { "field": "d.esActivo", "op": "Eq", "value": "1" }
-    ],
-    "filters_op": "And",
-    "order_by": [
-      { "field": "ph.parqueaderoId", "direction": "Asc" },
-      { "field": "ph.diaId", "direction": "Asc" }
-    ],
-    "select": [
-      { "field": "ph.parqueaderoId", "as": "parqueaderoId" },
-      { "field": "ph.diaId", "as": "diaId" },
-      { "field": "ph.horaApertura", "as": "horaApertura" },
-      { "field": "ph.horaCierre", "as": "horaCierre" },
-      { "field": "d.nombre", "as": "diaNombre" },
-      { "field": "d.abreviatura", "as": "diaAbreviatura" }
-    ],
-    "response_grouping": {
-      "field": "parqueaderoId",
-      "items_as": "horarios_por_dia"
-    }
-  }
-}
-```
-
-The REST response becomes:
-
-```json
-{
-  "data": [
-    {
-      "parqueaderoId": 5,
-      "horarios_por_dia": [
-        {
-          "diaId": 2,
-          "horaApertura": "05:43",
-          "horaCierre": "08:43",
-          "diaNombre": "Monday",
-          "diaAbreviatura": "M"
-        },
-        {
-          "diaId": 3,
-          "horaApertura": "05:43",
-          "horaCierre": "08:43",
-          "diaNombre": "Tuesday",
-          "diaAbreviatura": "T"
-        }
-      ]
-    }
-  ]
-}
-```
-
-Notes about `response_grouping`:
-
-- It currently applies only to REST responses for saved operations.
-- It groups by the projected field name from `select` or `selected_fields`.
-- It supports `field` for a single parent field or `fields` to promote multiple projected fields to the parent object.
-- It supports `children` for multi-level hierarchical grouping.
-- By default it removes the grouping field or fields from each nested item.
-- When enabled, Bittice gathers all required rows for the grouped response and omits `pagination`.
-- Grouped responses are capped at `10000` source rows for safety.
-
-Example with multiple parent fields:
-
-```json
-"response_grouping": {
-  "fields": ["parqueaderoId", "parqueaderoNombre"],
-  "items_as": "horarios_por_dia"
-}
-```
-
-Example with two grouping levels:
-
-```json
-"response_grouping": {
-  "fields": ["clienteId", "clienteNombre"],
-  "items_as": "cuentas",
-  "children": [
-    {
-      "fields": ["cuentaId", "cuentaNumero"],
-      "items_as": "movimientos"
-    }
-  ]
-}
-```
-
-That lets a flat projection like `clienteId, clienteNombre, cuentaId, cuentaNumero, movimientoId, fecha, valor` come back as `cliente -> cuentas -> movimientos` in REST.
-
-### Collect Aggregation for Nested Arrays
-If you want to keep the main REST response flat or paginated, but also return a grouped nested structure as an aggregation, use `Collect`.
-
-`Collect` is REST-only for now. It works over the projected response shape, so its `group_by`, `group_by_fields`, `item_fields`, and nested `order_by` should reference output field names from `select` or `selected_fields`.
-
-```json
-{
-  "type": "read",
-  "details": {
-    "name": "parking_schedules_collect",
-    "entity": "inside",
-    "table": "ParqueaderoHorario",
-    "table_alias": "ph",
-    "joins": [
-      {
-        "type": "Inner",
-        "table": "Dia",
-        "alias": "d",
-        "on": [
-          { "left": "ph.diaId", "op": "Eq", "right": "d.diaId" }
-        ]
-      }
-    ],
-    "select": [
-      { "field": "ph.parqueaderoId", "as": "parqueaderoId" },
-      { "field": "ph.diaId", "as": "diaId" },
-      { "field": "ph.horaApertura", "as": "horaApertura" },
-      { "field": "ph.horaCierre", "as": "horaCierre" },
-      { "field": "d.nombre", "as": "diaNombre" },
-      { "field": "d.abreviatura", "as": "diaAbreviatura" }
-    ],
-    "aggregations": [
-      {
-        "Collect": {
-          "group_by": "parqueaderoId",
-          "items_as": "horarios_por_dia",
-          "item_fields": ["diaId", "horaApertura", "horaCierre", "diaNombre", "diaAbreviatura"],
-          "order_by": [
-            { "field": "diaId", "direction": "Asc" }
-          ]
-        }
-      }
-    ]
-  }
-}
-```
-
-The aggregation payload is returned under `aggregations`:
-
-```json
-{
-  "aggregations": [
-    {
-      "kind": "Collect",
-      "items_as": "horarios_por_dia",
-      "summary": 2,
-      "data": [
-        {
-          "parqueaderoId": 5,
-          "horarios_por_dia": [
-            {
-              "diaId": 2,
-              "horaApertura": "05:43",
-              "horaCierre": "08:43",
-              "diaNombre": "Monday",
-              "diaAbreviatura": "M"
-            },
-            {
-              "diaId": 3,
-              "horaApertura": "05:43",
-              "horaCierre": "08:43",
-              "diaNombre": "Tuesday",
-              "diaAbreviatura": "T"
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-Notes about `Collect`:
-
-- It is opt-in and does not change the main `data` response unless you also use `response_grouping`.
-- It currently runs only in REST saved queries.
-- It fetches all required source rows for the grouped aggregation and uses the same `10000` source-row safety cap as grouped REST responses.
-- Use `group_by_fields` when you need more than one parent field.
-- If `item_fields` is omitted, Bittice includes all projected fields except the parent grouping fields.
-
-### Advanced Filters
-Saved queries now support richer operators in `filters`, plus an optional nested `filter_tree` for multi-table saved queries.
-
-Supported operators in saved queries:
-
-- `Between`
-- `NotIn`
-- `IsNull`
-- `IsNotNull`
-- `Contains`
-- `StartsWith`
-- `EndsWith`
-- Existing operators like `Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`, and `In`
-
-Example using advanced operators in a flat filter list:
-
-```json
-"filters": [
-  { "field": "estado", "op": "Eq", "value": "ACTIVO" },
-  { "field": "fecha", "op": "Between", "value": "2026-04-01", "value_to": "2026-04-30" },
-  { "field": "canal", "op": "NotIn", "values": ["LEGACY", "BATCH"] },
-  { "field": "nombre", "op": "Contains", "value": "premium" },
-  { "field": "deletedAt", "op": "IsNull", "value": "" }
-],
-"filters_op": "And"
-```
-
-Example using nested logical groups with `filter_tree`:
-
-```json
-"filter_tree": {
-  "op": "Or",
-  "filters": [
-    {
-      "op": "And",
-      "filters": [
-        { "field": "c.estado", "op": "Eq", "value": "ACTIVO" },
-        { "field": "m.fecha", "op": "Between", "value": "2026-04-01", "value_to": "2026-04-30" }
-      ]
-    },
-    {
-      "op": "And",
-      "filters": [
-        { "field": "c.esVip", "op": "Eq", "value": "1" },
-        { "field": "m.saldo", "op": "Gt", "value": "100000" }
-      ]
-    }
-  ]
-}
-```
-
-Notes about advanced filters:
-
-- Advanced operators in `filters` are supported by the current single-table and multi-table saved-query execution paths.
-- `filter_tree` is opt-in and currently evaluated in the multi-table saved-query executor.
-- Direct ad-hoc gRPC `Search` and `SearchUnary` still use the existing proto enum, so the new operators are not exposed there yet.
-
-### Computed Select Fields
-Multi-table saved queries now support computed projections directly inside `select` using `expression`.
-
-Example:
-
-```json
-"select": [
-  { "field": "m.cargo", "as": "cargo" },
-  { "field": "m.abono", "as": "abono" },
-  { "expression": "m.cargo - m.abono", "as": "saldo" },
-  { "expression": "IF(m.cargo > m.abono, 1, 0)", "as": "enDeuda" }
-],
-"order_by": [
-  { "field": "saldo", "direction": "Desc" }
-]
-```
-
-Notes about computed fields:
-
-- This first cut is supported in the multi-table saved-query executor.
-- Expressions reuse Bittice's current arithmetic and `IF(...)` expression parser.
-- Expressions are numeric today, so this covers cases like balances, differences, ratios, and simple conditional business flags.
-- You can order by the computed alias in `order_by`.
-
-### Analytical Aggregations
-Multi-table saved queries now also support `Avg`, `Min`, `Max`, and `CountDistinct`, plus an optional `having` clause for grouped aggregation output.
-
-Example:
-
-```json
-"aggregations": [
-  {
-    "Avg": {
-      "expression": "m.cargo - m.abono",
-      "group_by": "c.ciudad",
-      "having": { "op": "Gt", "value": "1000" }
-    }
-  },
-  {
-    "CountDistinct": {
-      "field": "m.facturaId",
-      "group_by": "c.ciudad",
-      "having": { "op": "Gte", "value": "3" }
-    }
-  },
-  {
-    "Max": {
-      "field": "m.saldo"
-    }
-  }
-]
-```
-
-Notes about analytical aggregations:
-
-- `Avg`, `Min`, and `Max` accept either `field` or `expression`.
-- `CountDistinct` currently requires `field`.
-- `having` is optional and only applies to grouped outputs such as `GroupBy`, `TopN`, `Sum`, `Avg`, `Min`, `Max`, and `CountDistinct`.
-- `having` reuses the saved-query comparison operators such as `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `Between`, and `In`.
-- This first cut is implemented in the multi-table saved-query executor.
+### Advanced Query Features
+Bittice supports:
+*   **Parameterized Queries:** Use `$` (e.g., `"value": "$min_amount"`) and pass values via URL params.
+*   **Computed Fields:** Use arithmetic expressions directly in `select`.
+*   **Response Grouping:** Group REST responses by keys for hierarchical JSON structures.
+*   **Filter Trees:** Build complex nested logical groups (`AND`/`OR`).
 
 ---
 
 ## 🌐 API Reference
 
 ### REST API (Port 3000)
-
-- **Execute Query:** `GET /query_name`
-- **Parameterized Query:** `GET /query_name?param1=value1`
-  - *Note: Use `$` prefix in your query definition (e.g., `"value": "$min_amount"`) to make it a parameter.*
-- **System Info:** `GET /_debug`, `GET /_entities`
+*   `GET /query_name` - Execute a saved query.
+*   `GET /query_name?param=value` - Execute with parameters.
+*   `POST /_config` - Create/Update an operation.
+*   `GET /_config` - List operations.
+*   `GET /_entities` - List synchronized entities.
 
 ### gRPC API (Port 50051)
-
-Bittice provides a high-performance gRPC interface defined in `proto/bittice.proto`.
-
-- **`Search` / `SearchUnary`:** Direct ad-hoc searching on a single table.
-- **`ExecuteSavedQuery`:** Run a pre-configured operation by name.
-- **`SubscribeUpdates` (Real-time):** Stream updates for a specific table. Get notified instantly when data changes.
+*   `Search` / `SearchUnary`: Ad-hoc single-table searches.
+*   `ExecuteSavedQuery`: Run pre-configured operations.
+*   `SubscribeUpdates`: Stream real-time data changes.
 
 ---
 
-## 📁 Data Structure & Ports
+## 📜 License
 
-- **Default REST Port:** `3000`
-- **Default gRPC Port:** `50051`
-- **Storage Path:** All indexed data is stored in the `data/` directory.
-- **Operations:** Saved queries are persisted in `data/.bittice_ops.json`.
+Bittice is licensed under the **Polyform Noncommercial License 1.0.0**.
+
+*   **Permitted:** Personal use, research, hobby projects, and use by non-commercial organizations (charities, schools, etc.).
+*   **Prohibited:** Any commercial use or application intended to generate profit.
+
+For the full terms, see the [LICENSE](LICENSE) file.
 
 ---
 *Bittice - Fast, Local, Efficient.*
