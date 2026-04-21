@@ -7,7 +7,6 @@ Cargo.lock
 *.log
 
 # Sensitive Deployment Files (Moved to private repo)
-install.sh
 install.ps1
 docker-compose.yml
 Dockerfile
