@@ -88,6 +88,10 @@ struct ResolvedJoin {
     alias: String,
     kind: JoinKind,
     conditions: Vec<ResolvedJoinCondition>,
+    /// Synthetic field `{alias}.{name}` filled with match count instead of row-expanding join.
+    count_matches_as: Option<String>,
+    sum_matches_field: Option<String>,
+    sum_matches_as: Option<String>,
 }
 
 type FlatRow = HashMap<String, String>;
@@ -146,7 +150,7 @@ pub fn execute_join_query(
     )?;
 
     for join in &joins {
-        let join_fields = sorted_fields(needed_fields.get(&join.alias), &join.alias)?;
+        let join_fields = sorted_join_fetch_fields(needed_fields.get(&join.alias), join)?;
         let join_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &join.alias);
         let join_rows = fetch_join_rows(
             join,
@@ -448,6 +452,58 @@ fn resolve_join(join: &SavedJoin, base_alias: &str, bound_aliases: &mut HashSet<
         conditions.push(resolved);
     }
 
+    let count_matches_as = join
+        .count_matches_as
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(name) = &count_matches_as {
+        if name.contains('.') {
+            bail!("join '{}' count_matches_as must be an unqualified field name, got '{}'", alias, name);
+        }
+    }
+
+    let sum_matches_field = join
+        .sum_matches_field
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let sum_matches_as = join
+        .sum_matches_as
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let has_sum_field = sum_matches_field.is_some();
+    let has_sum_as = sum_matches_as.is_some();
+    if has_sum_field != has_sum_as {
+        bail!(
+            "join '{}' sum_matches_field and sum_matches_as must both be set or both omitted",
+            alias
+        );
+    }
+    if let Some(name) = &sum_matches_field {
+        if name.contains('.') {
+            bail!("join '{}' sum_matches_field must be an unqualified column name, got '{}'", alias, name);
+        }
+    }
+    if let Some(name) = &sum_matches_as {
+        if name.contains('.') {
+            bail!("join '{}' sum_matches_as must be an unqualified field name, got '{}'", alias, name);
+        }
+    }
+    if let (Some(f), Some(a)) = (&sum_matches_field, &sum_matches_as) {
+        if f.eq_ignore_ascii_case(a) {
+            bail!(
+                "join '{}' sum_matches_field and sum_matches_as must differ (got '{}' for both)",
+                alias,
+                f
+            );
+        }
+    }
+
     bound_aliases.insert(alias.clone());
     Ok(ResolvedJoin {
         entity: join.entity.clone().unwrap_or_else(|| base_entity.to_string()),
@@ -455,6 +511,9 @@ fn resolve_join(join: &SavedJoin, base_alias: &str, bound_aliases: &mut HashSet<
         alias,
         kind,
         conditions,
+        count_matches_as,
+        sum_matches_field,
+        sum_matches_as,
     })
 }
 
@@ -496,6 +555,9 @@ fn collect_needed_fields(
         for condition in &join.conditions {
             ensure_required_field(&mut needed, &condition.existing_side.alias, &condition.existing_side.field);
             ensure_required_field(&mut needed, &condition.joining_side.alias, &condition.joining_side.field);
+        }
+        if let Some(ref sf) = join.sum_matches_field {
+            ensure_required_field(&mut needed, &join.alias, sf);
         }
     }
     collect_aggregation_fields(&mut needed, aggregations, base_alias);
@@ -606,6 +668,22 @@ fn sorted_fields(fields: Option<&HashSet<String>>, alias: &str) -> Result<Vec<St
     Ok(sorted)
 }
 
+/// Fields to load from storage for a join; excludes synthetic outputs (`count_matches_as`, `sum_matches_as`).
+fn sorted_join_fetch_fields(fields: Option<&HashSet<String>>, join: &ResolvedJoin) -> Result<Vec<String>> {
+    let Some(set) = fields else {
+        bail!("no fields resolved for alias '{}'", join.alias);
+    };
+    let filtered: HashSet<String> = set
+        .iter()
+        .filter(|f| {
+            join.count_matches_as.as_deref() != Some(f.as_str())
+                && join.sum_matches_as.as_deref() != Some(f.as_str())
+        })
+        .cloned()
+        .collect();
+    sorted_fields(Some(&filtered), &join.alias)
+}
+
 fn collect_pushdown_filters(
     resolved_filters: &[ResolvedFilter],
     resolved_filter_tree: Option<&ResolvedFilterTreeNode>,
@@ -680,7 +758,8 @@ fn build_join_lookup_filters(
         let mut key_parts = Vec::with_capacity(join.conditions.len());
 
         for condition in &join.conditions {
-            let value = row.get(&condition.existing_side.qualified)?.clone();
+            let value_raw = row.get(&condition.existing_side.qualified)?.clone();
+            let value = normalize_join_key_fragment(&value_raw);
             key_parts.push(format!("{}={}", condition.joining_side.field, value));
             filters.push(Filter {
                 field: condition.joining_side.field.clone(),
@@ -763,6 +842,75 @@ fn build_join_index<'a>(rows: &'a [FlatRow], conditions: &[ResolvedJoinCondition
 }
 
 fn apply_join(current_rows: Vec<FlatRow>, join: &ResolvedJoin, join_index: &HashMap<String, Vec<&FlatRow>>) -> Result<Vec<FlatRow>> {
+    let aggregate_join = join.count_matches_as.is_some()
+        || (join.sum_matches_field.is_some() && join.sum_matches_as.is_some());
+    if aggregate_join {
+        let qualified_count = join
+            .count_matches_as
+            .as_ref()
+            .map(|count_field| qualify(&join.alias, count_field));
+        let sum_in_q = join
+            .sum_matches_field
+            .as_ref()
+            .map(|sum_field| qualify(&join.alias, sum_field));
+        let qualified_sum_out = join
+            .sum_matches_as
+            .as_ref()
+            .map(|sum_as| qualify(&join.alias, sum_as));
+
+        let mut joined_rows = Vec::new();
+        for row in current_rows {
+            let key = compose_key(&row, join.conditions.iter().map(|condition| &condition.existing_side));
+            let lookup = key.as_ref().and_then(|lookup_key| join_index.get(lookup_key));
+
+            match lookup {
+                Some(matches) => {
+                    if matches.is_empty() {
+                        if join.kind == JoinKind::Left {
+                            let mut merged = row.clone();
+                            if let Some(qc) = &qualified_count {
+                                merged.insert(qc.clone(), "0".to_string());
+                            }
+                            if let Some(qout) = &qualified_sum_out {
+                                merged.insert(qout.clone(), format_computed_value(0.0));
+                            }
+                            joined_rows.push(merged);
+                        }
+                    } else {
+                        let mut merged = row.clone();
+                        if let Some(qc) = &qualified_count {
+                            merged.insert(qc.clone(), matches.len().to_string());
+                        }
+                        if let (Some(qin), Some(qout)) = (&sum_in_q, &qualified_sum_out) {
+                            let total: f64 = matches
+                                .iter()
+                                .filter_map(|m| m.get(qin.as_str()).and_then(|s| s.parse::<f64>().ok()))
+                                .sum();
+                            merged.insert(qout.clone(), format_computed_value(total));
+                        }
+                        joined_rows.push(merged);
+                    }
+                }
+                None if join.kind == JoinKind::Left => {
+                    let mut merged = row.clone();
+                    if let Some(qc) = &qualified_count {
+                        merged.insert(qc.clone(), "0".to_string());
+                    }
+                    if let Some(qout) = &qualified_sum_out {
+                        merged.insert(qout.clone(), format_computed_value(0.0));
+                    }
+                    joined_rows.push(merged);
+                }
+                None => {}
+            }
+
+            if joined_rows.len() > JOIN_RESULT_LIMIT {
+                bail!("multi-table query exceeded the in-memory join result limit ({})", JOIN_RESULT_LIMIT);
+            }
+        }
+        return Ok(joined_rows);
+    }
+
     let mut joined_rows = Vec::new();
     for row in current_rows {
         let key = compose_key(&row, join.conditions.iter().map(|condition| &condition.existing_side));
@@ -891,11 +1039,21 @@ fn run_aggregations(rows: &[FlatRow], aggregations: &[serde_json::Value], base_a
 
         match agg_type.as_str() {
             "Count" => {
-                results.push(AggregationResult {
-                    headers: vec![],
-                    rows: vec![],
-                    summary: Some(rows.len() as f64),
-                });
+                if let Some(field) = params.get("field").and_then(|v| v.as_str()) {
+                    let qualified = parse_qualified_field(field, base_alias)?;
+                    let count = rows.iter().filter(|row| row.get(&qualified.qualified).is_some()).count();
+                    results.push(AggregationResult {
+                        headers: vec![field.to_string(), "count".to_string()],
+                        rows: vec![vec![field.to_string(), count.to_string()]],
+                        summary: Some(count as f64),
+                    });
+                } else {
+                    results.push(AggregationResult {
+                        headers: vec![],
+                        rows: vec![],
+                        summary: Some(rows.len() as f64),
+                    });
+                }
             }
             "GroupBy" | "TopN" => {
                 let field = params
@@ -1205,10 +1363,25 @@ fn parse_qualified_field(value: &str, base_alias: &str) -> Result<QualifiedField
     })
 }
 
+/// Aligns join keys across tables/column types (e.g. `6351` vs `6351.0`, whitespace).
+fn normalize_join_key_fragment(value: &str) -> String {
+    let t = value.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Ok(n) = t.parse::<f64>() {
+        if (n.fract()).abs() < f64::EPSILON && n.is_finite() {
+            return format!("{}", n as i64);
+        }
+    }
+    t.to_string()
+}
+
 fn compose_key<'a>(row: &FlatRow, fields: impl Iterator<Item = &'a QualifiedField>) -> Option<String> {
     let mut values = Vec::new();
     for field in fields {
-        values.push(row.get(&field.qualified)?.clone());
+        let raw = row.get(&field.qualified)?.clone();
+        values.push(normalize_join_key_fragment(&raw));
     }
     Some(values.join(&JOIN_SEPARATOR.to_string()))
 }

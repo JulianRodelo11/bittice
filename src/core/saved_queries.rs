@@ -115,6 +115,17 @@ pub struct SavedJoin {
     pub alias: Option<String>,
     #[serde(default)]
     pub on: Vec<SavedJoinCondition>,
+    /// When set, matching joined rows are not merged into extra base rows; instead one scalar
+    /// field `{alias}.{count_matches_as}` is set to the number of matches (Left: 0 if none).
+    #[serde(default)]
+    pub count_matches_as: Option<String>,
+    /// Column on the joined table to sum across all matches (must differ from `sum_matches_as`).
+    /// Use with `sum_matches_as`; compatible with `count_matches_as` on the same join.
+    #[serde(default)]
+    pub sum_matches_field: Option<String>,
+    /// Synthetic field `{alias}.{sum_matches_as}` set to the sum of `sum_matches_field` (Left: 0 if none).
+    #[serde(default)]
+    pub sum_matches_as: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
