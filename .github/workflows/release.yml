@@ -91,14 +91,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Checkout Private Deploy Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/bittice-deploy
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy-assets
+
       - name: Download Linux Binaries
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
       - name: Prepare Docker Build Context
         run: |
           cp artifacts/bittice-linux-x86_64/bittice-linux-x86_64 bittice-linux-amd64
           cp artifacts/bittice-linux-aarch64/bittice-linux-aarch64 bittice-linux-arm64
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -116,6 +126,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: deploy-assets/Dockerfile
           platforms: linux/amd64
           push: true
           build-args: |
@@ -126,6 +137,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: deploy-assets/Dockerfile
           platforms: linux/arm64
           push: true
           build-args: |

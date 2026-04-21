@@ -4,7 +4,7 @@
 
 Proporciona un modelo de almacenamiento columnar ultra rápido que actúa como una réplica en tiempo real, liberando a sus bases de datos principales de cargas masivas de búsqueda y análisis para ahorrar costos de infraestructura y maximizar el rendimiento.
 
-> **Nota:** Bittice está bajo la **Licencia Elastic v2.0**. Es gratuito para uso personal, interno y comercial (ej. para ahorrar costos de infraestructura). Sin embargo, no puedes ofrecerlo a terceros como un servicio gestionado.
+> **Note:** Bittice está bajo la **Licencia Elastic v2.0**. Es gratuito para uso personal, interno y comercial (ej. para ahorrar costos de infraestructura). Sin embargo, no puedes ofrecerlo a terceros como un servicio gestionado.
 
 ## 🚀 La Visión: Sincronización Multi-Fuente
 Aunque actualmente cuenta con un conector robusto para **MySQL** vía CDC (Change Data Capture), Bittice está arquitecturado para ser agnóstico a la fuente. Nuestra hoja de ruta incluye sincronización nativa para:
@@ -45,7 +45,7 @@ Para obtener la documentación completa, referencia de la API y guías de instal
 ### Licencia
 Bittice está bajo la **Licencia Elastic v2.0**.
 
-*   **Permitido:** Gratuito para uso personal y uso interno en entornos de producción de cualquier organización para optimizar su propia infraestructura de datos. Puedes modificar y redistribuir el código para fines internos.
+*   **Permitido:** Gratuito para uso personal, uso interno en empresas y uso comercial para ahorrar en costos de infraestructura. Puedes modificar y redistribuir el código.
 *   **Prohibido:** No puedes ofrecer Bittice a terceros como un servicio alojado o gestionado (SaaS), ni puedes vender el software por sí mismo o eliminar los avisos de licencia o derechos de autor.
 
 Consulte [LICENSE](LICENSE) para más detalles.
