@@ -45,8 +45,8 @@ For full documentation, API reference, and installation guides, please visit our
 ### License
 Bittice is licensed under the **Elastic License v2.0**. 
 
-*   **Permitted:** Free for personal use, internal use within companies, and commercial use to save on infrastructure costs. You can modify and redistribute the code.
-*   **Prohibited:** You may not provide Bittice to third parties as a hosted or managed service (SaaS), and you may not remove licensing/copyright notices.
+*   **Permitted:** Free for personal use and internal production use within any organization to optimize their own data infrastructure. You can modify and redistribute the code for internal purposes.
+*   **Prohibited:** You may not provide Bittice to third parties as a hosted or managed service (SaaS), and you may not sell the software itself or remove licensing/copyright notices.
 
 See [LICENSE](LICENSE) for full details.
 
