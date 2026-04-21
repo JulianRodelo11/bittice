@@ -6,6 +6,13 @@ Cargo.lock
 .env
 *.log
 
+# Sensitive Deployment Files (Moved to private repo)
+install.sh
+install.ps1
+docker-compose.yml
+Dockerfile
+deploy/
+
 # Generated docker-compose files
 docker-compose-bittice-*.yml
 
