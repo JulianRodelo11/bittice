@@ -417,27 +417,34 @@ async fn execute_query_result_internal(
     offset_override: u32,
     auth_context: Option<crate::core::types::AuthContext>,
 ) -> Result<QueryResult, Status> {
+    fn param_key(raw: &str) -> Option<&str> {
+        raw.strip_prefix('$')
+            .and_then(|spec| spec.split('|').next())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    }
+
     let entity = query.entity.clone();
     let table_name = query.table.clone();
 
     let filters: Vec<CoreFilter> = query.filters.iter().map(|sf| {
         let mut val = sf.value.clone();
-        if val.starts_with('$') {
-            if let Some(param_val) = params_map.get(&val[1..]) { val = param_val.clone(); }
+        if let Some(key) = param_key(&val) {
+            if let Some(param_val) = params_map.get(key) { val = param_val.clone(); }
         }
         CoreFilter {
             field: sf.field.clone(),
             op: ComparisonOp::from_str(&sf.op),
             value: val,
             value_to: sf.value_to.as_ref().map(|raw| {
-                if let Some(key) = raw.strip_prefix('$') {
+                if let Some(key) = param_key(raw) {
                     params_map.get(key).cloned().unwrap_or_else(|| raw.clone())
                 } else {
                     raw.clone()
                 }
             }),
             value_options: sf.values.iter().map(|raw| {
-                if let Some(key) = raw.strip_prefix('$') {
+                if let Some(key) = param_key(raw) {
                     params_map.get(key).cloned().unwrap_or_else(|| raw.clone())
                 } else {
                     raw.clone()
@@ -452,7 +459,7 @@ async fn execute_query_result_internal(
         if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
             for val in obj.values_mut() {
                 if let Some(s) = val.as_str() {
-                    if let Some(key) = s.strip_prefix('$') {
+                    if let Some(key) = param_key(s) {
                         if let Some(param_val) = params_map.get(key) {
                             if let Ok(num) = param_val.parse::<u64>() { *val = serde_json::json!(num); }
                             else { *val = serde_json::json!(param_val); }
@@ -469,7 +476,7 @@ async fn execute_query_result_internal(
     }).collect();
 
     let mut limit = if let Some(ref param) = query.limit_param {
-        let key = param.strip_prefix('$').unwrap_or(param);
+        let key = param_key(param).unwrap_or(param);
         params_map.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
     } else { query.limit }.unwrap_or(100).min(100);
 

@@ -739,23 +739,29 @@ async fn execute_read_operation(
     ops_load_ms: f64,
     auth_context: Option<&AuthContext>,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    fn param_key(raw: &str) -> Option<&str> {
+        raw.strip_prefix('$')
+            .and_then(|spec| spec.split('|').next())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    }
+
     let mut missing_params = Vec::new();
     let filters: Vec<Filter> = query.filters.iter().map(|sf| {
         let mut val = sf.value.clone();
-        if val.starts_with('$') {
-            let key = &val[1..];
+        if let Some(key) = param_key(&val) {
             if let Some(param_val) = params.get(key) { val = param_val.clone(); }
             else { missing_params.push(key.to_string()); }
         }
         let value_to = sf.value_to.as_ref().map(|raw| {
-            if let Some(key) = raw.strip_prefix('$') {
+            if let Some(key) = param_key(raw) {
                 params.get(key).cloned().unwrap_or_else(|| raw.clone())
             } else {
                 raw.clone()
             }
         });
         let value_options = sf.values.iter().map(|raw| {
-            if let Some(key) = raw.strip_prefix('$') {
+            if let Some(key) = param_key(raw) {
                 params.get(key).cloned().unwrap_or_else(|| raw.clone())
             } else {
                 raw.clone()
@@ -769,7 +775,7 @@ async fn execute_read_operation(
         if let Some(obj) = agg.as_object_mut().and_then(|o| o.values_mut().next()).and_then(|v| v.as_object_mut()) {
             for val in obj.values_mut() {
                 if let Some(s) = val.as_str() {
-                    if let Some(key) = s.strip_prefix('$') {
+                    if let Some(key) = param_key(s) {
                         if let Some(param_val) = params.get(key) {
                             if let Ok(num) = param_val.parse::<u64>() { *val = serde_json::json!(num); }
                             else { *val = serde_json::json!(param_val); }
@@ -820,7 +826,7 @@ async fn execute_read_operation(
     
     let param_fields: Vec<String> = params.get("fields").map(|s| s.split(',').map(|f| f.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
     let limit = if let Some(ref param) = query.limit_param {
-        let key = param.strip_prefix('$').unwrap_or(param);
+        let key = param_key(param).unwrap_or(param);
         params.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
     } else { query.limit }.unwrap_or(100).min(100);
     let page = params

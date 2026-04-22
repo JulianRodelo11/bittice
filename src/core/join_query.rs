@@ -1304,11 +1304,44 @@ fn apply_having(entries: Vec<(String, f64)>, having: Option<&ResolvedHaving>) ->
 }
 
 fn resolve_param(raw: &str, params_map: &HashMap<String, String>) -> Result<String> {
-    if let Some(key) = raw.strip_prefix('$') {
-        params_map
+    if let Some(spec) = raw.strip_prefix('$') {
+        let mut parts = spec.split('|');
+        let key = parts.next().unwrap_or_default();
+        let mut value = params_map
             .get(key)
             .cloned()
-            .ok_or_else(|| anyhow!("missing param '{}'", key))
+            .ok_or_else(|| anyhow!("missing param '{}'", key))?;
+
+        for transform in parts {
+            if transform.eq_ignore_ascii_case("trim") {
+                value = value.trim().to_string();
+                continue;
+            }
+
+            if let Some(split_spec) = transform.strip_prefix("split:") {
+                let mut split_parts = split_spec.splitn(2, ':');
+                let delimiter = split_parts.next().unwrap_or_default();
+                if delimiter.is_empty() {
+                    return Err(anyhow!("invalid split transform '{}': empty delimiter", transform));
+                }
+                let index_raw = split_parts
+                    .next()
+                    .ok_or_else(|| anyhow!("invalid split transform '{}': missing index", transform))?;
+                let index = index_raw
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("invalid split index '{}' in '{}'", index_raw, transform))?;
+                let segments: Vec<&str> = value.split(delimiter).collect();
+                value = segments
+                    .get(index)
+                    .map(|segment| segment.to_string())
+                    .ok_or_else(|| anyhow!("split transform '{}' out of bounds for value '{}'", transform, value))?;
+                continue;
+            }
+
+            return Err(anyhow!("unsupported param transform '{}'", transform));
+        }
+
+        Ok(value)
     } else {
         Ok(raw.to_string())
     }
