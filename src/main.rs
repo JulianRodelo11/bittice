@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
             }
             // ... rest of commands ...
 
-            Commands::Cdc { url, entity, database } => {
+            Commands::Cdc { url, entity, database, sync_all } => {
                 // Check if there's a saved config with VPN for this entity
                 let config_path = format!("data/{}/cdc_config.json", entity);
                 if let Ok(content) = std::fs::read_to_string(&config_path) {
@@ -51,7 +51,14 @@ async fn main() -> Result<()> {
                     let _ = bittice::server::start_all_servers(Some(server_entity)).await;
                 });
 
-                let worker = bittice::core::cdc::CdcWorker::new(url, entity, database);
+                let worker = if sync_all {
+                    bittice::core::cdc::CdcWorker::new_sync_all(url, entity)
+                } else {
+                    let db = database.ok_or_else(|| {
+                        anyhow::anyhow!("--database is required unless --sync-all is set")
+                    })?;
+                    bittice::core::cdc::CdcWorker::new(url, entity, db)
+                };
                 worker.run().await?;
             }
             Commands::Update => {

@@ -16,12 +16,15 @@ pub enum Commands {
         /// MySQL connection URL (e.g., mysql://root:sakila@localhost:3306/sakila)
         #[arg(short, long)]
         url: String,
-        /// Entity name in Bittice
+        /// Connection profile folder under data/ (stores cdc_config.json and cdc_state.json)
         #[arg(short, long)]
         entity: String,
-        /// Database to synchronize
+        /// Database to synchronize (omit when using --sync-all)
         #[arg(short, long)]
-        database: String,
+        database: Option<String>,
+        /// Sync every user database on the server into data/<schema>/
+        #[arg(long, default_value_t = false)]
+        sync_all: bool,
     },
     /// Update the bittice binary to the latest version (Manual)
     Update,

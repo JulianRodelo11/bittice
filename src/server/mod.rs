@@ -150,6 +150,7 @@ pub fn scan_and_start_cdc(
                             let user = config["user"].as_str().unwrap_or_default().to_string();
                             let pass = config["pass"].as_str().unwrap_or_default().to_string();
                             let mut host = config["host"].as_str().unwrap_or_default().to_string();
+                            let sync_all = config["sync_all_databases"].as_bool().unwrap_or(false);
                             let db = config["database"].as_str().unwrap_or_default().to_string();
                             let entity = config["entity"].as_str().unwrap_or(&entity_folder_name).to_string();
                             
@@ -198,10 +199,18 @@ pub fn scan_and_start_cdc(
                                 host = "host.docker.internal".to_string();
                             }
 
-                            let url = format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db);
+                            let url = if sync_all {
+                                format!("mysql://{}:{}@{}:{}/", user, pass, host, port)
+                            } else {
+                                format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db)
+                            };
                             let worker_tm = table_manager.clone();
                             let worker_entity = entity.clone();
-                            let worker_db = db.clone();
+                            let worker_db = if sync_all {
+                                String::new()
+                            } else {
+                                db.clone()
+                            };
 
                             // Mark as active
                             {
@@ -211,12 +220,18 @@ pub fn scan_and_start_cdc(
 
                             std::thread::spawn(move || {
                                 let rt = tokio::runtime::Runtime::new().unwrap();
-                                let db_name_for_log = worker_db.clone();
-                                let worker = crate::core::cdc::CdcWorker::with_manager(
-                                    url, 
-                                    worker_entity, 
-                                    worker_db, 
-                                    worker_tm, 
+                                let db_name_for_log = if sync_all {
+                                    worker_entity.clone()
+                                } else {
+                                    worker_db.clone()
+                                };
+                                let worker = crate::core::cdc::CdcWorker::with_manager_and_log(
+                                    url,
+                                    worker_entity,
+                                    worker_db,
+                                    worker_tm,
+                                    None,
+                                    sync_all,
                                 );
                                 if let Err(e) = rt.block_on(worker.run()) {
                                     error!("CDC: Worker for '{}' failed: {}", db_name_for_log, e);

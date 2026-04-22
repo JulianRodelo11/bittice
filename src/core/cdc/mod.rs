@@ -23,8 +23,11 @@ pub struct CdcState {
 
 pub struct CdcWorker {
     url: String,
+    /// Folder under `data/` for `cdc_config.json` / `cdc_state.json` (connection profile).
     entity: String,
     database: String,
+    /// When true: one binlog stream for the server; data under `data/<schema>/` using real DB names.
+    sync_all_databases: bool,
     state_path: String,
     table_manager: Arc<TableManager>,
     column_maps: Arc<RwLock<HashMap<String, Vec<String>>>>,
@@ -39,20 +42,47 @@ impl CdcWorker {
         Self::with_log(url, entity, database, None)
     }
 
+    /// Full-server sync: one binlog stream; tables stored under `data/<mysql_schema>/`.
+    pub fn new_sync_all(url: String, entity: String) -> Self {
+        Self::with_manager_and_log(
+            url,
+            entity,
+            String::new(),
+            Arc::new(TableManager::new()),
+            None,
+            true,
+        )
+    }
+
     pub fn with_log(url: String, entity: String, database: String, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
-        Self::with_manager_and_log(url, entity, database, Arc::new(TableManager::new()), log_tx)
+        Self::with_manager_and_log(
+            url,
+            entity,
+            database,
+            Arc::new(TableManager::new()),
+            log_tx,
+            false,
+        )
     }
 
     pub fn with_manager(url: String, entity: String, database: String, table_manager: Arc<TableManager>) -> Self {
-        Self::with_manager_and_log(url, entity, database, table_manager, None)
+        Self::with_manager_and_log(url, entity, database, table_manager, None, false)
     }
 
-    pub fn with_manager_and_log(url: String, entity: String, database: String, table_manager: Arc<TableManager>, log_tx: Option<tokio::sync::mpsc::Sender<String>>) -> Self {
+    pub fn with_manager_and_log(
+        url: String,
+        entity: String,
+        database: String,
+        table_manager: Arc<TableManager>,
+        log_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        sync_all_databases: bool,
+    ) -> Self {
         let state_path = format!("data/{}/cdc_state.json", entity);
-        Self { 
-            url, 
-            entity, 
+        Self {
+            url,
+            entity,
             database,
+            sync_all_databases,
             state_path,
             table_manager,
             column_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -61,6 +91,59 @@ impl CdcWorker {
             table_map_events: Arc::new(RwLock::new(HashMap::new())),
             log_tx,
         }
+    }
+
+    fn mysql_ident(ident: &str) -> String {
+        format!("`{}`", ident.replace('`', "``"))
+    }
+
+    fn mysql_string_literal(s: &str) -> String {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+    }
+
+    /// Fully-qualified `schema`.`table` for SQL (uses server schema casing).
+    fn qualified_schema_table(schema: &str, table: &str) -> String {
+        format!(
+            "{}.{}",
+            Self::mysql_ident(schema),
+            Self::mysql_ident(table)
+        )
+    }
+
+    fn is_system_schema(name: &str) -> bool {
+        matches!(
+            name.to_lowercase().as_str(),
+            "information_schema"
+                | "mysql"
+                | "performance_schema"
+                | "sys"
+                | "ndbinfo"
+                | "mysql_innodb_cluster_metadata"
+        )
+    }
+
+    /// Row map key: `schema.table` in sync-all mode (schema lowercased for stable binlog match),
+    /// plain `table` in single-DB mode.
+    fn qualified_table_key(sync_all: bool, schema: &str, table: &str) -> String {
+        if sync_all {
+            format!("{}.{}", schema.to_lowercase(), table)
+        } else {
+            table.to_string()
+        }
+    }
+
+    async fn list_user_schemas(conn: &mut Conn) -> Result<Vec<String>> {
+        // Use explicit row type: `Vec<String>` with SHOW DATABASES can deserialize incorrectly
+        // on some setups (e.g. a single concatenated value), breaking multi-schema sync.
+        let rows: Vec<(String,)> = conn
+            .query("SHOW DATABASES")
+            .await
+            .context("SHOW DATABASES")?;
+        Ok(rows
+            .into_iter()
+            .map(|(s,)| s)
+            .filter(|s| !Self::is_system_schema(s))
+            .collect())
     }
 
     fn log_info(&self, msg: String) {
@@ -188,14 +271,45 @@ impl CdcWorker {
     }
 
     async fn fetch_all_tables(&self, conn: &mut Conn) -> Result<Vec<String>> {
-        let tables: Vec<String> = conn.query("SHOW TABLES").await?;
-        Ok(tables)
+        // `Vec<String>` + SHOW TABLES is unreliable across mysql_async / server combos.
+        // information_schema + one column per row avoids a single bogus "table name".
+        let rows: Vec<(String,)> = conn
+            .query(
+                "SELECT TABLE_NAME FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' \
+                 ORDER BY TABLE_NAME",
+            )
+            .await
+            .context("list tables (information_schema)")?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
-    async fn fetch_column_info(&self, conn: &mut Conn, table_name: &str) -> Result<(Vec<String>, Vec<String>)> {
-        let rows: Vec<(String, String, String, String, Option<String>, String)> = 
-            conn.query(format!("DESCRIBE {}", table_name)).await?;
-        
+    /// List base tables for a schema without relying on `USE` / `DATABASE()`.
+    async fn fetch_all_tables_in_schema(conn: &mut Conn, schema: &str) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = {} AND TABLE_TYPE = 'BASE TABLE' \
+             ORDER BY TABLE_NAME",
+            Self::mysql_string_literal(schema)
+        );
+        let rows: Vec<(String,)> = conn
+            .query(sql)
+            .await
+            .context("list tables (information_schema, named schema)")?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
+    async fn fetch_column_info(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        qualified_table_key: &str,
+        table_name: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let fq = Self::qualified_schema_table(schema, table_name);
+        let rows: Vec<(String, String, String, String, Option<String>, String)> =
+            conn.query(format!("DESCRIBE {}", fq)).await?;
+
         let mut all_cols = Vec::new();
         let mut date_cols = Vec::new();
         let mut enum_info = HashMap::new();
@@ -205,14 +319,17 @@ impl CdcWorker {
             let col_type_raw = row.1;
             let col_type_lower = col_type_raw.to_lowercase();
             all_cols.push(col_name.clone());
-            
+
             if col_type_lower.contains("date") || col_type_lower.contains("timestamp") {
                 date_cols.push(col_name.clone());
             }
 
             // Detect ENUM and extract values (Preserving Case)
             if col_type_lower.starts_with("enum(") {
-                let values_str = col_type_raw.trim_start_matches(|c| c != '(').trim_start_matches('(').trim_end_matches(')');
+                let values_str = col_type_raw
+                    .trim_start_matches(|c| c != '(')
+                    .trim_start_matches('(')
+                    .trim_end_matches(')');
                 let values: Vec<String> = values_str
                     .split(',')
                     .map(|v| v.trim_matches('\'').to_string())
@@ -220,27 +337,45 @@ impl CdcWorker {
                 enum_info.insert(col_name, values);
             }
         }
-        
+
         if !enum_info.is_empty() {
             let mut maps = self.enum_maps.write().unwrap();
-            maps.insert(table_name.to_string(), enum_info);
+            maps.insert(qualified_table_key.to_string(), enum_info);
         }
 
         Ok((all_cols, date_cols))
     }
 
-    async fn bootstrap_table(&self, conn: &mut Conn, table_name: &str, state: &mut CdcState) -> Result<()> {
-        self.log_info(format!("CDC: Bootstrapping table '{}'...", table_name));
-        
-        let (cols, dates) = self.fetch_column_info(conn, table_name).await?;
+    async fn bootstrap_table(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        table_name: &str,
+        state: &mut CdcState,
+    ) -> Result<()> {
+        let qkey = Self::qualified_table_key(self.sync_all_databases, schema, table_name);
+        let disk_entity: String = if self.sync_all_databases {
+            schema.to_lowercase()
+        } else {
+            self.entity.clone()
+        };
+
+        self.log_info(format!(
+            "CDC: Bootstrapping table '{}' (schema '{}')...",
+            table_name, schema
+        ));
+
+        let (cols, dates) = self
+            .fetch_column_info(conn, schema, &qkey, table_name)
+            .await?;
         {
             let mut maps = self.column_maps.write().unwrap();
-            maps.insert(table_name.to_string(), cols.clone());
+            maps.insert(qkey.clone(), cols.clone());
             let mut d_maps = self.date_columns.write().unwrap();
-            d_maps.insert(table_name.to_string(), dates.clone());
+            d_maps.insert(qkey.clone(), dates.clone());
         }
 
-        let table_lock = self.table_manager.get_table(&self.entity, table_name)?;
+        let table_lock = self.table_manager.get_table(&disk_entity, table_name)?;
         let mut table = table_lock.write().unwrap();
 
         // Save the original fields in the manifest
@@ -248,24 +383,29 @@ impl CdcWorker {
 
         let pk_query = format!(
             "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
-             WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
+             WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
              AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX LIMIT 1",
-            self.database, table_name
+            Self::mysql_string_literal(schema),
+            Self::mysql_string_literal(table_name)
         );
         let pk_col: Option<String> = conn.query_first(pk_query).await?;
-        
+
         if let Some(col) = pk_col {
             table.manifest.primary_key = col.clone();
-            state.pk_map.insert(table_name.to_string(), col);
-            debug!("CDC: Detected PK='{}' for table '{}'", table.manifest.primary_key, table_name);
-        } else {
-            if let Some(pk_cand) = cols.iter().find(|c| c.ends_with("_id") || *c == "id") {
-                table.manifest.primary_key = pk_cand.clone();
-                state.pk_map.insert(table_name.to_string(), pk_cand.clone());
-            }
+            state.pk_map.insert(qkey.clone(), col);
+            debug!(
+                "CDC: Detected PK='{}' for table '{}'",
+                table.manifest.primary_key, qkey
+            );
+        } else if let Some(pk_cand) = cols.iter().find(|c| c.ends_with("_id") || *c == "id") {
+            table.manifest.primary_key = pk_cand.clone();
+            state.pk_map.insert(qkey.clone(), pk_cand.clone());
         }
 
-        let mut result_set = conn.query_iter(format!("SELECT * FROM {}", table_name)).await?;
+        let fq = Self::qualified_schema_table(schema, table_name);
+        let mut result_set = conn
+            .query_iter(format!("SELECT * FROM {}", fq))
+            .await?;
         let mut count = 0;
 
         while let Some(row) = result_set.next().await? {
@@ -302,12 +442,19 @@ impl CdcWorker {
         }
 
         table.flush_active_segment()?;
-        self.log_info(format!("CDC: Table '{}' synchronized ({} rows).", table_name, count));
+        self.log_info(format!(
+            "CDC: Table '{}' synchronized ({} rows).",
+            qkey, count
+        ));
         Ok(())
     }
 
     pub async fn run(&self) -> Result<()> {
-        self.log_info(format!("CDC: Connecting to MySQL on DB '{}'...", self.database));
+        if self.sync_all_databases {
+            self.log_info("CDC: Connecting to MySQL (sync all databases on server)...".to_string());
+        } else {
+            self.log_info(format!("CDC: Connecting to MySQL on DB '{}'...", self.database));
+        }
         let mut final_url = self.url.clone();
         
         // Host translation for Docker (macOS/Windows)
@@ -342,47 +489,160 @@ impl CdcWorker {
             }
         };
 
-        self.log_info(format!("CDC: Successfully connected to DB '{}'. Checking Binlog status...", self.database));
+        self.log_info("CDC: Successfully connected. Checking Binlog status...".to_string());
 
-        if let Err(e) = conn.query_drop(format!("USE {}", self.database)).await {
+        if self.sync_all_databases {
+            if let Err(e) = conn.query_drop("USE information_schema").await {
+                self.log_error(format!("CDC: USE information_schema failed: {}", e));
+                return Err(e.into());
+            }
+        } else if let Err(e) = conn
+            .query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
+            .await
+        {
             self.log_error(format!("Database '{}' not found: {}", self.database, e));
             return Err(e.into());
         }
 
         let mut state = self.load_state();
-        let tables = match self.fetch_all_tables(&mut conn).await {
-            Ok(t) => t,
-            Err(e) => {
-                self.log_error(format!("Failed to fetch tables: {}", e));
-                return Err(e.into());
+        if self.sync_all_databases {
+            let all_simple = !state.bootstrapped_tables.is_empty()
+                && state.bootstrapped_tables.iter().all(|k| !k.contains('.'));
+            if all_simple {
+                self.log_warn(
+                    "CDC: Existing cdc_state used single-table keys; resetting bootstrap metadata for sync-all."
+                        .to_string(),
+                );
+                state.bootstrapped_tables.clear();
+                state.pk_map.clear();
+                let _ = self.save_state(&state);
             }
-        };
+        }
 
-        for table_name in &tables {
-            if !state.bootstrapped_tables.contains(table_name) {
-                if let Err(e) = self.bootstrap_table(&mut conn, table_name, &mut state).await {
-                    return self.enter_static_mode(format!(
-                        "Bootstrap failed for '{}': {}. Falling back to static data mode.",
-                        table_name, e
-                    )).await;
+        if self.sync_all_databases {
+            let schemas = match Self::list_user_schemas(&mut conn).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.log_error(format!("Failed to list databases: {}", e));
+                    return Err(e.into());
                 }
-                state.bootstrapped_tables.push(table_name.clone());
-                self.save_state(&state)?;
-            } else {
-                let (cols, dates) = match self.fetch_column_info(&mut conn, table_name).await {
-                    Ok(info) => info,
+            };
+            self.log_info(format!(
+                "CDC: Discovered {} user database(s) to sync.",
+                schemas.len()
+            ));
+            for schema in schemas {
+                let tables = match Self::fetch_all_tables_in_schema(&mut conn, &schema).await {
+                    Ok(t) => t,
                     Err(e) => {
-                        return self.enter_static_mode(format!(
-                            "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
-                            table_name, e
-                        )).await;
+                        self.log_warn(format!(
+                            "CDC: Skipping database '{}' (listing tables failed): {}",
+                            schema, e
+                        ));
+                        continue;
                     }
                 };
-                {
-                    let mut maps = self.column_maps.write().unwrap();
-                    maps.insert(table_name.to_string(), cols);
-                    let mut d_maps = self.date_columns.write().unwrap();
-                    d_maps.insert(table_name.to_string(), dates);
+                self.log_info(format!(
+                    "CDC: Schema '{}' — {} base table(s) to process.",
+                    schema,
+                    tables.len()
+                ));
+                for table_name in &tables {
+                    let qkey = Self::qualified_table_key(true, &schema, table_name);
+                    if !state.bootstrapped_tables.contains(&qkey) {
+                        if let Err(e) = self
+                            .bootstrap_table(&mut conn, &schema, table_name, &mut state)
+                            .await
+                        {
+                            return self
+                                .enter_static_mode(format!(
+                                    "Bootstrap failed for '{}': {}. Falling back to static data mode.",
+                                    qkey, e
+                                ))
+                                .await;
+                        }
+                        state.bootstrapped_tables.push(qkey.clone());
+                        self.save_state(&state)?;
+                    } else {
+                        let (cols, dates) = match self
+                            .fetch_column_info(&mut conn, &schema, &qkey, table_name)
+                            .await
+                        {
+                            Ok(info) => info,
+                            Err(e) => {
+                                return self
+                                    .enter_static_mode(format!(
+                                        "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
+                                        qkey, e
+                                    ))
+                                    .await;
+                            }
+                        };
+                        {
+                            let mut maps = self.column_maps.write().unwrap();
+                            maps.insert(qkey.clone(), cols);
+                            let mut d_maps = self.date_columns.write().unwrap();
+                            d_maps.insert(qkey.clone(), dates);
+                        }
+                    }
+                }
+            }
+        } else {
+            let tables = match self.fetch_all_tables(&mut conn).await {
+                Ok(t) => t,
+                Err(e) => {
+                    self.log_error(format!("Failed to fetch tables: {}", e));
+                    return Err(e.into());
+                }
+            };
+            self.log_info(format!(
+                "CDC: Database '{}' — {} base table(s) to process.",
+                self.database,
+                tables.len()
+            ));
+
+            for table_name in &tables {
+                let qkey = Self::qualified_table_key(false, &self.database, table_name);
+                if !state.bootstrapped_tables.contains(&qkey) {
+                    if let Err(e) = self
+                        .bootstrap_table(&mut conn, self.database.as_str(), table_name, &mut state)
+                        .await
+                    {
+                        return self
+                            .enter_static_mode(format!(
+                                "Bootstrap failed for '{}': {}. Falling back to static data mode.",
+                                table_name, e
+                            ))
+                            .await;
+                    }
+                    state.bootstrapped_tables.push(qkey.clone());
+                    self.save_state(&state)?;
+                } else {
+                    let (cols, dates) = match self
+                        .fetch_column_info(
+                            &mut conn,
+                            self.database.as_str(),
+                            &qkey,
+                            table_name,
+                        )
+                        .await
+                    {
+                        Ok(info) => info,
+                        Err(e) => {
+                            return self
+                                .enter_static_mode(format!(
+                                    "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
+                                    table_name, e
+                                ))
+                                .await;
+                        }
+                    };
+                    {
+                        let mut maps = self.column_maps.write().unwrap();
+                        maps.insert(qkey.clone(), cols);
+                        let mut d_maps = self.date_columns.write().unwrap();
+                        d_maps.insert(qkey.clone(), dates);
+                    }
                 }
             }
         }
@@ -423,7 +683,12 @@ impl CdcWorker {
                         state.binlog_pos = 4;
                         self.save_state(&state)?;
                         conn = pool.get_conn().await?;
-                        conn.query_drop(format!("USE {}", self.database)).await?;
+                        if self.sync_all_databases {
+                            conn.query_drop("USE information_schema").await?;
+                        } else {
+                            conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
+                                .await?;
+                        }
                         continue 'binlog_retry;
                     }
                     return self.enter_static_mode(format!(
@@ -444,7 +709,12 @@ impl CdcWorker {
                             state.binlog_pos = 4;
                             self.save_state(&state)?;
                             conn = pool.get_conn().await?;
-                            conn.query_drop(format!("USE {}", self.database)).await?;
+                            if self.sync_all_databases {
+                                conn.query_drop("USE information_schema").await?;
+                            } else {
+                                conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
+                                    .await?;
+                            }
                             continue 'binlog_retry;
                         }
                         return self.enter_static_mode(format!(
@@ -497,27 +767,54 @@ impl CdcWorker {
 
         let tm_guard = self.table_map_events.read().unwrap();
         let tm = tm_guard.get(&table_id).context("Missing TableMapEvent")?;
+        let schema = tm.database_name().to_string();
         let table_name = tm.table_name().to_string();
 
-        let table_lock = self.table_manager.get_table(&self.entity, &table_name)?;
+        if self.sync_all_databases && Self::is_system_schema(&schema) {
+            return Ok(());
+        }
+
+        let qkey = Self::qualified_table_key(self.sync_all_databases, &schema, &table_name);
+        let disk_entity = if self.sync_all_databases {
+            schema.to_lowercase()
+        } else {
+            self.entity.clone()
+        };
+
+        {
+            let maps = self.column_maps.read().unwrap();
+            if !maps.contains_key(&qkey) {
+                debug!(
+                    "CDC: Ignoring row event for '{}' (not bootstrapped / unknown)",
+                    qkey
+                );
+                return Ok(());
+            }
+        }
+
+        let table_lock = self.table_manager.get_table(&disk_entity, &table_name)?;
         let mut table = table_lock.write().unwrap();
 
-        let pk_field = state.pk_map.get(&table_name).cloned().unwrap_or_else(|| "PK".to_string());
+        let pk_field = state
+            .pk_map
+            .get(&qkey)
+            .cloned()
+            .unwrap_or_else(|| "PK".to_string());
         table.manifest.primary_key = pk_field.clone();
 
         match rows_data {
             RowsEventData::WriteRowsEvent(ev) => {
-                debug!("CDC: Received Write event for table '{}'", table_name);
+                debug!("CDC: Received Write event for table '{}'", qkey);
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                        let data = self.parse_row(row, &table_name)?;
+                        let data = self.parse_row(row, &qkey)?;
                         let pk_val = data.get(&pk_field).cloned().unwrap_or_default();
                         table.insert(data.clone())?;
                         
                         // Emit broadcast event
                         let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
-                            entity: self.entity.clone(),
+                            entity: disk_entity.clone(),
                             table_name: table_name.clone(),
                             event_type: "INSERT".to_string(),
                             pk: pk_val,
@@ -530,13 +827,13 @@ impl CdcWorker {
                 for row_pair in ev.rows(tm) {
                     if let Ok((_, Some(after_row))) = row_pair {
                         let row = Row::try_from(after_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                        let data = self.parse_row(row, &table_name)?;
+                        let data = self.parse_row(row, &qkey)?;
                         if let Some(pk_val) = data.get(&pk_field).cloned() {
                             table.update(&pk_val, data.clone())?;
                             
                             // Emit broadcast event
                             let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
-                                entity: self.entity.clone(),
+                                entity: disk_entity.clone(),
                                 table_name: table_name.clone(),
                                 event_type: "UPDATE".to_string(),
                                 pk: pk_val,
@@ -550,14 +847,14 @@ impl CdcWorker {
                 for row_pair in ev.rows(tm) {
                     if let Ok((Some(binlog_row), _)) = row_pair {
                         let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                        let data = self.parse_row(row, &table_name)?;
+                        let data = self.parse_row(row, &qkey)?;
                         if let Some(pk_val) = data.get(&pk_field) {
                             let pk_copy = pk_val.clone();
                             table.delete(pk_val)?;
                             
                             // Emit broadcast event
                             let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
-                                entity: self.entity.clone(),
+                                entity: disk_entity.clone(),
                                 table_name: table_name.clone(),
                                 event_type: "DELETE".to_string(),
                                 pk: pk_copy,

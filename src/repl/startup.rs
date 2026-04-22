@@ -1,6 +1,7 @@
 use anyhow::Result;
 use cliclack::{intro, outro, select, input, password, spinner};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
@@ -15,7 +16,11 @@ struct CdcInfo {
     port: String,
     user: String,
     pass: String,
+    #[serde(default)]
     database: String,
+    /// When true: sync every non-system database; data paths use real MySQL schema names.
+    #[serde(default)]
+    sync_all_databases: bool,
     entity: String,
     vpn_file: Option<String>,
 }
@@ -98,8 +103,31 @@ pub async fn run_startup_cliclack() -> Result<()> {
         let port: String = input("Port").default_input("3306").interact()?;
         let user: String = input("User").default_input("root").interact()?;
         let pass: String = password("Password").mask('*').interact()?;
-        let database: String = input("Database to synchronize").placeholder("name").interact()?;
-        let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
+
+        let sync_mode: u8 = select("What should be synchronized?")
+            .item(
+                0,
+                "All user databases on this server",
+                "One CDC connection; each schema is stored as data/<database_name>/",
+            )
+            .item(
+                1,
+                "A single database only",
+                "Classic mode: pick the database and an optional Bittice folder name",
+            )
+            .interact()?;
+
+        let (database, sync_all_databases, entity) = if sync_mode == 0 {
+            let profile: String = input("Connection profile name (folder under data/ for config)")
+                .default_input("_bittice_host")
+                .interact()?;
+            println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. _bittice_host).\x1b[0m");
+            (String::new(), true, profile)
+        } else {
+            let database: String = input("Database to synchronize").placeholder("name").interact()?;
+            let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
+            (database, false, entity)
+        };
 
         // Detect environment
         let is_docker_container = std::path::Path::new("/.dockerenv").exists();
@@ -243,30 +271,57 @@ pub async fn run_startup_cliclack() -> Result<()> {
             user,
             pass,
             database,
+            sync_all_databases,
             entity,
             vpn_file,
         };
 
         let _ = save_cdc_config(&cdc_info);
-        monitor_scope = format!("all synchronized entities (new: {})", cdc_info.entity);
+        monitor_scope = if cdc_info.sync_all_databases {
+            format!(
+                "connection profile '{}' (all schemas on host)",
+                cdc_info.entity
+            )
+        } else {
+            format!("all synchronized entities (new: {})", cdc_info.entity)
+        };
 
         // Sync Spinner for new connection
         let s = spinner();
         s.start("Starting CDC sync engine...");
 
-        let url = format!("mysql://{}:{}@{}:{}/{}",
-            cdc_info.user, cdc_info.pass,
-            cdc_info.host, cdc_info.port,
-            cdc_info.database);
+        let url = if cdc_info.sync_all_databases {
+            format!(
+                "mysql://{}:{}@{}:{}/",
+                cdc_info.user, cdc_info.pass, cdc_info.host, cdc_info.port
+            )
+        } else {
+            format!(
+                "mysql://{}:{}@{}:{}/{}",
+                cdc_info.user,
+                cdc_info.pass,
+                cdc_info.host,
+                cdc_info.port,
+                cdc_info.database
+            )
+        };
 
         let (log_tx, mut log_rx) = mpsc::channel::<String>(100);
         let worker_url = url.clone();
         let worker_entity = cdc_info.entity.clone();
         let worker_db = cdc_info.database.clone();
+        let worker_sync_all = cdc_info.sync_all_databases;
 
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let worker = CdcWorker::with_log(worker_url, worker_entity, worker_db, Some(log_tx));
+            let worker = CdcWorker::with_manager_and_log(
+                worker_url,
+                worker_entity,
+                worker_db,
+                Arc::new(crate::server::table_manager::TableManager::new()),
+                Some(log_tx),
+                worker_sync_all,
+            );
             let _ = rt.block_on(worker.run());
         });
 
