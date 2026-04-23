@@ -91,7 +91,11 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
     }
     
     // --- AUTO-START CDC WORKERS ---
-    scan_and_start_cdc(table_manager.clone(), entity_filter.clone(), active_workers.clone());
+    if cdc_autostart_enabled() {
+        scan_and_start_cdc(table_manager.clone(), entity_filter.clone(), active_workers.clone());
+    } else {
+        info!("CDC autostart disabled. Running with static local data only.");
+    }
 
     let http_tm = table_manager.clone();
     let http_filter = entity_filter.clone();
@@ -128,6 +132,7 @@ pub fn scan_and_start_cdc(
     entity_filter: Option<String>,
     active_workers: Arc<StdRwLock<HashSet<String>>>
 ) {
+    const SINGLE_DB_WORKER_LOCK_PREFIX: &str = "__single_db_worker_lock__";
     let data_dir = std::path::Path::new("data");
     
     if let Ok(entries) = std::fs::read_dir(data_dir) {
@@ -198,6 +203,23 @@ pub fn scan_and_start_cdc(
                             if (host == "localhost" || host == "0.0.0.0") && is_docker {
                                 host = "host.docker.internal".to_string();
                             }
+                            let single_db_lock_key = format!(
+                                "{}:{}:{}",
+                                SINGLE_DB_WORKER_LOCK_PREFIX,
+                                host.to_lowercase(),
+                                port
+                            );
+
+                            if !sync_all {
+                                let active = active_workers.read().unwrap();
+                                if active.contains(&single_db_lock_key) {
+                                    info!(
+                                        "CDC: Skipping entity '{}' because a single-database CDC worker is already running for {}:{}.",
+                                        entity, host, port
+                                    );
+                                    continue;
+                                }
+                            }
 
                             let url = if sync_all {
                                 format!("mysql://{}:{}@{}:{}/", user, pass, host, port)
@@ -211,11 +233,21 @@ pub fn scan_and_start_cdc(
                             } else {
                                 db.clone()
                             };
+                            let cleanup_entity_key = entity_key.clone();
+                            let cleanup_single_db_lock = if sync_all {
+                                None
+                            } else {
+                                Some(single_db_lock_key.clone())
+                            };
+                            let cleanup_active_workers = active_workers.clone();
 
                             // Mark as active
                             {
                                 let mut active = active_workers.write().unwrap();
                                 active.insert(entity_key);
+                                if !sync_all {
+                                    active.insert(single_db_lock_key);
+                                }
                             }
 
                             std::thread::spawn(move || {
@@ -236,6 +268,11 @@ pub fn scan_and_start_cdc(
                                 if let Err(e) = rt.block_on(worker.run()) {
                                     error!("CDC: Worker for '{}' failed: {}", db_name_for_log, e);
                                 }
+                                let mut active = cleanup_active_workers.write().unwrap();
+                                active.remove(&cleanup_entity_key);
+                                if let Some(lock_key) = cleanup_single_db_lock {
+                                    active.remove(&lock_key);
+                                }
                             });
                         }
                     }
@@ -243,6 +280,15 @@ pub fn scan_and_start_cdc(
             }
         }
     }
+}
+
+fn cdc_autostart_enabled() -> bool {
+    std::env::var("BITTICE_DISABLE_CDC_AUTOSTART")
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !(normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on")
+        })
+        .unwrap_or(true)
 }
 
 pub async fn start_server(
@@ -413,7 +459,11 @@ async fn handle_request(
 
     if path == "/_config/reload" {
         info!("Hot-reloading configuration from disk...");
-        scan_and_start_cdc(state.table_manager.clone(), state.entity_filter.clone(), state.active_workers.clone());
+        if cdc_autostart_enabled() {
+            scan_and_start_cdc(state.table_manager.clone(), state.entity_filter.clone(), state.active_workers.clone());
+        } else {
+            info!("CDC autostart is disabled; skipping CDC worker scan on reload.");
+        }
         return (StatusCode::OK, Json(serde_json::json!({ "status": "success", "message": "Configuration reloaded" }))).into_response();
     }
 
@@ -524,7 +574,21 @@ async fn handle_request(
 
             match (method, op) {
                 (Method::GET, SavedOperation::Read(ref q)) => {
-                    match execute_read_operation(q, query_params, state, start_total, ops_load_ms, effective_auth_ctx.as_ref()).await {
+                    let read_result = if let Some(crate::core::saved_queries::SavedExecutionProfile::Split(profile)) = &q.execution_profile {
+                        execute_split_enrichment_read(
+                            q,
+                            profile,
+                            query_params,
+                            state,
+                            start_total,
+                            ops_load_ms,
+                            effective_auth_ctx.as_ref(),
+                        )
+                        .await
+                    } else {
+                        execute_read_operation(q, query_params, state, start_total, ops_load_ms, effective_auth_ctx.as_ref()).await
+                    };
+                    match read_result {
                         Ok(val) => (StatusCode::OK, Json(val)).into_response(),
                         Err((status, val)) => (status, Json(val)).into_response(),
                     }
@@ -1005,6 +1069,172 @@ async fn execute_read_operation(
             Ok(serde_json::Value::Object(response))
         },
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e.to_string() })))
+    }
+}
+
+async fn execute_split_enrichment_read(
+    query: &crate::core::saved_queries::SavedQuery,
+    profile: &crate::core::saved_queries::SavedSplitExecutionProfile,
+    mut params: HashMap<String, String>,
+    state: Arc<ServerState>,
+    start_time: std::time::Instant,
+    ops_load_ms: f64,
+    auth_context: Option<&AuthContext>,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    if profile.mode != "split_enrichment" {
+        return execute_read_operation(query, params, state, start_time, ops_load_ms, auth_context).await;
+    }
+
+    let mut base_query = query.clone();
+    if !profile.base_join_aliases.is_empty() {
+        base_query.joins.retain(|join| {
+            let alias = join.alias.as_deref().unwrap_or(join.table.as_str());
+            profile.base_join_aliases.iter().any(|configured| configured == alias)
+        });
+    }
+    if !profile.base_select_aliases.is_empty() {
+        base_query.select.retain(|field| {
+            field
+                .output_name
+                .as_ref()
+                .map(|name| profile.base_select_aliases.iter().any(|configured| configured == name))
+                .unwrap_or(false)
+        });
+    }
+    base_query.execution_profile = None;
+
+    let mut base_result = execute_read_operation(
+        &base_query,
+        params.clone(),
+        state.clone(),
+        start_time,
+        ops_load_ms,
+        auth_context,
+    )
+    .await?;
+
+    let Some(base_data) = base_result.get_mut("data").and_then(|value| value.as_array_mut()) else {
+        return Ok(base_result);
+    };
+    if base_data.is_empty() {
+        return Ok(base_result);
+    }
+
+    let transaccion_ids = base_data
+        .iter()
+        .filter_map(|item| item.get(&profile.key_field))
+        .filter_map(value_to_id_token)
+        .collect::<Vec<_>>();
+    if transaccion_ids.is_empty() {
+        return Ok(base_result);
+    }
+    params.insert(profile.ids_param.clone(), transaccion_ids.join(","));
+
+    let mut enrichment_query = (*profile.enrichment_query).clone();
+    enrichment_query.execution_profile = None;
+
+    let enrichment_result = execute_read_operation(
+        &enrichment_query,
+        params,
+        state,
+        std::time::Instant::now(),
+        0.0,
+        auth_context,
+    )
+    .await?;
+    let enrichment_rows = enrichment_result
+        .get("data")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let enrichment_key_field = profile.enrichment_key_field.as_ref().unwrap_or(&profile.key_field);
+    let mut enrich_by_tx = HashMap::<String, serde_json::Value>::new();
+    for row in enrichment_rows {
+        if let Some(key) = row.get(enrichment_key_field).and_then(value_to_id_token) {
+            enrich_by_tx.insert(key, row);
+        }
+    }
+
+    for base_row in base_data.iter_mut() {
+        if let Some(obj) = base_row.as_object_mut() {
+            for (key, value) in &profile.defaults {
+                obj.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+
+        let Some(tx_id) = base_row.get(&profile.key_field).and_then(value_to_id_token) else {
+            continue;
+        };
+        let Some(enriched) = enrich_by_tx.get(&tx_id) else {
+            continue;
+        };
+
+        for field in &profile.merge_fields {
+            if let Some(value) = enriched.get(field) {
+                if let Some(obj) = base_row.as_object_mut() {
+                    obj.insert(field.clone(), value.clone());
+                }
+            }
+        }
+
+        for additive in &profile.additive_fields {
+            let base_discount = base_row
+                .get(&additive.target_field)
+                .and_then(value_to_f64)
+                .unwrap_or(0.0);
+            let bonus_discount = enriched
+                .get(&additive.source_field)
+                .and_then(value_to_f64)
+                .unwrap_or(0.0);
+            if let Some(obj) = base_row.as_object_mut() {
+                if let Some(number) = serde_json::Number::from_f64(base_discount + bonus_discount) {
+                    obj.insert(additive.target_field.clone(), serde_json::Value::Number(number));
+                }
+            }
+        }
+    }
+
+    if let Some(meta) = base_result.get_mut("meta").and_then(|value| value.as_object_mut()) {
+        meta.insert(
+            "fields_count".to_string(),
+            serde_json::json!(base_query.select.len()),
+        );
+        if let Some(debug) = meta.get("debug_info").and_then(|value| value.as_str()) {
+            let debug_label = profile
+                .debug_label
+                .as_deref()
+                .unwrap_or("split_mode: profile(split_enrichment)");
+            meta.insert(
+                "debug_info".to_string(),
+                serde_json::Value::String(format!("{debug}; {debug_label}")),
+            );
+        }
+    }
+
+    Ok(base_result)
+}
+
+fn value_to_id_token(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn value_to_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
     }
 }
 

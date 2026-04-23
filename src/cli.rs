@@ -11,6 +11,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Start servers in local static mode (no CDC sync)
+    Test,
     /// Start CDC synchronization from MySQL
     Cdc {
         /// MySQL connection URL (e.g., mysql://root:sakila@localhost:3306/sakila)

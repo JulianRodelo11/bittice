@@ -68,6 +68,60 @@ pub struct SavedQuery {
     /// Configuration for Row-Level Security via Bearer Token
     #[serde(default)]
     pub auth_config: Option<SavedAuthConfig>,
+    /// Optional execution strategy/profile for runtime specialization.
+    #[serde(default)]
+    pub execution_profile: Option<SavedExecutionProfile>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum SavedExecutionProfile {
+    Name(String),
+    Split(SavedSplitExecutionProfile),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedSplitExecutionProfile {
+    /// Strategy identifier. Current supported value: "split_enrichment".
+    pub mode: String,
+    /// Field used to correlate base rows with enrichment rows.
+    pub key_field: String,
+    /// Runtime param name where collected keys are injected for enrichment query.
+    #[serde(default = "default_split_ids_param")]
+    pub ids_param: String,
+    /// Optional key field in enrichment rows (defaults to `key_field`).
+    #[serde(default)]
+    pub enrichment_key_field: Option<String>,
+    /// Base query keeps only these join aliases.
+    #[serde(default)]
+    pub base_join_aliases: Vec<String>,
+    /// If set, base query keeps only selected output aliases.
+    #[serde(default)]
+    pub base_select_aliases: Vec<String>,
+    /// Full enrichment query definition (executed as a second internal read).
+    pub enrichment_query: Box<SavedQuery>,
+    /// Fields copied from enrichment row into base row.
+    #[serde(default)]
+    pub merge_fields: Vec<String>,
+    /// Numeric additive merge rules: target = base(target) + enrichment(source).
+    #[serde(default)]
+    pub additive_fields: Vec<SavedSplitAdditiveField>,
+    /// Optional default values inserted on base rows before enrichment merge.
+    #[serde(default)]
+    pub defaults: std::collections::HashMap<String, serde_json::Value>,
+    /// Extra debug marker appended to response meta.debug_info.
+    #[serde(default)]
+    pub debug_label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SavedSplitAdditiveField {
+    pub target_field: String,
+    pub source_field: String,
+}
+
+fn default_split_ids_param() -> String {
+    "split_ids".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

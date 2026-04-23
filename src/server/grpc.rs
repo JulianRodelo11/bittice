@@ -663,6 +663,7 @@ impl Database for MyDatabase {
             select: Vec::new(),
             response_grouping: None,
             auth_config: None,
+            execution_profile: None,
         };
 
         let resp = execute_query_unary_internal(

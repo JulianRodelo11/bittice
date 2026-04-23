@@ -173,12 +173,14 @@ pub fn is_nullish(value: &str) -> bool {
 }
 
 fn compare_numeric(left: &str, right: &str) -> Option<Ordering> {
-    let left_num = left.parse::<f64>().ok()?;
-    let right_num = right.parse::<f64>().ok()?;
+    let left_num = left.trim().parse::<f64>().ok()?;
+    let right_num = right.trim().parse::<f64>().ok()?;
     left_num.partial_cmp(&right_num)
 }
 
 fn compare_dates(left: &str, right: &str) -> Option<Ordering> {
+    let left = left.trim();
+    let right = right.trim();
     if crate::core::date_utils::is_date_format(left) && crate::core::date_utils::is_date_format(right) {
         Some(left.cmp(right))
     } else {

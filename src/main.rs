@@ -26,6 +26,11 @@ async fn main() -> Result<()> {
     if std::env::args().len() > 1 || env_entity.is_some() {
         let cli = Cli::parse();
         match cli.command {
+            Commands::Test => {
+                std::env::set_var("BITTICE_DISABLE_CDC_AUTOSTART", "1");
+                info!("Test mode: CDC autostart disabled. Using local data only.");
+                return bittice::server::start_all_servers(None).await;
+            }
             Commands::Setup => {
                 let _ = bittice::repl::startup::run_startup_cliclack().await?;
             }

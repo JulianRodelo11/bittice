@@ -128,6 +128,9 @@ pub fn execute_join_query(
     let resolved_order_by = resolve_order_by(&query.order_by, &base_alias, &computed_headers)?;
     let resolved_aggregations = resolve_aggregations(&query.aggregations, params_map)?;
     let joins = resolve_joins(query, &base_alias)?;
+    let mut available_aliases = HashSet::new();
+    available_aliases.insert(base_alias.clone());
+    let mut filters_applied_early = false;
 
     if projections.is_empty() && resolved_aggregations.is_empty() {
         bail!("multi-table queries require selected fields, select projections, or aggregations");
@@ -149,7 +152,7 @@ pub fn execute_join_query(
         auth_context,
     )?;
 
-    for join in &joins {
+    for (idx, join) in joins.iter().enumerate() {
         let join_fields = sorted_join_fetch_fields(needed_fields.get(&join.alias), join)?;
         let join_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &join.alias);
         let join_rows = fetch_join_rows(
@@ -161,9 +164,36 @@ pub fn execute_join_query(
         )?;
         let join_index = build_join_index(&join_rows, &join.conditions);
         current_rows = apply_join(current_rows, join, &join_index)?;
+        available_aliases.insert(join.alias.clone());
+
+        // If all filter/order aliases are already available and only LEFT joins remain,
+        // trim early to avoid expensive enrichment joins on rows that won't be returned.
+        if !filters_applied_early
+            && can_apply_early_window(
+                &resolved_filters,
+                resolved_filter_tree.as_ref(),
+                &resolved_order_by,
+                &resolved_aggregations,
+                &available_aliases,
+                &joins[idx + 1..],
+            )
+        {
+            current_rows = apply_filters(current_rows, &resolved_filters, &filters_op);
+            filters_applied_early = true;
+            if !resolved_order_by.is_empty() {
+                current_rows.sort_by(|left, right| compare_rows(left, right, &resolved_order_by));
+                let capped_limit = limit.min(100);
+                let early_window = offset.saturating_add(capped_limit);
+                if early_window > 0 && current_rows.len() > early_window {
+                    current_rows.truncate(early_window);
+                }
+            }
+        }
     }
 
-    current_rows = apply_filters(current_rows, &resolved_filters, &filters_op);
+    if !filters_applied_early {
+        current_rows = apply_filters(current_rows, &resolved_filters, &filters_op);
+    }
     if let Some(filter_tree) = &resolved_filter_tree {
         current_rows = apply_filter_tree(current_rows, filter_tree);
     }
@@ -714,17 +744,13 @@ fn fetch_join_rows(
     let lookup_filters = build_join_lookup_filters(current_rows, join, pushdown_filters);
 
     if let Some(filter_sets) = lookup_filters {
+        let table_lock = table_manager.get_table(&join.entity, &join.table)?;
+        let mut table = table_lock.write().unwrap();
+        let _ = table.reload_if_needed();
+
         let mut rows = Vec::new();
         for filters in filter_sets {
-            let mut batch = fetch_table_rows(
-                &join.entity,
-                &join.table,
-                &join.alias,
-                fields,
-                &filters,
-                table_manager.clone(),
-                None,
-            )?;
+            let mut batch = fetch_rows_from_table(&mut table, &join.alias, fields, &filters, None)?;
             rows.append(&mut batch);
         }
         Ok(rows)
@@ -794,6 +820,16 @@ fn fetch_table_rows(
     let table_lock = table_manager.get_table(entity, table_name)?;
     let mut table = table_lock.write().unwrap();
     let _ = table.reload_if_needed();
+    fetch_rows_from_table(&mut table, alias, fields, filters, auth_context)
+}
+
+fn fetch_rows_from_table(
+    table: &mut crate::core::storage::table::Table,
+    alias: &str,
+    fields: &[String],
+    filters: &[Filter],
+    auth_context: Option<&AuthContext>,
+) -> Result<Vec<FlatRow>> {
 
     let mut rows = Vec::new();
     let mut offset = 0;
@@ -947,6 +983,38 @@ fn apply_filters(rows: Vec<FlatRow>, filters: &[ResolvedFilter], filters_op: &Lo
             LogicalOp::Or => filters.iter().any(|filter| evaluate_filter(row, filter)),
         })
         .collect()
+}
+
+fn can_apply_early_window(
+    resolved_filters: &[ResolvedFilter],
+    resolved_filter_tree: Option<&ResolvedFilterTreeNode>,
+    resolved_order_by: &[ResolvedOrderBy],
+    resolved_aggregations: &[serde_json::Value],
+    available_aliases: &HashSet<String>,
+    remaining_joins: &[ResolvedJoin],
+) -> bool {
+    if resolved_order_by.is_empty() {
+        return false;
+    }
+    if resolved_filter_tree.is_some() {
+        return false;
+    }
+    if !resolved_aggregations.is_empty() {
+        return false;
+    }
+    if !resolved_filters
+        .iter()
+        .all(|filter| available_aliases.contains(&filter.field.alias))
+    {
+        return false;
+    }
+    if !resolved_order_by
+        .iter()
+        .all(|order| available_aliases.contains(&order.field.alias))
+    {
+        return false;
+    }
+    remaining_joins.iter().all(|join| join.kind == JoinKind::Left)
 }
 
 fn apply_filter_tree(rows: Vec<FlatRow>, node: &ResolvedFilterTreeNode) -> Vec<FlatRow> {
