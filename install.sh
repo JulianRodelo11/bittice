@@ -17,6 +17,7 @@ DEFAULT_CLOUD_APP_DIR="${HOME}/.bittice"
 # - BITTICE_APP_DIR: cloud working directory (compose/data). Default: ~/.bittice
 # - BITTICE_VPN_MODE: host|container (default on cloud: container)
 # - BITTICE_VERSION: install a specific release tag (e.g. v0.1.56)
+# - BITTICE_USE_LEGACY_ASSET: if true, download standalone bittice-{os}-{arch} instead of OS bundle (.zip / .tar.gz)
 
 # Terminal colors
 GREEN='\033[0;32m'
@@ -88,6 +89,27 @@ esac
 
 TARGET="bittice-${OS}-${ARCH}"
 
+# Map uname-style arch to bundle member filename inside OS archives (see release workflow)
+bundle_member_for_arch() {
+    case "$OS" in
+        linux)
+            case "$ARCH" in
+                x86_64)  echo "bittice-x86_64-unknown-linux-musl" ;;
+                aarch64) echo "bittice-aarch64-unknown-linux-gnu" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        macos)
+            case "$ARCH" in
+                x86_64)  echo "bittice-x86_64-apple-darwin" ;;
+                aarch64) echo "bittice-aarch64-apple-darwin" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 # --- Cloud Instance Detection ---
 is_cloud_instance() {
     # 1. Check DMI/BIOS vendors
@@ -124,18 +146,68 @@ fi
 
 echo -e "Installing version ${GREEN}$LATEST_TAG${NC} for ${GREEN}$OS ($ARCH)${NC}..."
 
-# 4. Download binary
-DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$TARGET"
+# 4. Download binary (prefer per-OS bundle; fallback to legacy standalone asset name)
 TEMP_FILE=$(mktemp)
 
-# Use -f to fail on 404
-if ! curl -sSLf "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
-    echo -e "${RED}Error: Failed to download binary from $DOWNLOAD_URL${NC}"
-    echo -e "Please ensure the release $LATEST_TAG has finished building on GitHub."
-    exit 1
-fi
+download_via_bundle() {
+    local member extract_dir zf
+    member=$(bundle_member_for_arch) || return 1
+    extract_dir=$(mktemp -d)
 
-chmod +x "$TEMP_FILE"
+    case "$OS" in
+        linux)
+            if ! curl -sSLf "https://github.com/$REPO/releases/download/$LATEST_TAG/bittice-${LATEST_TAG}-linux.tar.gz" | tar -xzf - -C "$extract_dir"; then
+                rm -rf "$extract_dir"
+                return 1
+            fi
+            ;;
+        macos)
+            zf=$(mktemp)
+            if ! curl -sSLf "https://github.com/$REPO/releases/download/$LATEST_TAG/bittice-${LATEST_TAG}-macos.zip" -o "$zf"; then
+                rm -f "$zf"
+                rm -rf "$extract_dir"
+                return 1
+            fi
+            unzip -q "$zf" -d "$extract_dir"
+            rm -f "$zf"
+            ;;
+        *)
+            rm -rf "$extract_dir"
+            return 1
+            ;;
+    esac
+
+    if [ ! -f "$extract_dir/$member" ]; then
+        rm -rf "$extract_dir"
+        return 1
+    fi
+    cp "$extract_dir/$member" "$TEMP_FILE"
+    chmod +x "$TEMP_FILE"
+    rm -rf "$extract_dir"
+    return 0
+}
+
+if is_true "${BITTICE_USE_LEGACY_ASSET:-0}"; then
+    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$TARGET"
+    if ! curl -sSLf "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
+        echo -e "${RED}Error: Failed to download binary from $DOWNLOAD_URL${NC}"
+        exit 1
+    fi
+    chmod +x "$TEMP_FILE"
+else
+    if download_via_bundle; then
+        echo -e "Downloaded OS bundle for ${GREEN}$OS${NC} (${GREEN}$ARCH${NC})."
+    else
+        echo -e "${BLUE}Bundle not available; trying standalone asset ${TARGET}...${NC}"
+        DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$TARGET"
+        if ! curl -sSLf "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
+            echo -e "${RED}Error: Failed to download from bundle and from $DOWNLOAD_URL${NC}"
+            echo -e "Ensure release $LATEST_TAG finished building, or set BITTICE_USE_LEGACY_ASSET=1."
+            exit 1
+        fi
+        chmod +x "$TEMP_FILE"
+    fi
+fi
 
 # 5. Move to bin directory
 echo -e "Moving binary to $INSTALL_DIR (may require sudo)..."

@@ -37,6 +37,15 @@ cd bittice
 cargo run
 ```
 
+### Prebuilt binaries (GitHub Releases)
+Each `v*` release publishes:
+
+- **Per-OS bundles** (recommended for scripted downloads): `bittice-<tag>-macos.zip`, `bittice-<tag>-linux.tar.gz`, `bittice-<tag>-windows.zip`
+- **Standalone** files per target, e.g. `bittice-linux-x86_64`, `bittice-macos-aarch64`, `bittice-windows-x86_64.exe`
+- **`bittice-<tag>-downloads.json`** — lists bundle filenames and standalone asset names
+
+`install.sh` (Linux/macOS) prefers the OS bundle and falls back to standalone assets. `install.ps1` (Windows) does the same.
+
 ### Docker and production servers
 See [`deploy/README.md`](deploy/README.md) for building the runtime image, `docker compose` and publishing to GitHub Container Registry (automated on version tags `v*`).
 

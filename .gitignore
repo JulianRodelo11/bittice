@@ -10,7 +10,6 @@ Cargo.lock
 README.es.md
 
 # Note: deployment definitions in ./deploy/ (Docker image, compose). Local secrets: .env (ignored).
-install.ps1
 docker-compose.yml
 /Dockerfile
 
