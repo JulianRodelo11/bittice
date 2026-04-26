@@ -6,11 +6,13 @@ use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
 use crate::core::vpn::VpnManager;
-use crate::core::saved_queries::load_operations;
 use tracing::info;
 use std::process::{Command, Stdio};
 use std::io::{self, BufRead, BufReader};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::deploy_pipeline::{self, BuildPlatform, FullDeployConfig};
 
 /// Set after the first local `start_all_servers` spawn so returning to the menu does not start duplicate listeners.
 static LOCAL_ENGINE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -64,6 +66,260 @@ fn list_available_ovpn_configs(vpn_storage: &std::path::Path) -> Vec<String> {
     files
 }
 
+/// Persists a user's .ovpn (path, http(s) URL, or pasted content) into `vpn_storage`.
+/// Returns the path string of the stored file (for `cdc_config` or logs).
+async fn copy_ovpn_input_to_vpn_storage(
+    input_val: &str,
+    vpn_storage: &std::path::Path,
+) -> Result<String> {
+    if input_val.is_empty() {
+        return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
+    }
+
+    if input_val.starts_with("http://") || input_val.starts_with("https://") {
+        let s = spinner();
+        s.start("Downloading VPN configuration...");
+        let response = reqwest::get(input_val).await?;
+        let bytes = response.bytes().await?;
+        let file_name = input_val.split('/').last().unwrap_or("downloaded.ovpn");
+        let dest_path = vpn_storage.join(file_name);
+        std::fs::write(&dest_path, bytes)?;
+        let final_vpn_path = dest_path.to_string_lossy().to_string();
+        s.stop("✓ Download complete.");
+        return Ok(final_vpn_path);
+    }
+
+    if input_val.contains("client") && input_val.contains("dev") {
+        let dest_path = vpn_storage.join("pasted_config.ovpn");
+        std::fs::write(&dest_path, input_val)?;
+        info!("Using pasted VPN configuration.");
+        return Ok(dest_path.to_string_lossy().to_string());
+    }
+
+    let normalized_input = input_val.replace("\\", "/");
+    let parts: Vec<&str> = normalized_input
+        .split('/')
+        .filter(|s: &&str| !s.is_empty())
+        .collect();
+
+    let mut found_path = None;
+    if std::path::Path::new(input_val).exists() {
+        found_path = Some(input_val.to_string());
+    } else {
+        let is_linux = cfg!(target_os = "linux");
+        if is_linux
+            && (input_val.starts_with("/Users/")
+                || input_val.starts_with("C:\\")
+                || input_val.starts_with("/home/"))
+        {
+            return Err(anyhow::anyhow!(
+                "Path Error: You are using a local machine path ('{}') on a cloud Linux instance.\n\n1. Open the .ovpn on your computer.\n2. Copy the full text.\n3. Paste it here.",
+                input_val
+            ));
+        }
+
+        for i in 0..parts.len() {
+            let sub_path = parts[i..].join("/");
+            let candidate = format!("/app/host_home/{}", sub_path);
+            if std::path::Path::new(&candidate).exists() {
+                found_path = Some(candidate);
+                break;
+            }
+        }
+    }
+
+    let final_path_to_copy = found_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "File not found at: {}.\n- Ensure the path is valid, or paste the .ovpn text (must include client and dev).",
+            input_val
+        )
+    })?;
+
+    let path = std::path::Path::new(&final_path_to_copy);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
+    let dest_path = vpn_storage.join(file_name);
+    if path != dest_path {
+        std::fs::copy(path, &dest_path)
+            .map_err(|e| anyhow::anyhow!("Failed to copy VPN file: {}", e))?;
+    }
+    Ok(dest_path.to_string_lossy().to_string())
+}
+
+/// Browse folders (cliclack `select`) or type path / URL / pasted `.ovpn` text.
+async fn read_ovpn_source_interactive() -> io::Result<String> {
+    // Hints stay empty: long (hint) text breaks line-wrap alignment with the frame bar in cliclack.
+    println!("\x1b[90m│\x1b[0m  \x1b[90mBrowse: type to filter; pick a file or “text input” at the bottom.\x1b[0m");
+    let how: u8 = match select("How do you want to add the OpenVPN file?")
+        .item(0u8, "Browse folders and pick an .ovpn", "")
+        .item(1u8, "Type path, URL, or paste .ovpn text", "")
+        .interact()
+    {
+        Ok(x) => x,
+        Err(e) => return Err(e),
+    };
+
+    if how == 0u8 {
+        match super::ovpn_picker::browse_for_ovpn_path() {
+            Ok(Some(s)) => return Ok(s),
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    match input("OpenVPN: path, http(s) URL, or full .ovpn text")
+        .placeholder("/path/file.ovpn or https://... ")
+        .interact()
+    {
+        Ok(s) => Ok(s),
+        Err(e) => Err(e),
+    }
+}
+
+/// Add an .ovpn for later Docker / export-server-bundle; does not start OpenVPN.
+async fn add_ovpn_profile_to_storage_for_deploy() -> Result<()> {
+    let vpn_storage = VpnManager::storage_dir();
+    std::fs::create_dir_all(&vpn_storage)?;
+    println!("\x1b[90m│\x1b[0m  \x1b[90mFiles are stored under {} for export to the server.\x1b[0m", vpn_storage.display());
+    let input_val: String = match read_ovpn_source_interactive().await {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let saved = copy_ovpn_input_to_vpn_storage(&input_val, &vpn_storage).await?;
+    println!("\x1b[32m◆\x1b[0m  Saved OpenVPN profile: \x1b[1m{}\x1b[0m", saved);
+    Ok(())
+}
+
+fn print_deploy_instructions() {
+    println!("\x1b[90m│\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[1mDeploy\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mBittice is published as a Docker image on every v* release.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m1. GitHub → Releases: download bittice-server-<version>.zip\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m2. On the server: Docker + docker compose (the .env already points at the GHCR image).\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m3. Manual bundle: deploy/scripts/export-server-bundle.sh (see deploy/README.md)\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m4. Or: Deploy menu → “Build image + deploy over SSH” to do it from here.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m5. Docs: deploy/README.md and deploy/SERVER_QUICKSTART.md\x1b[0m");
+    println!("\x1b[90m│\x1b[0m");
+}
+
+async fn run_interactive_full_ssh_deploy() -> Result<()> {
+    println!("\x1b[90m│\x1b[0m  \x1b[90mThis builds the image in Docker, exports data/vpn, streams the image to the server, and runs compose over SSH. Requires: Docker, ssh, keys, and python3. Can take 10+ minutes the first time.\x1b[0m");
+    let default_root = deploy_pipeline::find_bittice_project_root()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let root_s: String = match input("Bittice project root (repo with deploy/)")
+        .default_input(&default_root)
+        .interact()
+    {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let project_root = PathBuf::from(root_s.trim());
+    if !project_root.join("deploy/Dockerfile.from-source").is_file() {
+        return Err(anyhow::anyhow!(
+            "Not the Bittice repo root: missing deploy/Dockerfile.from-source in {}",
+            project_root.display()
+        ));
+    }
+    let local_image: String = match input("Docker image name:tag (same on your machine and the server)")
+        .default_input("bittice:local-run")
+        .interact()
+    {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if local_image.is_empty() {
+        return Err(anyhow::anyhow!("Image name is required."));
+    }
+    let ssh_target: String = match input("SSH target (e.g. ubuntu@ec2-…amazonaws.com)")
+        .interact()
+    {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if ssh_target.is_empty() {
+        return Err(anyhow::anyhow!("SSH target is required (user@host)."));
+    }
+    let remote_subdir: String = match input("Remote folder (under the server home) for compose and data")
+        .default_input("bittice-run")
+        .interact()
+    {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if remote_subdir.is_empty() {
+        return Err(anyhow::anyhow!("Remote folder name is required."));
+    }
+    let pl: u8 = match select("Target server CPU (image must match)")
+        .item(0u8, "linux/amd64 (typical x86 cloud VMs)", "")
+        .item(1u8, "linux/arm64 (e.g. AWS Graviton)", "")
+        .item(2u8, "Native (this computer — no buildx)", "")
+        .interact()
+    {
+        Ok(x) => x,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let platform = match pl {
+        0 => BuildPlatform::LinuxAmd64,
+        1 => BuildPlatform::LinuxArm64,
+        _ => BuildPlatform::HostNative,
+    };
+    let cfg = FullDeployConfig {
+        project_root,
+        local_image: local_image.clone(),
+        ssh_target: ssh_target.clone(),
+        remote_subdir: remote_subdir.clone(),
+        platform,
+    };
+    let res = tokio::task::spawn_blocking(move || deploy_pipeline::run_full_deploy(&cfg))
+        .await
+        .map_err(|e| anyhow::anyhow!("join error: {e}"))?;
+    res?;
+    Ok(())
+}
+
+async fn run_deploy_flow() -> Result<()> {
+    println!("\x1b[90m│\x1b[0m  \x1b[90m(1) Adds a .ovpn to VPN storage; (2) “Full SSH” builds the image, ships data, and runs on the instance.\x1b[0m");
+    let first: u8 = match select("Deploy to a server (Docker)")
+        .item(0u8, "Add OpenVPN profile (for server export)", "")
+        .item(1u8, "Build image + bundle + deploy over SSH (full)", "")
+        .item(2u8, "Show deployment instructions only", "")
+        .item(SEL_BACK_MAIN, "« Back to main menu", "")
+        .interact()
+    {
+        Ok(x) => x,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if first == SEL_BACK_MAIN {
+        return Ok(());
+    }
+    if first == 0u8 {
+        add_ovpn_profile_to_storage_for_deploy().await?;
+    } else if first == 1u8 {
+        run_interactive_full_ssh_deploy().await?;
+    } else if first == 2u8 {
+        print_deploy_instructions();
+    }
+    let _ = match select("Deploy")
+        .item((), "« Back to main menu", "")
+        .interact()
+    {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(())
+}
+
 fn list_synced_entities() -> Vec<String> {
     let data_dir = std::path::Path::new("data");
     let mut entities = Vec::new();
@@ -112,14 +368,9 @@ fn list_data_entity_roots() -> Vec<String> {
     roots
 }
 
-fn has_saved_operations() -> bool {
-    load_operations()
-        .map(|ops| !ops.is_empty())
-        .unwrap_or(false)
-}
-
+/// Show the Deploy entry once there is at least one `data/<entity>/` tree (so bundle/export/SSH is meaningful).
 fn deploy_menu_eligible() -> bool {
-    !list_data_entity_roots().is_empty() && has_saved_operations()
+    !list_data_entity_roots().is_empty()
 }
 
 /// Follow `data/server.log` on stdout (filtered). Caller must kill the child on exit. Unix only.
@@ -149,25 +400,6 @@ fn spawn_server_log_tail_follow(log_path: &str) -> Option<std::process::Child> {
 #[cfg(not(unix))]
 fn spawn_server_log_tail_follow(_log_path: &str) -> Option<std::process::Child> {
     None
-}
-
-fn run_deploy_info_screen() -> io::Result<()> {
-    println!("\x1b[90m│\x1b[0m");
-    println!("\x1b[32m◆\x1b[0m  \x1b[1mDeploy\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mBittice se publica como imagen Docker en cada release (tag v*).\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m1. En GitHub: Releases → descarga bittice-server-<versión>.zip\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m2. En el servidor: Docker + docker compose (el .env ya apunta a la imagen GHCR).\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m3. Documentación en el repo: deploy/README.md y deploy/SERVER_QUICKSTART.md\x1b[0m");
-    println!("\x1b[90m│\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mChoose « Back below, or press Esc / Ctrl+C if your terminal sends it.\x1b[0m");
-
-    let mut back = select("Deploy")
-        .item((), "« Back to main menu", "Return without leaving Bittice");
-    match back.interact() {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 macro_rules! interact_or_cancel {
@@ -201,23 +433,12 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
     });
 
     let sync_mode: u8 = interact_or_cancel!({
-        let mut s = select("What should be synchronized?")
-            .item(
-                0u8,
-                "All user databases on this server",
-                "One CDC connection; each schema is stored as data/<database_name>/",
-            )
-            .item(
-                1u8,
-                "A single database only",
-                "Classic mode: pick the database and an optional Bittice folder name",
-            )
-            .item(
-                SEL_BACK_MAIN,
-                "« Back to main menu",
-                "Leave this wizard without saving",
-            );
-        s.interact()
+        println!("\x1b[90m│\x1b[0m  \x1b[90m“All DBs”: one CDC; each schema is stored as data/<schema>/\x1b[0m");
+        select("What should be synchronized?")
+            .item(0u8, "All user databases on this host", "")
+            .item(1u8, "A single database only", "")
+            .item(SEL_BACK_MAIN, "« Back to main menu", "")
+            .interact()
     });
     if sync_mode == SEL_BACK_MAIN {
         return Ok(WizardOutcome::Cancelled);
@@ -248,15 +469,11 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
 
     let use_vpn: bool = if is_docker_container {
         let v: u8 = interact_or_cancel!({
-            let mut s = select("Use internal VPN for database connection?")
-                .item(0u8, "Yes", "Choose a VPN provider")
-                .item(1u8, "No", "Direct connection")
-                .item(
-                    SEL_BACK_MAIN,
-                    "« Back to main menu",
-                    "Leave this wizard without saving",
-                );
-            s.interact()
+            select("Use internal VPN for database connection?")
+                .item(0u8, "Yes", "")
+                .item(1u8, "No", "")
+                .item(SEL_BACK_MAIN, "« Back to main menu", "")
+                .interact()
         });
         match v {
             SEL_BACK_MAIN => return Ok(WizardOutcome::Cancelled),
@@ -270,15 +487,11 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
     let mut vpn_file = None;
     if use_vpn {
         let vpn_provider: u8 = interact_or_cancel!({
-            let mut s = select("Select VPN provider")
-                .item(0u8, "OpenVPN", "Use .ovpn file or content")
-                .item(1u8, "My provider is not listed", "Request new integration")
-                .item(
-                    SEL_BACK_MAIN,
-                    "« Back to main menu",
-                    "Leave this wizard without saving",
-                );
-            s.interact()
+            select("Select VPN provider")
+                .item(0u8, "OpenVPN", "")
+                .item(1u8, "My provider is not listed", "")
+                .item(SEL_BACK_MAIN, "« Back to main menu", "")
+                .interact()
         });
 
         if vpn_provider == SEL_BACK_MAIN {
@@ -309,95 +522,38 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
             let back_idx = available_configs.len();
             let mut picker = select("Select the uploaded OpenVPN config");
             for (i, file) in available_configs.iter().enumerate() {
-                picker = picker.item(i, file, "Stored in persistent VPN folder");
+                let label = if file.chars().count() > 48 {
+                    format!("{}…", file.chars().take(47).collect::<String>())
+                } else {
+                    file.clone()
+                };
+                picker = picker.item(i, label, "");
             }
-            picker = picker.item(
-                back_idx,
-                "« Back to main menu",
-                "Leave this wizard without saving",
-            );
+            picker = picker.item(back_idx, "« Back to main menu", "");
             let chosen_idx: usize = interact_or_cancel!({ picker.interact() });
             if chosen_idx == back_idx {
                 return Ok(WizardOutcome::Cancelled);
             }
             vpn_storage.join(&available_configs[chosen_idx]).to_string_lossy().to_string()
         } else {
-            interact_or_cancel!({
-                let mut p = input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
-                    .placeholder("/Users/.../vpn.ovpn or config text");
-                p.interact()
-            })
+            match read_ovpn_source_interactive().await {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    return Ok(WizardOutcome::Cancelled);
+                }
+                Err(e) => return Err(e.into()),
+            }
         };
 
-        if input_val.is_empty() {
-            return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
-        }
-
-        let final_vpn_path: String;
-
-        if input_val.starts_with("http") {
-            let s = spinner();
-            s.start("Downloading VPN configuration...");
-            let response = reqwest::get(&input_val).await?;
-            let bytes = response.bytes().await?;
-            let file_name = input_val.split('/').last().unwrap_or("downloaded.ovpn");
-            let dest_path = vpn_storage.join(file_name);
-            std::fs::write(&dest_path, bytes)?;
-            final_vpn_path = dest_path.to_string_lossy().to_string();
-            s.stop("✓ Download complete.");
-        } else if input_val.contains("client") && input_val.contains("dev") {
-            let dest_path = vpn_storage.join("pasted_config.ovpn");
-            std::fs::write(&dest_path, &input_val)?;
-            final_vpn_path = dest_path.to_string_lossy().to_string();
-            info!("Using pasted VPN configuration.");
-        } else {
-            let normalized_input = input_val.replace("\\", "/");
-            let parts: Vec<&str> = normalized_input.split('/').filter(|s: &&str| !s.is_empty()).collect();
-
-            let mut found_path = None;
-            if std::path::Path::new(&input_val).exists() {
-                found_path = Some(input_val.clone());
-            } else {
-                let is_linux = cfg!(target_os = "linux");
-                if is_linux && (input_val.starts_with("/Users/") || input_val.starts_with("C:\\") || input_val.starts_with("/home/")) {
-                    return Err(anyhow::anyhow!(
-                        "Path Error: You are providing a LOCAL path from your PC ('{}'),\nbut Bittice is running on a REMOTE Cloud Instance.\n\nTips:\n1. Open the .ovpn file on your computer.\n2. COPY all its text content.\n3. PASTE it here directly.",
-                        input_val
-                    ));
-                }
-
-                for i in 0..parts.len() {
-                    let sub_path = parts[i..].join("/");
-                    let candidate = format!("/app/host_home/{}", sub_path);
-                    if std::path::Path::new(&candidate).exists() {
-                        found_path = Some(candidate);
-                        break;
-                    }
-                }
-            }
-
-            let final_path_to_copy = found_path.ok_or_else(|| {
-                anyhow::anyhow!("File not found at: {}.\nTips:\n- Make sure the file is inside your PC's Home folder.\n- Or just copy and paste the TEXT of the .ovpn file here.", input_val)
-            })?;
-
-            let path = std::path::Path::new(&final_path_to_copy);
-            let file_name = path.file_name().ok_or(anyhow::anyhow!("Invalid file name"))?;
-            let dest_path = vpn_storage.join(file_name);
-            if path != dest_path { std::fs::copy(&path, &dest_path)?; }
-            final_vpn_path = dest_path.to_string_lossy().to_string();
-        }
+        let final_vpn_path: String = copy_ovpn_input_to_vpn_storage(&input_val, &vpn_storage).await?;
 
         if !VpnManager::is_installed() {
             let install_vpn: u8 = interact_or_cancel!({
-                let mut s = select("OpenVPN is not installed. Install it now?")
-                    .item(0u8, "Yes", "Try automatic installation (requires sudo)")
-                    .item(1u8, "No", "Abort this connection setup")
-                    .item(
-                        SEL_BACK_MAIN,
-                        "« Back to main menu",
-                        "Leave this wizard without saving",
-                    );
-                s.interact()
+                select("OpenVPN is not installed. Install it now?")
+                    .item(0u8, "Yes (needs sudo for apt)", "")
+                    .item(1u8, "No", "")
+                    .item(SEL_BACK_MAIN, "« Back to main menu", "")
+                    .interact()
             });
 
             match install_vpn {
@@ -507,27 +663,15 @@ pub async fn run_startup_cliclack() -> Result<()> {
     let (option, monitor_scope): (u8, String) = 'main: loop {
         let deploy_ok = deploy_menu_eligible();
         let mut main_sel = select("Select operation mode")
-            .item(
-                0u8,
-                "Connect and synchronize to a database",
-                "Configure a new MySQL CDC connection",
-            )
-            .item(
-                1u8,
-                "Use Bittice with synchronized databases",
-                "Load and monitor all synchronized entities",
-            );
+            .item(0u8, "Connect and sync to a database", "")
+            .item(1u8, "Use Bittice with synced databases", "");
 
         if deploy_ok {
-            main_sel = main_sel.item(
-                2u8,
-                "Deploy",
-                "Docker image & server bundle (GitHub Releases)",
-            );
+            main_sel = main_sel.item(2u8, "Deploy (Docker / server bundle)", "");
         }
 
         let exit_id: u8 = if deploy_ok { 3 } else { 2 };
-        main_sel = main_sel.item(exit_id, "Exit", "Quit Bittice");
+        main_sel = main_sel.item(exit_id, "Exit", "");
 
         let choice = match main_sel.interact() {
             Ok(c) => c,
@@ -579,10 +723,8 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 );
             }
             2u8 => {
-                if let Err(e) = run_deploy_info_screen() {
-                    if e.kind() != io::ErrorKind::Interrupted {
-                        return Err(e.into());
-                    }
+                if let Err(e) = run_deploy_flow().await {
+                    return Err(e);
                 }
                 continue 'main;
             }

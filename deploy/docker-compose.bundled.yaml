@@ -1,0 +1,31 @@
+# Local-to-server deploy: ships your `data/` tree and OpenVPN profiles.
+# Generated/used with `deploy/scripts/export-server-bundle.sh` (also copied as `docker-compose.yaml` in the bundle).
+#
+# Replaces the production named volume with bind mounts so the zip/scp you upload
+# can carry the same `data` you used when configuring CDC + VPN, and `vpn` with .ovpn files.
+#
+# On the server, from the extracted folder:
+#   docker compose --env-file .env up -d
+#
+# Requires: Linux, Docker Compose v2, and ./data and ./vpn directories (the export script creates them).
+
+services:
+  bittice:
+    image: ${BITTICE_IMAGE:?set BITTICE_IMAGE in .env or environment}
+    container_name: bittice
+    restart: always
+    ports:
+      - "${BITTICE_REST_PORT:-3000}:3000"
+      - "${BITTICE_GRPC_PORT:-50051}:50051"
+    environment:
+      BITTICE_HOST: ${BITTICE_HOST:-0.0.0.0}
+      BITTICE_VPN_DIR: ${BITTICE_VPN_DIR:-/app/vpn}
+      BITTICE_VPN_SPLIT_TUNNEL: ${BITTICE_VPN_SPLIT_TUNNEL:-true}
+    volumes:
+      - ./data:/app/data
+      - ./vpn:/app/vpn
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun

@@ -1,67 +1,71 @@
-# Bittice en el servidor (sin clonar el repositorio)
+# Bittice on the server (no git clone)
 
-Este paquete se genera en cada **release** de GitHub junto con la imagen Docker publicada en **GHCR**.
+This package is built on each GitHub **release** along with the Docker image published to **GHCR**.
 
-## Qué incluye
+## What’s in the package
 
-- `docker-compose.yaml` — arranque en producción (puertos, volumen de datos).
-- `docker-compose.vpn.yaml` — opcional, si usas OpenVPN en contenedor.
-- `.env` — ya trae `BITTICE_IMAGE` apuntando a la imagen de **este** release.
+- `docker-compose.yaml` — production start (ports, data volume).
+- `docker-compose.vpn.yaml` — optional, if you use OpenVPN in the container.
+- `.env` — `BITTICE_IMAGE` already points at **this** release’s image.
 
-## Requisitos en la instancia
+## Instance requirements
 
-- Linux con **Docker** y **Docker Compose v2**.
-- Puertos abiertos en el firewall solo hacia quien deba usar la API (3000 REST, 50051 gRPC).
+- Linux with **Docker** and **Docker Compose v2**.
+- Firewall allows REST (3000) and gRPC (50051) only to who should use the API.
 
-## Pasos
+## Steps
 
-1. En la página del release en GitHub, descarga **`bittice-server-<versión>.zip`** (por ejemplo `bittice-server-v0.1.58.zip`).
-2. Sube el zip al servidor o descárgalo allí con `curl`/`wget` (enlace del asset del release).
-3. Descomprime y entra en la carpeta:
+1. On the release page, download **`bittice-server-<version>.zip`** (e.g. `bittice-server-v0.1.58.zip`).
+2. Copy the zip to the server or download it there with `curl`/`wget` (use the release asset link).
+3. Unzip and enter the folder:
 
    ```bash
    unzip bittice-server-v0.1.58.zip
    cd server-bundle
    ```
 
-4. Si la imagen en GHCR es **privada**, inicia sesión en el registro (crea un token con permiso *read:packages*):
+4. If the GHCR image is **private**, sign in to the registry (create a token with *read:packages*):
 
    ```bash
-   echo TU_TOKEN | docker login ghcr.io -u TU_USUARIO_GITHUB --password-stdin
+   echo YOUR_TOKEN | docker login ghcr.io -u GITHUB_USER --password-stdin
    ```
 
-5. Arranca:
+5. Start:
 
    ```bash
    docker compose -f docker-compose.yaml --env-file .env up -d
    ```
 
-6. Comprueba que el contenedor está en marcha:
+6. Verify the container is running:
 
    ```bash
    docker ps
    docker logs bittice
    ```
 
-## Solo con Docker (sin archivos del zip)
+## Docker only (no zip files)
 
-Si ya conoces el nombre de la imagen de este release:
+If you already know the image name for this release:
 
-`ghcr.io/<propietario>/<repo>:<tag>`
+`ghcr.io/<owner>/<repo>:<tag>`
 
-puedes hacer:
+you can run:
 
 ```bash
-docker pull ghcr.io/<propietario>/<repo>:<tag>
+docker pull ghcr.io/<owner>/<repo>:<tag>
 docker run -d --name bittice --restart always \
   -p 3000:3000 -p 50051:50051 \
   -e BITTICE_HOST=0.0.0.0 \
   -v bittice-data:/app/data \
-  ghcr.io/<propietario>/<repo>:<tag>
+  ghcr.io/<owner>/<repo>:<tag>
 ```
 
-Los datos quedan en el volumen `bittice-data`.
+Data lives in the `bittice-data` volume.
 
 ## MySQL / CDC
 
-Conectar Bittice a tu base no depende de clonar el repo: la configuración vive en el **volumen de datos** del contenedor. Asegúrate de que la instancia tenga **conectividad de red** hasta el MySQL (y VPN si tu entorno la requiere). Para el overlay VPN, usa también `docker-compose.vpn.yaml` como en `deploy/README.md` del repositorio de desarrollo.
+You do not need the repo to connect Bittice to your database: configuration is in the container’s **data volume**. Ensure the instance has **network** access to MySQL (and a VPN or tunnel if your environment requires it). For the VPN overlay, also use `docker-compose.vpn.yaml` as in `deploy/README.md` in the development repository.
+
+## From a machine where Bittice is already set up (recommended with VPN)
+
+In the development repository you can build a package with `data/`, `.ovpn` profiles, and a `docker-compose` that bind-mounts `./data` and `./vpn` so the server needs no extra manual steps. See *Deploy with a pre-configured local profile* in `deploy/README.md` and the `deploy/scripts/export-server-bundle.sh` script.
