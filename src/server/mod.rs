@@ -76,7 +76,12 @@ pub(crate) async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> a
     }
     Ok(())
 }
-pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<()> {
+/// When `shutdown_on_ctrl_c` is `false`, the HTTP engine keeps running and this call does **not**
+/// register a Ctrl+C handler (for interactive REPL: the caller owns Ctrl+C so “back to menu” works).
+pub async fn start_all_servers(
+    entity_filter: Option<String>,
+    shutdown_on_ctrl_c: bool,
+) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let table_manager = Arc::new(TableManager::new());
     let active_workers = Arc::new(StdRwLock::new(HashSet::new()));
@@ -110,10 +115,15 @@ pub async fn start_all_servers(entity_filter: Option<String>) -> anyhow::Result<
         let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter, None).await;
     });
 
-    show_banner();
-    println!("\x1b[34m│\x1b[0m");
-    println!("\x1b[32m◆\x1b[0m  \x1b[90mPress Ctrl+C to stop the server\x1b[0m");
-    wait_for_exit(Some(shutdown_tx)).await
+    if shutdown_on_ctrl_c {
+        show_banner();
+        println!("\x1b[34m│\x1b[0m");
+        println!("\x1b[32m◆\x1b[0m  \x1b[90mPress Ctrl+C to stop the server\x1b[0m");
+        wait_for_exit(Some(shutdown_tx)).await
+    } else {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
 }
 
 use std::collections::HashSet;

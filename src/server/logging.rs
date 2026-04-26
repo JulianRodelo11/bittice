@@ -108,7 +108,21 @@ impl<W1: std::io::Write, W2: std::io::Write> std::io::Write for MultiWriter<W1, 
     }
 }
 
-pub fn init_logging() {
+struct DiscardStdout;
+
+impl std::io::Write for DiscardStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// When `quiet_stdout` is true (interactive wizard / `setup`), tracing still mirrors to
+/// `data/server.log` but skips the real stdout so engine noise does not break cliclack.
+pub fn init_logging(quiet_stdout: bool) {
+    let _ = std::fs::create_dir_all("data");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -118,14 +132,31 @@ pub fn init_logging() {
         .event_format(CliclackFormatter);
 
     if let Ok(file) = log_file {
-        let file_for_writer = file.try_clone().expect("Failed to clone log file");
-        let _ = subscriber
-            .with_writer(move || {
-                let stdout = std::io::stdout();
-                let f = file_for_writer.try_clone().expect("Failed to clone log file for writer");
-                MultiWriter { w1: stdout, w2: f }
-            })
-            .try_init();
+        if quiet_stdout {
+            let file_for_writer = file.try_clone().expect("Failed to clone log file");
+            let _ = subscriber
+                .with_writer(move || {
+                    let f = file_for_writer
+                        .try_clone()
+                        .expect("Failed to clone log file for writer");
+                    MultiWriter {
+                        w1: DiscardStdout,
+                        w2: f,
+                    }
+                })
+                .try_init();
+        } else {
+            let file_for_writer = file.try_clone().expect("Failed to clone log file");
+            let _ = subscriber
+                .with_writer(move || {
+                    let stdout = std::io::stdout();
+                    let f = file_for_writer
+                        .try_clone()
+                        .expect("Failed to clone log file for writer");
+                    MultiWriter { w1: stdout, w2: f }
+                })
+                .try_init();
+        }
     } else {
         let _ = subscriber.try_init();
     }

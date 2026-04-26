@@ -8,17 +8,22 @@ use bittice::cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    logging::init_logging();
     let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
+    let args_len = std::env::args().len();
     let is_docker_env = std::path::Path::new("/.dockerenv").exists();
     let is_pid1 = std::process::id() == 1;
+    let is_docker_pid1_engine =
+        is_docker_env && is_pid1 && args_len == 1 && env_entity.is_none();
+    let tracing_quiet_stdout = (!is_docker_pid1_engine && args_len == 1 && env_entity.is_none())
+        || (std::env::args().nth(1).as_deref() == Some("setup"));
+    logging::init_logging(tracing_quiet_stdout);
 
     // Flow decision:
     // 1. Docker Background Engine: PID 1 in Docker always starts servers.
     if is_docker_env && is_pid1 {
         if std::env::args().len() == 1 && env_entity.is_none() {
             info!("Docker Engine: Starting Bittice (PID 1)...");
-            return bittice::server::start_all_servers(None).await;
+            return bittice::server::start_all_servers(None, true).await;
         }
     }
 
@@ -29,7 +34,7 @@ async fn main() -> Result<()> {
             Commands::Test => {
                 std::env::set_var("BITTICE_DISABLE_CDC_AUTOSTART", "1");
                 info!("Test mode: CDC autostart disabled. Using local data only.");
-                return bittice::server::start_all_servers(None).await;
+                return bittice::server::start_all_servers(None, true).await;
             }
             Commands::Setup => {
                 let _ = bittice::repl::startup::run_startup_cliclack().await?;
@@ -53,7 +58,7 @@ async fn main() -> Result<()> {
                 // Start server automatically for CDC
                 let server_entity = entity.clone();
                 tokio::spawn(async move {
-                    let _ = bittice::server::start_all_servers(Some(server_entity)).await;
+                    let _ = bittice::server::start_all_servers(Some(server_entity), true).await;
                 });
 
                 let worker = if sync_all {

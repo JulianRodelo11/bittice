@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cliclack::{intro, outro, outro_cancel, select, input, password, spinner};
+use cliclack::{intro, outro_cancel, select, input, password, spinner};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::thread;
@@ -10,6 +10,10 @@ use crate::core::saved_queries::load_operations;
 use tracing::info;
 use std::process::{Command, Stdio};
 use std::io::{self, BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set after the first local `start_all_servers` spawn so returning to the menu does not start duplicate listeners.
+static LOCAL_ENGINE_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CdcInfo {
@@ -116,6 +120,35 @@ fn has_saved_operations() -> bool {
 
 fn deploy_menu_eligible() -> bool {
     !list_data_entity_roots().is_empty() && has_saved_operations()
+}
+
+/// Follow `data/server.log` on stdout (filtered). Caller must kill the child on exit. Unix only.
+#[cfg(unix)]
+fn spawn_server_log_tail_follow(log_path: &str) -> Option<std::process::Child> {
+    if !std::path::Path::new(log_path).exists() {
+        return None;
+    }
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "tail -f -n 0 {} | grep --line-buffered -i -E 'GET|POST|PUT|DELETE|CDC|CDC_ERROR|Error|Warn|AUTH|binlog|Server started'",
+            log_path
+        ))
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().flatten() {
+            println!("{}", line);
+        }
+    });
+    Some(child)
+}
+
+#[cfg(not(unix))]
+fn spawn_server_log_tail_follow(_log_path: &str) -> Option<std::process::Child> {
+    None
 }
 
 fn run_deploy_info_screen() -> io::Result<()> {
@@ -468,12 +501,10 @@ async fn run_cdc_initial_sync(cdc_info: &CdcInfo) -> Result<()> {
 pub async fn run_startup_cliclack() -> Result<()> {
     intro("Bittice")?;
     println!("\x1b[90m│\x1b[0m  \x1b[90mTip: In lists, choose « Back or Exit when you see them. Esc / Ctrl+C also cancel prompts when the terminal forwards those keys.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mAfter setup, the live monitor only responds to Ctrl+C (not Esc).\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mFrom the live monitor, press Ctrl+C to return to this menu (engine keeps running). Esc is not used there.\x1b[0m");
 
-    let option: u8;
-    let monitor_scope: String;
-
-    'main: loop {
+    'session: loop {
+    let (option, monitor_scope): (u8, String) = 'main: loop {
         let deploy_ok = deploy_menu_eligible();
         let mut main_sel = select("Select operation mode")
             .item(
@@ -518,16 +549,17 @@ pub async fn run_startup_cliclack() -> Result<()> {
                     WizardOutcome::Cancelled => continue 'main,
                     WizardOutcome::Done(cdc_info) => {
                         run_cdc_initial_sync(&cdc_info).await?;
-                        monitor_scope = if cdc_info.sync_all_databases {
-                            format!(
-                                "connection profile '{}' (all schemas on host)",
-                                cdc_info.entity
-                            )
-                        } else {
-                            format!("all synchronized entities (new: {})", cdc_info.entity)
-                        };
-                        option = 0u8;
-                        break 'main;
+                        break 'main (
+                            0u8,
+                            if cdc_info.sync_all_databases {
+                                format!(
+                                    "connection profile '{}' (all schemas on host)",
+                                    cdc_info.entity
+                                )
+                            } else {
+                                format!("all synchronized entities (new: {})", cdc_info.entity)
+                            },
+                        );
                     }
                 }
             }
@@ -541,9 +573,10 @@ pub async fn run_startup_cliclack() -> Result<()> {
                     continue 'main;
                 }
 
-                monitor_scope = format!("all synchronized entities ({})", entities.join(", "));
-                option = 1u8;
-                break 'main;
+                break 'main (
+                    1u8,
+                    format!("all synchronized entities ({})", entities.join(", ")),
+                );
             }
             2u8 => {
                 if let Err(e) = run_deploy_info_screen() {
@@ -555,7 +588,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
             }
             _ => continue 'main,
         }
-    }
+    };
 
     crate::server::show_banner();
 
@@ -569,7 +602,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m");
     println!("\x1b[32m◆\x1b[0m  \x1b[1mLive Monitor\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for {} in real-time.\x1b[0m", monitor_scope);
-    println!("\x1b[90m│\x1b[0m  \x1b[90mPress Ctrl+C to leave this screen (Esc is not handled here).\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mPress Ctrl+C to return to the main menu.\x1b[0m");
     println!("\x1b[90m│\x1b[0m");
 
     let is_docker_only = std::path::Path::new("/.dockerenv").exists();
@@ -586,36 +619,45 @@ pub async fn run_startup_cliclack() -> Result<()> {
         println!("\x1b[90m│\x1b[0m");
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     } else {
-        tokio::spawn(async move {
-            let _ = crate::server::start_all_servers(None).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        let first_local_start = !LOCAL_ENGINE_STARTED.swap(true, Ordering::SeqCst);
+        if first_local_start {
+            tokio::spawn(async move {
+                let _ = crate::server::start_all_servers(None, false).await;
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
     }
 
     let log_path = "data/server.log";
-    if is_docker_only && std::path::Path::new(log_path).exists() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(format!("tail -f -n 0 {} | grep --line-buffered -i -E 'GET|POST|PUT|DELETE|CDC|Error|Warn|AUTH'", log_path))
-            .stdout(Stdio::piped())
-            .spawn()?;
+    println!("\x1b[90m│\x1b[0m");
+    println!(
+        "\x1b[90m│\x1b[0m  \x1b[90mSync:\x1b[0m MySQL → local tables runs in the engine (binlog CDC). Engine logs go to \x1b[1m{}\x1b[0m\x1b[90m; filtered lines stream below when available.\x1b[0m",
+        log_path
+    );
+    println!("\x1b[90m│\x1b[0m  \x1b[90mIf nothing new appears, you are usually caught up or there is no MySQL traffic yet.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m");
 
-        let stdout = child.stdout.take().unwrap();
-        let reader = BufReader::new(stdout);
-
-        thread::spawn(move || {
-            for line in reader.lines().flatten() {
-                println!("{}", line);
-            }
-        });
-
-        tokio::signal::ctrl_c().await?;
-        let _ = child.kill();
-    } else {
-        tokio::signal::ctrl_c().await?;
+    let mut tail_child = spawn_server_log_tail_follow(log_path);
+    if tail_child.is_none() {
+        println!(
+            "\x1b[90m│\x1b[0m  \x1b[90m(Log follow not started — open \x1b[0m{}\x1b[90m in another terminal, or use Unix/macOS for inline tail.)\x1b[0m",
+            log_path
+        );
     }
 
-    outro("Exiting monitor. Bittice engine remains active.".to_string())?;
+    tokio::signal::ctrl_c().await?;
+    if let Some(mut c) = tail_child.take() {
+        let _ = c.kill();
+    }
 
+    println!("\x1b[90m│\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[1mBack to main menu\x1b[0m  \x1b[90m(HTTP/gRPC engine keeps running)\x1b[0m");
+    println!("\x1b[90m│\x1b[0m");
+    continue 'session;
+    }
+
+    #[allow(unreachable_code)]
     Ok(())
 }
