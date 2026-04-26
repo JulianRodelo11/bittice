@@ -46,6 +46,23 @@ Each `v*` release publishes:
 
 `install.sh` (Linux/macOS) prefers the OS bundle and falls back to standalone assets. `install.ps1` (Windows) does the same.
 
+### One-command install (macOS / Linux)
+
+This downloads the latest release, places the binary under **`~/.local/bin`**, marks it executable, and adds that directory to your PATH — **no manual `chmod` or `mv`**, and **no `sudo` on a normal laptop**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.sh | bash
+```
+
+Then open a **new terminal** (or `source ~/.zshrc` on macOS / `source ~/.profile` on many Linux setups) and run `bittice`.
+
+- **Cloud VMs** (AWS, GCP, Azure): the script detects them and uses `/usr/local/bin` plus optional Docker.
+- **System-wide `/usr/local`** on your own machine (may prompt `sudo` once; the installer then assigns the binary to your user so `bittice update` / uninstall usually need no further `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.sh | env BITTICE_USE_SYSTEM_INSTALL=1 bash
+```
+
 ### Docker and production servers
 See [`deploy/README.md`](deploy/README.md) for building the runtime image, `docker compose` and publishing to GitHub Container Registry (automated on version tags `v*`).
 

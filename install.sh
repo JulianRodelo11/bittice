@@ -7,8 +7,6 @@ set -e
 
 REPO="JulianRodelo11/bittice"
 BINARY_NAME="bittice"
-INSTALL_DIR="/usr/local/bin"
-LIBEXEC_DIR="/usr/local/lib/bittice"
 DEFAULT_CLOUD_APP_DIR="${HOME}/.bittice"
 
 # Cloud installer behavior controls (env vars)
@@ -18,6 +16,8 @@ DEFAULT_CLOUD_APP_DIR="${HOME}/.bittice"
 # - BITTICE_VPN_MODE: host|container (default on cloud: container)
 # - BITTICE_VERSION: install a specific release tag (e.g. v0.1.56)
 # - BITTICE_USE_LEGACY_ASSET: if true, download standalone bittice-{os}-{arch} instead of OS bundle (.zip / .tar.gz)
+# - BITTICE_USE_SYSTEM_INSTALL=1: force /usr/local/bin on a normal machine (may prompt sudo once; binary is chowned to you)
+# - BITTICE_INSTALL_DIR / BITTICE_LIBEXEC_DIR: full override of install paths
 
 # Terminal colors
 GREEN='\033[0;32m'
@@ -68,7 +68,115 @@ write_text_file() {
     printf "%s\n" "$content" | sudo tee "$dst" > /dev/null
 }
 
+# --- Cloud Instance Detection ---
+is_cloud_instance() {
+    if [ -f /sys/class/dmi/id/sys_vendor ]; then
+        vendor=$(cat /sys/class/dmi/id/sys_vendor)
+        if [[ "$vendor" == *"Amazon"* ]] || [[ "$vendor" == *"Google"* ]] || [[ "$vendor" == *"Microsoft"* ]]; then
+            return 0
+        fi
+    fi
+    if curl -s -m 1 http://169.254.169.254/latest/meta-data/ > /dev/null 2>&1; then
+        return 0
+    fi
+    if curl -s -m 1 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/ > /dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# Workstations: ~/.local/bin (no sudo). Cloud or BITTICE_USE_SYSTEM_INSTALL: /usr/local.
+if [ -n "${BITTICE_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$BITTICE_INSTALL_DIR"
+elif is_true "${BITTICE_USE_SYSTEM_INSTALL:-0}"; then
+    INSTALL_DIR="/usr/local/bin"
+elif is_cloud_instance; then
+    INSTALL_DIR="/usr/local/bin"
+else
+    INSTALL_DIR="${HOME}/.local/bin"
+fi
+
+if [ -n "${BITTICE_LIBEXEC_DIR:-}" ]; then
+    LIBEXEC_DIR="$BITTICE_LIBEXEC_DIR"
+elif is_true "${BITTICE_USE_SYSTEM_INSTALL:-0}"; then
+    LIBEXEC_DIR="/usr/local/lib/bittice"
+elif is_cloud_instance; then
+    LIBEXEC_DIR="/usr/local/lib/bittice"
+else
+    LIBEXEC_DIR="${HOME}/.local/lib/bittice"
+fi
+
+install_owner() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        echo "$SUDO_USER"
+    else
+        id -un
+    fi
+}
+
+install_primary_group() {
+    local u
+    u="$(install_owner)"
+    id -gn "$u" 2>/dev/null || id -gn
+}
+
+file_owned_by_root() {
+    local f="$1"
+    [ -e "$f" ] || return 1
+    [ "$(ls -nd "$f" | awk '{print $3}')" = "0" ]
+}
+
+# chmod +x and, if root owns the file, chown to the real user so `bittice update` / uninstall work without sudo.
+finalize_binary_permissions() {
+    local f owner grp
+    owner="$(install_owner)"
+    grp="$(install_primary_group)"
+    for f in "$INSTALL_DIR/$BINARY_NAME" "$LIBEXEC_DIR/bittice-host"; do
+        [ -f "$f" ] || continue
+        chmod +x "$f" 2>/dev/null || sudo chmod +x "$f"
+        if file_owned_by_root "$f"; then
+            sudo chown "$owner:$grp" "$f" 2>/dev/null || true
+        fi
+    done
+}
+
+# Add INSTALL_DIR to PATH when missing (no sudo).
+configure_path_for_workstation() {
+    if is_cloud_instance; then
+        return 0
+    fi
+    case ":${PATH:-}:" in *:"$INSTALL_DIR":*)
+        echo -e "${GREEN}$INSTALL_DIR is already in your PATH.${NC}"
+        return 0
+        ;;
+    esac
+    local marker="# bittice installer PATH"
+    append_hook() {
+        local rcfile="$1"
+        local create="$2"
+        if [ ! -f "$rcfile" ]; then
+            if [ "$create" != "1" ]; then
+                return 0
+            fi
+            touch "$rcfile"
+        fi
+        if grep -qF "$marker" "$rcfile" 2>/dev/null; then
+            return 0
+        fi
+        printf '\n%s\nexport PATH="%s:$PATH"\n' "$marker" "$INSTALL_DIR" >>"$rcfile"
+        echo -e "${GREEN}Added ${BLUE}$INSTALL_DIR${NC} to PATH via ${BLUE}$rcfile${NC}"
+        echo -e "  Open a ${BLUE}new terminal${NC}, or run: ${BLUE}source \"$rcfile\"${NC}"
+    }
+    if [ "$(uname -s)" = "Darwin" ]; then
+        append_hook "${HOME}/.zshrc" 1
+    else
+        append_hook "${HOME}/.bashrc" 1
+        append_hook "${HOME}/.profile" 1
+    fi
+}
+
 echo -e "${BLUE}--- Bittice Installer ---${NC}"
+echo -e "Install directory: ${GREEN}$INSTALL_DIR${NC}  (libexec: ${GREEN}$LIBEXEC_DIR${NC})"
 
 # 1. Detect Operating System
 OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -108,25 +216,6 @@ bundle_member_for_arch() {
             ;;
         *) return 1 ;;
     esac
-}
-
-# --- Cloud Instance Detection ---
-is_cloud_instance() {
-    # 1. Check DMI/BIOS vendors
-    if [ -f /sys/class/dmi/id/sys_vendor ]; then
-        vendor=$(cat /sys/class/dmi/id/sys_vendor)
-        if [[ "$vendor" == *"Amazon"* ]] || [[ "$vendor" == *"Google"* ]] || [[ "$vendor" == *"Microsoft"* ]]; then
-            return 0
-        fi
-    fi
-    # 2. Check metadata endpoints (timeout 1s)
-    if curl -s -m 1 http://169.254.169.254/latest/meta-data/ > /dev/null 2>&1; then
-        return 0 # AWS
-    fi
-    if curl -s -m 1 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/ > /dev/null 2>&1; then
-        return 0 # GCP
-    fi
-    return 1
 }
 
 # 3. Resolve version tag
@@ -209,20 +298,23 @@ else
     fi
 fi
 
-# 5. Move to bin directory
-echo -e "Moving binary to $INSTALL_DIR (may require sudo)..."
-if [ -w "$INSTALL_DIR" ]; then
-    mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
+# 5. Install binary (chmod is applied here and in finalize; sudo only if the directory is not writable)
+ensure_dir "$INSTALL_DIR"
+echo -e "${BLUE}Installing ${BINARY_NAME} to ${GREEN}$INSTALL_DIR${NC}..."
+if mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null; then
+    :
 else
+    echo -e "${BLUE}Requesting elevated permissions once (sudo) to write under ${INSTALL_DIR}...${NC}"
     sudo mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
 fi
+chmod +x "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
 # Keep a stable host copy even when /usr/local/bin/bittice is replaced by a wrapper in cloud mode
 ensure_dir "$LIBEXEC_DIR"
 copy_to_path "$INSTALL_DIR/$BINARY_NAME" "$LIBEXEC_DIR/bittice-host"
-if [ ! -x "$LIBEXEC_DIR/bittice-host" ]; then
-    sudo chmod +x "$LIBEXEC_DIR/bittice-host"
-fi
+finalize_binary_permissions
+
+configure_path_for_workstation
 
 # 6. Instance Flow (Cloud Detection)
 if is_cloud_instance; then
@@ -253,7 +345,7 @@ if is_cloud_instance; then
         if ! command -v docker &> /dev/null; then
             echo -e "Docker not found. ${BLUE}Installing Docker...${NC}"
             curl -fsSL https://get.docker.com | sh
-            sudo usermod -aG docker "$USER"
+            sudo usermod -aG docker "$(install_owner)"
             echo -e "${GREEN}Docker installed.${NC} (Note: you may need to re-login for group permissions)."
         fi
 
@@ -378,6 +470,9 @@ else
 fi
 EOF
         sudo chmod +x /usr/local/bin/bittice
+        if file_owned_by_root /usr/local/bin/bittice; then
+            sudo chown "$(install_owner):$(install_primary_group)" /usr/local/bin/bittice 2>/dev/null || true
+        fi
 
         echo -e "\n${GREEN}Bittice Engine is now running in the background!${NC}"
         echo -e "To configure your database or monitor events, simply type: ${BLUE}bittice${NC}"
@@ -391,4 +486,9 @@ fi
 
 # 7. Finalize
 echo -e "\n${GREEN}Bittice ($LATEST_TAG) installed successfully!${NC}"
-echo -e "Type '${BLUE}bittice${NC}' to get started."
+echo -e "Binary: ${BLUE}$INSTALL_DIR/$BINARY_NAME${NC}"
+if command -v "$BINARY_NAME" &>/dev/null; then
+    echo -e "Run: ${BLUE}bittice${NC}"
+else
+    echo -e "Open a ${BLUE}new terminal${NC} (PATH was updated), then run: ${BLUE}bittice${NC}"
+fi
