@@ -31,6 +31,9 @@ enum WizardOutcome {
     Done(CdcInfo),
 }
 
+/// Reserved `select` value: explicit return to the main menu (works when Esc does not).
+const SEL_BACK_MAIN: u8 = 240;
+
 fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
     let path = std::path::Path::new("data").join(&info.entity).join("cdc_config.json");
     if let Some(parent) = path.parent() {
@@ -123,10 +126,10 @@ fn run_deploy_info_screen() -> io::Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90m2. En el servidor: Docker + docker compose (el .env ya apunta a la imagen GHCR).\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90m3. Documentación en el repo: deploy/README.md y deploy/SERVER_QUICKSTART.md\x1b[0m");
     println!("\x1b[90m│\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m[Esc] Volver al menú principal\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mChoose « Back below, or press Esc / Ctrl+C if your terminal sends it.\x1b[0m");
 
     let mut back = select("Deploy")
-        .item((), "Back to main menu", "Return without leaving Bittice");
+        .item((), "« Back to main menu", "Return without leaving Bittice");
     match back.interact() {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
@@ -175,9 +178,17 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
                 1u8,
                 "A single database only",
                 "Classic mode: pick the database and an optional Bittice folder name",
+            )
+            .item(
+                SEL_BACK_MAIN,
+                "« Back to main menu",
+                "Leave this wizard without saving",
             );
         s.interact()
     });
+    if sync_mode == SEL_BACK_MAIN {
+        return Ok(WizardOutcome::Cancelled);
+    }
 
     let (database, sync_all_databases, entity) = if sync_mode == 0 {
         let profile: String = interact_or_cancel!({
@@ -203,12 +214,22 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
     let is_cloud_env = is_docker_container;
 
     let use_vpn: bool = if is_docker_container {
-        interact_or_cancel!({
+        let v: u8 = interact_or_cancel!({
             let mut s = select("Use internal VPN for database connection?")
-                .item(true, "Yes", "Choose a VPN provider")
-                .item(false, "No", "Direct connection");
+                .item(0u8, "Yes", "Choose a VPN provider")
+                .item(1u8, "No", "Direct connection")
+                .item(
+                    SEL_BACK_MAIN,
+                    "« Back to main menu",
+                    "Leave this wizard without saving",
+                );
             s.interact()
-        })
+        });
+        match v {
+            SEL_BACK_MAIN => return Ok(WizardOutcome::Cancelled),
+            0 => true,
+            _ => false,
+        }
     } else {
         false
     };
@@ -218,9 +239,18 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         let vpn_provider: u8 = interact_or_cancel!({
             let mut s = select("Select VPN provider")
                 .item(0u8, "OpenVPN", "Use .ovpn file or content")
-                .item(1u8, "My provider is not listed", "Request new integration");
+                .item(1u8, "My provider is not listed", "Request new integration")
+                .item(
+                    SEL_BACK_MAIN,
+                    "« Back to main menu",
+                    "Leave this wizard without saving",
+                );
             s.interact()
         });
+
+        if vpn_provider == SEL_BACK_MAIN {
+            return Ok(WizardOutcome::Cancelled);
+        }
 
         if vpn_provider == 1 {
             println!("\x1b[90m│\x1b[0m");
@@ -243,11 +273,20 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
                 return Ok(WizardOutcome::Cancelled);
             }
 
+            let back_idx = available_configs.len();
             let mut picker = select("Select the uploaded OpenVPN config");
             for (i, file) in available_configs.iter().enumerate() {
                 picker = picker.item(i, file, "Stored in persistent VPN folder");
             }
+            picker = picker.item(
+                back_idx,
+                "« Back to main menu",
+                "Leave this wizard without saving",
+            );
             let chosen_idx: usize = interact_or_cancel!({ picker.interact() });
+            if chosen_idx == back_idx {
+                return Ok(WizardOutcome::Cancelled);
+            }
             vpn_storage.join(&available_configs[chosen_idx]).to_string_lossy().to_string()
         } else {
             interact_or_cancel!({
@@ -316,17 +355,22 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         }
 
         if !VpnManager::is_installed() {
-            let install_vpn: bool = interact_or_cancel!({
+            let install_vpn: u8 = interact_or_cancel!({
                 let mut s = select("OpenVPN is not installed. Install it now?")
-                    .item(true, "Yes", "Try automatic installation (requires sudo)")
-                    .item(false, "No", "Abort");
+                    .item(0u8, "Yes", "Try automatic installation (requires sudo)")
+                    .item(1u8, "No", "Abort this connection setup")
+                    .item(
+                        SEL_BACK_MAIN,
+                        "« Back to main menu",
+                        "Leave this wizard without saving",
+                    );
                 s.interact()
             });
 
-            if install_vpn {
-                VpnManager::install()?;
-            } else {
-                return Err(anyhow::anyhow!("OpenVPN is required for this connection."));
+            match install_vpn {
+                SEL_BACK_MAIN => return Ok(WizardOutcome::Cancelled),
+                0 => VpnManager::install()?,
+                _ => return Err(anyhow::anyhow!("OpenVPN is required for this connection.")),
             }
         }
 
@@ -423,11 +467,14 @@ async fn run_cdc_initial_sync(cdc_info: &CdcInfo) -> Result<()> {
 
 pub async fn run_startup_cliclack() -> Result<()> {
     intro("Bittice")?;
+    println!("\x1b[90m│\x1b[0m  \x1b[90mTip: In lists, choose « Back or Exit when you see them. Esc / Ctrl+C also cancel prompts when the terminal forwards those keys.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mAfter setup, the live monitor only responds to Ctrl+C (not Esc).\x1b[0m");
 
     let option: u8;
     let monitor_scope: String;
 
     'main: loop {
+        let deploy_ok = deploy_menu_eligible();
         let mut main_sel = select("Select operation mode")
             .item(
                 0u8,
@@ -440,13 +487,16 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 "Load and monitor all synchronized entities",
             );
 
-        if deploy_menu_eligible() {
+        if deploy_ok {
             main_sel = main_sel.item(
                 2u8,
                 "Deploy",
                 "Docker image & server bundle (GitHub Releases)",
             );
         }
+
+        let exit_id: u8 = if deploy_ok { 3 } else { 2 };
+        main_sel = main_sel.item(exit_id, "Exit", "Quit Bittice");
 
         let choice = match main_sel.interact() {
             Ok(c) => c,
@@ -456,6 +506,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
             }
             Err(e) => return Err(e.into()),
         };
+
+        if choice == exit_id {
+            outro_cancel("Goodbye.")?;
+            return Ok(());
+        }
 
         match choice {
             0u8 => {
@@ -514,6 +569,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m");
     println!("\x1b[32m◆\x1b[0m  \x1b[1mLive Monitor\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for {} in real-time.\x1b[0m", monitor_scope);
+    println!("\x1b[90m│\x1b[0m  \x1b[90mPress Ctrl+C to leave this screen (Esc is not handled here).\x1b[0m");
     println!("\x1b[90m│\x1b[0m");
 
     let is_docker_only = std::path::Path::new("/.dockerenv").exists();
