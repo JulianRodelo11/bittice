@@ -37,6 +37,9 @@ cd bittice
 cargo run
 ```
 
+### Docker and production servers
+See [`deploy/README.md`](deploy/README.md) for building the runtime image, `docker compose` and publishing to GitHub Container Registry (automated on version tags `v*`).
+
 ---
 
 ## 📜 Documentation & License

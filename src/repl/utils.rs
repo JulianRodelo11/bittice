@@ -233,7 +233,7 @@ pub fn get_indexed_fields(entity: &str, table: &str) -> Vec<String> {
     let table_path = data_path.join(entity).join(table);
     let mut all_fields = std::collections::HashSet::new();
     
-    // Escaneamos TODOS los archivos .dat para tener la lista completa (Originales + Derivados)
+    // Scan every .dat file so the list is complete (original + derived)
     let segments_dir = table_path.join("segments");
     if let Ok(entries) = std::fs::read_dir(segments_dir) {
         for entry in entries.flatten() {

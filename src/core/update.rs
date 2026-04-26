@@ -45,7 +45,7 @@ pub async fn perform_update() -> Result<()> {
             return Ok::<self_update::Status, anyhow::Error>(self_update::Status::UpToDate(current_version.to_string()));
         }
 
-        // Terminamos nuestra barra de progreso ANTES de que self_update tome el control de la terminal
+        // Finish our progress bar before self_update takes over the terminal
         pb.finish_and_clear();
 
         // 2. Configure and perform update

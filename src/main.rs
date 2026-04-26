@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Iniciar servidor automáticamente para CDC
+                // Start server automatically for CDC
                 let server_entity = entity.clone();
                 tokio::spawn(async move {
                     let _ = bittice::server::start_all_servers(Some(server_entity)).await;

@@ -1,0 +1,26 @@
+# Foreground-style service: Bittice engine with persisted data.
+# From this deploy/ directory:
+#   cp .env.example .env
+#   docker compose -f docker-compose.production.yaml up -d
+#
+# From bittice repository root:
+#   cp deploy/.env.example deploy/.env
+#   docker compose -f deploy/docker-compose.production.yaml --env-file deploy/.env up -d
+#
+# Data: named volume bittice-data (name follows Compose project directory rules).
+
+services:
+  bittice:
+    image: ${BITTICE_IMAGE:?set BITTICE_IMAGE in .env or environment}
+    container_name: bittice
+    restart: always
+    ports:
+      - "${BITTICE_REST_PORT:-3000}:3000"
+      - "${BITTICE_GRPC_PORT:-50051}:50051"
+    environment:
+      BITTICE_HOST: ${BITTICE_HOST:-0.0.0.0}
+    volumes:
+      - bittice-data:/app/data
+
+volumes:
+  bittice-data:

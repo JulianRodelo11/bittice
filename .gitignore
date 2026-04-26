@@ -6,11 +6,13 @@ Cargo.lock
 .env
 *.log
 
-# Sensitive Deployment Files (Moved to private repo)
+# Internal-only documentation (not published)
+README.es.md
+
+# Note: deployment definitions in ./deploy/ (Docker image, compose). Local secrets: .env (ignored).
 install.ps1
 docker-compose.yml
-Dockerfile
-deploy/
+/Dockerfile
 
 # Generated docker-compose files
 docker-compose-bittice-*.yml

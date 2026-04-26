@@ -20,7 +20,7 @@ pub struct FieldMetadata {
     pub count: u64,
 }
 
-// Stats internas para el analizador
+// Internal stats for the analyzer
 pub struct FieldStats {
     pub is_date: bool,
     pub has_time: bool,

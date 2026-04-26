@@ -5,7 +5,7 @@ use std::fs;
 pub async fn perform_uninstall() -> Result<()> {
     intro("Bittice Uninstaller")?;
 
-    // Detección de Docker
+    // Docker detection
     let is_docker = std::path::Path::new("/.dockerenv").exists();
 
     if is_docker {

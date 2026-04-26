@@ -1,0 +1,9 @@
+# Build context for deploy/Dockerfile.from-source and similar image builds
+target/
+data/
+.git/
+**/*.log
+.DS_Store
+.env
+.env.*
+!.env.example

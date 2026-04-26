@@ -1,14 +1,15 @@
 use anyhow::Result;
-use cliclack::{intro, outro, select, input, password, spinner};
+use cliclack::{intro, outro, outro_cancel, select, input, password, spinner};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
 use crate::core::vpn::VpnManager;
+use crate::core::saved_queries::load_operations;
 use tracing::info;
 use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CdcInfo {
@@ -23,6 +24,11 @@ struct CdcInfo {
     sync_all_databases: bool,
     entity: String,
     vpn_file: Option<String>,
+}
+
+enum WizardOutcome {
+    Cancelled,
+    Done(CdcInfo),
 }
 
 fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
@@ -76,291 +82,428 @@ fn list_synced_entities() -> Vec<String> {
     entities
 }
 
-pub async fn run_startup_cliclack() -> Result<()> {
-    intro("Bittice")?;
+/// Direct children of `data/` treated as data environments (CDC or static-only).
+/// Includes any non-hidden subdirectory; does not require `cdc_config.json`.
+fn list_data_entity_roots() -> Vec<String> {
+    let data_dir = std::path::Path::new("data");
+    let mut roots = Vec::new();
 
-    let option: u8 = select("Select operation mode")
-        .item(0, "Connect and synchronize to a database", "Configure a new MySQL CDC connection")
-        .item(1, "Use Bittice with synchronized databases", "Load and monitor all synchronized entities")
-        .interact()?;
-
-    let monitor_scope: String;
-
-    if option == 1 {
-        let entities = list_synced_entities();
-
-        if entities.is_empty() {
-            println!("\x1b[90m│\x1b[0m");
-            println!("\x1b[33m▲\x1b[0m  \x1b[1mNo synchronized entities found\x1b[0m");
-            println!("\x1b[90m│\x1b[0m  \x1b[90mYou must connect and synchronize at least one database first.\x1b[0m");
-            return Ok(());
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            roots.push(name);
         }
+    }
 
-        monitor_scope = format!("all synchronized entities ({})", entities.join(", "));
-    } else {
-        // Option 0: Connection flow - New configuration
-        let host: String = input("MySQL Host").default_input("localhost").interact()?;
-        let port: String = input("Port").default_input("3306").interact()?;
-        let user: String = input("User").default_input("root").interact()?;
-        let pass: String = password("Password").mask('*').interact()?;
+    roots.sort();
+    roots
+}
 
-        let sync_mode: u8 = select("What should be synchronized?")
+fn has_saved_operations() -> bool {
+    load_operations()
+        .map(|ops| !ops.is_empty())
+        .unwrap_or(false)
+}
+
+fn deploy_menu_eligible() -> bool {
+    !list_data_entity_roots().is_empty() && has_saved_operations()
+}
+
+fn run_deploy_info_screen() -> io::Result<()> {
+    println!("\x1b[90m│\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[1mDeploy\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mBittice se publica como imagen Docker en cada release (tag v*).\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m1. En GitHub: Releases → descarga bittice-server-<versión>.zip\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m2. En el servidor: Docker + docker compose (el .env ya apunta a la imagen GHCR).\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m3. Documentación en el repo: deploy/README.md y deploy/SERVER_QUICKSTART.md\x1b[0m");
+    println!("\x1b[90m│\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m[Esc] Volver al menú principal\x1b[0m");
+
+    let mut back = select("Deploy")
+        .item((), "Back to main menu", "Return without leaving Bittice");
+    match back.interact() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+macro_rules! interact_or_cancel {
+    ($bl:block) => {
+        match $bl {
+            Ok(x) => x,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                return Ok(WizardOutcome::Cancelled);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+}
+
+async fn run_connect_wizard() -> Result<WizardOutcome> {
+    let host: String = interact_or_cancel!({
+        let mut p = input("MySQL Host").default_input("localhost");
+        p.interact()
+    });
+    let port: String = interact_or_cancel!({
+        let mut p = input("Port").default_input("3306");
+        p.interact()
+    });
+    let user: String = interact_or_cancel!({
+        let mut p = input("User").default_input("root");
+        p.interact()
+    });
+    let pass: String = interact_or_cancel!({
+        let mut p = password("Password").mask('*');
+        p.interact()
+    });
+
+    let sync_mode: u8 = interact_or_cancel!({
+        let mut s = select("What should be synchronized?")
             .item(
-                0,
+                0u8,
                 "All user databases on this server",
                 "One CDC connection; each schema is stored as data/<database_name>/",
             )
             .item(
-                1,
+                1u8,
                 "A single database only",
                 "Classic mode: pick the database and an optional Bittice folder name",
-            )
-            .interact()?;
-
-        let (database, sync_all_databases, entity) = if sync_mode == 0 {
-            let profile: String = input("Connection profile name (folder under data/ for config)")
-                .default_input("_bittice_host")
-                .interact()?;
-            println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. _bittice_host).\x1b[0m");
-            (String::new(), true, profile)
-        } else {
-            let database: String = input("Database to synchronize").placeholder("name").interact()?;
-            let entity: String = input("Entity name in Bittice").default_input(&database).interact()?;
-            (database, false, entity)
-        };
-
-        // Detect environment
-        let is_docker_container = std::path::Path::new("/.dockerenv").exists();
-        let is_cloud_env = is_docker_container;
-
-        // Preguntar por VPN SOLO si estamos en Docker (donde bittice gestiona el túnel)
-        // En local, el usuario usa su propia VPN.
-        let use_vpn: bool = if is_docker_container {
-            select("Use internal VPN for database connection?")
-                .item(true, "Yes", "Choose a VPN provider")
-                .item(false, "No", "Direct connection")
-                .interact()?
-        } else {
-            false
-        };
-
-        let mut vpn_file = None;
-        if use_vpn {
-            let vpn_provider: u8 = select("Select VPN provider")
-                .item(0, "OpenVPN", "Use .ovpn file or content")
-                .item(1, "My provider is not listed", "Request new integration")
-                .interact()?;
-
-            if vpn_provider == 1 {
-                println!("\x1b[90m│\x1b[0m");
-                println!("\x1b[33m▲\x1b[0m  \x1b[1mProvider not yet supported\x1b[0m");
-                println!("\x1b[90m│\x1b[0m  \x1b[90mCurrently we only support OpenVPN. Please contact support to add your provider.\x1b[0m");
-                println!("\x1b[90m│\x1b[0m");
-                return Ok(());
-            }
-
-            // OpenVPN logic
-            let vpn_storage = crate::core::vpn::VpnManager::storage_dir();
-            std::fs::create_dir_all(&vpn_storage)?;
-            let available_configs = list_available_ovpn_configs(&vpn_storage);
-
-            let input_val = if is_cloud_env {
-                if available_configs.is_empty() {
-                    println!("\x1b[34m│\x1b[0m");
-                    println!("\x1b[33m▲\x1b[0m  \x1b[1mNo uploaded VPN configs found\x1b[0m");
-                    println!("\x1b[90m│\x1b[0m  \x1b[90mUpload your .ovpn file to {} and run setup again.\x1b[0m", vpn_storage.display());
-                    println!("\x1b[90m│\x1b[0m  \x1b[90mExample: scp -i key.pem my-vpn.ovpn ec2-user@<ip>:{}/\x1b[0m", vpn_storage.display());
-                    return Ok(());
-                }
-
-                let mut picker = select("Select the uploaded OpenVPN config");
-                for (i, file) in available_configs.iter().enumerate() {
-                    picker = picker.item(i, file, "Stored in persistent VPN folder");
-                }
-                let chosen_idx = picker.interact()?;
-                vpn_storage.join(&available_configs[chosen_idx]).to_string_lossy().to_string()
-            } else {
-                input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
-                    .placeholder("/Users/.../vpn.ovpn or config text")
-                    .interact()?
-            };
-
-            if input_val.is_empty() {
-                return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
-            }
-
-            let final_vpn_path: String;
-
-            // 1. Check if it's a URL
-            if input_val.starts_with("http") {
-                let s = spinner();
-                s.start("Downloading VPN configuration...");
-                let response = reqwest::get(&input_val).await?;
-                let bytes = response.bytes().await?;
-                let file_name = input_val.split('/').last().unwrap_or("downloaded.ovpn");
-                let dest_path = vpn_storage.join(file_name);
-                std::fs::write(&dest_path, bytes)?;
-                final_vpn_path = dest_path.to_string_lossy().to_string();
-                s.stop("✓ Download complete.");
-            } else if input_val.contains("client") && input_val.contains("dev") {
-                // 2. It's the content of the file
-                let dest_path = vpn_storage.join("pasted_config.ovpn");
-                std::fs::write(&dest_path, &input_val)?;
-                final_vpn_path = dest_path.to_string_lossy().to_string();
-                info!("Using pasted VPN configuration.");
-            } else {
-                // 3. Smart Path Translation (Windows/Mac/Linux)
-                let normalized_input = input_val.replace("\\", "/");
-                let parts: Vec<&str> = normalized_input.split('/').filter(|s: &&str| !s.is_empty()).collect();
-                
-                let mut found_path = None;
-                if std::path::Path::new(&input_val).exists() {
-                    found_path = Some(input_val.clone());
-                } else {
-                    // Smart detection of "Local Path on Remote Instance" mistake
-                    let is_linux = cfg!(target_os = "linux");
-                    if is_linux && (input_val.starts_with("/Users/") || input_val.starts_with("C:\\") || input_val.starts_with("/home/")) {
-                         return Err(anyhow::anyhow!(
-                            "Path Error: You are providing a LOCAL path from your PC ('{}'),\nbut Bittice is running on a REMOTE Cloud Instance.\n\nTips:\n1. Open the .ovpn file on your computer.\n2. COPY all its text content.\n3. PASTE it here directly.",
-                            input_val
-                        ));
-                    }
-
-                    for i in 0..parts.len() {
-                        let sub_path = parts[i..].join("/");
-                        let candidate = format!("/app/host_home/{}", sub_path);
-                        if std::path::Path::new(&candidate).exists() {
-                            found_path = Some(candidate);
-                            break;
-                        }
-                    }
-                }
-
-                let final_path_to_copy = found_path.ok_or_else(|| {
-                    anyhow::anyhow!("File not found at: {}.\nTips:\n- Make sure the file is inside your PC's Home folder.\n- Or just copy and paste the TEXT of the .ovpn file here.", input_val)
-                })?;
-
-                let path = std::path::Path::new(&final_path_to_copy);
-                let file_name = path.file_name().ok_or(anyhow::anyhow!("Invalid file name"))?;
-                let dest_path = vpn_storage.join(file_name);
-                if path != dest_path { std::fs::copy(&path, &dest_path)?; }
-                final_vpn_path = dest_path.to_string_lossy().to_string();
-            }
-
-            if !VpnManager::is_installed() {
-                let install_vpn: bool = select("OpenVPN is not installed. Install it now?")
-                    .item(true, "Yes", "Try automatic installation (requires sudo)")
-                    .item(false, "No", "Abort")
-                    .interact()?;
-                
-                if install_vpn {
-                    VpnManager::install()?;
-                } else {
-                    return Err(anyhow::anyhow!("OpenVPN is required for this connection."));
-                }
-            }
-
-            let prepared_path = VpnManager::prepare_ovpn_file(&final_vpn_path, &host)?;
-            VpnManager::start(&prepared_path)?;
-            vpn_file = Some(final_vpn_path);
-        }
-
-        let cdc_info = CdcInfo {
-            host,
-            port,
-            user,
-            pass,
-            database,
-            sync_all_databases,
-            entity,
-            vpn_file,
-        };
-
-        let _ = save_cdc_config(&cdc_info);
-        monitor_scope = if cdc_info.sync_all_databases {
-            format!(
-                "connection profile '{}' (all schemas on host)",
-                cdc_info.entity
-            )
-        } else {
-            format!("all synchronized entities (new: {})", cdc_info.entity)
-        };
-
-        // Sync Spinner for new connection
-        let s = spinner();
-        s.start("Starting CDC sync engine...");
-
-        let url = if cdc_info.sync_all_databases {
-            format!(
-                "mysql://{}:{}@{}:{}/",
-                cdc_info.user, cdc_info.pass, cdc_info.host, cdc_info.port
-            )
-        } else {
-            format!(
-                "mysql://{}:{}@{}:{}/{}",
-                cdc_info.user,
-                cdc_info.pass,
-                cdc_info.host,
-                cdc_info.port,
-                cdc_info.database
-            )
-        };
-
-        let (log_tx, mut log_rx) = mpsc::channel::<String>(100);
-        let worker_url = url.clone();
-        let worker_entity = cdc_info.entity.clone();
-        let worker_db = cdc_info.database.clone();
-        let worker_sync_all = cdc_info.sync_all_databases;
-
-        thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let worker = CdcWorker::with_manager_and_log(
-                worker_url,
-                worker_entity,
-                worker_db,
-                Arc::new(crate::server::table_manager::TableManager::new()),
-                Some(log_tx),
-                worker_sync_all,
             );
-            let _ = rt.block_on(worker.run());
+        s.interact()
+    });
+
+    let (database, sync_all_databases, entity) = if sync_mode == 0 {
+        let profile: String = interact_or_cancel!({
+            let mut p = input("Connection profile name (folder under data/ for config)")
+                .default_input("_bittice_host");
+            p.interact()
+        });
+        println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. _bittice_host).\x1b[0m");
+        (String::new(), true, profile)
+    } else {
+        let database: String = interact_or_cancel!({
+            let mut p = input("Database to synchronize").placeholder("name");
+            p.interact()
+        });
+        let entity: String = interact_or_cancel!({
+            let mut p = input("Entity name in Bittice").default_input(&database);
+            p.interact()
+        });
+        (database, false, entity)
+    };
+
+    let is_docker_container = std::path::Path::new("/.dockerenv").exists();
+    let is_cloud_env = is_docker_container;
+
+    let use_vpn: bool = if is_docker_container {
+        interact_or_cancel!({
+            let mut s = select("Use internal VPN for database connection?")
+                .item(true, "Yes", "Choose a VPN provider")
+                .item(false, "No", "Direct connection");
+            s.interact()
+        })
+    } else {
+        false
+    };
+
+    let mut vpn_file = None;
+    if use_vpn {
+        let vpn_provider: u8 = interact_or_cancel!({
+            let mut s = select("Select VPN provider")
+                .item(0u8, "OpenVPN", "Use .ovpn file or content")
+                .item(1u8, "My provider is not listed", "Request new integration");
+            s.interact()
         });
 
-        while let Some(msg) = log_rx.recv().await {
-            // Mostrar progreso de tablas mientras esperamos el READY final
-            if msg.contains("Syncing table") || msg.contains("Table sync") || msg.contains("rows") {
-                 s.set_message(format!("\x1b[34m→\x1b[0m  {}", msg));
-                 continue;
+        if vpn_provider == 1 {
+            println!("\x1b[90m│\x1b[0m");
+            println!("\x1b[33m▲\x1b[0m  \x1b[1mProvider not yet supported\x1b[0m");
+            println!("\x1b[90m│\x1b[0m  \x1b[90mCurrently we only support OpenVPN. Please contact support to add your provider.\x1b[0m");
+            println!("\x1b[90m│\x1b[0m");
+            return Ok(WizardOutcome::Cancelled);
+        }
+
+        let vpn_storage = crate::core::vpn::VpnManager::storage_dir();
+        std::fs::create_dir_all(&vpn_storage)?;
+        let available_configs = list_available_ovpn_configs(&vpn_storage);
+
+        let input_val = if is_cloud_env {
+            if available_configs.is_empty() {
+                println!("\x1b[34m│\x1b[0m");
+                println!("\x1b[33m▲\x1b[0m  \x1b[1mNo uploaded VPN configs found\x1b[0m");
+                println!("\x1b[90m│\x1b[0m  \x1b[90mUpload your .ovpn file to {} and run setup again.\x1b[0m", vpn_storage.display());
+                println!("\x1b[90m│\x1b[0m  \x1b[90mExample: scp -i key.pem my-vpn.ovpn ec2-user@<ip>:{}/\x1b[0m", vpn_storage.display());
+                return Ok(WizardOutcome::Cancelled);
             }
 
-            if msg == "CDC_READY" { 
-                s.stop("✓ Sync established (Real-time enabled).");
-                break;
+            let mut picker = select("Select the uploaded OpenVPN config");
+            for (i, file) in available_configs.iter().enumerate() {
+                picker = picker.item(i, file, "Stored in persistent VPN folder");
             }
-            if msg == "CDC_DISABLED" || msg.contains("Connection timed out") || msg.contains("Access denied") {
-                let reason = if msg == "CDC_DISABLED" { "CDC is not enabled on server" } else { "Could not connect to Binlog" };
-                s.stop(format!("\x1b[32m◆\x1b[0m  Static data sync established ({}. Real-time updates inactive).", reason));
-                break;
+            let chosen_idx: usize = interact_or_cancel!({ picker.interact() });
+            vpn_storage.join(&available_configs[chosen_idx]).to_string_lossy().to_string()
+        } else {
+            interact_or_cancel!({
+                let mut p = input("Provide OpenVPN configuration (Paste .ovpn content OR enter Path)")
+                    .placeholder("/Users/.../vpn.ovpn or config text");
+                p.interact()
+            })
+        };
+
+        if input_val.is_empty() {
+            return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
+        }
+
+        let final_vpn_path: String;
+
+        if input_val.starts_with("http") {
+            let s = spinner();
+            s.start("Downloading VPN configuration...");
+            let response = reqwest::get(&input_val).await?;
+            let bytes = response.bytes().await?;
+            let file_name = input_val.split('/').last().unwrap_or("downloaded.ovpn");
+            let dest_path = vpn_storage.join(file_name);
+            std::fs::write(&dest_path, bytes)?;
+            final_vpn_path = dest_path.to_string_lossy().to_string();
+            s.stop("✓ Download complete.");
+        } else if input_val.contains("client") && input_val.contains("dev") {
+            let dest_path = vpn_storage.join("pasted_config.ovpn");
+            std::fs::write(&dest_path, &input_val)?;
+            final_vpn_path = dest_path.to_string_lossy().to_string();
+            info!("Using pasted VPN configuration.");
+        } else {
+            let normalized_input = input_val.replace("\\", "/");
+            let parts: Vec<&str> = normalized_input.split('/').filter(|s: &&str| !s.is_empty()).collect();
+
+            let mut found_path = None;
+            if std::path::Path::new(&input_val).exists() {
+                found_path = Some(input_val.clone());
+            } else {
+                let is_linux = cfg!(target_os = "linux");
+                if is_linux && (input_val.starts_with("/Users/") || input_val.starts_with("C:\\") || input_val.starts_with("/home/")) {
+                    return Err(anyhow::anyhow!(
+                        "Path Error: You are providing a LOCAL path from your PC ('{}'),\nbut Bittice is running on a REMOTE Cloud Instance.\n\nTips:\n1. Open the .ovpn file on your computer.\n2. COPY all its text content.\n3. PASTE it here directly.",
+                        input_val
+                    ));
+                }
+
+                for i in 0..parts.len() {
+                    let sub_path = parts[i..].join("/");
+                    let candidate = format!("/app/host_home/{}", sub_path);
+                    if std::path::Path::new(&candidate).exists() {
+                        found_path = Some(candidate);
+                        break;
+                    }
+                }
             }
-            // ... rest of log handling ...
-            if let Some(err) = msg.strip_prefix("CDC_ERROR: ") {
-                let err_str = err.to_string();
-                s.stop(format!("✗ Error: {}", err_str));
-                return Err(anyhow::anyhow!(err_str));
+
+            let final_path_to_copy = found_path.ok_or_else(|| {
+                anyhow::anyhow!("File not found at: {}.\nTips:\n- Make sure the file is inside your PC's Home folder.\n- Or just copy and paste the TEXT of the .ovpn file here.", input_val)
+            })?;
+
+            let path = std::path::Path::new(&final_path_to_copy);
+            let file_name = path.file_name().ok_or(anyhow::anyhow!("Invalid file name"))?;
+            let dest_path = vpn_storage.join(file_name);
+            if path != dest_path { std::fs::copy(&path, &dest_path)?; }
+            final_vpn_path = dest_path.to_string_lossy().to_string();
+        }
+
+        if !VpnManager::is_installed() {
+            let install_vpn: bool = interact_or_cancel!({
+                let mut s = select("OpenVPN is not installed. Install it now?")
+                    .item(true, "Yes", "Try automatic installation (requires sudo)")
+                    .item(false, "No", "Abort");
+                s.interact()
+            });
+
+            if install_vpn {
+                VpnManager::install()?;
+            } else {
+                return Err(anyhow::anyhow!("OpenVPN is required for this connection."));
             }
-            if let Some(warn) = msg.strip_prefix("WARN: ") {
-                s.set_message(format!("\x1b[33m▲\x1b[0m  {}", warn));
-                continue;
+        }
+
+        let prepared_path = VpnManager::prepare_ovpn_file(&final_vpn_path, &host)?;
+        VpnManager::start(&prepared_path)?;
+        vpn_file = Some(final_vpn_path);
+    }
+
+    let cdc_info = CdcInfo {
+        host,
+        port,
+        user,
+        pass,
+        database,
+        sync_all_databases,
+        entity,
+        vpn_file,
+    };
+
+    let _ = save_cdc_config(&cdc_info);
+    Ok(WizardOutcome::Done(cdc_info))
+}
+
+async fn run_cdc_initial_sync(cdc_info: &CdcInfo) -> Result<()> {
+    let s = spinner();
+    s.start("Starting CDC sync engine...");
+
+    let url = if cdc_info.sync_all_databases {
+        format!(
+            "mysql://{}:{}@{}:{}/",
+            cdc_info.user, cdc_info.pass, cdc_info.host, cdc_info.port
+        )
+    } else {
+        format!(
+            "mysql://{}:{}@{}:{}/{}",
+            cdc_info.user,
+            cdc_info.pass,
+            cdc_info.host,
+            cdc_info.port,
+            cdc_info.database
+        )
+    };
+
+    let (log_tx, mut log_rx) = mpsc::channel::<String>(100);
+    let worker_url = url.clone();
+    let worker_entity = cdc_info.entity.clone();
+    let worker_db = cdc_info.database.clone();
+    let worker_sync_all = cdc_info.sync_all_databases;
+
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let worker = CdcWorker::with_manager_and_log(
+            worker_url,
+            worker_entity,
+            worker_db,
+            Arc::new(crate::server::table_manager::TableManager::new()),
+            Some(log_tx),
+            worker_sync_all,
+        );
+        let _ = rt.block_on(worker.run());
+    });
+
+    while let Some(msg) = log_rx.recv().await {
+        if msg.contains("Syncing table") || msg.contains("Table sync") || msg.contains("rows") {
+            s.set_message(format!("\x1b[34m→\x1b[0m  {}", msg));
+            continue;
+        }
+
+        if msg == "CDC_READY" {
+            s.stop("✓ Sync established (Real-time enabled).");
+            break;
+        }
+        if msg == "CDC_DISABLED" || msg.contains("Connection timed out") || msg.contains("Access denied") {
+            let reason = if msg == "CDC_DISABLED" { "CDC is not enabled on server" } else { "Could not connect to Binlog" };
+            s.stop(format!("\x1b[32m◆\x1b[0m  Static data sync established ({}. Real-time updates inactive).", reason));
+            break;
+        }
+        if let Some(err) = msg.strip_prefix("CDC_ERROR: ") {
+            let err_str = err.to_string();
+            s.stop(format!("✗ Error: {}", err_str));
+            return Err(anyhow::anyhow!(err_str));
+        }
+        if let Some(warn) = msg.strip_prefix("WARN: ") {
+            s.set_message(format!("\x1b[33m▲\x1b[0m  {}", warn));
+            continue;
+        }
+        if !msg.contains("-----") && !msg.contains("key") && !msg.contains("pass") {
+            s.set_message(msg);
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn run_startup_cliclack() -> Result<()> {
+    intro("Bittice")?;
+
+    let option: u8;
+    let monitor_scope: String;
+
+    'main: loop {
+        let mut main_sel = select("Select operation mode")
+            .item(
+                0u8,
+                "Connect and synchronize to a database",
+                "Configure a new MySQL CDC connection",
+            )
+            .item(
+                1u8,
+                "Use Bittice with synchronized databases",
+                "Load and monitor all synchronized entities",
+            );
+
+        if deploy_menu_eligible() {
+            main_sel = main_sel.item(
+                2u8,
+                "Deploy",
+                "Docker image & server bundle (GitHub Releases)",
+            );
+        }
+
+        let choice = match main_sel.interact() {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                outro_cancel("Goodbye.")?;
+                return Ok(());
             }
-            // Evitar imprimir líneas que contengan secretos o configuraciones sensibles
-            if !msg.contains("-----") && !msg.contains("key") && !msg.contains("pass") {
-                s.set_message(msg);
+            Err(e) => return Err(e.into()),
+        };
+
+        match choice {
+            0u8 => {
+                match run_connect_wizard().await? {
+                    WizardOutcome::Cancelled => continue 'main,
+                    WizardOutcome::Done(cdc_info) => {
+                        run_cdc_initial_sync(&cdc_info).await?;
+                        monitor_scope = if cdc_info.sync_all_databases {
+                            format!(
+                                "connection profile '{}' (all schemas on host)",
+                                cdc_info.entity
+                            )
+                        } else {
+                            format!("all synchronized entities (new: {})", cdc_info.entity)
+                        };
+                        option = 0u8;
+                        break 'main;
+                    }
+                }
             }
+            1u8 => {
+                let entities = list_synced_entities();
+
+                if entities.is_empty() {
+                    println!("\x1b[90m│\x1b[0m");
+                    println!("\x1b[33m▲\x1b[0m  \x1b[1mNo synchronized entities found\x1b[0m");
+                    println!("\x1b[90m│\x1b[0m  \x1b[90mYou must connect and synchronize at least one database first.\x1b[0m");
+                    continue 'main;
+                }
+
+                monitor_scope = format!("all synchronized entities ({})", entities.join(", "));
+                option = 1u8;
+                break 'main;
+            }
+            2u8 => {
+                if let Err(e) = run_deploy_info_screen() {
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        return Err(e.into());
+                    }
+                }
+                continue 'main;
+            }
+            _ => continue 'main,
         }
     }
 
     crate::server::show_banner();
-    
-    // Check if we are already running in Docker
+
     let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
     if is_docker && option == 0 {
         println!("\x1b[90m│\x1b[0m");
@@ -369,39 +512,32 @@ pub async fn run_startup_cliclack() -> Result<()> {
     }
 
     println!("\x1b[90m│\x1b[0m");
-    // Integrated Live Monitor filtered by entity
     println!("\x1b[32m◆\x1b[0m  \x1b[1mLive Monitor\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for {} in real-time.\x1b[0m", monitor_scope);
     println!("\x1b[90m│\x1b[0m");
 
-    // Flow separation for Setup Completion
-    let is_docker = std::path::Path::new("/.dockerenv").exists();
+    let is_docker_only = std::path::Path::new("/.dockerenv").exists();
 
-    if is_docker {
-        // --- DOCKER FLOW: NOTIFY BACKGROUND ENGINE ---
+    if is_docker_only {
         let client = reqwest::Client::new();
         let _ = client.post("http://localhost:3000/_config/reload")
             .send()
             .await;
-        
+
         println!("\x1b[90m│\x1b[0m");
         println!("\x1b[32m◆\x1b[0m  \x1b[1mBittice Engine Updated!\x1b[0m");
         println!("\x1b[90m│\x1b[0m  \x1b[90mThe background engine has automatically loaded the new entity.\x1b[0m");
         println!("\x1b[90m│\x1b[0m");
-        // Esperamos un momento para que el motor de fondo empiece a loguear la sincronización
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     } else {
-        // --- LOCAL FLOW: START SERVER IN-PROCESS ---
         tokio::spawn(async move {
             let _ = crate::server::start_all_servers(None).await;
         });
-        // Dar tiempo al servidor local para arrancar antes de mostrar el monitor
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
 
-
     let log_path = "data/server.log";
-    if is_docker && std::path::Path::new(log_path).exists() {
+    if is_docker_only && std::path::Path::new(log_path).exists() {
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(format!("tail -f -n 0 {} | grep --line-buffered -i -E 'GET|POST|PUT|DELETE|CDC|Error|Warn|AUTH'", log_path))
@@ -422,8 +558,8 @@ pub async fn run_startup_cliclack() -> Result<()> {
     } else {
         tokio::signal::ctrl_c().await?;
     }
-    
+
     outro("Exiting monitor. Bittice engine remains active.".to_string())?;
-    
+
     Ok(())
 }

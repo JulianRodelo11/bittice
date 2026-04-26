@@ -48,7 +48,7 @@ impl AuthService {
             token_candidates.len()
         );
 
-        // Buscar en la tabla de usuarios
+        // Look up in the users table
         let tm = self.table_manager.clone();
         let e_name = entity.to_string();
         let t_name = resolved_table_name;

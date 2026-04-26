@@ -1,0 +1,18 @@
+# Optional: VPN (OpenVPN) overlay inside the container (matches cloud install.sh flow).
+# From deploy/:
+#   docker compose -f docker-compose.production.yaml -f docker-compose.vpn.yaml up -d
+#
+# Create ./vpn on the host and put required .ovpn files there; they mount at /app/vpn.
+
+services:
+  bittice:
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    environment:
+      BITTICE_VPN_DIR: ${BITTICE_VPN_DIR:-/app/vpn}
+      BITTICE_VPN_SPLIT_TUNNEL: ${BITTICE_VPN_SPLIT_TUNNEL:-true}
+    volumes:
+      - ${BITTICE_VPN_HOST_DIR:-./vpn}:/app/vpn

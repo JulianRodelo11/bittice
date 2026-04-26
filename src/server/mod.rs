@@ -305,13 +305,13 @@ pub async fn start_server(
         active_workers,
     });
 
-    // Middleware de autenticación
+    // Authentication middleware
     let auth_layer = axum::middleware::from_fn_with_state(state.clone(), auth_middleware);
 
-    // Definir rutas: Catch-all para cualquier método
+    // Routes: catch-all for any HTTP method
     let app = Router::new()
         .route("/*path", any(handle_request))
-        .layer(auth_layer) // Añadimos la capa de auth
+        .layer(auth_layer) // Attach auth layer
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
         .with_state(state.clone());
@@ -361,9 +361,8 @@ pub async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // El middleware ahora es transparente. 
-    // La resolución de identidad se hace bajo demanda en handle_request
-    // usando la configuración específica de la query guardada.
+    // Middleware is a no-op here: identity resolution runs on demand in `handle_request`
+    // using each saved operation's auth configuration.
     Ok(next.run(request).await)
 }
 
@@ -385,7 +384,7 @@ async fn handle_request(
     
     let op_name = path.trim_start_matches('/').to_string();
     
-    // Obtener token directamente de los headers para evitar problemas con extensiones
+    // Read token straight from headers to avoid extension-related issues
     let raw_auth_token = headers.get("authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
@@ -552,7 +551,7 @@ async fn handle_request(
                             effective_auth_ctx = state.auth_service.resolve_token(&q.entity, token, Some(auth_cfg)).await;
 
                             
-                            // VALIDACIÓN ESTRICTA: Si no se pudo resolver el token (token inválido o usuario inexistente)
+                            // Strict: token could not be resolved (invalid token or unknown user)
                             if effective_auth_ctx.is_none() {
                                 warn!("-> 401 Unauthorized (Identity resolution failed for {})", op_name);
                                 return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ 
@@ -561,7 +560,7 @@ async fn handle_request(
                                 }))).into_response();
                             }
                         } else {
-                            // VALIDACIÓN ESTRICTA: Si falta el token por completo
+                            // Strict: bearer token is missing
                             warn!("-> 401 Unauthorized (No token provided for {})", op_name);
                             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ 
                                 "error": "Unauthorized", 
@@ -1498,7 +1497,7 @@ fn group_rows_by_field(
         }
     }
 
-    // Aplicar paginación a los items agrupados
+    // Apply pagination to grouped items
     let limit = grouping.limit_grouping.unwrap_or(100).min(100);
     let offset = grouping.offset_grouping.unwrap_or(0);
     let use_source_total_override = source_total_override.filter(|_| grouped.len() == 1);

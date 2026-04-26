@@ -91,13 +91,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Checkout Private Deploy Repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/bittice-deploy
-          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
-          path: deploy-assets
 
       - name: Download Linux Binaries
         uses: actions/download-artifact@v4
@@ -126,7 +119,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: deploy-assets/Dockerfile
+          file: deploy/Dockerfile
           platforms: linux/amd64
           push: true
           build-args: |
@@ -137,7 +130,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: deploy-assets/Dockerfile
+          file: deploy/Dockerfile
           platforms: linux/arm64
           push: true
           build-args: |
@@ -149,3 +142,39 @@ jobs:
           docker buildx imagetools create -t ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }} \
             ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-amd64 \
             ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-arm64
+
+  attach-server-bundle:
+    name: Server bundle (no git clone)
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build zip for bare-metal deploy
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          REPO_LOWER="${GITHUB_REPOSITORY,,}"
+          mkdir -p server-bundle
+          cp deploy/docker-compose.production.yaml server-bundle/docker-compose.yaml
+          cp deploy/docker-compose.vpn.yaml server-bundle/
+          cp deploy/SERVER_QUICKSTART.md server-bundle/README.md
+          {
+            echo "# Image published by GitHub Actions for ${REF_NAME}"
+            echo "BITTICE_IMAGE=ghcr.io/${REPO_LOWER}:${REF_NAME}"
+            echo "BITTICE_HOST=0.0.0.0"
+            echo "BITTICE_REST_PORT=3000"
+            echo "BITTICE_GRPC_PORT=50051"
+          } > server-bundle/.env
+          zip -r "bittice-server-${REF_NAME}.zip" server-bundle
+          rm -rf server-bundle
+
+      - name: Upload bundle to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: bittice-server-${{ github.ref_name }}.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
