@@ -18,13 +18,13 @@ pub enum Commands {
         /// MySQL connection URL (e.g., mysql://root:sakila@localhost:3306/sakila)
         #[arg(short, long)]
         url: String,
-        /// Connection profile folder under data/ (stores cdc_config.json and cdc_state.json)
+        /// Connection profile under data/profiles/<name>/ (cdc_config.json and cdc_state.json)
         #[arg(short, long)]
         entity: String,
         /// Database to synchronize (omit when using --sync-all)
         #[arg(short, long)]
         database: Option<String>,
-        /// Sync every user database on the server into data/<schema>/
+        /// Sync every user database on the server into data/mirror/<schema>/
         #[arg(long, default_value_t = false)]
         sync_all: bool,
     },

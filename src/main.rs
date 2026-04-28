@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
             Commands::Cdc { url, entity, database, sync_all } => {
                 // Check if there's a saved config with VPN for this entity
-                let config_path = format!("data/{}/cdc_config.json", entity);
+                let config_path = bittice::core::data_paths::profile_dir(&entity).join("cdc_config.json");
                 if let Ok(content) = std::fs::read_to_string(&config_path) {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                         if let Some(vpn_path) = json.get("vpn_file").and_then(|v| v.as_str()) {

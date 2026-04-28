@@ -148,7 +148,7 @@ fn build_token_candidates(token: &str) -> Vec<String> {
 }
 
 fn resolve_table_name_case_insensitive(entity: &str, configured_table: &str) -> Option<String> {
-    let path = Path::new("data").join(entity);
+    let path = crate::core::data_paths::mirror_entity_dir(entity);
     let configured_lower = configured_table.to_lowercase();
 
     if path.join(configured_table).is_dir() {

@@ -1,4 +1,5 @@
 pub mod core {
+    pub mod data_paths;
     pub mod auth;
     pub mod config;
     pub mod date_utils;

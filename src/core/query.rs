@@ -48,7 +48,7 @@ pub fn execute_query(
         return Ok(QueryResult { headers: vec![], rows: vec![], row_ids: None, total_found: 0, execution_time_micros: 0, debug_info: None, aggregations: None });
     }
 
-    let base_path = Path::new("data").join(entity).join(table);
+    let base_path = crate::core::data_paths::mirror_entity_dir(entity).join(table);
     let index_dir = base_path.join("index");
     let stores_dir = base_path.join("stores");
 

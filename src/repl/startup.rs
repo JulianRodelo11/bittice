@@ -41,7 +41,7 @@ enum WizardOutcome {
 const SEL_BACK_MAIN: u8 = 240;
 
 fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
-    let path = std::path::Path::new("data").join(&info.entity).join("cdc_config.json");
+    let path = crate::core::data_paths::profile_dir(&info.entity).join("cdc_config.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -321,34 +321,22 @@ async fn run_deploy_flow() -> Result<()> {
 }
 
 fn list_synced_entities() -> Vec<String> {
-    let data_dir = std::path::Path::new("data");
-    let mut entities = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(data_dir) {
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-
-            if entry.path().join("cdc_config.json").exists() {
-                entities.push(name);
-            }
-        }
-    }
-
+    let mut entities: Vec<String> = crate::core::data_paths::scan_all_cdc_config_paths()
+        .into_iter()
+        .filter_map(|p| {
+            p.parent()
+                .and_then(|pa| pa.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .collect();
     entities.sort();
+    entities.dedup();
     entities
 }
 
-/// Direct children of `data/` treated as data environments (CDC or static-only).
-/// Includes any non-hidden subdirectory; does not require `cdc_config.json`.
+/// Direct children of the data root (`data/`): profiles, mirror, vpn, logs, etc.
 fn list_data_entity_roots() -> Vec<String> {
-    let data_dir = std::path::Path::new("data");
+    let data_dir = crate::core::data_paths::resolved_data_root();
     let mut roots = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(data_dir) {
@@ -368,12 +356,12 @@ fn list_data_entity_roots() -> Vec<String> {
     roots
 }
 
-/// Show the Deploy entry once there is at least one `data/<entity>/` tree (so bundle/export/SSH is meaningful).
+/// Show the Deploy entry once there is at least one subtree under `data/` (mirror data, profiles, etc.).
 fn deploy_menu_eligible() -> bool {
     !list_data_entity_roots().is_empty()
 }
 
-/// Follow `data/server.log` on stdout (filtered). Caller must kill the child on exit. Unix only.
+/// Follow engine log file on stdout (filtered). Caller must kill the child on exit. Unix only.
 #[cfg(unix)]
 fn spawn_server_log_tail_follow(log_path: &str) -> Option<std::process::Child> {
     if !std::path::Path::new(log_path).exists() {
@@ -433,7 +421,7 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
     });
 
     let sync_mode: u8 = interact_or_cancel!({
-        println!("\x1b[90m│\x1b[0m  \x1b[90m“All DBs”: one CDC; each schema is stored as data/<schema>/\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[90m“All DBs”: one CDC; each schema is stored under data/mirror/<schema>/\x1b[0m");
         select("What should be synchronized?")
             .item(0u8, "All user databases on this host", "")
             .item(1u8, "A single database only", "")
@@ -446,7 +434,7 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
 
     let (database, sync_all_databases, entity) = if sync_mode == 0 {
         let profile: String = interact_or_cancel!({
-            let mut p = input("Connection profile name (folder under data/ for config)")
+            let mut p = input("Connection profile name (folder under data/profiles/)")
                 .default_input("_bittice_host");
             p.interact()
         });
@@ -772,20 +760,21 @@ pub async fn run_startup_cliclack() -> Result<()> {
         }
     }
 
-    let log_path = "data/server.log";
+    let log_path = crate::core::data_paths::server_log_path();
+    let log_path_s = log_path.to_string_lossy().into_owned();
     println!("\x1b[90m│\x1b[0m");
     println!(
         "\x1b[90m│\x1b[0m  \x1b[90mSync:\x1b[0m MySQL → local tables runs in the engine (binlog CDC). Engine logs go to \x1b[1m{}\x1b[0m\x1b[90m; filtered lines stream below when available.\x1b[0m",
-        log_path
+        log_path.display()
     );
     println!("\x1b[90m│\x1b[0m  \x1b[90mIf nothing new appears, you are usually caught up or there is no MySQL traffic yet.\x1b[0m");
     println!("\x1b[90m│\x1b[0m");
 
-    let mut tail_child = spawn_server_log_tail_follow(log_path);
+    let mut tail_child = spawn_server_log_tail_follow(&log_path_s);
     if tail_child.is_none() {
         println!(
             "\x1b[90m│\x1b[0m  \x1b[90m(Log follow not started — open \x1b[0m{}\x1b[90m in another terminal, or use Unix/macOS for inline tail.)\x1b[0m",
-            log_path
+            log_path.display()
         );
     }
 

@@ -143,24 +143,26 @@ pub fn scan_and_start_cdc(
     active_workers: Arc<StdRwLock<HashSet<String>>>
 ) {
     const SINGLE_DB_WORKER_LOCK_PREFIX: &str = "__single_db_worker_lock__";
-    let data_dir = std::path::Path::new("data");
     
-    if let Ok(entries) = std::fs::read_dir(data_dir) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let entity_folder_name = entry.file_name().to_string_lossy().to_string();
-                
-                // If a filter is provided, skip this directory if it doesn't match
-                if let Some(ref filter) = entity_filter {
-                    if entity_folder_name.to_lowercase() != *filter {
-                        continue;
-                    }
-                }
+    for config_path in crate::core::data_paths::scan_all_cdc_config_paths() {
+        let entity_folder_name = config_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
 
-                let config_path = entry.path().join("cdc_config.json");
-                
-                if config_path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if entity_folder_name.is_empty() {
+            continue;
+        }
+
+        // If a filter is provided, skip this directory if it doesn't match
+        if let Some(ref filter) = entity_filter {
+            if entity_folder_name.to_lowercase() != *filter {
+                continue;
+            }
+        }
+
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
                         if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
                             let user = config["user"].as_str().unwrap_or_default().to_string();
                             let pass = config["pass"].as_str().unwrap_or_default().to_string();
@@ -286,9 +288,6 @@ pub fn scan_and_start_cdc(
                             });
                         }
                     }
-                }
-            }
-        }
     }
 }
 
@@ -439,29 +438,36 @@ async fn handle_request(
     if path == "/_debug" {
         let mut debug_info = serde_json::Map::new();
         debug_info.insert("ops_loaded".to_string(), serde_json::json!(ops.len()));
-        let entities = std::fs::read_dir("data").map(|d| d.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().to_string()).collect::<Vec<_>>()).unwrap_or_default();
+        let entities: Vec<String> = crate::core::data_paths::iter_mirror_entity_paths()
+            .into_iter()
+            .filter_map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .collect();
         debug_info.insert("entities_on_disk".to_string(), serde_json::json!(entities));
         return (StatusCode::OK, Json(serde_json::Value::Object(debug_info))).into_response();
     }
 
     if path == "/_entities" {
-        let data_dir = std::path::Path::new("data");
         let mut catalog = serde_json::Map::new();
-        if let Ok(entities) = std::fs::read_dir(data_dir) {
-            for entity_entry in entities.flatten() {
-                if entity_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    let entity_name = entity_entry.file_name().to_string_lossy().to_string();
-                    let mut tables = Vec::new();
-                    if let Ok(table_entries) = std::fs::read_dir(entity_entry.path()) {
-                        for table_entry in table_entries.flatten() {
-                            if table_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                                tables.push(table_entry.file_name().to_string_lossy().to_string());
-                            }
-                        }
+        for entity_path in crate::core::data_paths::iter_mirror_entity_paths() {
+            let entity_name = entity_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if entity_name.is_empty() {
+                continue;
+            }
+            let mut tables = Vec::new();
+            if let Ok(table_entries) = std::fs::read_dir(&entity_path) {
+                for table_entry in table_entries.flatten() {
+                    if table_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        tables.push(table_entry.file_name().to_string_lossy().to_string());
                     }
-                    catalog.insert(entity_name, serde_json::json!(tables));
                 }
             }
+            catalog.insert(entity_name, serde_json::json!(tables));
         }
         return (StatusCode::OK, Json(serde_json::Value::Object(catalog))).into_response();
     }

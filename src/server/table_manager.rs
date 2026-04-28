@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
-use std::path::Path;
 use crate::core::storage::table::Table;
 
 #[derive(Debug, Clone)]
@@ -39,7 +38,7 @@ impl TableManager {
             }
         }
 
-        let entity_path = Path::new("data").join(entity);
+        let entity_path = crate::core::data_paths::mirror_entity_dir(entity);
         let table = Arc::new(RwLock::new(Table::open(&entity_path, table_name)?));
         
         let mut cache = self.tables.write().unwrap();

@@ -120,13 +120,15 @@ impl std::io::Write for DiscardStdout {
 }
 
 /// When `quiet_stdout` is true (interactive wizard / `setup`), tracing still mirrors to
-/// `data/server.log` but skips the real stdout so engine noise does not break cliclack.
+/// the engine log file under the data root (e.g. `data/server.log`) but skips the real stdout so engine noise does not break cliclack.
 pub fn init_logging(quiet_stdout: bool) {
-    let _ = std::fs::create_dir_all("data");
+    let root = crate::core::data_paths::resolved_data_root();
+    let _ = std::fs::create_dir_all(&root);
+    let _ = crate::core::data_paths::migrate_legacy_layout();
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("data/server.log");
+        .open(crate::core::data_paths::server_log_path());
 
     let subscriber = tracing_subscriber::fmt()
         .event_format(CliclackFormatter);

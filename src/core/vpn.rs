@@ -23,7 +23,7 @@ impl VpnManager {
             return app_vpn;
         }
 
-        PathBuf::from("data/vpn")
+        crate::core::data_paths::vpn_storage_dir()
     }
 
     fn resolve_ovpn_path(original_path: &str) -> PathBuf {
@@ -39,7 +39,7 @@ impl VpnManager {
 
         let candidates = [
             Self::storage_dir().join(&file_name),
-            PathBuf::from("data/vpn").join(&file_name),
+            crate::core::data_paths::vpn_storage_dir().join(&file_name),
             PathBuf::from("/app/vpn").join(&file_name),
             PathBuf::from("/app/data/vpn").join(&file_name),
         ];

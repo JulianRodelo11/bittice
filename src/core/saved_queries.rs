@@ -364,7 +364,7 @@ impl SavedCollectAggregation {
 
 pub fn save_operations(ops: &[SavedOperation]) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(ops)?;
-    let path = Path::new("data").join(".bittice_ops.json");
+    let path = crate::core::data_paths::bittice_ops_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -377,7 +377,7 @@ pub fn load_operations() -> anyhow::Result<Vec<SavedOperation>> {
 }
 
 pub fn load_operations_with_filter(entity_filter: Option<String>) -> anyhow::Result<Vec<SavedOperation>> {
-    let new_path = Path::new("data").join(".bittice_ops.json");
+    let new_path = crate::core::data_paths::bittice_ops_path();
     let old_path_root = Path::new(".bittice_ops.json");
     let very_old_path = Path::new(".bittice_queries.json");
 

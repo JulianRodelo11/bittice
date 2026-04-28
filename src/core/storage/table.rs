@@ -903,11 +903,7 @@ impl Table {
     }
 
     pub fn get_indexed_fields_static(entity: &str, table: &str) -> Vec<String> {
-        let mut data_path = Path::new("bittice/data");
-        if !data_path.exists() {
-            data_path = Path::new("data");
-        }
-        let table_path = data_path.join(entity).join(table);
+        let table_path = crate::core::data_paths::mirror_entity_dir(entity).join(table);
         let mut all_fields = std::collections::HashSet::new();
         
         let segments_dir = table_path.join("segments");

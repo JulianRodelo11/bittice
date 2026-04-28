@@ -23,10 +23,10 @@ pub struct CdcState {
 
 pub struct CdcWorker {
     url: String,
-    /// Folder under `data/` for `cdc_config.json` / `cdc_state.json` (connection profile).
+    /// Folder name under `data/profiles/<entity>/` for `cdc_config.json` / `cdc_state.json`.
     entity: String,
     database: String,
-    /// When true: one binlog stream for the server; data under `data/<schema>/` using real DB names.
+    /// When true: one binlog stream for the server; data under `data/mirror/<schema>/` using real DB names.
     sync_all_databases: bool,
     state_path: String,
     table_manager: Arc<TableManager>,
@@ -42,7 +42,7 @@ impl CdcWorker {
         Self::with_log(url, entity, database, None)
     }
 
-    /// Full-server sync: one binlog stream; tables stored under `data/<mysql_schema>/`.
+    /// Full-server sync: one binlog stream; tables stored under `data/mirror/<mysql_schema>/`.
     pub fn new_sync_all(url: String, entity: String) -> Self {
         Self::with_manager_and_log(
             url,
@@ -77,7 +77,10 @@ impl CdcWorker {
         log_tx: Option<tokio::sync::mpsc::Sender<String>>,
         sync_all_databases: bool,
     ) -> Self {
-        let state_path = format!("data/{}/cdc_state.json", entity);
+        let state_path = crate::core::data_paths::profile_dir(&entity)
+            .join("cdc_state.json")
+            .to_string_lossy()
+            .into_owned();
         Self {
             url,
             entity,
@@ -450,6 +453,7 @@ impl CdcWorker {
     }
 
     pub async fn run(&self) -> Result<()> {
+        let _ = crate::core::data_paths::migrate_legacy_layout();
         if self.sync_all_databases {
             self.log_info("CDC: Connecting to MySQL (sync all databases on server)...".to_string());
         } else {

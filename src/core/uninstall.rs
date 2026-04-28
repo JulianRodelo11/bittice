@@ -36,8 +36,9 @@ pub async fn perform_uninstall() -> Result<()> {
     
     // 2. Delete data folder if requested
     if delete_data {
-        if std::path::Path::new("data").exists() {
-            fs::remove_dir_all("data")?;
+        let data_root = crate::core::data_paths::resolved_data_root();
+        if data_root.exists() {
+            fs::remove_dir_all(&data_root)?;
             println!("✓ 'data' folder deleted.");
         }
     }

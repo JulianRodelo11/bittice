@@ -116,7 +116,7 @@ def has_ovpn(basename: str) -> bool:
     b = data_in_pack / "vpn" / basename
     return a.is_file() or b.is_file()
 
-for cfg in data_in_pack.glob("*/cdc_config.json"):
+for cfg in sorted(data_in_pack.rglob("cdc_config.json"), key=lambda p: str(p)):
     try:
         j = json.loads(cfg.read_text())
     except Exception as e:
