@@ -1,16 +1,24 @@
 use anyhow::{Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, Pool, BinlogStreamRequest};
+use mysql_common::packets::Sid;
 use mysql_common::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql_common::row::Row;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio_stream::StreamExt;
+use uuid::Uuid;
 use crate::server::table_manager::TableManager;
 use crate::core::date_utils::{extract_day, extract_month, extract_hour_bucket, is_date_format, has_time_component};
 use tracing::{info, debug, warn, error};
+
+/// Upper bound on replay lag after crash during CDC (wall clock).
+const CDC_STATE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Cap burst writes when many small binlog events arrive within [`CDC_STATE_SAVE_INTERVAL`].
+const CDC_STATE_SAVE_EVENT_BURST: u32 = 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CdcState {
@@ -19,6 +27,9 @@ pub struct CdcState {
     pub bootstrapped_tables: Vec<String>,
     #[serde(default)]
     pub pk_map: HashMap<String, String>,
+    /// Rolling GTID set aligned with processed transactions (bootstrap snapshot plus merges from binlog `GtidEvent`s).
+    #[serde(default)]
+    pub gtid_executed: String,
 }
 
 pub struct CdcWorker {
@@ -191,6 +202,7 @@ impl CdcWorker {
                 binlog_pos: 4,
                 bootstrapped_tables: Vec::new(),
                 pk_map: HashMap::new(),
+                gtid_executed: String::new(),
             })
         } else {
             CdcState {
@@ -198,6 +210,7 @@ impl CdcWorker {
                 binlog_pos: 4,
                 bootstrapped_tables: Vec::new(),
                 pk_map: HashMap::new(),
+                gtid_executed: String::new(),
             }
         }
     }
@@ -222,12 +235,14 @@ impl CdcWorker {
             || m.contains("could not find first log file")
     }
 
-    async fn resolve_binlog_position(&self, conn: &mut Conn, state: &mut CdcState) -> Result<()> {
-        if !state.binlog_file.is_empty() {
-            return Ok(());
+    async fn rollback_consistent_snapshot(conn: &mut Conn, active: bool) {
+        if active {
+            let _ = conn.query_drop("ROLLBACK").await;
         }
+    }
 
-        // Try modern MySQL command first (MySQL 8.4+)
+    /// Reads `(binlog_file, position)` using `SHOW BINARY LOG STATUS` / `SHOW MASTER STATUS`.
+    async fn query_master_coordinates(conn: &mut Conn) -> Result<Option<(String, u32)>> {
         let mut last_err = String::new();
         let mut row: Option<Row> = match conn.query_first("SHOW BINARY LOG STATUS").await {
             Ok(r) => r,
@@ -237,14 +252,11 @@ impl CdcWorker {
             }
         };
 
-        // Fallback to older MySQL command (MySQL < 8.4)
         if row.is_none() {
             row = match conn.query_first("SHOW MASTER STATUS").await {
                 Ok(r) => r,
                 Err(e) => {
                     let e_msg = e.to_string();
-                    // If this also fails, we decide what to log. 
-                    // If the first error was a permission issue (not syntax), it's more important.
                     if !last_err.is_empty() && !last_err.contains("1064") {
                         debug!("CDC Binlog check: {}", last_err);
                     } else if !e_msg.contains("1064") {
@@ -258,17 +270,213 @@ impl CdcWorker {
         }
 
         if let Some(r) = row {
-            // Extract file (column 0) and position (column 1)
             let file: String = r.get(0).unwrap_or_default();
             let pos: u32 = r.get(1).unwrap_or(4);
-            
             if !file.is_empty() {
+                return Ok(Some((file, pos)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn detect_mariadb_server(conn: &mut Conn) -> bool {
+        match conn.query_first::<String, _>("SELECT VERSION()").await {
+            Ok(Some(v)) => v.to_lowercase().contains("mariadb"),
+            _ => false,
+        }
+    }
+
+    async fn global_gtid_mode_on(conn: &mut Conn) -> bool {
+        match conn.query_first::<String, _>("SELECT @@GLOBAL.GTID_MODE").await {
+            Ok(Some(mode)) => {
+                let m = mode.trim();
+                m.eq_ignore_ascii_case("ON") || m.starts_with("ON_PERMISSIVE")
+            }
+            _ => false,
+        }
+    }
+
+    async fn maybe_capture_gtid_executed(
+        &self,
+        conn: &mut Conn,
+        state: &mut CdcState,
+        master_gtid_enabled: bool,
+    ) -> Result<()> {
+        if !master_gtid_enabled {
+            return Ok(());
+        }
+        match conn.query_first::<String, _>("SELECT @@GLOBAL.gtid_executed").await {
+            Ok(Some(gs)) => {
+                let gs = gs.trim().to_string();
+                if !gs.is_empty() {
+                    state.gtid_executed = gs;
+                    self.log_info(
+                        "CDC: Stored @@GLOBAL.gtid_executed for GTID-aware binlog streaming.".into(),
+                    );
+                }
+            }
+            Err(e) => debug!("CDC: @@GLOBAL.gtid_executed query failed: {}", e),
+            Ok(None) => {}
+        }
+        Ok(())
+    }
+
+    fn split_gtid_executed_chunks(gtids: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for part in gtids.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            Sid::from_str(p).with_context(|| format!("invalid GTID fragment `{}`", p))?;
+            out.push(p.to_string());
+        }
+        anyhow::ensure!(!out.is_empty(), "GTID set parsed to zero fragments");
+        Ok(out)
+    }
+
+    /// Parses a comma-separated GTID set into half-open `[start,end)` intervals per source UUID.
+    fn parse_gtid_executed_interval_map(s: &str) -> Result<HashMap<[u8; 16], Vec<(u64, u64)>>> {
+        let mut map: HashMap<[u8; 16], Vec<(u64, u64)>> = HashMap::new();
+        for part in s.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            let (uuid_bytes, mut intervals) =
+                Self::parse_gtid_sid_block(p).with_context(|| format!("GTID fragment `{}`", p))?;
+            map.entry(uuid_bytes)
+                .or_default()
+                .append(&mut intervals);
+        }
+        for ivs in map.values_mut() {
+            Self::merge_half_open_intervals(ivs);
+        }
+        Ok(map)
+    }
+
+    /// One fragment like `uuid:gno` or `uuid:start-end:start2-end2`.
+    fn parse_gtid_sid_block(block: &str) -> Result<([u8; 16], Vec<(u64, u64)>)> {
+        let mut colon_parts = block.splitn(2, ':');
+        let uuid_part = colon_parts.next().unwrap_or("");
+        let rest = colon_parts.next().context("GTID fragment missing ':'")?;
+        let u = Uuid::parse_str(uuid_part.trim()).context("GTID UUID")?;
+        let uuid_bytes = *u.as_bytes();
+        let mut intervals = Vec::new();
+        for seg in rest.split(':') {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            let iv = if let Some((a, b)) = seg.split_once('-') {
+                let start: u64 = a.trim().parse().context("GTID interval start")?;
+                let end_inclusive: u64 = b.trim().parse().context("GTID interval end")?;
+                anyhow::ensure!(start <= end_inclusive, "GTID inverted interval {}", seg);
+                (start, end_inclusive.saturating_add(1))
+            } else {
+                let n: u64 = seg.parse().context("GTID gno")?;
+                (n, n.saturating_add(1))
+            };
+            anyhow::ensure!(iv.0 > 0 && iv.1 > iv.0, "invalid GTID interval {:?}", iv);
+            intervals.push(iv);
+        }
+        anyhow::ensure!(!intervals.is_empty(), "GTID fragment has no intervals");
+        Ok((uuid_bytes, intervals))
+    }
+
+    fn merge_half_open_intervals(ivs: &mut Vec<(u64, u64)>) {
+        if ivs.is_empty() {
+            return;
+        }
+        ivs.sort_by_key(|x| x.0);
+        let mut merged = Vec::with_capacity(ivs.len());
+        let mut cur = ivs[0];
+        for &(s, e) in ivs.iter().skip(1) {
+            if s <= cur.1 {
+                cur.1 = cur.1.max(e);
+            } else {
+                merged.push(cur);
+                cur = (s, e);
+            }
+        }
+        merged.push(cur);
+        *ivs = merged;
+    }
+
+    fn format_gtid_executed_interval_map(map: &HashMap<[u8; 16], Vec<(u64, u64)>>) -> String {
+        let mut keys: Vec<[u8; 16]> = map.keys().copied().collect();
+        keys.sort_by_key(|k| Uuid::from_bytes(*k).as_u128());
+        let mut parts = Vec::with_capacity(keys.len());
+        for k in keys {
+            let Some(intervals) = map.get(&k) else {
+                continue;
+            };
+            if intervals.is_empty() {
+                continue;
+            }
+            let uuid_str = Uuid::from_bytes(k).to_string();
+            let mut block = uuid_str;
+            for &(s, e) in intervals {
+                block.push(':');
+                if e == s.saturating_add(1) {
+                    block.push_str(&s.to_string());
+                } else {
+                    block.push_str(&format!("{}-{}", s, e.saturating_sub(1)));
+                }
+            }
+            parts.push(block);
+        }
+        parts.join(",")
+    }
+
+    /// Extends `gtid_executed` with one committed transaction (`sid`, `gno`) and merges intervals per server UUID.
+    fn merge_gtid_executed_increment(existing: &str, sid_bytes: &[u8; 16], gno: u64) -> Result<String> {
+        if gno == 0 {
+            return Ok(existing.to_string());
+        }
+        let mut map = match Self::parse_gtid_executed_interval_map(existing.trim()) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "CDC: gtid_executed parse failed ({}); rebuilding set from streamed GTIDs.",
+                    e
+                );
+                HashMap::new()
+            }
+        };
+        let ivs = map.entry(*sid_bytes).or_default();
+        ivs.push((gno, gno.saturating_add(1)));
+        Self::merge_half_open_intervals(ivs);
+        Ok(Self::format_gtid_executed_interval_map(&map))
+    }
+
+    async fn resolve_binlog_position(
+        &self,
+        conn: &mut Conn,
+        state: &mut CdcState,
+        master_gtid_enabled: bool,
+    ) -> Result<()> {
+        if !state.binlog_file.is_empty() {
+            return Ok(());
+        }
+
+        match Self::query_master_coordinates(conn).await? {
+            Some((file, pos)) => {
                 state.binlog_file = file;
                 state.binlog_pos = pos;
-                self.log_info(format!("CDC: Real-time sync enabled. Starting from {} at position {}", state.binlog_file, state.binlog_pos));
+                self.log_info(format!(
+                    "CDC: Real-time sync enabled. Starting from {} at position {}",
+                    state.binlog_file, state.binlog_pos
+                ));
+                self.maybe_capture_gtid_executed(conn, state, master_gtid_enabled)
+                    .await?;
             }
-        } else {
-            self.log_info("CDC: Operating in Static Data mode (Real-time updates not enabled on MySQL).".to_string());
+            None => {
+                self.log_info(
+                    "CDC: Operating in Static Data mode (Real-time updates not enabled on MySQL)."
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -508,6 +716,9 @@ impl CdcWorker {
             return Err(e.into());
         }
 
+        let server_is_mariadb = Self::detect_mariadb_server(&mut conn).await;
+        let master_gtid_enabled = !server_is_mariadb && Self::global_gtid_mode_on(&mut conn).await;
+
         let mut state = self.load_state();
         if self.sync_all_databases {
             let all_simple = !state.bootstrapped_tables.is_empty()
@@ -523,10 +734,50 @@ impl CdcWorker {
             }
         }
 
+        // InnoDB-only: single MVCC snapshot + binlog coords **before** bulk `SELECT *`, matching mysqldump `--single-transaction` semantics.
+        let mut rr_snapshot_active = false;
+        let mut coords_pre_bootstrap: Option<(String, u32)> = None;
+
+        if state.binlog_file.is_empty() {
+            match conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT").await {
+                Ok(()) => {
+                    rr_snapshot_active = true;
+                    match Self::query_master_coordinates(&mut conn).await {
+                        Ok(Some((f, p))) if !f.is_empty() => {
+                            coords_pre_bootstrap = Some((f.clone(), p));
+                            self.log_info(format!(
+                                "CDC: InnoDB consistent snapshot active; captured binlog {}:{} before bulk table copy.",
+                                f, p
+                            ));
+                        }
+                        Ok(Some(_)) | Ok(None) => {
+                            self.log_warn(
+                                "CDC: SHOW MASTER STATUS returned empty coordinates inside snapshot; binlog tip will be resolved after bootstrap."
+                                    .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            self.log_warn(format!(
+                                "CDC: Could not read binlog coordinates inside snapshot ({}); tip resolved after bootstrap.",
+                                e
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.log_warn(format!(
+                        "CDC: START TRANSACTION WITH CONSISTENT SNAPSHOT failed ({}): sequential snapshot without MVCC alignment; binlog tip resolved after bootstrap.",
+                        e
+                    ));
+                }
+            }
+        }
+
         if self.sync_all_databases {
             let schemas = match Self::list_user_schemas(&mut conn).await {
                 Ok(s) => s,
                 Err(e) => {
+                    Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                     self.log_error(format!("Failed to list databases: {}", e));
                     return Err(e.into());
                 }
@@ -558,6 +809,7 @@ impl CdcWorker {
                             .bootstrap_table(&mut conn, &schema, table_name, &mut state)
                             .await
                         {
+                            Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                             return self
                                 .enter_static_mode(format!(
                                     "Bootstrap failed for '{}': {}. Falling back to static data mode.",
@@ -574,6 +826,7 @@ impl CdcWorker {
                         {
                             Ok(info) => info,
                             Err(e) => {
+                                Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                                 return self
                                     .enter_static_mode(format!(
                                         "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
@@ -595,6 +848,7 @@ impl CdcWorker {
             let tables = match self.fetch_all_tables(&mut conn).await {
                 Ok(t) => t,
                 Err(e) => {
+                    Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                     self.log_error(format!("Failed to fetch tables: {}", e));
                     return Err(e.into());
                 }
@@ -612,6 +866,7 @@ impl CdcWorker {
                         .bootstrap_table(&mut conn, self.database.as_str(), table_name, &mut state)
                         .await
                     {
+                        Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                         return self
                             .enter_static_mode(format!(
                                 "Bootstrap failed for '{}': {}. Falling back to static data mode.",
@@ -633,6 +888,7 @@ impl CdcWorker {
                     {
                         Ok(info) => info,
                         Err(e) => {
+                            Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                             return self
                                 .enter_static_mode(format!(
                                     "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
@@ -651,7 +907,26 @@ impl CdcWorker {
             }
         }
 
-        self.resolve_binlog_position(&mut conn, &mut state).await?;
+        if rr_snapshot_active {
+            if let Err(e) = conn.query_drop("COMMIT").await {
+                self.log_error(format!(
+                    "CDC: COMMIT after consistent snapshot bootstrap failed: {}",
+                    e
+                ));
+                return Err(e.into());
+            }
+        }
+
+        if let Some((f, p)) = coords_pre_bootstrap.take() {
+            state.binlog_file = f;
+            state.binlog_pos = p;
+            self.maybe_capture_gtid_executed(&mut conn, &mut state, master_gtid_enabled)
+                .await?;
+            let _ = self.save_state(&state);
+        }
+
+        self.resolve_binlog_position(&mut conn, &mut state, master_gtid_enabled)
+            .await?;
 
         if state.binlog_file.is_empty() {
             return self.enter_static_mode("CDC is not enabled on server.".to_string()).await;
@@ -663,7 +938,8 @@ impl CdcWorker {
         }
 
         let pool = pool.clone();
-        let mut last_flush = std::time::Instant::now();
+        let mut last_state_save = std::time::Instant::now();
+        let mut events_since_save: u32 = 0;
 
         'binlog_retry: loop {
             self.log_info(format!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos));
@@ -671,13 +947,59 @@ impl CdcWorker {
             let server_id = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_millis() % 100000) as u32 + 1000;
+                .as_millis()
+                % 100_000) as u32
+                + 1000;
 
-            let request = BinlogStreamRequest::new(server_id)
-                .with_filename(state.binlog_file.as_bytes())
-                .with_pos(state.binlog_pos as u64);
+            let filename_b = state.binlog_file.as_bytes();
+            let pos_u64 = state.binlog_pos as u64;
 
-            let mut stream = match conn.get_binlog_stream(request).await {
+            let use_gtid_dump = master_gtid_enabled && !state.gtid_executed.trim().is_empty();
+
+            let binlog_open_result = if use_gtid_dump {
+                match Self::split_gtid_executed_chunks(state.gtid_executed.trim()) {
+                    Ok(chunk_strings) => {
+                        let sids: Vec<Sid<'_>> = chunk_strings
+                            .iter()
+                            .map(|c| Sid::from_str(c.as_str()).expect("GTID fragment pre-validated"))
+                            .collect();
+                        conn.get_binlog_stream(
+                            BinlogStreamRequest::new(server_id)
+                                .with_gtid()
+                                .with_filename(filename_b)
+                                .with_pos(pos_u64)
+                                .with_gtid_set(sids.into_iter()),
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        warn!(
+                            "CDC: Stored gtid_executed could not be parsed ({}); opening binlog stream without GTID.",
+                            e
+                        );
+                        conn.get_binlog_stream(
+                            BinlogStreamRequest::new(server_id)
+                                .with_filename(filename_b)
+                                .with_pos(pos_u64),
+                        )
+                        .await
+                    }
+                }
+            } else {
+                if master_gtid_enabled && state.gtid_executed.trim().is_empty() {
+                    debug!(
+                        "CDC: GTID_MODE is ON but gtid_executed snapshot empty; using filename/position replication."
+                    );
+                }
+                conn.get_binlog_stream(
+                    BinlogStreamRequest::new(server_id)
+                        .with_filename(filename_b)
+                        .with_pos(pos_u64),
+                )
+                .await
+            };
+
+            let mut stream = match binlog_open_result {
                 Ok(s) => s,
                 Err(e) => {
                     let msg = e.to_string();
@@ -685,6 +1007,7 @@ impl CdcWorker {
                         warn!("CDC: Saved binlog no longer available on server ({}). Re-syncing from current head.", msg);
                         state.binlog_file.clear();
                         state.binlog_pos = 4;
+                        state.gtid_executed.clear();
                         self.save_state(&state)?;
                         conn = pool.get_conn().await?;
                         if self.sync_all_databases {
@@ -711,6 +1034,7 @@ impl CdcWorker {
                             warn!("CDC: Binlog stream error ({}). Re-syncing from current head.", msg);
                             state.binlog_file.clear();
                             state.binlog_pos = 4;
+                            state.gtid_executed.clear();
                             self.save_state(&state)?;
                             conn = pool.get_conn().await?;
                             if self.sync_all_databases {
@@ -735,7 +1059,20 @@ impl CdcWorker {
                 }
 
                 let data = event.read_data()?;
+                let checkpoint_rotate =
+                    matches!(&data, Some(EventData::RotateEvent(_)));
+
                 match data {
+                    Some(EventData::GtidEvent(ev)) if master_gtid_enabled => {
+                        match Self::merge_gtid_executed_increment(
+                            state.gtid_executed.as_str(),
+                            &ev.sid(),
+                            ev.gno(),
+                        ) {
+                            Ok(merged) => state.gtid_executed = merged,
+                            Err(e) => warn!("CDC: gtid_executed merge failed: {}", e),
+                        }
+                    }
                     Some(EventData::TableMapEvent(tm)) => {
                         let mut map = self.table_map_events.write().unwrap();
                         map.insert(tm.table_id(), tm.into_owned());
@@ -750,13 +1087,17 @@ impl CdcWorker {
                     _ => {}
                 }
 
-                self.save_state(&state)?;
-
-                if last_flush.elapsed() > std::time::Duration::from_secs(10) {
-                    last_flush = std::time::Instant::now();
+                events_since_save = events_since_save.saturating_add(1);
+                let periodic_save = last_state_save.elapsed() >= CDC_STATE_SAVE_INTERVAL
+                    || events_since_save >= CDC_STATE_SAVE_EVENT_BURST;
+                if checkpoint_rotate || periodic_save {
+                    self.save_state(&state)?;
+                    events_since_save = 0;
+                    last_state_save = std::time::Instant::now();
                 }
             }
 
+            self.save_state(&state)?;
             return Ok(());
         }
     }
