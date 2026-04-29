@@ -63,6 +63,28 @@ Then open a **new terminal** (or `source ~/.zshrc` on macOS / `source ~/.profile
 curl -fsSL https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.sh | env BITTICE_USE_SYSTEM_INSTALL=1 bash
 ```
 
+### One-command install (Windows)
+
+From **cmd** or **PowerShell**, same idea as `irm … | iex` installers (e.g. OpenClaw):
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+```
+
+This downloads the **latest** GitHub release, prefers the Windows bundle (`bittice-<tag>-windows.zip`), falls back to `bittice-windows-x86_64.exe`, and installs `bittice.exe` under `%USERPROFILE%\AppData\Local\Microsoft\WindowsApps` (usually already on your PATH). Open a **new terminal** and run `bittice --help`.
+
+If execution policy blocks the script, use:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+```
+
+Optional (same meaning as on Linux/macOS): pin a version or install directory before invoking `iex`:
+
+```powershell
+$env:BITTICE_VERSION = "v0.1.64"; irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex
+```
+
 ### Docker and production servers
 See [`deploy/README.md`](deploy/README.md) for building the runtime image, `docker compose` and publishing to GitHub Container Registry (automated on version tags `v*`).
 

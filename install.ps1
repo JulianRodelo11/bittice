@@ -1,7 +1,12 @@
 # Bittice installer for Windows
+# Env (optional): BITTICE_VERSION (e.g. v0.1.64), BITTICE_INSTALL_DIR (full path for bittice.exe)
+#
+# One-liner (from PowerShell or cmd):
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+
 $repo = "JulianRodelo11/bittice"
 $binaryName = "bittice.exe"
-$installDir = "$HOME\AppData\Local\Microsoft\WindowsApps"
+$installDir = if ($env:BITTICE_INSTALL_DIR) { $env:BITTICE_INSTALL_DIR.TrimEnd('\') } else { "$HOME\AppData\Local\Microsoft\WindowsApps" }
 
 Write-Host "--- Bittice installer (Windows) ---" -ForegroundColor Blue
 
@@ -9,10 +14,16 @@ Write-Host "--- Bittice installer (Windows) ---" -ForegroundColor Blue
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "AMD64") { "x86_64" } elseif ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
 $standaloneTarget = "bittice-windows-x86_64.exe"
 
-# 2. Latest release tag
-Write-Host "Fetching latest release from GitHub..."
-$release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest"
-$latestTag = $release.tag_name
+# 2. Release tag: pinned via BITTICE_VERSION or latest from GitHub
+$latestTag = $null
+if ($env:BITTICE_VERSION) {
+    $latestTag = $env:BITTICE_VERSION.Trim()
+    Write-Host "Using release tag from BITTICE_VERSION: $latestTag" -ForegroundColor Cyan
+} else {
+    Write-Host "Fetching latest release from GitHub..."
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest"
+    $latestTag = $release.tag_name
+}
 
 if (-not $latestTag) {
     Write-Host "No published release found." -ForegroundColor Red

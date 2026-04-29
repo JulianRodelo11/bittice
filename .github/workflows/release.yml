@@ -129,7 +129,13 @@ jobs:
           tar -czvf "bittice-${REF_NAME}-linux.tar.gz" -C bundle-linux .
 
           cp artifacts/bittice-windows-x86_64.exe/bittice-windows-x86_64.exe bundle-win/bittice.exe
-          printf '%s\r\n' "Bittice ${REF_NAME} for Windows (x86_64)." "" "Run bittice.exe from this folder or add it to your PATH." > bundle-win/INSTALL.txt
+          {
+            printf '%s\r\n' "Bittice ${REF_NAME} for Windows (x86_64)." ""
+            printf '%s\r\n' "One-liner (latest release; run in cmd or PowerShell):"
+            printf '%s\r\n' "  powershell -c \"irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.ps1 | iex\""
+            printf '%s\r\n' ""
+            printf '%s\r\n' "This folder: run bittice.exe here or copy it anywhere on your PATH."
+          } > bundle-win/INSTALL.txt
           (cd bundle-win && zip -r "../bittice-${REF_NAME}-windows.zip" .)
 
           cat > "bittice-${REF_NAME}-downloads.json" <<EOF
