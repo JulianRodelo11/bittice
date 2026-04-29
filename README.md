@@ -65,21 +65,21 @@ curl -fsSL https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install
 
 ### One-command install (Windows)
 
-From **cmd** or **PowerShell**, same idea as `irm … | iex` installers (e.g. OpenClaw):
+From **cmd** or **PowerShell**, same idea as `irm … | iex` installers (e.g. OpenClaw). **Important in cmd:** the full expression `irm … | iex` must stay **inside** the same pair of double quotes after `-c`. If you end the quote before `| iex`, only the script text is fetched and **nothing runs** (so the binary and PATH are not updated).
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+```
+
+Shorter (if execution policy already allows scripts):
 
 ```powershell
 powershell -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
 ```
 
-This downloads the **latest** GitHub release, prefers the Windows bundle (`bittice-<tag>-windows.zip`), falls back to `bittice-windows-x86_64.exe`, and installs `bittice.exe` under **`%LOCALAPPDATA%\Programs\Bittice`**, appending that folder to your **user** PATH if needed. Close the terminal, open a **new** one, and run `bittice --help`. If `cmd` still does not see it, sign out and back in once so Windows reloads PATH.
+This downloads the **latest** GitHub release, prefers the Windows bundle (`bittice-<tag>-windows.zip`), falls back to `bittice-windows-x86_64.exe`, and installs `bittice.exe` under **`%LOCALAPPDATA%\Programs\Bittice`**, appending that folder to your **user** PATH. Run the installer from a **normal** shell if you can; **Run as administrator** updates the PATH for the admin account, not necessarily the one you use every day. Close the terminal, open a **new** one, and run `bittice --help`. If `cmd` still does not see it, sign out and back in once so Windows reloads PATH.
 
-If execution policy blocks the script, use:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
-```
-
-Optional (same meaning as on Linux/macOS): pin a version or install directory before invoking `iex`:
+Optional (same meaning as on Linux/macOS): pin a version from PowerShell directly:
 
 ```powershell
 $env:BITTICE_VERSION = "v0.1.64"; irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex
