@@ -68,13 +68,13 @@ curl -fsSL https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install
 From **cmd** or **PowerShell**, same idea as `irm … | iex` installers (e.g. OpenClaw). **Important in cmd:** the full expression `irm … | iex` must stay **inside** the same pair of double quotes after `-c`. If you end the quote before `| iex`, only the script text is fetched and **nothing runs** (so the binary and PATH are not updated).
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+powershell -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
 ```
 
-Shorter (if execution policy already allows scripts):
+That is enough whenever **ExecutionPolicy** lets `iex` run (typical on many Windows setups). If you get a policy error, use:
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
 ```
 
 This downloads the **latest** GitHub release, prefers the Windows bundle (`bittice-<tag>-windows.zip`), falls back to `bittice-windows-x86_64.exe`, and installs `bittice.exe` under **`%LOCALAPPDATA%\Programs\Bittice`**, appending that folder to your **user** PATH. Run the installer from a **normal** shell if you can; **Run as administrator** updates the PATH for the admin account, not necessarily the one you use every day. Close the terminal, open a **new** one, and run `bittice --help`. If `cmd` still does not see it, sign out and back in once so Windows reloads PATH.

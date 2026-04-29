@@ -1,8 +1,10 @@
 # Bittice installer for Windows
 # Env (optional): BITTICE_VERSION (e.g. v0.1.64), BITTICE_INSTALL_DIR (full path for bittice.exe)
 #
-# One-liner (cmd.exe — keep | iex INSIDE the quotes so cmd does not steal the pipe):
-#   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+# One-liner (cmd.exe — keep | iex INSIDE the quotes):
+#   powershell -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
+# If ExecutionPolicy blocks iex:
+#   powershell -NoProfile -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
 
 $repo = "JulianRodelo11/bittice"
 $binaryName = "bittice.exe"
