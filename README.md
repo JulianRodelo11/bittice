@@ -71,7 +71,7 @@ From **cmd** or **PowerShell**, same idea as `irm … | iex` installers (e.g. Op
 powershell -c "irm https://raw.githubusercontent.com/JulianRodelo11/bittice/main/install.ps1 | iex"
 ```
 
-This downloads the **latest** GitHub release, prefers the Windows bundle (`bittice-<tag>-windows.zip`), falls back to `bittice-windows-x86_64.exe`, and installs `bittice.exe` under `%USERPROFILE%\AppData\Local\Microsoft\WindowsApps` (usually already on your PATH). Open a **new terminal** and run `bittice --help`.
+This downloads the **latest** GitHub release, prefers the Windows bundle (`bittice-<tag>-windows.zip`), falls back to `bittice-windows-x86_64.exe`, and installs `bittice.exe` under **`%LOCALAPPDATA%\Programs\Bittice`**, appending that folder to your **user** PATH if needed. Close the terminal, open a **new** one, and run `bittice --help`. If `cmd` still does not see it, sign out and back in once so Windows reloads PATH.
 
 If execution policy blocks the script, use:
 

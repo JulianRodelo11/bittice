@@ -6,7 +6,34 @@
 
 $repo = "JulianRodelo11/bittice"
 $binaryName = "bittice.exe"
-$installDir = if ($env:BITTICE_INSTALL_DIR) { $env:BITTICE_INSTALL_DIR.TrimEnd('\') } else { "$HOME\AppData\Local\Microsoft\WindowsApps" }
+$installDir = if ($env:BITTICE_INSTALL_DIR) {
+    $env:BITTICE_INSTALL_DIR.Trim().TrimEnd('\')
+} else {
+    Join-Path $env:LOCALAPPDATA "Programs\Bittice"
+}
+
+function Add-BitticeToUserPath {
+    param([string]$BinDir)
+    $add = $BinDir.TrimEnd('\')
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not $userPath) { $userPath = '' }
+    $parts = @(
+        $userPath -split ';' |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ }
+    )
+    foreach ($p in $parts) {
+        if ([string]::Equals($add, $p.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "Install directory already on your user PATH." -ForegroundColor DarkGray
+            $env:Path = "$add;$env:Path"
+            return
+        }
+    }
+    $joined = if ($parts.Count -gt 0) { "$userPath;$add" } else { $add }
+    [Environment]::SetEnvironmentVariable('Path', $joined, 'User')
+    $env:Path = "$add;$env:Path"
+    Write-Host "Added to user PATH: $add" -ForegroundColor Green
+}
 
 Write-Host "--- Bittice installer (Windows) ---" -ForegroundColor Blue
 
@@ -61,8 +88,12 @@ if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
 
-Move-Item -Path $tempFile -Destination "$installDir\$binaryName" -Force
+Move-Item -Path $tempFile -Destination (Join-Path $installDir $binaryName) -Force
+
+Add-BitticeToUserPath -BinDir $installDir
 
 Write-Host "Bittice ($latestTag) installed successfully." -ForegroundColor Green
+Write-Host "Installed to: $(Join-Path $installDir $binaryName)" -ForegroundColor DarkGray
 if ($usedBundle) { Write-Host "Installed from OS bundle: $bundle" -ForegroundColor DarkGray }
-Write-Host "Restart your terminal and run: bittice --help" -ForegroundColor Blue
+Write-Host "Close this window, open a new terminal, then run: bittice --help" -ForegroundColor Blue
+Write-Host "(If cmd still does not find it, sign out and back in once so PATH refreshes.)" -ForegroundColor DarkGray
