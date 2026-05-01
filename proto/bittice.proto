@@ -13,7 +13,8 @@ service Database {
   rpc ExecuteSavedQuery (SavedQueryRequest) returns (stream SearchResponse);
   rpc ExecuteSavedQueryUnary (SavedQueryRequest) returns (SearchUnaryResponse);
 
-  // SUSCRIPCIÓN EN TIEMPO REAL: Recibe notificaciones de cambios en una tabla
+  // Tiempo real: notificaciones cuando el CDC aplica cambios. La query guardada puede ser
+  // de una tabla o con JOINs; cada evento describe solo la tabla física que cambió (no la fila ya unida).
   rpc SubscribeUpdates (SubscribeRequest) returns (stream UpdateEvent);
 }
 
@@ -25,8 +26,8 @@ message SubscribeRequest {
 message UpdateEvent {
   string type = 1; // "INSERT", "UPDATE", "DELETE"
   string table = 2;
-  Row row = 3;     // Los datos de la fila que cambió
-  string pk = 4;   // El ID de la fila
+  Row row = 3;     // Valores según el mirror de `table` (vacío en algunos DELETE)
+  string pk = 4;   // PK según la tabla del evento
 }
 
 message SavedQueryRequest {
