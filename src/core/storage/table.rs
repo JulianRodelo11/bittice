@@ -204,6 +204,26 @@ impl Table {
         Ok(())
     }
 
+    /// Full row as map by primary key value (for CDC merge on partial binlog UPDATE images).
+    pub fn get_row_as_map(&self, pk_val: &str) -> Result<Option<HashMap<String, String>>> {
+        let Some((seg_id, local_id)) = self.primary_index.get(pk_val) else {
+            return Ok(None);
+        };
+        let fields = &self.manifest.original_fields;
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let rows = self.get_rows_batch(fields, &[(*seg_id, *local_id)])?;
+        let Some(vals) = rows.first() else {
+            return Ok(None);
+        };
+        let mut map = HashMap::with_capacity(fields.len());
+        for (i, f) in fields.iter().enumerate() {
+            map.insert(f.clone(), vals.get(i).cloned().unwrap_or_default());
+        }
+        Ok(Some(map))
+    }
+
     pub fn delete(&mut self, id: &str) -> Result<()> {
         if let Some((seg_id, local_id)) = self.primary_index.remove(id) {
             let op = WalOperation::Delete { id: id.to_string() };
@@ -760,13 +780,8 @@ impl Table {
     }
 
     fn exact_matches_for_field_value(&self, filter: &Filter) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
-        let has_persisted_index = self.exact_index_path(&filter.field).exists();
-        let has_active_index = self.active_segment
-            .as_ref()
-            .is_some_and(|writer| writer.bitmaps.contains_key(&filter.field));
         let immutable_index = self.load_exact_index(&filter.field)?;
         let mut matches = Vec::new();
-        let mut field_is_indexed = has_persisted_index || has_active_index || !immutable_index.is_empty();
         let mut found_exact_key = false;
 
         if let Some(entries) = immutable_index.get(&filter.value) {
@@ -781,7 +796,6 @@ impl Table {
 
         if let Some(writer) = &self.active_segment {
             if let Some(field_bitmaps) = writer.bitmaps.get(&filter.field) {
-                field_is_indexed = true;
                 if let Some(bitmap) = field_bitmaps.get(&filter.value) {
                     found_exact_key = true;
                     let mut live_bitmap = bitmap.clone();
@@ -797,9 +811,8 @@ impl Table {
 
         if found_exact_key {
             Ok(Some(matches))
-        } else if field_is_indexed {
-            Ok(Some(Vec::new()))
         } else {
+            // Without confirmed bitmap hits, do not assume "zero rows": persisted indexes can omit active CDC rows.
             Ok(None)
         }
     }

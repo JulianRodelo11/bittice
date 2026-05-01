@@ -1,17 +1,21 @@
 use anyhow::{Context, Result};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, Pool, BinlogStreamRequest};
+use mysql_async::{BinlogStream, Conn, Opts, Pool, BinlogStreamRequest};
 use mysql_common::packets::Sid;
-use mysql_common::binlog::events::{EventData, RowsEventData, TableMapEvent};
+use mysql_common::binlog::events::{EventData, RowsEventData, RowsEventRows, TableMapEvent};
+use mysql_common::packets::Column;
 use mysql_common::row::Row;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
-use crate::server::table_manager::TableManager;
+use crate::core::storage::table::Table;
+use crate::server::table_manager::{TableManager, TableUpdateEvent};
 use crate::core::date_utils::{extract_day, extract_month, extract_hour_bucket, is_date_format, has_time_component};
 use tracing::{info, debug, warn, error};
 
@@ -19,6 +23,9 @@ use tracing::{info, debug, warn, error};
 const CDC_STATE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Cap burst writes when many small binlog events arrive within [`CDC_STATE_SAVE_INTERVAL`].
 const CDC_STATE_SAVE_EVENT_BURST: u32 = 1024;
+
+/// Guard for the one-line startup hint when `BITTICE_CDC_LOG_ROW_EVENTS` is enabled.
+static CDC_ROW_TRACE_BANNER_EMITTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CdcState {
@@ -30,6 +37,24 @@ pub struct CdcState {
     /// Rolling GTID set aligned with processed transactions (bootstrap snapshot plus merges from binlog `GtidEvent`s).
     #[serde(default)]
     pub gtid_executed: String,
+    /// Last values seen from MySQL at CDC startup (`/_cdc/state`).
+    #[serde(default)]
+    pub observed_binlog_format_global: Option<String>,
+    #[serde(default)]
+    pub observed_binlog_format_session: Option<String>,
+    /// Updated whenever a row batch is successfully applied to the mirror (`applied > 0`).
+    #[serde(default)]
+    pub last_mirror_batch_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_mirror_batch: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapMode {
+    /// `SELECT *` snapshot then CDC (initial menu sync).
+    FullSnapshot,
+    /// DESCRIBE + empty mirror during binlog replay; avoids duplicate rows vs replayed INSERTs.
+    SchemaOnly,
 }
 
 pub struct CdcWorker {
@@ -136,6 +161,13 @@ impl CdcWorker {
         )
     }
 
+    /// With `sync_all_databases = false`, MySQL still ships **one server-wide binlog**; events include
+    /// writes to every schema on the instance. We only mirror `self.database` — everything else is skipped.
+    #[inline]
+    fn is_out_of_scope_binlog_schema(&self, schema: &str) -> bool {
+        !self.sync_all_databases && !schema.eq_ignore_ascii_case(&self.database)
+    }
+
     /// Row map key: `schema.table` in sync-all mode (schema lowercased for stable binlog match),
     /// plain `table` in single-DB mode.
     fn qualified_table_key(sync_all: bool, schema: &str, table: &str) -> String {
@@ -144,6 +176,75 @@ impl CdcWorker {
         } else {
             table.to_string()
         }
+    }
+
+    /// Align binlog table identifiers with bootstrap keys (`column_maps`, `pk_map` in [`CdcState`]).
+    /// RDS often lowercases names in the binlog while `information_schema` keeps mixed case.
+    fn resolve_cdc_table_keys(
+        sync_all: bool,
+        schema: &str,
+        binlog_table: &str,
+        maps: &HashMap<String, Vec<String>>,
+    ) -> Option<String> {
+        if sync_all {
+            let schema_l = schema.to_lowercase();
+            let cand_a = format!("{}.{}", schema_l, binlog_table);
+            let cand_b = format!("{}.{}", schema_l, binlog_table.to_lowercase());
+            if maps.contains_key(&cand_a) {
+                return Some(cand_a);
+            }
+            if maps.contains_key(&cand_b) {
+                return Some(cand_b);
+            }
+            let bt_lower = binlog_table.to_lowercase();
+            for key in maps.keys() {
+                let Some((s, t)) = key.split_once('.') else {
+                    continue;
+                };
+                if s.to_lowercase() == schema_l && t.to_lowercase() == bt_lower {
+                    return Some(key.clone());
+                }
+            }
+            None
+        } else {
+            let cand_a = binlog_table.to_string();
+            let cand_b = binlog_table.to_lowercase();
+            if maps.contains_key(&cand_a) {
+                return Some(cand_a);
+            }
+            if maps.contains_key(&cand_b) {
+                return Some(cand_b);
+            }
+            let bt_lower = binlog_table.to_lowercase();
+            for key in maps.keys() {
+                if key.to_lowercase() == bt_lower {
+                    return Some(key.clone());
+                }
+            }
+            None
+        }
+    }
+
+    /// Directory name under `data/mirror/<entity>/` matching how bootstrap created the table tree.
+    fn resolve_mirror_table_dir(entity: &str, binlog_table: &str) -> String {
+        let base = crate::core::data_paths::mirror_entity_dir(entity);
+        let direct = base.join(binlog_table);
+        if direct.is_dir() {
+            return binlog_table.to_string();
+        }
+        let want = binlog_table.to_lowercase();
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.to_lowercase() == want {
+                    return name;
+                }
+            }
+        }
+        binlog_table.to_string()
     }
 
     async fn list_user_schemas(conn: &mut Conn) -> Result<Vec<String>> {
@@ -195,23 +296,33 @@ impl CdcWorker {
         }
     }
 
+    fn empty_cdc_state() -> CdcState {
+        CdcState {
+            binlog_file: String::new(),
+            binlog_pos: 4,
+            bootstrapped_tables: Vec::new(),
+            pk_map: HashMap::new(),
+            gtid_executed: String::new(),
+            observed_binlog_format_global: None,
+            observed_binlog_format_session: None,
+            last_mirror_batch_unix_ms: None,
+            last_mirror_batch: None,
+        }
+    }
+
     fn load_state(&self) -> CdcState {
-        if let Ok(file) = std::fs::File::open(&self.state_path) {
-            serde_json::from_reader(file).unwrap_or(CdcState {
-                binlog_file: String::new(),
-                binlog_pos: 4,
-                bootstrapped_tables: Vec::new(),
-                pk_map: HashMap::new(),
-                gtid_executed: String::new(),
-            })
-        } else {
-            CdcState {
-                binlog_file: String::new(),
-                binlog_pos: 4,
-                bootstrapped_tables: Vec::new(),
-                pk_map: HashMap::new(),
-                gtid_executed: String::new(),
-            }
+        match std::fs::File::open(&self.state_path) {
+            Ok(file) => match serde_json::from_reader::<_, CdcState>(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "CDC: Ignoring corrupt or incompatible {} ({}); treating as first-run CDC metadata.",
+                        self.state_path, e
+                    );
+                    Self::empty_cdc_state()
+                }
+            },
+            Err(_) => Self::empty_cdc_state(),
         }
     }
 
@@ -220,8 +331,16 @@ impl CdcWorker {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(path)?;
-        serde_json::to_writer_pretty(file, state)?;
+        let tmp_path = path.with_extension("json.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            serde_json::to_writer_pretty(&mut file, state)?;
+            let _ = file.sync_all();
+        }
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 
@@ -233,6 +352,54 @@ impl CdcWorker {
             || m.contains("error 1236")
             || m.contains("could not open log file")
             || m.contains("could not find first log file")
+    }
+
+    fn env_truthy(var_name: &str) -> bool {
+        std::env::var(var_name)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// Logs each applied binlog row-batch so `data/server.log` + the CLI Live Monitor (`grep CDC`) stay informative.
+    /// When `BITTICE_CDC_LOG_ROW_EVENTS` is set, also emits a verbose mysql→mirror line (paths + binlog coords).
+    fn maybe_log_mysql_row_batch(
+        &self,
+        op: &'static str,
+        schema: &str,
+        mysql_table: &str,
+        mirror_entity: &str,
+        mirror_table_dir: &str,
+        qkey: &str,
+        rows: usize,
+        state: &CdcState,
+    ) {
+        if rows == 0 {
+            return;
+        }
+        // Compact line always (matches Live Monitor grep `CDC` without requiring env vars).
+        self.log_info(format!(
+            "CDC: applied {} {} row(s) on {}.{}",
+            op, rows, schema, mysql_table
+        ));
+        if Self::env_truthy("BITTICE_CDC_LOG_ROW_EVENTS") {
+            self.log_info(format!(
+                "CDC mysql→mirror {} {}.{} → mirror entity='{}' table_dir='{}' qkey='{}' {} row(s) @ {}:{}",
+                op,
+                schema,
+                mysql_table,
+                mirror_entity,
+                mirror_table_dir,
+                qkey,
+                rows,
+                state.binlog_file,
+                state.binlog_pos,
+            ));
+        }
     }
 
     async fn rollback_consistent_snapshot(conn: &mut Conn, active: bool) {
@@ -313,10 +480,21 @@ impl CdcWorker {
                     self.log_info(
                         "CDC: Stored @@GLOBAL.gtid_executed for GTID-aware binlog streaming.".into(),
                     );
+                } else {
+                    self.log_warn(
+                        "CDC: @@GLOBAL.gtid_executed returned empty — GTID-aware streaming cannot activate; \
+if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or verify GTID configuration."
+                            .to_string(),
+                    );
                 }
             }
-            Err(e) => debug!("CDC: @@GLOBAL.gtid_executed query failed: {}", e),
-            Ok(None) => {}
+            Err(e) => self.log_warn(format!(
+                "CDC: @@GLOBAL.gtid_executed query failed ({}). GTID-aware binlog streaming disabled.",
+                e
+            )),
+            Ok(None) => self.log_warn(
+                "CDC: @@GLOBAL.gtid_executed returned NULL — GTID-aware streaming disabled.".to_string(),
+            ),
         }
         Ok(())
     }
@@ -563,6 +741,7 @@ impl CdcWorker {
         schema: &str,
         table_name: &str,
         state: &mut CdcState,
+        mode: BootstrapMode,
     ) -> Result<()> {
         let qkey = Self::qualified_table_key(self.sync_all_databases, schema, table_name);
         let disk_entity: String = if self.sync_all_databases {
@@ -572,8 +751,8 @@ impl CdcWorker {
         };
 
         self.log_info(format!(
-            "CDC: Bootstrapping table '{}' (schema '{}')...",
-            table_name, schema
+            "CDC: Bootstrapping table '{}' (schema '{}', {:?})...",
+            table_name, schema, mode
         ));
 
         let (cols, dates) = self
@@ -613,50 +792,133 @@ impl CdcWorker {
             state.pk_map.insert(qkey.clone(), pk_cand.clone());
         }
 
-        let fq = Self::qualified_schema_table(schema, table_name);
-        let mut result_set = conn
-            .query_iter(format!("SELECT * FROM {}", fq))
-            .await?;
-        let mut count = 0;
+        let mut count = 0usize;
+        if mode == BootstrapMode::FullSnapshot {
+            let fq = Self::qualified_schema_table(schema, table_name);
+            let mut result_set = conn.query_iter(format!("SELECT * FROM {}", fq)).await?;
 
-        while let Some(row) = result_set.next().await? {
-            let mut data = HashMap::new();
-            for (i, col_name) in cols.iter().enumerate() {
-                let val: mysql_common::Value = row.get(i).unwrap_or(mysql_common::Value::NULL);
-                let mut val_str = match val {
-                    mysql_common::Value::NULL => "".to_string(),
-                    mysql_common::Value::Bytes(ref b) => String::from_utf8_lossy(b).to_string(),
-                    mysql_common::Value::Date(y, m, d, h, min, s, ms) => format!("{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", y, m, d, h, min, s, ms),
-                    _ => format!("{:?}", val),
-                };
-                if val_str.starts_with("Int(") || val_str.starts_with("UInt(") {
-                    if let Some(start) = val_str.find('(') {
-                        if let Some(end) = val_str.find(')') {
-                            val_str = val_str[start+1..end].to_string();
+            while let Some(row) = result_set.next().await? {
+                let mut data = HashMap::new();
+                for (i, col_name) in cols.iter().enumerate() {
+                    let val: mysql_common::Value = row.get(i).unwrap_or(mysql_common::Value::NULL);
+                    let mut val_str = match val {
+                        mysql_common::Value::NULL => "".to_string(),
+                        mysql_common::Value::Bytes(ref b) => String::from_utf8_lossy(b).to_string(),
+                        mysql_common::Value::Date(y, m, d, h, min, s, ms) => format!("{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", y, m, d, h, min, s, ms),
+                        _ => format!("{:?}", val),
+                    };
+                    if val_str.starts_with("Int(") || val_str.starts_with("UInt(") {
+                        if let Some(start) = val_str.find('(') {
+                            if let Some(end) = val_str.find(')') {
+                                val_str = val_str[start+1..end].to_string();
+                            }
                         }
                     }
-                }
-                
-                // Date expansion if applicable
-                if dates.contains(col_name) && is_date_format(&val_str) {
-                    if let Some(d) = extract_day(&val_str) { data.insert(format!("{}_day", col_name), d); }
-                    if let Some(m) = extract_month(&val_str) { data.insert(format!("{}_month", col_name), m); }
-                    if has_time_component(&val_str) {
-                        if let Some(h) = extract_hour_bucket(&val_str) { data.insert(format!("{}_hour_bucket", col_name), h); }
-                    }
-                }
 
-                data.insert(col_name.clone(), val_str);
+                    // Date expansion if applicable
+                    if dates.contains(col_name) && is_date_format(&val_str) {
+                        if let Some(d) = extract_day(&val_str) { data.insert(format!("{}_day", col_name), d); }
+                        if let Some(m) = extract_month(&val_str) { data.insert(format!("{}_month", col_name), m); }
+                        if has_time_component(&val_str) {
+                            if let Some(h) = extract_hour_bucket(&val_str) { data.insert(format!("{}_hour_bucket", col_name), h); }
+                        }
+                    }
+
+                    data.insert(col_name.clone(), val_str);
+                }
+                table.insert(data)?;
+                count += 1;
             }
-            table.insert(data)?;
-            count += 1;
+            self.log_info(format!(
+                "CDC: Table '{}' synchronized ({} rows).",
+                qkey, count
+            ));
+        } else {
+            self.log_info(format!(
+                "CDC: Table '{}' registered without bulk snapshot — row data comes from binlog replay only.",
+                qkey
+            ));
         }
 
         table.flush_active_segment()?;
-        self.log_info(format!(
-            "CDC: Table '{}' synchronized ({} rows).",
-            qkey, count
-        ));
+        Ok(())
+    }
+
+    fn resolve_rows_table_map(
+        &self,
+        rows_data: &RowsEventData<'_>,
+        stream: &BinlogStream,
+    ) -> Result<TableMapEvent<'static>> {
+        let table_id = rows_data.table_id();
+        stream
+            .get_tme(table_id)
+            .map(|t| t.clone().into_owned())
+            .or_else(|| {
+                self.table_map_events
+                    .read()
+                    .unwrap()
+                    .get(&table_id)
+                    .cloned()
+            })
+            .with_context(|| {
+                format!(
+                    "CDC: Missing TableMapEvent for table_id {} — cursor may resume mid-file before the table map for this event",
+                    table_id
+                )
+            })
+    }
+
+    /// Tables created after the first snapshot (or missed earlier) appear in the binlog but not in `column_maps`.
+    /// Register schema/PK via `information_schema` without `SELECT *` so replay can apply row events safely.
+    async fn ensure_local_mirror_for_binlog_table(
+        &self,
+        conn: &mut Conn,
+        state: &mut CdcState,
+        schema_binlog: &str,
+        table_binlog: &str,
+    ) -> Result<()> {
+        let maps_read = self.column_maps.read().unwrap();
+        if Self::resolve_cdc_table_keys(
+            self.sync_all_databases,
+            schema_binlog,
+            table_binlog,
+            &maps_read,
+        )
+        .is_some()
+        {
+            return Ok(());
+        }
+        drop(maps_read);
+
+        let rows: Vec<(String, String)> = conn
+            .exec(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES \
+                 WHERE LOWER(TABLE_SCHEMA) = LOWER(?) AND LOWER(TABLE_NAME) = LOWER(?) \
+                 AND TABLE_TYPE = 'BASE TABLE'",
+                (schema_binlog, table_binlog),
+            )
+            .await?;
+
+        let Some((sch, tbl)) = rows.into_iter().next() else {
+            debug!(
+                "CDC: Binlog referenced '{}.{}' but no BASE TABLE in information_schema (skipped).",
+                schema_binlog, table_binlog
+            );
+            return Ok(());
+        };
+
+        let qkey = Self::qualified_table_key(self.sync_all_databases, &sch, &tbl);
+        if self.column_maps.read().unwrap().contains_key(&qkey) {
+            return Ok(());
+        }
+
+        self.bootstrap_table(conn, &sch, &tbl, state, BootstrapMode::SchemaOnly)
+            .await?;
+
+        if !state.bootstrapped_tables.contains(&qkey) {
+            state.bootstrapped_tables.push(qkey);
+        }
+        self.save_state(state)?;
         Ok(())
     }
 
@@ -734,6 +996,44 @@ impl CdcWorker {
             }
         }
 
+        match conn.query_first::<String, _>("SELECT @@GLOBAL.binlog_format").await {
+            Ok(Some(fmt)) => {
+                let trimmed = fmt.trim().to_string();
+                state.observed_binlog_format_global = Some(trimmed.clone());
+                self.log_info(format!("CDC: MySQL @@GLOBAL.binlog_format='{}'.", trimmed));
+                if trimmed.to_ascii_lowercase() != "row" {
+                    self.log_error(format!(
+                        "CDC: @@GLOBAL.binlog_format is '{}' — Bittice CANNOT mirror most transactional INSERT/UPDATE/DELETE. \
+The binlog stream uses statement/mixed events for many writes; this engine only applies row events (WRITE/UPDATE/DELETE_ROWS). \
+Fix on MySQL/RDS: set parameter binlog_format=ROW (custom DB parameter group on RDS; apply to instance/cluster; reboot if required). \
+Then restart Bittice.",
+                        trimmed
+                    ));
+                }
+            }
+            Ok(None) | Err(_) => {
+                self.log_warn(
+                    "CDC: Could not read @@GLOBAL.binlog_format; if it is not ROW, changes may not replicate."
+                        .to_string(),
+                );
+            }
+        }
+        match conn.query_first::<String, _>("SELECT @@SESSION.binlog_format").await {
+            Ok(Some(fmt)) => {
+                let trimmed = fmt.trim().to_string();
+                state.observed_binlog_format_session = Some(trimmed.clone());
+                self.log_info(format!("CDC: MySQL @@SESSION.binlog_format='{}'.", trimmed));
+                if trimmed.to_ascii_lowercase() != "row" {
+                    self.log_warn(format!(
+                        "CDC: @@SESSION.binlog_format is '{}' — apps may override session format; global binlog_format must still be ROW for reliable CDC.",
+                        trimmed
+                    ));
+                }
+            }
+            Ok(None) | Err(_) => {}
+        }
+        let _ = self.save_state(&state);
+
         // InnoDB-only: single MVCC snapshot + binlog coords **before** bulk `SELECT *`, matching mysqldump `--single-transaction` semantics.
         let mut rr_snapshot_active = false;
         let mut coords_pre_bootstrap: Option<(String, u32)> = None;
@@ -806,7 +1106,7 @@ impl CdcWorker {
                     let qkey = Self::qualified_table_key(true, &schema, table_name);
                     if !state.bootstrapped_tables.contains(&qkey) {
                         if let Err(e) = self
-                            .bootstrap_table(&mut conn, &schema, table_name, &mut state)
+                            .bootstrap_table(&mut conn, &schema, table_name, &mut state, BootstrapMode::FullSnapshot)
                             .await
                         {
                             Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
@@ -863,7 +1163,7 @@ impl CdcWorker {
                 let qkey = Self::qualified_table_key(false, &self.database, table_name);
                 if !state.bootstrapped_tables.contains(&qkey) {
                     if let Err(e) = self
-                        .bootstrap_table(&mut conn, self.database.as_str(), table_name, &mut state)
+                        .bootstrap_table(&mut conn, self.database.as_str(), table_name, &mut state, BootstrapMode::FullSnapshot)
                         .await
                     {
                         Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
@@ -917,6 +1217,25 @@ impl CdcWorker {
             }
         }
 
+        if rr_snapshot_active && coords_pre_bootstrap.is_some() && Self::env_truthy("BITTICE_CDC_SKIP_BINLOG_BACKLOG") {
+            match Self::query_master_coordinates(&mut conn).await {
+                Ok(Some((f, p))) if !f.is_empty() => {
+                    coords_pre_bootstrap = Some((f, p));
+                    self.log_warn(
+                        "CDC: BITTICE_CDC_SKIP_BINLOG_BACKLOG is set — streaming from current binlog tip after bootstrap. \
+Commits during the bulk snapshot window may be missed; use only when that gap is acceptable (typical dev)."
+                            .to_string(),
+                    );
+                }
+                Ok(_) | Err(_) => {
+                    self.log_warn(
+                        "CDC: BITTICE_CDC_SKIP_BINLOG_BACKLOG set but tip coordinates unreadable; keeping snapshot coordinates."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         if let Some((f, p)) = coords_pre_bootstrap.take() {
             state.binlog_file = f;
             state.binlog_pos = p;
@@ -932,9 +1251,51 @@ impl CdcWorker {
             return self.enter_static_mode("CDC is not enabled on server.".to_string()).await;
         }
 
+        // RDS/Aurora often runs with @@GLOBAL.GTID_MODE=ON. If our persisted `gtid_executed` is empty (common after
+        // upgrades, permission gaps, or first-run snapshots that skipped capture), mysql_async may open the binlog
+        // stream file/position-only — that combination has been observed to stall after rotate while ROW events keep
+        // flowing on the writer. Refresh GTID once before live streaming whenever GTID is enabled but state is empty.
+        if master_gtid_enabled && state.gtid_executed.trim().is_empty() {
+            self.log_warn(
+                "CDC: GTID_MODE=ON but saved gtid_executed is empty — fetching @@GLOBAL.gtid_executed before binlog stream."
+                    .to_string(),
+            );
+            self.maybe_capture_gtid_executed(&mut conn, &mut state, master_gtid_enabled)
+                .await?;
+            let _ = self.save_state(&state);
+        }
+
+        let global_binlog_is_row = state
+            .observed_binlog_format_global
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("row"));
+        if !global_binlog_is_row {
+            if Self::env_truthy("BITTICE_CDC_REQUIRE_ROW") {
+                return self
+                    .enter_static_mode(
+                        "CDC: @@GLOBAL.binlog_format is not ROW and BITTICE_CDC_REQUIRE_ROW=1. \
+Set binlog_format=ROW on the RDS/MySQL instance (parameter group), reboot if needed, then restart Bittice — or unset BITTICE_CDC_REQUIRE_ROW to run with incomplete live sync."
+                            .to_string(),
+                    )
+                    .await;
+            }
+            self.log_warn(
+                "CDC: Live transactional sync is PARTIAL or INACTIVE for typical writes — @@GLOBAL.binlog_format is not ROW. \
+Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse streaming until the server is fixed."
+                    .to_string(),
+            );
+        }
+
         // Notify UI that bootstrap is complete and we are entering live mode
         if let Some(tx) = &self.log_tx {
             let _ = tx.try_send("CDC_READY".to_string());
+        }
+        if self.sync_all_databases {
+            self.log_info(
+                "CDC: Sync-all mode — live rows go to data/mirror/<mysql_schema>/ (schema lowercased). \
+Saved queries and API `entity` must use that schema folder name, not the profile name under data/profiles/. \
+Use GET /_entities to list mirror roots.".to_string(),
+            );
         }
 
         let pool = pool.clone();
@@ -942,7 +1303,36 @@ impl CdcWorker {
         let mut events_since_save: u32 = 0;
 
         'binlog_retry: loop {
+            if Self::env_truthy("BITTICE_CDC_LOG_ROW_EVENTS")
+                && !CDC_ROW_TRACE_BANNER_EMITTED.swap(true, Ordering::SeqCst)
+            {
+                self.log_info(
+                    "CDC: BITTICE_CDC_LOG_ROW_EVENTS=1 — logging mysql→mirror INSERT/UPDATE/DELETE batches (unset to silence)."
+                        .to_string(),
+                );
+            }
+
             self.log_info(format!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos));
+
+            conn = pool.get_conn().await?;
+            if self.sync_all_databases {
+                conn.query_drop("USE information_schema").await?;
+            } else {
+                conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
+                    .await?;
+            }
+
+            if state.binlog_file.is_empty() {
+                self.resolve_binlog_position(&mut conn, &mut state, master_gtid_enabled)
+                    .await?;
+                if state.binlog_file.is_empty() {
+                    return self
+                        .enter_static_mode(
+                            "CDC: Could not resolve binlog coordinates for streaming.".to_string(),
+                        )
+                        .await;
+                }
+            }
 
             let server_id = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1009,13 +1399,6 @@ impl CdcWorker {
                         state.binlog_pos = 4;
                         state.gtid_executed.clear();
                         self.save_state(&state)?;
-                        conn = pool.get_conn().await?;
-                        if self.sync_all_databases {
-                            conn.query_drop("USE information_schema").await?;
-                        } else {
-                            conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
-                                .await?;
-                        }
                         continue 'binlog_retry;
                     }
                     return self.enter_static_mode(format!(
@@ -1036,13 +1419,6 @@ impl CdcWorker {
                             state.binlog_pos = 4;
                             state.gtid_executed.clear();
                             self.save_state(&state)?;
-                            conn = pool.get_conn().await?;
-                            if self.sync_all_databases {
-                                conn.query_drop("USE information_schema").await?;
-                            } else {
-                                conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
-                                    .await?;
-                            }
                             continue 'binlog_retry;
                         }
                         return self.enter_static_mode(format!(
@@ -1078,9 +1454,57 @@ impl CdcWorker {
                         map.insert(tm.table_id(), tm.into_owned());
                     }
                     Some(EventData::RowsEvent(rows_data)) => {
-                        self.handle_rows_event(rows_data, &state)?;
+                        if let Ok(tm_probe) = self.resolve_rows_table_map(&rows_data, &stream) {
+                            let schema = tm_probe.database_name().to_string();
+                            let tbl = tm_probe.table_name().to_string();
+                            if !(self.sync_all_databases && Self::is_system_schema(&schema))
+                                && !self.is_out_of_scope_binlog_schema(&schema)
+                            {
+                                let known = {
+                                    let maps = self.column_maps.read().unwrap();
+                                    Self::resolve_cdc_table_keys(
+                                        self.sync_all_databases,
+                                        &schema,
+                                        &tbl,
+                                        &maps,
+                                    )
+                                    .is_some()
+                                };
+                                if !known {
+                                    let mut extra = pool.get_conn().await?;
+                                    if self.sync_all_databases {
+                                        extra.query_drop("USE information_schema").await?;
+                                    } else {
+                                        extra
+                                            .query_drop(format!(
+                                                "USE {}",
+                                                Self::mysql_ident(&self.database)
+                                            ))
+                                            .await?;
+                                    }
+                                    if let Err(e) = self
+                                        .ensure_local_mirror_for_binlog_table(
+                                            &mut extra,
+                                            &mut state,
+                                            &schema,
+                                            &tbl,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            "CDC: Could not register '{}.{}' from binlog ({})",
+                                            schema, tbl, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        self.handle_rows_event(rows_data, &mut state, &stream)?;
                     }
                     Some(EventData::RotateEvent(rotate_data)) => {
+                        if !rotate_data.is_fake() {
+                            self.table_map_events.write().unwrap().clear();
+                        }
                         state.binlog_file = rotate_data.name().to_string();
                         state.binlog_pos = rotate_data.position() as u32;
                     }
@@ -1098,46 +1522,233 @@ impl CdcWorker {
             }
 
             self.save_state(&state)?;
-            return Ok(());
+            warn!(
+                "CDC: Binlog stream ended unexpectedly for entity '{}'; reconnecting.",
+                self.entity
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            continue 'binlog_retry;
         }
     }
 
-    fn handle_rows_event(&self, rows_data: RowsEventData, state: &CdcState) -> Result<()> {
-        let table_id = match &rows_data {
-            RowsEventData::WriteRowsEvent(ev) => ev.table_id(),
-            RowsEventData::UpdateRowsEvent(ev) => ev.table_id(),
-            RowsEventData::DeleteRowsEvent(ev) => ev.table_id(),
-            _ => return Ok(()),
-        };
+    fn apply_binlog_write_rows<'a>(
+        &self,
+        rows: RowsEventRows<'a>,
+        qkey: &str,
+        disk_entity: &str,
+        table_name: &str,
+        pk_field: &str,
+        table: &mut Table,
+    ) -> Result<usize> {
+        debug!("CDC: Received Write event for table '{}'", qkey);
+        let mut applied = 0usize;
+        for row_pair in rows {
+            let Ok((before_opt, after_opt)) = row_pair else {
+                continue;
+            };
+            // mysql_common `RowsEventRows`: WRITE_ROWS yields `(None, Some(row))` (after-image only);
+            // DELETE uses `(Some, None)`. Prefer after, then before.
+            let Some(binlog_row) = after_opt.or(before_opt) else {
+                continue;
+            };
+            let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            let data = self.parse_row(row, qkey)?;
+            let pk_val = data.get(pk_field).cloned().unwrap_or_default();
+            table.insert(data.clone())?;
+            applied += 1;
+            let _ = self.table_manager.events_tx.send(TableUpdateEvent {
+                entity: disk_entity.to_string(),
+                table_name: table_name.to_string(),
+                event_type: "INSERT".to_string(),
+                pk: pk_val,
+                row: table
+                    .manifest
+                    .original_fields
+                    .iter()
+                    .map(|f| data.get(f).cloned().unwrap_or_default())
+                    .collect(),
+            });
+        }
+        Ok(applied)
+    }
 
-        let tm_guard = self.table_map_events.read().unwrap();
-        let tm = tm_guard.get(&table_id).context("Missing TableMapEvent")?;
-        let schema = tm.database_name().to_string();
-        let table_name = tm.table_name().to_string();
+    fn apply_binlog_update_rows<'a>(
+        &self,
+        rows: RowsEventRows<'a>,
+        qkey: &str,
+        disk_entity: &str,
+        table_name: &str,
+        pk_field: &str,
+        table: &mut Table,
+    ) -> Result<usize> {
+        let mut applied = 0usize;
+        for row_pair in rows {
+            let Ok((before_opt, after_opt)) = row_pair else {
+                continue;
+            };
+            let Some(after_row) = after_opt else {
+                continue;
+            };
+            let mut delta =
+                self.parse_row(Row::try_from(after_row).map_err(|e| anyhow::anyhow!("{:?}", e))?, qkey)?;
+
+            // With `binlog_row_image=MINIMAL` (RDS default), UPDATE after-images list only columns that
+            // changed; unchanged primary-key columns live in the before-image only.
+            if let Some(before_row) = before_opt {
+                let before_map =
+                    self.parse_row(Row::try_from(before_row).map_err(|e| anyhow::anyhow!("{:?}", e))?, qkey)?;
+                let pk_missing_or_empty = delta
+                    .get(pk_field)
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+                if pk_missing_or_empty {
+                    if let Some(pk_val) = before_map.get(pk_field).cloned().filter(|s| !s.trim().is_empty()) {
+                        delta.insert(pk_field.to_string(), pk_val);
+                    }
+                }
+            }
+
+            let Some(pk_val) = delta.get(pk_field).cloned().filter(|s| !s.trim().is_empty()) else {
+                warn!(
+                    "CDC: Skipped UPDATE on '{}' — primary key '{}' missing from binlog row pair \
+                     (often MINIMAL row image + composite PK / PK detection mismatch). Table '{}'.",
+                    qkey, pk_field, table_name
+                );
+                continue;
+            };
+
+            let pk_trim = pk_val.trim().to_string();
+            let mut lookup_candidates = vec![pk_val.clone(), pk_trim.clone()];
+            if let Ok(n) = pk_trim.parse::<i64>() {
+                lookup_candidates.push(n.to_string());
+            }
+            if let Ok(n) = pk_trim.parse::<u64>() {
+                lookup_candidates.push(n.to_string());
+            }
+            lookup_candidates.sort_unstable();
+            lookup_candidates.dedup();
+
+            let mut merged = None;
+            let mut storage_pk: Option<String> = None;
+            for cand in lookup_candidates {
+                if cand.is_empty() {
+                    continue;
+                }
+                if let Ok(Some(m)) = table.get_row_as_map(&cand) {
+                    merged = Some(m);
+                    storage_pk = Some(cand);
+                    break;
+                }
+            }
+
+            let mut merged = match merged {
+                Some(m) => m,
+                None => {
+                    self.log_warn(format!(
+                        "CDC: UPDATE '{}' — no mirror row for pk '{}' (tried normalized numeric aliases); \
+skipped merge (likely missed INSERT / bootstrap gap). Table '{}'.",
+                        qkey, pk_val, table_name
+                    ));
+                    continue;
+                }
+            };
+            let storage_pk = storage_pk.unwrap_or_else(|| pk_trim.clone());
+
+            for (k, v) in delta {
+                merged.insert(k, v);
+            }
+            table.update(&storage_pk, merged.clone())?;
+            applied += 1;
+            let display_row: Vec<String> = table
+                .manifest
+                .original_fields
+                .iter()
+                .map(|f| merged.get(f).cloned().unwrap_or_default())
+                .collect();
+            let _ = self.table_manager.events_tx.send(TableUpdateEvent {
+                entity: disk_entity.to_string(),
+                table_name: table_name.to_string(),
+                event_type: "UPDATE".to_string(),
+                pk: storage_pk.clone(),
+                row: display_row,
+            });
+        }
+        Ok(applied)
+    }
+
+    fn apply_binlog_delete_rows<'a>(
+        &self,
+        rows: RowsEventRows<'a>,
+        qkey: &str,
+        disk_entity: &str,
+        table_name: &str,
+        pk_field: &str,
+        table: &mut Table,
+    ) -> Result<usize> {
+        let mut applied = 0usize;
+        for row_pair in rows {
+            if let Ok((Some(binlog_row), _)) = row_pair {
+                let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let data = self.parse_row(row, qkey)?;
+                if let Some(pk_val) = data.get(pk_field) {
+                    let pk_copy = pk_val.clone();
+                    table.delete(pk_val)?;
+                    applied += 1;
+                    let _ = self.table_manager.events_tx.send(TableUpdateEvent {
+                        entity: disk_entity.to_string(),
+                        table_name: table_name.to_string(),
+                        event_type: "DELETE".to_string(),
+                        pk: pk_copy,
+                        row: vec![],
+                    });
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    fn handle_rows_event(
+        &self,
+        rows_data: RowsEventData,
+        state: &mut CdcState,
+        stream: &BinlogStream,
+    ) -> Result<()> {
+        let tm_owned: TableMapEvent<'static> = self.resolve_rows_table_map(&rows_data, stream)?;
+        let schema = tm_owned.database_name().to_string();
+        let table_name = tm_owned.table_name().to_string();
 
         if self.sync_all_databases && Self::is_system_schema(&schema) {
             return Ok(());
         }
 
-        let qkey = Self::qualified_table_key(self.sync_all_databases, &schema, &table_name);
+        if self.is_out_of_scope_binlog_schema(&schema) {
+            return Ok(());
+        }
+
         let disk_entity = if self.sync_all_databases {
             schema.to_lowercase()
         } else {
             self.entity.clone()
         };
 
-        {
+        let qkey = {
             let maps = self.column_maps.read().unwrap();
-            if !maps.contains_key(&qkey) {
-                debug!(
-                    "CDC: Ignoring row event for '{}' (not bootstrapped / unknown)",
-                    qkey
-                );
-                return Ok(());
+            match Self::resolve_cdc_table_keys(self.sync_all_databases, &schema, &table_name, &maps)
+            {
+                Some(k) => k,
+                None => {
+                    self.log_warn(format!(
+                        "CDC: Ignoring row event for '{}.{}' (still unknown after registration attempt — check grants or table type).",
+                        schema,
+                        table_name
+                    ));
+                    return Ok(());
+                }
             }
-        }
+        };
 
-        let table_lock = self.table_manager.get_table(&disk_entity, &table_name)?;
+        let mirror_table = Self::resolve_mirror_table_dir(&disk_entity, &table_name);
+        let table_lock = self.table_manager.get_table(&disk_entity, &mirror_table)?;
         let mut table = table_lock.write().unwrap();
 
         let pk_field = state
@@ -1147,72 +1758,144 @@ impl CdcWorker {
             .unwrap_or_else(|| "PK".to_string());
         table.manifest.primary_key = pk_field.clone();
 
-        match rows_data {
-            RowsEventData::WriteRowsEvent(ev) => {
-                debug!("CDC: Received Write event for table '{}'", qkey);
-                for row_pair in ev.rows(tm) {
-                    if let Ok((Some(binlog_row), _)) = row_pair {
-                        let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                        let data = self.parse_row(row, &qkey)?;
-                        let pk_val = data.get(&pk_field).cloned().unwrap_or_default();
-                        table.insert(data.clone())?;
-                        
-                        // Emit broadcast event
-                        let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
-                            entity: disk_entity.clone(),
-                            table_name: table_name.clone(),
-                            event_type: "INSERT".to_string(),
-                            pk: pk_val,
-                            row: table.manifest.original_fields.iter().map(|f| data.get(f).cloned().unwrap_or_default()).collect(),
-                        });
-                    }
-                }
-            }
-            RowsEventData::UpdateRowsEvent(ev) => {
-                for row_pair in ev.rows(tm) {
-                    if let Ok((_, Some(after_row))) = row_pair {
-                        let row = Row::try_from(after_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                        let data = self.parse_row(row, &qkey)?;
-                        if let Some(pk_val) = data.get(&pk_field).cloned() {
-                            table.update(&pk_val, data.clone())?;
-                            
-                            // Emit broadcast event
-                            let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
-                                entity: disk_entity.clone(),
-                                table_name: table_name.clone(),
-                                event_type: "UPDATE".to_string(),
-                                pk: pk_val,
-                                row: table.manifest.original_fields.iter().map(|f| data.get(f).cloned().unwrap_or_default()).collect(),
-                            });
-                        }
-                    }
-                }
-            }
-            RowsEventData::DeleteRowsEvent(ev) => {
-                for row_pair in ev.rows(tm) {
-                    if let Ok((Some(binlog_row), _)) = row_pair {
-                        let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                        let data = self.parse_row(row, &qkey)?;
-                        if let Some(pk_val) = data.get(&pk_field) {
-                            let pk_copy = pk_val.clone();
-                            table.delete(pk_val)?;
-                            
-                            // Emit broadcast event
-                            let _ = self.table_manager.events_tx.send(crate::server::table_manager::TableUpdateEvent {
-                                entity: disk_entity.clone(),
-                                table_name: table_name.clone(),
-                                event_type: "DELETE".to_string(),
-                                pk: pk_copy,
-                                row: vec![],
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        let is_write = matches!(
+            &rows_data,
+            RowsEventData::WriteRowsEvent(_) | RowsEventData::WriteRowsEventV1(_)
+        );
+
+        let (applied, op_label): (usize, &'static str) = match rows_data {
+            RowsEventData::WriteRowsEvent(ev) => (
+                self.apply_binlog_write_rows(
+                    ev.rows(&tm_owned),
+                    &qkey,
+                    &disk_entity,
+                    &mirror_table,
+                    &pk_field,
+                    &mut table,
+                )?,
+                "INSERT",
+            ),
+            RowsEventData::WriteRowsEventV1(ev) => (
+                self.apply_binlog_write_rows(
+                    ev.rows(&tm_owned),
+                    &qkey,
+                    &disk_entity,
+                    &mirror_table,
+                    &pk_field,
+                    &mut table,
+                )?,
+                "INSERT",
+            ),
+            RowsEventData::UpdateRowsEvent(ev) => (
+                self.apply_binlog_update_rows(
+                    ev.rows(&tm_owned),
+                    &qkey,
+                    &disk_entity,
+                    &mirror_table,
+                    &pk_field,
+                    &mut table,
+                )?,
+                "UPDATE",
+            ),
+            RowsEventData::UpdateRowsEventV1(ev) => (
+                self.apply_binlog_update_rows(
+                    ev.rows(&tm_owned),
+                    &qkey,
+                    &disk_entity,
+                    &mirror_table,
+                    &pk_field,
+                    &mut table,
+                )?,
+                "UPDATE",
+            ),
+            RowsEventData::PartialUpdateRowsEvent(ev) => (
+                self.apply_binlog_update_rows(
+                    ev.rows(&tm_owned),
+                    &qkey,
+                    &disk_entity,
+                    &mirror_table,
+                    &pk_field,
+                    &mut table,
+                )?,
+                "UPDATE",
+            ),
+            RowsEventData::DeleteRowsEvent(ev) => (
+                self.apply_binlog_delete_rows(
+                    ev.rows(&tm_owned),
+                    &qkey,
+                    &disk_entity,
+                    &mirror_table,
+                    &pk_field,
+                    &mut table,
+                )?,
+                "DELETE",
+            ),
+            RowsEventData::DeleteRowsEventV1(ev) => (
+                self.apply_binlog_delete_rows(
+                    ev.rows(&tm_owned),
+                    &qkey,
+                    &disk_entity,
+                    &mirror_table,
+                    &pk_field,
+                    &mut table,
+                )?,
+                "DELETE",
+            ),
+        };
+
         table.flush_active_segment()?;
+        self.maybe_log_mysql_row_batch(
+            op_label,
+            &schema,
+            &table_name,
+            &disk_entity,
+            &mirror_table,
+            &qkey,
+            applied,
+            state,
+        );
+        if applied > 0 {
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            state.last_mirror_batch_unix_ms = Some(ms);
+            state.last_mirror_batch = Some(format!(
+                "{} {}.{} qkey={} rows={} @ {}:{}",
+                op_label,
+                schema,
+                table_name,
+                qkey,
+                applied,
+                state.binlog_file,
+                state.binlog_pos
+            ));
+        }
+        if applied == 0 && is_write {
+            self.log_warn(format!(
+                "CDC: WRITE_ROWS for '{}.{}' (qkey='{}', mirror_dir='{}') applied 0 rows — \
+if this persists, verify ROW-format binlog and run a current Bittice build (WRITE_ROWS uses the after-image slot).",
+                schema,
+                table_name,
+                qkey,
+                mirror_table
+            ));
+        }
         Ok(())
+    }
+
+    /// Maps binlog/metadata column name to the bootstrap column list (`@i` → ordinal i).
+    fn binlog_column_display_name(col: &Column, bootstrap_order: &[String]) -> String {
+        let s = col.name_str();
+        let r = s.as_ref();
+        if r.starts_with('@') {
+            if let Ok(idx) = r[1..].parse::<usize>() {
+                if let Some(name) = bootstrap_order.get(idx) {
+                    return name.clone();
+                }
+            }
+        }
+        r.to_string()
     }
 
     fn parse_row(&self, row: Row, table_name: &str) -> Result<HashMap<String, String>> {
@@ -1226,8 +1909,19 @@ impl CdcWorker {
         let e_maps = self.enum_maps.read().unwrap();
         let table_enums = e_maps.get(table_name);
 
+        // Sparse binlog images (e.g. binlog_row_image=MINIMAL) carry fewer cells than the table
+        // has columns; Row metadata maps each cell to the correct name. Full snapshots keep the
+        // legacy ordinal path when lengths match (query/bootstrap paths).
+        let cols_meta = row.columns_ref();
+        let use_binlog_names =
+            cols_meta.len() == row.len() && cols_meta.len() != columns_names.len();
+
         for i in 0..row.len() {
-            let col_name = columns_names.get(i).cloned().unwrap_or_else(|| format!("col_{}", i));
+            let col_name = if use_binlog_names {
+                Self::binlog_column_display_name(&cols_meta[i], columns_names)
+            } else {
+                columns_names.get(i).cloned().unwrap_or_else(|| format!("col_{}", i))
+            };
             
             let mut val_str = match row.get_opt::<mysql_common::Value, usize>(i) {
                 Some(Ok(v)) => match v {

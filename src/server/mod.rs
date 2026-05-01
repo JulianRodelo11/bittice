@@ -55,7 +55,8 @@ pub fn show_banner_with_filter(filter: Option<String>) {
     println!("\x1b[90m│\x1b[0m");
     println!("\x1b[32m◆\x1b[0m  \x1b[1mConfig API (REST):\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_config             (List all)");
-    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_config?name=...    (View definition)");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_debug             (ops + CDC snapshot)");
+    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_cdc/state        (binlog cursor per profile)");
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m POST   /_config             (Create)");
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m PUT    /_config             (Edit)");
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m DELETE /_config?name=...    (Delete)");
@@ -278,7 +279,8 @@ pub fn scan_and_start_cdc(
                                     sync_all,
                                 );
                                 if let Err(e) = rt.block_on(worker.run()) {
-                                    error!("CDC: Worker for '{}' failed: {}", db_name_for_log, e);
+                                    // `{:#}` prints anyhow's full chain (e.g. path context); `{}` often hides the root cause.
+                                    error!("CDC: Worker for '{}' failed: {:#}", db_name_for_log, e);
                                 }
                                 let mut active = cleanup_active_workers.write().unwrap();
                                 active.remove(&cleanup_entity_key);
@@ -375,6 +377,98 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Persisted CDC cursor per profile (`cdc_state.json`). Does not stream live events — use `BITTICE_CDC_LOG_ROW_EVENTS=1` for per-batch mysql→mirror logs.
+fn cdc_binlog_status_snapshot() -> serde_json::Value {
+    use crate::core::cdc::CdcState;
+
+    let mut profiles = Vec::new();
+    for config_path in crate::core::data_paths::scan_all_cdc_config_paths() {
+        let mut obj = serde_json::Map::new();
+        let folder = config_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        obj.insert("profile_folder".into(), serde_json::json!(folder));
+        obj.insert(
+            "cdc_config_path".into(),
+            serde_json::json!(config_path.to_string_lossy()),
+        );
+
+        if let Ok(txt) = std::fs::read_to_string(&config_path) {
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&txt) {
+                obj.insert(
+                    "entity".into(),
+                    cfg.get("entity").cloned().unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "sync_all_databases".into(),
+                    cfg.get("sync_all_databases")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(false)),
+                );
+                obj.insert(
+                    "database".into(),
+                    cfg.get("database").cloned().unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "host".into(),
+                    cfg.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "port".into(),
+                    cfg.get("port").cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+
+        if let Some(parent) = config_path.parent() {
+            let state_path = parent.join("cdc_state.json");
+            if let Ok(bytes) = std::fs::read(&state_path) {
+                if let Ok(st) = serde_json::from_slice::<CdcState>(&bytes) {
+                    let prefix: String = st.gtid_executed.chars().take(160).collect();
+                    let row_based_binlog = st
+                        .observed_binlog_format_global
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("row"));
+                    obj.insert(
+                        "cdc_state".into(),
+                        serde_json::json!({
+                            "binlog_file": st.binlog_file,
+                            "binlog_pos": st.binlog_pos,
+                            "bootstrapped_table_count": st.bootstrapped_tables.len(),
+                            "pk_map_entries": st.pk_map.len(),
+                            "gtid_executed_total_chars": st.gtid_executed.len(),
+                            "gtid_executed_prefix": prefix,
+                            "observed_binlog_format_global": st.observed_binlog_format_global,
+                            "observed_binlog_format_session": st.observed_binlog_format_session,
+                            "last_mirror_batch_unix_ms": st.last_mirror_batch_unix_ms,
+                            "last_mirror_batch": st.last_mirror_batch,
+                            "transactional_queries_match_mysql": row_based_binlog,
+                            "transactional_sync_detail": if row_based_binlog {
+                                "CDC consumes row-format binlog events; INSERT/UPDATE/DELETE from MySQL can be applied to the mirror for Bittice queries."
+                            } else {
+                                "NOT ROW: MySQL is emitting statement/mixed binlog for many writes — Bittice does not execute SQL from the binlog, so new/edited/deleted rows usually never reach the mirror. Set binlog_format=ROW on the RDS/MySQL instance (DB parameter group)."
+                            },
+                        }),
+                    );
+                }
+            }
+        }
+
+        profiles.push(serde_json::Value::Object(obj));
+    }
+
+    serde_json::json!({
+        "profiles": profiles,
+        "data_root": crate::core::data_paths::resolved_data_root().to_string_lossy(),
+        "cdc_autostart": cdc_autostart_enabled(),
+        "BITTICE_CDC_LOG_ROW_EVENTS": std::env::var("BITTICE_CDC_LOG_ROW_EVENTS").unwrap_or_default(),
+        "BITTICE_CDC_REQUIRE_ROW": std::env::var("BITTICE_CDC_REQUIRE_ROW").unwrap_or_default(),
+        "hint": "For live INSERT/UPDATE/DELETE in Bittice queries, MySQL @@GLOBAL.binlog_format must be ROW (RDS: custom DB parameter group). Each profile lists transactional_queries_match_mysql. BITTICE_CDC_REQUIRE_ROW=1 disables streaming when not ROW."
+    })
+}
+
 #[debug_handler]
 async fn handle_request(
     State(state): State<Arc<ServerState>>,
@@ -446,7 +540,19 @@ async fn handle_request(
             })
             .collect();
         debug_info.insert("entities_on_disk".to_string(), serde_json::json!(entities));
+        debug_info.insert(
+            "cdc".to_string(),
+            cdc_binlog_status_snapshot(),
+        );
         return (StatusCode::OK, Json(serde_json::Value::Object(debug_info))).into_response();
+    }
+
+    if path == "/_cdc/state" && method == Method::GET {
+        return (
+            StatusCode::OK,
+            Json(cdc_binlog_status_snapshot()),
+        )
+            .into_response();
     }
 
     if path == "/_entities" {

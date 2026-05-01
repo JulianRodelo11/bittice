@@ -1,5 +1,7 @@
 # Bittice on the server (no git clone)
 
+> **Working from the Bittice CLI on your laptop?** The usual path is: sync data and save queries locally, then use **Deploy → Build image here + bundle + deploy over SSH** so the image is built on your PC and uploaded to the instance (see `deploy/README.md`, *Full deploy from the Bittice menu*). This document describes the **release zip** workflow, which uses the pre-built **GHCR** image and is geared toward a fresh or separately configured data volume.
+
 This package is built on each GitHub **release** along with the Docker image published to **GHCR**.
 
 ## What’s in the package
