@@ -397,6 +397,8 @@ services:
         image: $IMAGE_NAME
         container_name: bittice
         restart: always
+        labels:
+            - com.centurylinklabs.watchtower.enable=true
         environment:
             - BITTICE_HOST=0.0.0.0
             - BITTICE_ENGINE_ONLY=1
@@ -423,6 +425,8 @@ services:
         image: $IMAGE_NAME
         container_name: bittice
         restart: always
+        labels:
+            - com.centurylinklabs.watchtower.enable=true
         environment:
             - BITTICE_HOST=0.0.0.0
             - BITTICE_ENGINE_ONLY=1

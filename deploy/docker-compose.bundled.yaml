@@ -14,6 +14,8 @@ services:
     image: ${BITTICE_IMAGE:?set BITTICE_IMAGE in .env or environment}
     container_name: bittice
     restart: always
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
     ports:
       - "${BITTICE_REST_PORT:-3000}:3000"
       - "${BITTICE_REST_ADMIN_PORT:-8080}:8080"

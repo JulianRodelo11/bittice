@@ -79,6 +79,7 @@ fi
 
 # Compose template from this repo; the bundle only needs docker-compose.yaml at its root
 cp -f "$REPO_ROOT/deploy/docker-compose.bundled.yaml" "$OUT_ABS/docker-compose.yaml"
+cp -f "$REPO_ROOT/deploy/docker-compose.watchtower.yaml" "$OUT_ABS/docker-compose.watchtower.yaml"
 
 # .env
 if [[ -z "$BITTICE_IMAGE" ]]; then
@@ -106,6 +107,8 @@ Bittice — bundle exported from your local machine
 3. Edit .env if needed (especially BITTICE_IMAGE).
 4. From this directory:
      docker compose --env-file .env up -d
+   Optional — automatic pulls when BITTICE_IMAGE points at GHCR (see deploy/actualizacion-automatica-ec2.md):
+     docker compose -f docker-compose.yaml -f docker-compose.watchtower.yaml --env-file .env up -d
 5. Verify: docker ps && docker logs bittice
 
 Contains ./data (CDC, tables, cdc_config.json) and ./vpn (.ovpn profiles). Do not share this bundle publicly; it includes credentials.

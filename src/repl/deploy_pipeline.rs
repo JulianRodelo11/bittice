@@ -2,10 +2,16 @@
 //! bundle (compose + `.env` + VPN dir — no embedded `data/`), **`rsync` `data/`** (incremental / resumable for
 //! large mirrors), `docker compose up`, brief stop, **delta `rsync`**, start again.
 //!
+//! **`run_ssh_engine_image_refresh`** — when `~/remote_subdir` already has compose + `.env`: rebuild →
+//! `docker save | ssh docker load` → optional `rsync data/` → `compose up --force-recreate`. On a **single EC2**
+//! expect a **short TCP gap** during container swap (typically seconds); true zero-downtime needs two instances + LB.
+//!
 //! **Networking:** sync profiles **without** `vpn_file` need nothing extra for EC2. If `vpn_file` is set,
 //! only **OpenVPN** `.ovpn` profiles are supported today — those files must live under `data/vpn/` or repo `vpn/`
 //! before deploy so the bundle mounts `./vpn` correctly.
-//! Requires Docker, OpenSSH (`ssh`), **`rsync`**, bash, tar, and python3 on the path.
+//!
+//! Full SSH deploy needs Docker, OpenSSH (`ssh`), **`rsync`**, bash, tar, and python3. Image-only refresh needs
+//! Docker, ssh, and bash ([`check_prerequisites_image_update`]).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -59,7 +65,18 @@ fn which_ok(cmd: &str) -> bool {
 }
 
 pub fn check_prerequisites() -> Result<()> {
-    for c in ["docker", "ssh", "rsync", "bash", "tar", "python3"] {
+    check_prerequisites_image_update()?;
+    for c in ["rsync", "tar", "python3"] {
+        if !which_ok(c) {
+            bail!("`{c}` is not on PATH. Install it and try again.");
+        }
+    }
+    Ok(())
+}
+
+/// Minimal toolchain for **image-only** SSH refresh (`docker save | ssh docker load`, compose recreate).
+pub fn check_prerequisites_image_update() -> Result<()> {
+    for c in ["docker", "ssh", "bash"] {
         if !which_ok(c) {
             bail!("`{c}` is not on PATH. Install it and try again.");
         }
@@ -410,6 +427,93 @@ pub fn rsync_project_data_dir_to_remote(
 fn verify_remote_toolchain(ssh: &str) -> Result<()> {
     let cmd = "command -v rsync >/dev/null 2>&1 || { echo 'remote host: install rsync (e.g. sudo apt install rsync / sudo yum install rsync)' >&2; exit 1; }";
     run_ssh(ssh, cmd)
+}
+
+fn verify_remote_has_docker_compose(ssh: &str) -> Result<()> {
+    run_ssh(
+        ssh,
+        "command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1",
+    )
+    .context("remote host needs Docker Engine and Compose v2 (`docker compose`)")?;
+    Ok(())
+}
+
+fn verify_remote_deploy_bundle_ready(ssh: &str, remote_subdir: &str) -> Result<()> {
+    let cmd = format!(
+        "cd $HOME/{} && test -f docker-compose.yaml && test -f .env",
+        remote_subdir
+    );
+    run_ssh(ssh, &cmd).context(
+        "remote folder is missing docker-compose.yaml or .env — run “full SSH deploy” once first",
+    )?;
+    Ok(())
+}
+
+/// Replace running containers with a freshly `docker load`’d image for the same tag (`--force-recreate`).
+pub fn recreate_engine_container_on_remote(ssh: &str, remote_subdir: &str) -> Result<()> {
+    let cmd = format!(
+        "cd $HOME/{} && docker compose -f docker-compose.yaml --env-file .env up -d --force-recreate --no-deps bittice",
+        remote_subdir
+    );
+    run_ssh(ssh, &cmd)
+}
+
+/// Rebuild locally → `docker save | ssh docker load` → optional rsync `data/` → `--force-recreate`.  
+/// Keeps `~/remote_subdir`; on a **single EC2** there is still a **short cutover** while the container restarts (typically seconds).
+pub fn run_ssh_engine_image_refresh(cfg: &FullDeployConfig, sync_data_from_laptop: bool) -> Result<()> {
+    check_prerequisites_image_update()?;
+    for s in [cfg.ssh_target.as_str(), &cfg.local_image, &cfg.remote_subdir] {
+        if s.contains('\'') || s.contains('\"') {
+            bail!("Invalid characters in parameters (no quotes).");
+        }
+    }
+    if !cfg.remote_subdir.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        bail!("Use only letters, digits, - and _ for the remote directory name.");
+    }
+
+    verify_remote_has_docker_compose(&cfg.ssh_target)?;
+    verify_remote_deploy_bundle_ready(&cfg.ssh_target, &cfg.remote_subdir)?;
+
+    if sync_data_from_laptop {
+        let deploy_data = resolve_deploy_data_root(&cfg.project_root);
+        if !deploy_data.is_dir() {
+            bail!(
+                "No data directory at {}. Pick “image only” or create data first.",
+                deploy_data.display()
+            );
+        }
+        ensure_openvpn_profiles_for_ec2_deploy(&cfg.project_root)?;
+        verify_remote_toolchain(&cfg.ssh_target)?;
+    }
+
+    println!("\n\x1b[34m→\x1b[0m  docker build (same tag overwrites locally; server gets it on load)…\n");
+    docker_build_from_source(&cfg.project_root, &cfg.local_image, cfg.platform)?;
+    println!(
+        "\n\x1b[90m│\x1b[0m  Current EC2 container keeps serving until recreate runs after image upload.\x1b[0m"
+    );
+    transfer_image_to_remote(&cfg.ssh_target, &cfg.local_image)?;
+
+    if sync_data_from_laptop {
+        println!("\n\x1b[34m→\x1b[0m  Stopping remote stack briefly for rsync of data/…\n");
+        stop_compose_on_remote(&cfg.ssh_target, &cfg.remote_subdir)?;
+        rsync_project_data_dir_to_remote(
+            &cfg.ssh_target,
+            &cfg.project_root,
+            &cfg.remote_subdir,
+            "refresh — merge local data/ before new container",
+        )?;
+    }
+
+    println!(
+        "\n\x1b[34m→\x1b[0m  docker compose up --force-recreate (expect a brief TCP gap on one host).\n"
+    );
+    recreate_engine_container_on_remote(&cfg.ssh_target, &cfg.remote_subdir)?;
+
+    println!(
+        "\n\x1b[32m◆\x1b[0m  Image refresh done. Logs: ssh {} 'docker logs -f --tail 80 bittice'\n",
+        cfg.ssh_target
+    );
+    Ok(())
 }
 
 /// Full pipeline: build → save|load → lite bundle → tar bundle → rsync data → compose up → stop → rsync delta → start.

@@ -95,7 +95,7 @@ La primera configuración CDC, los espejos grandes y las queries las preparas **
 
 1. En el menú principal, entras en **Deploy**.
 2. Si usas VPN para algún perfil, antes añades los **.ovpn** necesarios (ver sección 5).
-3. Eliges **“Build image + bundle + deploy over SSH (full)”** (o el nombre equivalente en tu versión).
+3. Primera vez o cambio grande de compose/vpn: **“Build image + bundle + deploy over SSH (full)”**. Actualizaciones posteriores solo de binario/imagen: **“Update engine image on SSH only…”** (ver §9).
 4. Indicas:
    - **Raíz del repo** Bittice (donde está `deploy/Dockerfile.from-source`).
    - **Nombre:etiqueta** de la imagen Docker (la misma en local y en el servidor).
@@ -120,20 +120,37 @@ En el servidor, el `docker-compose` del bundle monta **`./data`** y **`./vpn`**;
 
 ---
 
-## 9. Después del deploy
+## 9. Actualizar solo la imagen en EC2
+
+Cuando ya hiciste un deploy completo al menos una vez y solo necesitas **un binario/imagen nueva** (bugs, funcionalidad):
+
+1. Menú **Deploy → “Update engine image on SSH only (reuse server data; optional rsync)”**.
+2. Mismos datos que el deploy completo (repo, imagen `tag`, SSH, carpeta remota, CPU).
+3. Indicas si también quieres **rsync de tu `data/`** local (queries, vpn, mirrors).
+
+Durante la **subida de la imagen** el contenedor **anterior puede seguir en marcha**. El **apagón** suele medirse en **segundos** en el momento del **`docker compose up --force-recreate`** — en **una sola EC2** no hay parada cero real porque solo un proceso debe escribir el mismo `data/`. Para algo cercano al zero-downtime harían falta **dos nodos + balanceador** y despliegues orchestrados (ECS/Kubernetes), fuera de este flujo.
+
+### 9.1 Que la EC2 se actualice sola cuando publicas imagen nueva
+
+El flujo **SSH + `docker load`** no notifica al host de un “release” remoto; para **pull automático desde un registro** (p. ej. **GHCR**) usa el overlay **`deploy/docker-compose.watchtower.yaml`** y `BITTICE_IMAGE` apuntando a esa imagen. Detalle y variables: **`deploy/actualizacion-automatica-ec2.md`**. Opcionalmente, **`BITTICE_RELEASE_CHECK_INTERVAL_SECS`** hace que el motor solo **avise en logs** si en GitHub hay una release más nueva (no reinicia el contenedor).
+
+---
+
+## 10. Después del deploy
 
 1. Verificas contenedores: `docker ps`, logs del servicio **bittice**.
 2. Los clientes apuntan al **puerto 3000** para ejecutar queries guardadas y al **8080** para administración, según cómo hayas abierto el security group.
 
 ---
 
-## 10. Documentación relacionada (inglés / detalle)
+## 11. Documentación relacionada (inglés / detalle)
 
 - `deploy/README.md` — despliegue con Docker y compose.
 - `deploy/SERVER_QUICKSTART.md` — arranque en servidor sin clonar el repo (zip de release).
+- `deploy/actualizacion-automatica-ec2.md` — Watchtower y avisos de versión en logs (GHCR).
 
 ---
 
-## 11. Resumen en una frase
+## 12. Resumen en una frase
 
 **En local preparas y sincronizas todo en `data/`; en EC2 el contenedor solo arranca el motor con ese volumen ya poblado — sin menú de “conectar desde cero”.**

@@ -1,0 +1,18 @@
+# Watchtower — poll GHCR (or other registry) and recreate labeled containers.
+# Use together with docker-compose.yaml / docker-compose.production.yaml / bundled bundle compose:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.watchtower.yaml --env-file .env up -d
+#
+# Requires: BITTICE_IMAGE from a registry (e.g. ghcr.io/...), docker login if private.
+
+services:
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "300"
+      WATCHTOWER_LABEL_ENABLE: "true"

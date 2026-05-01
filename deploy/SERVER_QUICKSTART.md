@@ -8,6 +8,7 @@ This package is built on each GitHub **release** along with the Docker image pub
 
 - `docker-compose.yaml` — production start (ports, data volume).
 - `docker-compose.vpn.yaml` — optional, if you use OpenVPN in the container.
+- `docker-compose.watchtower.yaml` — optional, [Watchtower](https://containrrr.dev/watchtower/) polls GHCR and recreates the labeled `bittice` service when the image digest changes (see `deploy/actualizacion-automatica-ec2.md` in the repo).
 - `.env` — `BITTICE_IMAGE` already points at **this** release’s image.
 
 ## Instance requirements
@@ -44,6 +45,16 @@ This package is built on each GitHub **release** along with the Docker image pub
    docker ps
    docker logs bittice
    ```
+
+## Automatic image updates (optional)
+
+If `BITTICE_IMAGE` uses a registry image (GHCR from this zip is the normal case), you can run **Watchtower** so the host **pulls and recreates** `bittice` when you publish a newer image **for the same tag** (e.g. moving `:latest`) or after you edit `.env` to a new tag and run `compose up` once. Example:
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.watchtower.yaml --env-file .env up -d
+```
+
+The engine can also **log a warning** when GitHub has a newer release than the running binary (`BITTICE_RELEASE_CHECK_INTERVAL_SECS`); that does **not** restart the container. Full detail: **`deploy/actualizacion-automatica-ec2.md`** in the repository.
 
 ## Docker only (no zip files)
 

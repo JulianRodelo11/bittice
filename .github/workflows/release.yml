@@ -250,6 +250,7 @@ jobs:
           mkdir -p server-bundle
           cp deploy/docker-compose.production.yaml server-bundle/docker-compose.yaml
           cp deploy/docker-compose.vpn.yaml server-bundle/
+          cp deploy/docker-compose.watchtower.yaml server-bundle/
           cp deploy/SERVER_QUICKSTART.md server-bundle/README.md
           {
             echo "# Image published by GitHub Actions for ${REF_NAME}"

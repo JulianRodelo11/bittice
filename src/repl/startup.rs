@@ -200,14 +200,13 @@ fn print_deploy_instructions() {
     println!("\x1b[90m│\x1b[0m  \x1b[90m1. GitHub → Releases: download bittice-server-<version>.zip\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90m2. On the server: Docker + docker compose (the .env already points at the GHCR image).\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90m3. Manual bundle: deploy/scripts/export-server-bundle.sh (see deploy/README.md)\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m4. Or: Deploy menu → “Build image + deploy over SSH” to do it from here.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m4. Or: Deploy menu → full SSH deploy or “Update engine image on SSH only”.\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90m5. Docs: deploy/README.md and deploy/SERVER_QUICKSTART.md\x1b[0m");
     println!("\x1b[90m│\x1b[0m");
 }
 
-async fn run_interactive_full_ssh_deploy() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90mVPN is optional: only profiles with `vpn_file` need .ovpn files in data/vpn/ before deploy (OpenVPN only).\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mBuilds the image in Docker, pushes it over SSH, uploads compose + vpn/, rsyncs data/ twice for large mirrors, then compose up. Requires: Docker, rsync, ssh, keys, python3.\x1b[0m");
+/// Shared prompts for SSH-based deploy flows (full or image refresh).
+async fn prompt_ssh_deploy_config() -> Result<Option<FullDeployConfig>> {
     let default_root = deploy_pipeline::find_bittice_project_root()
         .or_else(|| std::env::current_dir().ok())
         .map(|p| p.to_string_lossy().to_string())
@@ -217,7 +216,7 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
         .interact()
     {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let project_root = PathBuf::from(root_s.trim());
@@ -232,7 +231,7 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
         .interact()
     {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     if local_image.is_empty() {
@@ -242,7 +241,7 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
         .interact()
     {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     if ssh_target.is_empty() {
@@ -253,7 +252,7 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
         .interact()
     {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     if remote_subdir.is_empty() {
@@ -266,7 +265,7 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
         .interact()
     {
         Ok(x) => x,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let platform = match pl {
@@ -274,12 +273,20 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
         1 => BuildPlatform::LinuxArm64,
         _ => BuildPlatform::HostNative,
     };
-    let cfg = FullDeployConfig {
+    Ok(Some(FullDeployConfig {
         project_root,
-        local_image: local_image.clone(),
-        ssh_target: ssh_target.clone(),
-        remote_subdir: remote_subdir.clone(),
+        local_image,
+        ssh_target,
+        remote_subdir,
         platform,
+    }))
+}
+
+async fn run_interactive_full_ssh_deploy() -> Result<()> {
+    println!("\x1b[90m│\x1b[0m  \x1b[90mVPN is optional: only profiles with `vpn_file` need .ovpn files in data/vpn/ before deploy (OpenVPN only).\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mBuilds the image in Docker, pushes it over SSH, uploads compose + vpn/, rsyncs data/ twice for large mirrors, then compose up. Requires: Docker, rsync, ssh, keys, python3.\x1b[0m");
+    let Some(cfg) = prompt_ssh_deploy_config().await? else {
+        return Ok(());
     };
     let res = tokio::task::spawn_blocking(move || deploy_pipeline::run_full_deploy(&cfg))
         .await
@@ -288,13 +295,39 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
     Ok(())
 }
 
+async fn run_interactive_ssh_image_refresh() -> Result<()> {
+    println!("\x1b[90m│\x1b[0m  \x1b[90mFor fixes/features after the first deploy: rebuild image, docker load on EC2, recreate container — keeps server data.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mSingle-node caveat: ~seconds offline during recreate; large uploads happen while the old container still runs.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mNeeds docker + ssh only unless you rsync data (then rsync on remote too).\x1b[0m");
+    let Some(cfg) = prompt_ssh_deploy_config().await? else {
+        return Ok(());
+    };
+    let sync_data: u8 = match select("Merge local data/ onto the server before recreate?")
+        .item(0u8, "No — ship new binary/engine only", "")
+        .item(1u8, "Yes — queries, vpn, or mirrors changed on this laptop", "")
+        .interact()
+    {
+        Ok(x) => x,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let sync_flag = sync_data == 1u8;
+    let res =
+        tokio::task::spawn_blocking(move || deploy_pipeline::run_ssh_engine_image_refresh(&cfg, sync_flag))
+            .await
+            .map_err(|e| anyhow::anyhow!("join error: {e}"))?;
+    res?;
+    Ok(())
+}
+
 async fn run_deploy_flow() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mDirect DB access: no VPN setup required. OpenVPN `.ovpn` only when `vpn_file` is set on a profile.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m(1) Optional — add OpenVPN profiles when needed for EC2; (2) Full SSH deploy builds the image, ships compose + vpn/, rsyncs data.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m(1) Optional OpenVPN; (2) Full SSH deploy; (3) Quick image refresh on EC2 (keep data); (4) Instructions.\x1b[0m");
     let first: u8 = match select("Deploy to a server (Docker)")
         .item(0u8, "Add OpenVPN profile (only if sync uses VPN — OpenVPN → data/vpn/)", "")
         .item(1u8, "Build image + bundle + deploy over SSH (full)", "")
-        .item(2u8, "Show deployment instructions only", "")
+        .item(2u8, "Update engine image on SSH only (reuse server data; optional rsync)", "")
+        .item(3u8, "Show deployment instructions only", "")
         .item(SEL_BACK_MAIN, "« Back to main menu", "")
         .interact()
     {
@@ -310,6 +343,8 @@ async fn run_deploy_flow() -> Result<()> {
     } else if first == 1u8 {
         run_interactive_full_ssh_deploy().await?;
     } else if first == 2u8 {
+        run_interactive_ssh_image_refresh().await?;
+    } else if first == 3u8 {
         print_deploy_instructions();
     }
     let _ = match select("Deploy")

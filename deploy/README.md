@@ -11,6 +11,8 @@ This directory holds the image definition, compose files, and scripts to run Bit
 | `docker-compose.production.yaml` | Service with restart policy, ports **3000** (saved queries), **8080** (admin), **50051** (gRPC), named volume for `/app/data`. |
 | `docker-compose.vpn.yaml` | Optional OpenVPN overlay (`/dev/net/tun`, `.ovpn` volume). |
 | `docker-compose.bundled.yaml` | Same stack as `production` + VPN with bind mounts for `./data` and `./vpn` (see *Deploy with pre-configured local profile* below). |
+| `docker-compose.watchtower.yaml` | Optional overlay: [Watchtower](https://containrrr.dev/watchtower/) polls the registry and recreates labeled containers (use with `BITTICE_IMAGE` from GHCR or another registry). |
+| `actualizacion-automatica-ec2.md` | Spanish guide: Watchtower vs log-only release checks; when `docker load` over SSH is not enough for automatic updates. |
 | `scripts/build-image-from-source.sh` | `docker build` using `Dockerfile.from-source`. |
 | `scripts/build-image-from-binary.sh` | `docker build` like a release, from a Linux `bittice` binary. |
 | `scripts/export-server-bundle.sh` | Packs a local project’s `data/` and `.ovpn` files into a folder ready for `docker compose` on the server. |
@@ -27,7 +29,7 @@ Set your tag and owner in `BITTICE_IMAGE` inside `deploy/.env`.
 
 ## Deploy without cloning the repo (GitHub Actions / release)
 
-Each release attaches **`bittice-server-<tag>.zip`**: it includes `docker-compose.yaml`, `docker-compose.vpn.yaml`, a `.env` with `BITTICE_IMAGE` pointing to that tag’s image, and **`SERVER_QUICKSTART.md`** (as `README.md` inside the zip). Download the asset from the release page, upload it to the server, and follow the zip’s README. You do not need the source on the instance.
+Each release attaches **`bittice-server-<tag>.zip`**: it includes `docker-compose.yaml`, `docker-compose.vpn.yaml`, `docker-compose.watchtower.yaml`, a `.env` with `BITTICE_IMAGE` pointing to that tag’s image, and **`SERVER_QUICKSTART.md`** (as `README.md` inside the zip). Download the asset from the release page, upload it to the server, and follow the zip’s README. You do not need the source on the instance.
 
 ## Run on a server (Compose)
 
@@ -43,6 +45,13 @@ docker compose -f docker-compose.production.yaml --env-file .env up -d
 Compose reads `BITTICE_IMAGE` and other `BITTICE_*` from the file; if you do not use `.env`, set at least `BITTICE_IMAGE` in the environment or pass another `--env-file`.
 
 Data is stored in the Docker volume `bittice-data` (it survives container recreation unless you remove the volume).
+
+**Automatic image updates:** the Bittice container cannot replace its own image. For EC2 to pull a newer image from a registry without manual steps, run Watchtower alongside compose (labeled service). See [`actualizacion-automatica-ec2.md`](actualizacion-automatica-ec2.md) and:
+
+```bash
+cd deploy
+docker compose -f docker-compose.production.yaml -f docker-compose.watchtower.yaml --env-file .env up -d
+```
 
 **VPN:** for the same OpenVPN-in-container pattern as the cloud installer:
 

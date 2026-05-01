@@ -1,6 +1,7 @@
 pub mod grpc;
 pub mod table_manager;
 pub mod logging;
+pub mod auto_update_hint;
 
 use axum::{
     debug_handler,
@@ -150,6 +151,8 @@ pub async fn start_all_servers(
     } else {
         info!("CDC autostart disabled. Running with static local data only.");
     }
+
+    crate::server::auto_update_hint::spawn_if_configured();
 
     let http_tm = table_manager.clone();
     let http_filter = entity_filter.clone();
