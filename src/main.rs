@@ -1,5 +1,5 @@
 use clap::Parser;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bittice::server::logging;
 use tracing::info;
 
@@ -17,6 +17,11 @@ fn env_truthy(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Production Docker (EC2): no interactive wizard or `cdc`/`setup` CLI — only the main process runs the engine.
+fn docker_engine_deploy_locked() -> bool {
+    std::path::Path::new("/.dockerenv").exists() && env_truthy("BITTICE_ENGINE_ONLY")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
@@ -24,13 +29,22 @@ async fn main() -> Result<()> {
     let is_docker_env = std::path::Path::new("/.dockerenv").exists();
     let is_pid1 = std::process::id() == 1;
 
-    // EC2/server images: run only the engine against mounted `data/` (no connect/sync wizard).
-    // PID 1 keeps backwards compatibility; BITTICE_ENGINE_ONLY is set in official compose files when PID≠1.
-    let docker_engine_mode = is_docker_env
+    // `docker exec ... bittice` is not PID 1; with BITTICE_ENGINE_ONLY the real engine is already running.
+    if is_docker_env
         && args_len == 1
         && env_entity.is_none()
-        && !env_truthy("BITTICE_CLI_MENU")
-        && (is_pid1 || env_truthy("BITTICE_ENGINE_ONLY"));
+        && !is_pid1
+        && env_truthy("BITTICE_ENGINE_ONLY")
+    {
+        bail!(
+            "El motor ya corre como proceso principal del contenedor (PID 1). \
+             Para ver CDC y HTTP como en local: docker logs -f bittice   (también: tail -f data/server.log en el volumen)"
+        );
+    }
+
+    // Docker main process: interactive wizard never runs here — only the engine with mounted /app/data.
+    let docker_engine_mode =
+        is_docker_env && args_len == 1 && env_entity.is_none() && is_pid1;
 
     let tracing_quiet_stdout = (!docker_engine_mode && args_len == 1 && env_entity.is_none())
         || (std::env::args().nth(1).as_deref() == Some("setup"));
@@ -38,8 +52,7 @@ async fn main() -> Result<()> {
 
     if docker_engine_mode {
         info!(
-            "Docker: engine-only startup — HTTP/gRPC + CDC from existing data (/app/data). \
-             Interactive sync/setup runs on your workstation (`bittice` or `bittice setup`), not in this container."
+            "Docker: engine (PID 1) — HTTP/gRPC + CDC from /app/data. Stream logs: docker logs -f bittice"
         );
         return bittice::server::start_all_servers(None, true).await;
     }
@@ -47,6 +60,13 @@ async fn main() -> Result<()> {
     // CLI / Command mode (includes `bittice setup`, `bittice cdc`, …)
     if std::env::args().len() > 1 || env_entity.is_some() {
         let cli = Cli::parse();
+        if docker_engine_deploy_locked() {
+            bail!(
+                "Este contenedor solo ejecuta el motor ya desplegado (BITTICE_ENGINE_ONLY=1): no está soportado \
+                 usar aquí setup, cdc, test ni otros subcomandos. Configura y sincroniza en tu PC, vuelve a desplegar. \
+                 Para ver el mismo tipo de líneas que en local (CDC, GET/POST), usa: docker logs -f bittice"
+            );
+        }
         match cli.command {
             Commands::Test => {
                 std::env::set_var("BITTICE_DISABLE_CDC_AUTOSTART", "1");

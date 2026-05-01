@@ -465,10 +465,9 @@ EOF
         echo -e "${BLUE}Creating bittice command wrapper...${NC}"
                 cat <<EOF | sudo tee /usr/local/bin/bittice > /dev/null
 #!/bin/bash
-# Bittice Docker Wrapper
-# If no arguments are provided, launch the interactive setup/monitor
+# Bittice Docker Wrapper (host → container). Engine runs as PID 1; no interactive wizard on the server.
 if [ "\$#" -eq 0 ]; then
-    docker exec -it bittice bittice
+    docker logs -f bittice
 else
     docker exec -it bittice bittice "\$@"
 fi
@@ -479,7 +478,8 @@ EOF
         fi
 
         echo -e "\n${GREEN}Bittice Engine is now running in the background!${NC}"
-        echo -e "To configure your database or monitor events, simply type: ${BLUE}bittice${NC}"
+        echo -e "To watch CDC and HTTP logs like on your PC: ${BLUE}bittice${NC} (runs docker logs -f)."
+        echo -e "Configure and sync databases from your workstation, then redeploy — not inside this container."
                 echo -e "Compose file: ${BLUE}$COMPOSE_FILE${NC}"
                 echo -e "Data dir: ${BLUE}$APP_DIR/data${NC}"
                 echo -e "VPN dir: ${BLUE}$APP_DIR/vpn${NC}"

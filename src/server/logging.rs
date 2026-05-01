@@ -3,6 +3,7 @@ use tracing_subscriber::fmt::{format, FmtContext};
 use tracing_subscriber::registry::LookupSpan;
 use tracing::{Level, Event, Subscriber};
 use std::fmt;
+use std::io::LineWriter;
 use console::Term;
 
 pub struct CliclackFormatter;
@@ -35,9 +36,17 @@ where
         event.record(&mut visitor);
         let msg = visitor.message;
 
-        let term = Term::stdout();
-        let width = term.size_checked().map(|(_, w)| w as usize).unwrap_or(120);
-        let max_text_width = if width > 20 { width - 10 } else { 100 };
+        let width: usize = if std::path::Path::new("/.dockerenv").exists() {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&w| w > 20)
+                .unwrap_or(120)
+        } else {
+            let term = Term::stdout();
+            term.size_checked().map(|(_, w)| w as usize).unwrap_or(120)
+        };
+        let max_text_width = if width > 20 { width.saturating_sub(10) } else { 100 };
 
         let wrapped = wrap_text(&msg, max_text_width);
         for (i, line) in wrapped.into_iter().enumerate() {
@@ -151,7 +160,7 @@ pub fn init_logging(quiet_stdout: bool) {
             let file_for_writer = file.try_clone().expect("Failed to clone log file");
             let _ = subscriber
                 .with_writer(move || {
-                    let stdout = std::io::stdout();
+                    let stdout = LineWriter::new(std::io::stdout());
                     let f = file_for_writer
                         .try_clone()
                         .expect("Failed to clone log file for writer");

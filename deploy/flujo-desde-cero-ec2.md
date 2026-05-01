@@ -21,7 +21,7 @@ No todas las conexiones necesitan VPN: solo si el perfil tiene **`vpn_file`** en
 | **Tu ordenador** | Menú interactivo: conectar y sincronizar desde cero, usar datos ya sincronizados, deploy, salir. |
 | **Docker en EC2** | **No hay ese menú**. El contenedor arranca **solo el motor** (APIs + CDC) usando el **`data/`** que ya viene montado desde el deploy. |
 
-La primera configuración CDC, los espejos grandes y las queries las preparas **en local**; el servidor solo **ejecuta** lo persistido en el volumen (`/app/data`). Los `docker-compose` de ejemplo fijan **`BITTICE_ENGINE_ONLY=1`** para garantizar ese comportamiento (incluso si el proceso no es PID 1). Para una sesión puntual de asistente dentro del contenedor existiría **`bittice setup`** explícito (no es el flujo normal de EC2).
+La primera configuración CDC, los espejos grandes y las queries las preparas **en local**; el servidor solo **ejecuta** lo persistido en el volumen (`/app/data`). Los compose llevan **`BITTICE_ENGINE_ONLY=1`**: solo **PID 1** arranca el motor; **`setup`/`cdc`/otros subcomandos** dentro del contenedor **no están soportados** (fallan con mensaje claro). Un `docker exec … bittice` sin args **no** debe duplicar el motor (también se rechaza); para el monitor en vivo usa **`docker logs -f bittice`** y verás líneas como **`◆ CDC:…`** y **`◆ GET /…`**, igual que el tracing local (y siguen en **`data/server.log`** del volumen).
 
 ---
 

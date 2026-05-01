@@ -111,7 +111,7 @@ On EC2, set `BITTICE_IMAGE` to the ECR URI and grant the instance/role `ecr:Batc
 
 ## Common environment variables
 
-The application reads `BITTICE_HOST` (e.g. `0.0.0.0`), `BITTICE_ENGINE_ONLY` (Docker: start engine only, no interactive wizard), `BITTICE_DISABLE_CDC_AUTOSTART`, `BITTICE_ENTITY`, VPN directory variables, and others (see the code). MySQL credentials do not belong in the image; they live under the data volume `/app/data` per the CDC configuration flow.
+The application reads `BITTICE_HOST` (e.g. `0.0.0.0`), `BITTICE_ENGINE_ONLY` (blocks interactive/`cdc`/`setup` CLI inside the container — official compose sets `1`), `BITTICE_DISABLE_CDC_AUTOSTART`, `BITTICE_ENTITY`, VPN directory variables, and others (see the code). MySQL credentials do not belong in the image; they live under the data volume `/app/data` per the CDC configuration flow.
 
 ## License
 
