@@ -71,6 +71,9 @@ pub struct CdcWorker {
     enum_maps: Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>, // table -> column -> values
     table_map_events: Arc<RwLock<HashMap<u64, TableMapEvent<'static>>>>,
     log_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// When true, return after bootstrap + `CDC_READY` instead of entering the live binlog loop.
+    /// Used by the connect wizard so only the HTTP engine owns long-running CDC (avoids two workers per profile).
+    exit_after_cdc_ready: bool,
 }
 
 impl CdcWorker {
@@ -87,6 +90,7 @@ impl CdcWorker {
             Arc::new(TableManager::new()),
             None,
             true,
+            false,
         )
     }
 
@@ -98,11 +102,12 @@ impl CdcWorker {
             Arc::new(TableManager::new()),
             log_tx,
             false,
+            false,
         )
     }
 
     pub fn with_manager(url: String, entity: String, database: String, table_manager: Arc<TableManager>) -> Self {
-        Self::with_manager_and_log(url, entity, database, table_manager, None, false)
+        Self::with_manager_and_log(url, entity, database, table_manager, None, false, false)
     }
 
     pub fn with_manager_and_log(
@@ -112,6 +117,7 @@ impl CdcWorker {
         table_manager: Arc<TableManager>,
         log_tx: Option<tokio::sync::mpsc::Sender<String>>,
         sync_all_databases: bool,
+        exit_after_cdc_ready: bool,
     ) -> Self {
         let state_path = crate::core::data_paths::profile_dir(&entity)
             .join("cdc_state.json")
@@ -129,6 +135,7 @@ impl CdcWorker {
             enum_maps: Arc::new(RwLock::new(HashMap::new())),
             table_map_events: Arc::new(RwLock::new(HashMap::new())),
             log_tx,
+            exit_after_cdc_ready,
         }
     }
 
@@ -332,23 +339,56 @@ impl CdcWorker {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cdc_state mkdir {:?}", parent.display()))?;
         }
-        let tmp_path = path.with_extension("json.tmp");
+        let Some(parent) = path.parent() else {
+            anyhow::bail!("cdc_state path {:?} has no parent directory", path.display());
+        };
+        let Some(file_name) = path.file_name() else {
+            anyhow::bail!("cdc_state path {:?} has no file name", path.display());
+        };
+        // Unique temp name: a fixed `*.json.tmp` races across processes or overlapping saves
+        // (another writer can rename our tmp away → ENOENT). Per-save UUID avoids that.
+        let tmp_path = parent.join(format!(
+            "{}.{}.tmp",
+            file_name.to_string_lossy(),
+            Uuid::new_v4()
+        ));
         {
             let mut file = std::fs::File::create(&tmp_path)
                 .with_context(|| format!("cdc_state create temp {:?}", tmp_path.display()))?;
             serde_json::to_writer_pretty(&mut file, state)?;
             let _ = file.sync_all();
         }
-        if path.exists() {
-            std::fs::remove_file(path).with_context(|| format!("cdc_state remove {:?}", path.display()))?;
+        Self::atomic_rename_into_place(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// Replace `dst` with `src` atomically where the platform allows it.
+    fn atomic_rename_into_place(src: &Path, dst: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::rename(src, dst).with_context(|| {
+                format!(
+                    "cdc_state rename {:?} -> {:?}",
+                    src.display(),
+                    dst.display()
+                )
+            })?;
         }
-        std::fs::rename(&tmp_path, path).with_context(|| {
-            format!(
-                "cdc_state rename {:?} -> {:?}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
+        #[cfg(not(unix))]
+        {
+            if dst.exists() {
+                std::fs::remove_file(dst).with_context(|| {
+                    format!("cdc_state remove {:?} before replace", dst.display())
+                })?;
+            }
+            std::fs::rename(src, dst).with_context(|| {
+                format!(
+                    "cdc_state rename {:?} -> {:?}",
+                    src.display(),
+                    dst.display()
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -484,7 +524,12 @@ impl CdcWorker {
             conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
                 .await?;
         }
-        let fq = Self::qualified_schema_table(schema, mysql_table);
+        let schema_mysql = if self.sync_all_databases {
+            Self::resolve_mysql_schema_folder_name(&mut conn, schema).await?
+        } else {
+            schema.to_string()
+        };
+        let fq = Self::qualified_schema_table(&schema_mysql, mysql_table);
         let sql = format!(
             "SELECT * FROM {} WHERE {} = {} LIMIT 1",
             fq,
@@ -740,6 +785,30 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
+    /// Sync-all stores qkeys as lowercased `schema.table`; MySQL may use mixed-case schema names.
+    /// Linux servers with `lower_case_table_names=0` reject `USE smartinvoicing` when the DB is `SmartInvoicing`.
+    async fn resolve_mysql_schema_folder_name(conn: &mut Conn, schema_hint: &str) -> Result<String> {
+        let rows: Vec<(String,)> = conn
+            .exec(
+                "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
+                 WHERE LOWER(SCHEMA_NAME) = LOWER(?) ORDER BY SCHEMA_NAME LIMIT 2",
+                (schema_hint,),
+            )
+            .await
+            .context("CDC: resolve schema via information_schema.SCHEMATA")?;
+        match rows.len() {
+            0 => anyhow::bail!(
+                "CDC: no schema matching `{}` (case-insensitive) on server",
+                schema_hint
+            ),
+            1 => Ok(rows.into_iter().next().unwrap().0),
+            _ => anyhow::bail!(
+                "CDC: ambiguous schema `{}`: multiple databases match case-insensitively",
+                schema_hint
+            ),
+        }
+    }
+
     async fn fetch_column_info(
         &self,
         conn: &mut Conn,
@@ -802,13 +871,19 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             self.entity.clone()
         };
 
+        let schema_mysql = if self.sync_all_databases {
+            Self::resolve_mysql_schema_folder_name(conn, schema).await?
+        } else {
+            schema.to_string()
+        };
+
         self.log_info(format!(
-            "CDC: Bootstrapping table '{}' (schema '{}', {:?})...",
-            table_name, schema, mode
+            "CDC: Bootstrapping table '{}' (schema '{}' {:?})...",
+            table_name, schema_mysql, mode
         ));
 
         let (cols, dates) = self
-            .fetch_column_info(conn, schema, &qkey, table_name)
+            .fetch_column_info(conn, &schema_mysql, &qkey, table_name)
             .await?;
         {
             let mut maps = self.column_maps.write().unwrap();
@@ -827,7 +902,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
              WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
              AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX LIMIT 1",
-            Self::mysql_string_literal(schema),
+            Self::mysql_string_literal(&schema_mysql),
             Self::mysql_string_literal(table_name)
         );
         let pk_col: Option<String> = conn.query_first(pk_query).await?;
@@ -846,7 +921,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
 
         let mut count = 0usize;
         if mode == BootstrapMode::FullSnapshot {
-            let fq = Self::qualified_schema_table(schema, table_name);
+            let fq = Self::qualified_schema_table(&schema_mysql, table_name);
             let mut result_set = conn.query_iter(format!("SELECT * FROM {}", fq)).await?;
 
             while let Some(row) = result_set.next().await? {
@@ -1474,6 +1549,14 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
             self.log_info(
                 "CDC: Sync-all mode".to_string(),
             );
+        }
+
+        if self.exit_after_cdc_ready {
+            self.log_info(
+                "CDC: Initial sync finished — releasing binlog consumer so the query engine can take over live CDC."
+                    .to_string(),
+            );
+            return Ok(());
         }
 
         let pool = pool.clone();

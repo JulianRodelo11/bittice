@@ -622,6 +622,7 @@ async fn run_cdc_initial_sync(cdc_info: &CdcInfo) -> Result<()> {
             Arc::new(crate::server::table_manager::TableManager::new()),
             Some(log_tx),
             worker_sync_all,
+            true,
         );
         let _ = rt.block_on(worker.run());
     });

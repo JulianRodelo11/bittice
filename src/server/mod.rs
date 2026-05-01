@@ -275,9 +275,14 @@ pub fn scan_and_start_cdc(
                             if !sync_all {
                                 let active = active_workers.read().unwrap();
                                 if active.contains(&single_db_lock_key) {
-                                    info!(
-                                        "CDC: Skipping entity '{}' because a single-database CDC worker is already running for {}:{}.",
-                                        entity, host, port
+                                    warn!(
+                                        "CDC: Skipping entity '{}' — another profile already owns single-database CDC for {}:{}. \
+MySQL publishes one binlog per server; Bittice allows only one single-DB worker per host:port. \
+Mirror '{}' will stay static unless you enable sync_all_databases on one profile for this server (covers all schemas in one stream) or use separate MySQL instances.",
+                                        entity,
+                                        host,
+                                        port,
+                                        entity,
                                     );
                                     continue;
                                 }
@@ -326,6 +331,7 @@ pub fn scan_and_start_cdc(
                                     worker_tm,
                                     None,
                                     sync_all,
+                                    false,
                                 );
                                 if let Err(e) = rt.block_on(worker.run()) {
                                     // `{:#}` prints anyhow's full chain (e.g. path context); `{}` often hides the root cause.
