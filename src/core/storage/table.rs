@@ -190,6 +190,15 @@ impl Table {
         Ok(())
     }
 
+    /// Removes every mirrored row (WAL tombstones + segment deletes). Used rarely after CDC checkpoint loss.
+    pub fn delete_all_rows(&mut self) -> Result<()> {
+        let ids: Vec<String> = self.primary_index.keys().cloned().collect();
+        for id in ids {
+            self.delete(&id)?;
+        }
+        self.flush_active_segment()
+    }
+
     pub fn insert(&mut self, row_data: HashMap<String, String>) -> Result<()> {
         let row_bytes = serde_json::to_vec(&row_data)?;
         let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };

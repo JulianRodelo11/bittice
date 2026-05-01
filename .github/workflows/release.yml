@@ -256,6 +256,7 @@ jobs:
             echo "BITTICE_IMAGE=ghcr.io/${REPO_LOWER}:${REF_NAME}"
             echo "BITTICE_HOST=0.0.0.0"
             echo "BITTICE_REST_PORT=3000"
+            echo "BITTICE_REST_ADMIN_PORT=8080"
             echo "BITTICE_GRPC_PORT=50051"
           } > server-bundle/.env
           zip -r "bittice-server-${REF_NAME}.zip" server-bundle

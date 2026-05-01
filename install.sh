@@ -368,7 +368,7 @@ RUN apt-get update && apt-get install -y ca-certificates libc6 openvpn iproute2 
 WORKDIR /app
 COPY bittice_bin /usr/local/bin/bittice
 RUN chmod +x /usr/local/bin/bittice
-EXPOSE 3000 50051
+EXPOSE 3000 8080 50051
 ENTRYPOINT ["bittice"]
 EOF
                         cp "$LIBEXEC_DIR/bittice-host" ./bittice_bin
@@ -403,6 +403,7 @@ services:
             - BITTICE_VPN_SPLIT_TUNNEL=true
         ports:
             - "3000:3000"
+            - "8080:8080"
             - "50051:50051"
         volumes:
             - $APP_DIR/data:/app/data
@@ -427,6 +428,7 @@ services:
             - BITTICE_VPN_SPLIT_TUNNEL=true
         ports:
             - "3000:3000"
+            - "8080:8080"
             - "50051:50051"
         volumes:
             - $APP_DIR/data:/app/data
@@ -445,14 +447,14 @@ EOF
                         docker-compose -f "$COMPOSE_FILE" down &> /dev/null || true
                         if ! docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans; then
                 echo -e "${RED}Error: Failed to start Bittice Engine with docker-compose.${NC}"
-                echo -e "Please check if ports 3000 or 50051 are already in use."
+                echo -e "Please check if ports 3000, 8080, or 50051 are already in use."
                 exit 1
             fi
         else
                         docker compose -f "$COMPOSE_FILE" down &> /dev/null || true
                         if ! docker compose -f "$COMPOSE_FILE" up -d --remove-orphans; then
                 echo -e "${RED}Error: Failed to start Bittice Engine with docker compose.${NC}"
-                echo -e "Please check if ports 3000 or 50051 are already in use."
+                echo -e "Please check if ports 3000, 8080, or 50051 are already in use."
                 exit 1
             fi
         fi

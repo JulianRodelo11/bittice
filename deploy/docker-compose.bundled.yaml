@@ -16,6 +16,7 @@ services:
     restart: always
     ports:
       - "${BITTICE_REST_PORT:-3000}:3000"
+      - "${BITTICE_REST_ADMIN_PORT:-8080}:8080"
       - "${BITTICE_GRPC_PORT:-50051}:50051"
     environment:
       BITTICE_HOST: ${BITTICE_HOST:-0.0.0.0}

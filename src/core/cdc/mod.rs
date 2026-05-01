@@ -37,7 +37,7 @@ pub struct CdcState {
     /// Rolling GTID set aligned with processed transactions (bootstrap snapshot plus merges from binlog `GtidEvent`s).
     #[serde(default)]
     pub gtid_executed: String,
-    /// Last values seen from MySQL at CDC startup (`/_cdc/state`).
+    /// Last values seen from MySQL at CDC startup (persisted in `cdc_state.json`).
     #[serde(default)]
     pub observed_binlog_format_global: Option<String>,
     #[serde(default)]
@@ -329,18 +329,26 @@ impl CdcWorker {
     fn save_state(&self, state: &CdcState) -> Result<()> {
         let path = Path::new(&self.state_path);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cdc_state mkdir {:?}", parent.display()))?;
         }
         let tmp_path = path.with_extension("json.tmp");
         {
-            let mut file = std::fs::File::create(&tmp_path)?;
+            let mut file = std::fs::File::create(&tmp_path)
+                .with_context(|| format!("cdc_state create temp {:?}", tmp_path.display()))?;
             serde_json::to_writer_pretty(&mut file, state)?;
             let _ = file.sync_all();
         }
         if path.exists() {
-            let _ = std::fs::remove_file(path);
+            std::fs::remove_file(path).with_context(|| format!("cdc_state remove {:?}", path.display()))?;
         }
-        std::fs::rename(&tmp_path, path)?;
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "cdc_state rename {:?} -> {:?}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -363,6 +371,19 @@ impl CdcWorker {
                 )
             })
             .unwrap_or(false)
+    }
+
+    /// When the mirror missed an INSERT (bootstrap / binlog gap), apply UPDATE by doing a targeted
+    /// `SELECT * … WHERE pk=?` unless `BITTICE_CDC_SKIP_UPDATE_HYDRATE=1`.
+    fn cdc_update_hydrate_enabled() -> bool {
+        !Self::env_truthy("BITTICE_CDC_SKIP_UPDATE_HYDRATE")
+    }
+
+    /// After binlog checkpoint loss (MySQL 1236 / purged logs), rebuild mirrors via `SELECT *` inside an InnoDB
+    /// consistent snapshot aligned with captured binlog coordinates — avoids silently skipping offline commits.
+    /// Set `BITTICE_CDC_SKIP_MIRROR_RESYNC_ON_GAP=1` to disable (large tables / ops preference).
+    fn cdc_mirror_resync_on_binlog_gap_enabled() -> bool {
+        !Self::env_truthy("BITTICE_CDC_SKIP_MIRROR_RESYNC_ON_GAP")
     }
 
     /// Logs each applied binlog row-batch so `data/server.log` + the CLI Live Monitor (`grep CDC`) stay informative.
@@ -444,6 +465,37 @@ impl CdcWorker {
             }
         }
         Ok(None)
+    }
+
+    /// Full current row from MySQL (same shape as bootstrap `SELECT *`) for self-healing CDC gaps.
+    async fn fetch_full_row_mysql(
+        &self,
+        pool: &Pool,
+        schema: &str,
+        mysql_table: &str,
+        qkey: &str,
+        pk_field: &str,
+        pk_val: &str,
+    ) -> Result<Option<HashMap<String, String>>> {
+        let mut conn = pool.get_conn().await?;
+        if self.sync_all_databases {
+            conn.query_drop("USE information_schema").await?;
+        } else {
+            conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
+                .await?;
+        }
+        let fq = Self::qualified_schema_table(schema, mysql_table);
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} = {} LIMIT 1",
+            fq,
+            Self::mysql_ident(pk_field),
+            Self::mysql_string_literal(pk_val.trim())
+        );
+        let row_opt: Option<Row> = conn.query_first(sql).await?;
+        match row_opt {
+            Some(row) => Ok(Some(self.parse_row(row, qkey)?)),
+            None => Ok(None),
+        }
     }
 
     async fn detect_mariadb_server(conn: &mut Conn) -> bool {
@@ -844,6 +896,117 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         Ok(())
     }
 
+    fn wipe_bootstrapped_mirror_tables(&self, state: &CdcState) -> Result<()> {
+        for qkey in &state.bootstrapped_tables {
+            let (table_sql_name, disk_entity) = if self.sync_all_databases {
+                let Some((s, t)) = qkey.split_once('.') else {
+                    warn!("CDC: wipe mirror skipping malformed sync-all qkey '{}'", qkey);
+                    continue;
+                };
+                (t.to_string(), s.to_lowercase())
+            } else {
+                (qkey.clone(), self.entity.clone())
+            };
+            let mirror_table = Self::resolve_mirror_table_dir(&disk_entity, &table_sql_name);
+            let table_lock = match self.table_manager.get_table(&disk_entity, &mirror_table) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        "CDC: wipe mirror skip '{}' (entity='{}' dir='{}'): {}",
+                        qkey, disk_entity, mirror_table, e
+                    );
+                    continue;
+                }
+            };
+            let mut table = table_lock.write().unwrap();
+            table.delete_all_rows()?;
+            debug!(
+                "CDC: wiped local mirror rows for '{}' (entity='{}' dir='{}')",
+                qkey, disk_entity, mirror_table
+            );
+        }
+        Ok(())
+    }
+
+    /// After losing binlog replay position (purged logs / 1236), reload every bootstrapped table via `SELECT *`
+    /// inside `START TRANSACTION WITH CONSISTENT SNAPSHOT`, matching bootstrap semantics so offline commits are not skipped.
+    async fn resync_mirror_after_checkpoint_loss_mvcc(
+        &self,
+        pool: &Pool,
+        state: &mut CdcState,
+        master_gtid_enabled: bool,
+    ) -> Result<()> {
+        self.log_warn(
+            "CDC: Rebuilding mirrors after checkpoint loss — InnoDB snapshot + full SELECT * per bootstrapped table."
+                .to_string(),
+        );
+
+        self.wipe_bootstrapped_mirror_tables(state)?;
+
+        let mut conn = pool.get_conn().await?;
+        if self.sync_all_databases {
+            conn.query_drop("USE information_schema").await?;
+        } else {
+            conn.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
+                .await?;
+        }
+
+        conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+            .await
+            .context("CDC resync: START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
+
+        let coords = match Self::query_master_coordinates(&mut conn).await {
+            Ok(Some((f, p))) if !f.is_empty() => (f, p),
+            Ok(_) => {
+                let _ = conn.query_drop("ROLLBACK").await;
+                anyhow::bail!("CDC resync: empty binlog coordinates inside snapshot");
+            }
+            Err(e) => {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(e.context("CDC resync: SHOW MASTER/BINARY LOG STATUS failed"));
+            }
+        };
+
+        let qkeys: Vec<String> = state.bootstrapped_tables.clone();
+        let mut bootstrap_err: Option<(String, anyhow::Error)> = None;
+        for qkey in qkeys {
+            let (schema, table_name) = if self.sync_all_databases {
+                match qkey.split_once('.') {
+                    Some((s, t)) => (s.to_string(), t.to_string()),
+                    None => {
+                        warn!("CDC: resync skipping malformed sync-all qkey '{}'", qkey);
+                        continue;
+                    }
+                }
+            } else {
+                (self.database.clone(), qkey.clone())
+            };
+
+            if let Err(e) = self
+                .bootstrap_table(&mut conn, &schema, &table_name, state, BootstrapMode::FullSnapshot)
+                .await
+            {
+                bootstrap_err = Some((qkey, e));
+                break;
+            }
+        }
+
+        if let Some((qkey, e)) = bootstrap_err {
+            let _ = conn.query_drop("ROLLBACK").await;
+            anyhow::bail!("CDC resync bootstrap failed for '{}': {}", qkey, e);
+        }
+
+        conn.query_drop("COMMIT").await.context("CDC resync COMMIT")?;
+
+        state.binlog_file = coords.0;
+        state.binlog_pos = coords.1;
+        state.gtid_executed.clear();
+        self.maybe_capture_gtid_executed(&mut conn, state, master_gtid_enabled)
+            .await?;
+
+        Ok(())
+    }
+
     fn resolve_rows_table_map(
         &self,
         rows_data: &RowsEventData<'_>,
@@ -923,7 +1086,24 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
     }
 
     pub async fn run(&self) -> Result<()> {
-        let _ = crate::core::data_paths::migrate_legacy_layout();
+        if let Err(e) = crate::core::data_paths::migrate_legacy_layout() {
+            warn!(
+                "CDC: migrate_legacy_layout failed ({:#}); profiles/mirror paths may be wrong for this process cwd.",
+                e
+            );
+        }
+        let data_root = crate::core::data_paths::resolved_data_root();
+        let root_disp = std::fs::canonicalize(&data_root).unwrap_or_else(|_| data_root.clone());
+        let state_pb = Path::new(&self.state_path);
+        let state_disp = std::fs::canonicalize(state_pb).unwrap_or_else(|_| state_pb.to_path_buf());
+        self.log_info(format!(
+            "CDC: entity='{}' sync_all={} data_root={} cdc_state_path={}",
+            self.entity,
+            self.sync_all_databases,
+            root_disp.display(),
+            state_disp.display()
+        ));
+
         if self.sync_all_databases {
             self.log_info("CDC: Connecting to MySQL (sync all databases on server)...".to_string());
         } else {
@@ -1292,9 +1472,7 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
         }
         if self.sync_all_databases {
             self.log_info(
-                "CDC: Sync-all mode — live rows go to data/mirror/<mysql_schema>/ (schema lowercased). \
-Saved queries and API `entity` must use that schema folder name, not the profile name under data/profiles/. \
-Use GET /_entities to list mirror roots.".to_string(),
+                "CDC: Sync-all mode".to_string(),
             );
         }
 
@@ -1311,8 +1489,6 @@ Use GET /_entities to list mirror roots.".to_string(),
                         .to_string(),
                 );
             }
-
-            self.log_info(format!("CDC: Resuming live stream from {}:{}", state.binlog_file, state.binlog_pos));
 
             conn = pool.get_conn().await?;
             if self.sync_all_databases {
@@ -1333,6 +1509,11 @@ Use GET /_entities to list mirror roots.".to_string(),
                         .await;
                 }
             }
+
+            self.log_info(format!(
+                "CDC: Resuming live stream from {}:{}",
+                state.binlog_file, state.binlog_pos
+            ));
 
             let server_id = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1394,9 +1575,46 @@ Use GET /_entities to list mirror roots.".to_string(),
                 Err(e) => {
                     let msg = e.to_string();
                     if Self::is_stale_saved_binlog_error(&msg) {
-                        warn!("CDC: Saved binlog no longer available on server ({}). Re-syncing from current head.", msg);
+                        warn!(
+                            "CDC: Saved binlog checkpoint no longer on server (purged or rotated; {}). {}",
+                            msg,
+                            if Self::cdc_mirror_resync_on_binlog_gap_enabled()
+                                && !state.bootstrapped_tables.is_empty()
+                            {
+                                "Attempting MVCC mirror rebuild so offline commits are not skipped."
+                            } else {
+                                "Discarding checkpoint and anchoring to binlog tip (mirror may omit rows changed while Bittice was offline)."
+                            }
+                        );
+                        if Self::cdc_mirror_resync_on_binlog_gap_enabled()
+                            && !state.bootstrapped_tables.is_empty()
+                        {
+                            match self
+                                .resync_mirror_after_checkpoint_loss_mvcc(
+                                    &pool,
+                                    &mut state,
+                                    master_gtid_enabled,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = self.save_state(&state);
+                                    self.log_info(
+                                        "CDC: Mirror rebuilt after checkpoint loss; streaming from MVCC-aligned binlog coordinates."
+                                            .to_string(),
+                                    );
+                                    continue 'binlog_retry;
+                                }
+                                Err(e) => {
+                                    self.log_warn(format!(
+                                        "CDC: MVCC mirror rebuild failed ({:#}); falling back to tip anchor only.",
+                                        e
+                                    ));
+                                }
+                            }
+                        }
                         state.binlog_file.clear();
-                        state.binlog_pos = 4;
+                        state.binlog_pos = 0;
                         state.gtid_executed.clear();
                         self.save_state(&state)?;
                         continue 'binlog_retry;
@@ -1414,9 +1632,46 @@ Use GET /_entities to list mirror roots.".to_string(),
                     Err(e) => {
                         let msg = e.to_string();
                         if Self::is_stale_saved_binlog_error(&msg) {
-                            warn!("CDC: Binlog stream error ({}). Re-syncing from current head.", msg);
+                            warn!(
+                                "CDC: Binlog stream interrupted — checkpoint stale or unavailable ({}). {}",
+                                msg,
+                                if Self::cdc_mirror_resync_on_binlog_gap_enabled()
+                                    && !state.bootstrapped_tables.is_empty()
+                                {
+                                    "Attempting MVCC mirror rebuild."
+                                } else {
+                                    "Discarding checkpoint and anchoring to binlog tip."
+                                }
+                            );
+                            if Self::cdc_mirror_resync_on_binlog_gap_enabled()
+                                && !state.bootstrapped_tables.is_empty()
+                            {
+                                match self
+                                    .resync_mirror_after_checkpoint_loss_mvcc(
+                                        &pool,
+                                        &mut state,
+                                        master_gtid_enabled,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        let _ = self.save_state(&state);
+                                        self.log_info(
+                                            "CDC: Mirror rebuilt after checkpoint loss; streaming from MVCC-aligned binlog coordinates."
+                                                .to_string(),
+                                        );
+                                        continue 'binlog_retry;
+                                    }
+                                    Err(e) => {
+                                        self.log_warn(format!(
+                                            "CDC: MVCC mirror rebuild failed ({:#}); falling back to tip anchor only.",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
                             state.binlog_file.clear();
-                            state.binlog_pos = 4;
+                            state.binlog_pos = 0;
                             state.gtid_executed.clear();
                             self.save_state(&state)?;
                             continue 'binlog_retry;
@@ -1499,7 +1754,7 @@ Use GET /_entities to list mirror roots.".to_string(),
                                 }
                             }
                         }
-                        self.handle_rows_event(rows_data, &mut state, &stream)?;
+                        self.handle_rows_event(&pool, rows_data, &mut state, &stream).await?;
                     }
                     Some(EventData::RotateEvent(rotate_data)) => {
                         if !rotate_data.is_fake() {
@@ -1572,16 +1827,14 @@ Use GET /_entities to list mirror roots.".to_string(),
         Ok(applied)
     }
 
-    fn apply_binlog_update_rows<'a>(
+    fn extract_binlog_update_deltas<'a>(
         &self,
         rows: RowsEventRows<'a>,
         qkey: &str,
-        disk_entity: &str,
-        table_name: &str,
+        mirror_table: &str,
         pk_field: &str,
-        table: &mut Table,
-    ) -> Result<usize> {
-        let mut applied = 0usize;
+    ) -> Result<Vec<(String, HashMap<String, String>)>> {
+        let mut deltas = Vec::new();
         for row_pair in rows {
             let Ok((before_opt, after_opt)) = row_pair else {
                 continue;
@@ -1612,13 +1865,36 @@ Use GET /_entities to list mirror roots.".to_string(),
                 warn!(
                     "CDC: Skipped UPDATE on '{}' — primary key '{}' missing from binlog row pair \
                      (often MINIMAL row image + composite PK / PK detection mismatch). Table '{}'.",
-                    qkey, pk_field, table_name
+                    qkey, pk_field, mirror_table
                 );
                 continue;
             };
 
             let pk_trim = pk_val.trim().to_string();
-            let mut lookup_candidates = vec![pk_val.clone(), pk_trim.clone()];
+            deltas.push((pk_trim, delta));
+        }
+        Ok(deltas)
+    }
+
+    async fn apply_binlog_update_deltas(
+        &self,
+        pool: &Pool,
+        schema: &str,
+        mysql_table: &str,
+        deltas: Vec<(String, HashMap<String, String>)>,
+        qkey: &str,
+        disk_entity: &str,
+        mirror_table: &str,
+        pk_field: &str,
+        table: &mut Table,
+    ) -> Result<usize> {
+        let mut applied = 0usize;
+        let mut hydrate_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        for (pk_trim, delta) in deltas {
+            let pk_val_display = delta.get(pk_field).cloned().unwrap_or_else(|| pk_trim.clone());
+
+            let mut lookup_candidates = vec![pk_val_display.clone(), pk_trim.clone()];
             if let Ok(n) = pk_trim.parse::<i64>() {
                 lookup_candidates.push(n.to_string());
             }
@@ -1630,28 +1906,66 @@ Use GET /_entities to list mirror roots.".to_string(),
 
             let mut merged = None;
             let mut storage_pk: Option<String> = None;
-            for cand in lookup_candidates {
+            for cand in &lookup_candidates {
                 if cand.is_empty() {
                     continue;
                 }
-                if let Ok(Some(m)) = table.get_row_as_map(&cand) {
+                if let Ok(Some(m)) = table.get_row_as_map(cand) {
                     merged = Some(m);
-                    storage_pk = Some(cand);
+                    storage_pk = Some(cand.clone());
                     break;
+                }
+            }
+
+            if merged.is_none() && Self::cdc_update_hydrate_enabled() {
+                let fetched_opt = if let Some(cached) = hydrate_cache.get(&pk_trim) {
+                    Some(cached.clone())
+                } else {
+                    match self
+                        .fetch_full_row_mysql(pool, schema, mysql_table, qkey, pk_field, &pk_trim)
+                        .await
+                    {
+                        Ok(Some(m)) => {
+                            hydrate_cache.insert(pk_trim.clone(), m.clone());
+                            debug!(
+                                "CDC: Hydrated missing mirror row for UPDATE '{}' pk '{}' via SELECT",
+                                qkey, pk_trim
+                            );
+                            Some(m)
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!(
+                                "CDC: UPDATE '{}' pk '{}' — hydrate SELECT failed ({}); skipping.",
+                                qkey, pk_trim, e
+                            );
+                            None
+                        }
+                    }
+                };
+
+                if let Some(base) = fetched_opt {
+                    merged = Some(base);
+                    storage_pk = Some(pk_trim.clone());
                 }
             }
 
             let mut merged = match merged {
                 Some(m) => m,
                 None => {
+                    let detail = if Self::cdc_update_hydrate_enabled() {
+                        "no mirror row and MySQL hydrate returned no row (deleted upstream, lag, or permissions)"
+                    } else {
+                        "no mirror row (unset BITTICE_CDC_SKIP_UPDATE_HYDRATE to pull current row from MySQL)"
+                    };
                     self.log_warn(format!(
-                        "CDC: UPDATE '{}' — no mirror row for pk '{}' (tried normalized numeric aliases); \
-skipped merge (likely missed INSERT / bootstrap gap). Table '{}'.",
-                        qkey, pk_val, table_name
+                        "CDC: UPDATE '{}' — pk '{}': {}; skipped. Table '{}'.",
+                        qkey, pk_trim, detail, mirror_table
                     ));
                     continue;
                 }
             };
+
             let storage_pk = storage_pk.unwrap_or_else(|| pk_trim.clone());
 
             for (k, v) in delta {
@@ -1667,7 +1981,7 @@ skipped merge (likely missed INSERT / bootstrap gap). Table '{}'.",
                 .collect();
             let _ = self.table_manager.events_tx.send(TableUpdateEvent {
                 entity: disk_entity.to_string(),
-                table_name: table_name.to_string(),
+                table_name: mirror_table.to_string(),
                 event_type: "UPDATE".to_string(),
                 pk: storage_pk.clone(),
                 row: display_row,
@@ -1707,9 +2021,10 @@ skipped merge (likely missed INSERT / bootstrap gap). Table '{}'.",
         Ok(applied)
     }
 
-    fn handle_rows_event(
+    async fn handle_rows_event(
         &self,
-        rows_data: RowsEventData,
+        pool: &Pool,
+        rows_data: RowsEventData<'_>,
         state: &mut CdcState,
         stream: &BinlogStream,
     ) -> Result<()> {
@@ -1786,39 +2101,63 @@ skipped merge (likely missed INSERT / bootstrap gap). Table '{}'.",
                 )?,
                 "INSERT",
             ),
-            RowsEventData::UpdateRowsEvent(ev) => (
-                self.apply_binlog_update_rows(
-                    ev.rows(&tm_owned),
-                    &qkey,
-                    &disk_entity,
-                    &mirror_table,
-                    &pk_field,
-                    &mut table,
-                )?,
-                "UPDATE",
-            ),
-            RowsEventData::UpdateRowsEventV1(ev) => (
-                self.apply_binlog_update_rows(
-                    ev.rows(&tm_owned),
-                    &qkey,
-                    &disk_entity,
-                    &mirror_table,
-                    &pk_field,
-                    &mut table,
-                )?,
-                "UPDATE",
-            ),
-            RowsEventData::PartialUpdateRowsEvent(ev) => (
-                self.apply_binlog_update_rows(
-                    ev.rows(&tm_owned),
-                    &qkey,
-                    &disk_entity,
-                    &mirror_table,
-                    &pk_field,
-                    &mut table,
-                )?,
-                "UPDATE",
-            ),
+            RowsEventData::UpdateRowsEvent(ev) => {
+                let deltas =
+                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_field)?;
+                (
+                    self.apply_binlog_update_deltas(
+                        pool,
+                        &schema,
+                        &table_name,
+                        deltas,
+                        &qkey,
+                        &disk_entity,
+                        &mirror_table,
+                        &pk_field,
+                        &mut table,
+                    )
+                    .await?,
+                    "UPDATE",
+                )
+            }
+            RowsEventData::UpdateRowsEventV1(ev) => {
+                let deltas =
+                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_field)?;
+                (
+                    self.apply_binlog_update_deltas(
+                        pool,
+                        &schema,
+                        &table_name,
+                        deltas,
+                        &qkey,
+                        &disk_entity,
+                        &mirror_table,
+                        &pk_field,
+                        &mut table,
+                    )
+                    .await?,
+                    "UPDATE",
+                )
+            }
+            RowsEventData::PartialUpdateRowsEvent(ev) => {
+                let deltas =
+                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_field)?;
+                (
+                    self.apply_binlog_update_deltas(
+                        pool,
+                        &schema,
+                        &table_name,
+                        deltas,
+                        &qkey,
+                        &disk_entity,
+                        &mirror_table,
+                        &pk_field,
+                        &mut table,
+                    )
+                    .await?,
+                    "UPDATE",
+                )
+            }
             RowsEventData::DeleteRowsEvent(ev) => (
                 self.apply_binlog_delete_rows(
                     ev.rows(&tm_owned),

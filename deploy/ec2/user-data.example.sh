@@ -19,9 +19,10 @@ EOF
 docker pull "$BITTICE_IMAGE"
 
 docker run -d --name bittice --restart always \
-  -p 3000:3000 -p 50051:50051 \
+  -p 3000:3000 -p 8080:8080 -p 50051:50051 \
   --env-file /opt/bittice/bittice.env \
   -v bittice-data:/app/data \
   "$BITTICE_IMAGE"
 
-# Security groups: expose 3000/50051 only to allowed sources. For HTTPS, use ALB/nginx in front.
+# Security groups: expose 3000 (saved queries) and 50051 to clients; expose 8080 (admin API) only to trusted ops/VPN.
+# For HTTPS, use ALB/nginx in front.

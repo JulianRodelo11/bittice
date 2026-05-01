@@ -13,7 +13,7 @@ This package is built on each GitHub **release** along with the Docker image pub
 ## Instance requirements
 
 - Linux with **Docker** and **Docker Compose v2**.
-- Firewall allows REST (3000) and gRPC (50051) only to who should use the API.
+- Firewall allows **saved-query REST** (3000), **admin REST** (8080 — create/edit queries, `/_config`; restrict this surface), and **gRPC** (50051) only to who should use each API.
 
 ## Steps
 
@@ -56,7 +56,7 @@ you can run:
 ```bash
 docker pull ghcr.io/<owner>/<repo>:<tag>
 docker run -d --name bittice --restart always \
-  -p 3000:3000 -p 50051:50051 \
+  -p 3000:3000 -p 8080:8080 -p 50051:50051 \
   -e BITTICE_HOST=0.0.0.0 \
   -v bittice-data:/app/data \
   ghcr.io/<owner>/<repo>:<tag>

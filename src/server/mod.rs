@@ -14,7 +14,7 @@ use axum::{
 use axum::extract::Request;
 use std::sync::{Arc};
 use std::time::Instant;
-use tokio::sync::{oneshot, RwLock as TokioRwLock};
+use tokio::sync::{oneshot, RwLock as TokioRwLock, Notify};
 use tower_http::trace::TraceLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use crate::core::saved_queries::{load_operations, SavedCollectAggregation, SavedOperation};
@@ -27,11 +27,61 @@ use tracing::{info, debug, warn, error};
 
 const MAX_GROUPED_RESPONSE_ROWS: usize = 10_000;
 
+/// Saved-query API only (`/_*` rejected). Always **3000** (plus `BITTICE_HOST`).
+const HTTP_QUERY_API_PORT: u16 = 3000;
+
+/// Full REST API (`/_config`, creating/editing queries, etc.). Always **8080** (plus `BITTICE_HOST`).
+const HTTP_ADMIN_API_PORT: u16 = 8080;
+
+/// Admin listener bind override (`host:port`), e.g. private VPC IP only. If unset: `{BITTICE_HOST}:8080`.
+pub fn resolve_http_internal_bind() -> String {
+    if let Ok(a) = std::env::var("BITTICE_HTTP_INTERNAL_ADDR") {
+        let t = a.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    format!("{}:{}", host, HTTP_ADMIN_API_PORT)
+}
+
+/// Query-only listener — fixed port **3000**.
+pub fn resolve_http_public_bind() -> String {
+    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    format!("{}:{}", host, HTTP_QUERY_API_PORT)
+}
+
+/// Base URL for calling `/_config/reload` from the same machine (Repl / tooling).
+/// Prefer `BITTICE_HTTP_INTERNAL_URL` when the internal bind address is not reachable via HTTP as-is (e.g. `0.0.0.0`).
+pub fn http_config_reload_url() -> String {
+    if let Ok(u) = std::env::var("BITTICE_HTTP_INTERNAL_URL") {
+        let t = u.trim().trim_end_matches('/');
+        if !t.is_empty() {
+            return format!("{}/_config/reload", t);
+        }
+    }
+    let bind = resolve_http_internal_bind();
+    let host_port = bind
+        .strip_prefix("0.0.0.0:")
+        .map(|p| format!("127.0.0.1:{}", p))
+        .unwrap_or(bind);
+    format!("http://{}/_config/reload", host_port)
+}
+
 pub fn show_banner_with_filter(filter: Option<String>) {
     println!("\x1b[90m│\x1b[0m");
     println!("\x1b[32m◆\x1b[0m  \x1b[1mBittice Query Engine\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90mThe engine is running and ready for requests.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m  \x1b[1mREST API:\x1b[0m    http://0.0.0.0:3000");
+    let pub_b = resolve_http_public_bind();
+    println!(
+        "\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m  \x1b[1mREST queries (public):\x1b[0m http://{} — saved operations only",
+        pub_b
+    );
+    let internal_bind = resolve_http_internal_bind();
+    println!(
+        "\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m  \x1b[1mREST admin (private):\x1b[0m http://{} — create/edit queries, /_config, /_entities",
+        internal_bind
+    );
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m  \x1b[1mgRPC API:\x1b[0m    0.0.0.0:50051");
 
     // Show saved queries
@@ -53,10 +103,8 @@ pub fn show_banner_with_filter(filter: Option<String>) {
     }
 
     println!("\x1b[90m│\x1b[0m");
-    println!("\x1b[32m◆\x1b[0m  \x1b[1mConfig API (REST):\x1b[0m");
+    println!("\x1b[32m◆\x1b[0m  \x1b[1mConfig API (REST, port {} only):\x1b[0m", HTTP_ADMIN_API_PORT);
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_config             (List all)");
-    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_debug             (ops + CDC snapshot)");
-    println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m GET    /_cdc/state        (binlog cursor per profile)");
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m POST   /_config             (Create)");
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m PUT    /_config             (Edit)");
     println!("\x1b[90m│\x1b[0m  \x1b[32m•\x1b[0m DELETE /_config?name=...    (Delete)");
@@ -118,8 +166,6 @@ pub async fn start_all_servers(
 
     if shutdown_on_ctrl_c {
         show_banner();
-        println!("\x1b[34m│\x1b[0m");
-        println!("\x1b[32m◆\x1b[0m  \x1b[90mPress Ctrl+C to stop the server\x1b[0m");
         wait_for_exit(Some(shutdown_tx)).await
     } else {
         std::future::pending::<()>().await;
@@ -316,34 +362,41 @@ pub async fn start_server(
         active_workers,
     });
 
-    // Authentication middleware
-    let auth_layer = axum::middleware::from_fn_with_state(state.clone(), auth_middleware);
-
-    // Routes: catch-all for any HTTP method
-    let app = Router::new()
+    // Authentication middleware (applied per-router; state is Arc-cloned)
+    let app_internal = Router::new()
         .route("/*path", any(handle_request))
-        .layer(auth_layer) // Attach auth layer
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
         .with_state(state.clone());
 
-    let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let addr = format!("{}:3000", host);
-    
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let internal_bind = resolve_http_internal_bind();
+    let listener_internal = match tokio::net::TcpListener::bind(&internal_bind).await {
         Ok(l) => l,
         Err(e) => {
-            error!("Could not bind HTTP server to {}: {}", addr, e);
+            error!(
+                "Could not bind internal HTTP server to {}: {}",
+                internal_bind, e
+            );
             return;
         }
     };
-    info!("Server started on http://{}", addr);
+    info!(
+        "HTTP admin API (full, incl. /_*) listening on http://{}",
+        internal_bind
+    );
 
     let initial_warmed = warm_saved_query_targets(state.clone()).await;
     if initial_warmed > 0 {
-        debug!("Startup: Warmed {} tables before serving requests", initial_warmed);
+        debug!(
+            "Startup: Warmed {} tables before serving requests",
+            initial_warmed
+        );
     }
-    
+
     // --- CACHE WARMING & MAINTENANCE ---
     let warm_state = state.clone();
     tokio::spawn(async move {
@@ -358,12 +411,54 @@ pub async fn start_server(
         }
     });
 
-    // Start Axum server with shutdown receiver
-    let _ = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .await;
+    let public_bind = resolve_http_public_bind();
+
+    let app_public = Router::new()
+        .route("/*path", any(handle_public_request))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
+        .with_state(state.clone());
+
+    let listener_public = match tokio::net::TcpListener::bind(&public_bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(
+                "Could not bind public query HTTP server to {}: {}",
+                public_bind, e
+            );
+            return;
+        }
+    };
+    info!(
+        "HTTP query API (saved operations only; /_* → 404) on http://{}",
+        public_bind
+    );
+
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_spawn = shutdown_notify.clone();
+    tokio::spawn(async move {
+        let _ = shutdown_rx.await;
+        shutdown_notify_spawn.notify_waiters();
+    });
+
+    let _ = tokio::join!(
+        axum::serve(listener_internal, app_internal).with_graceful_shutdown({
+            let n = shutdown_notify.clone();
+            async move {
+                n.notified().await;
+            }
+        }),
+        axum::serve(listener_public, app_public).with_graceful_shutdown({
+            let n = shutdown_notify.clone();
+            async move {
+                n.notified().await;
+            }
+        }),
+    );
 }
 
 pub async fn auth_middleware(
@@ -377,96 +472,32 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-/// Persisted CDC cursor per profile (`cdc_state.json`). Does not stream live events — use `BITTICE_CDC_LOG_ROW_EVENTS=1` for per-batch mysql→mirror logs.
-fn cdc_binlog_status_snapshot() -> serde_json::Value {
-    use crate::core::cdc::CdcState;
-
-    let mut profiles = Vec::new();
-    for config_path in crate::core::data_paths::scan_all_cdc_config_paths() {
-        let mut obj = serde_json::Map::new();
-        let folder = config_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        obj.insert("profile_folder".into(), serde_json::json!(folder));
-        obj.insert(
-            "cdc_config_path".into(),
-            serde_json::json!(config_path.to_string_lossy()),
-        );
-
-        if let Ok(txt) = std::fs::read_to_string(&config_path) {
-            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&txt) {
-                obj.insert(
-                    "entity".into(),
-                    cfg.get("entity").cloned().unwrap_or(serde_json::Value::Null),
-                );
-                obj.insert(
-                    "sync_all_databases".into(),
-                    cfg.get("sync_all_databases")
-                        .cloned()
-                        .unwrap_or(serde_json::json!(false)),
-                );
-                obj.insert(
-                    "database".into(),
-                    cfg.get("database").cloned().unwrap_or(serde_json::Value::Null),
-                );
-                obj.insert(
-                    "host".into(),
-                    cfg.get("host").cloned().unwrap_or(serde_json::Value::Null),
-                );
-                obj.insert(
-                    "port".into(),
-                    cfg.get("port").cloned().unwrap_or(serde_json::Value::Null),
-                );
-            }
-        }
-
-        if let Some(parent) = config_path.parent() {
-            let state_path = parent.join("cdc_state.json");
-            if let Ok(bytes) = std::fs::read(&state_path) {
-                if let Ok(st) = serde_json::from_slice::<CdcState>(&bytes) {
-                    let prefix: String = st.gtid_executed.chars().take(160).collect();
-                    let row_based_binlog = st
-                        .observed_binlog_format_global
-                        .as_deref()
-                        .is_some_and(|s| s.eq_ignore_ascii_case("row"));
-                    obj.insert(
-                        "cdc_state".into(),
-                        serde_json::json!({
-                            "binlog_file": st.binlog_file,
-                            "binlog_pos": st.binlog_pos,
-                            "bootstrapped_table_count": st.bootstrapped_tables.len(),
-                            "pk_map_entries": st.pk_map.len(),
-                            "gtid_executed_total_chars": st.gtid_executed.len(),
-                            "gtid_executed_prefix": prefix,
-                            "observed_binlog_format_global": st.observed_binlog_format_global,
-                            "observed_binlog_format_session": st.observed_binlog_format_session,
-                            "last_mirror_batch_unix_ms": st.last_mirror_batch_unix_ms,
-                            "last_mirror_batch": st.last_mirror_batch,
-                            "transactional_queries_match_mysql": row_based_binlog,
-                            "transactional_sync_detail": if row_based_binlog {
-                                "CDC consumes row-format binlog events; INSERT/UPDATE/DELETE from MySQL can be applied to the mirror for Bittice queries."
-                            } else {
-                                "NOT ROW: MySQL is emitting statement/mixed binlog for many writes — Bittice does not execute SQL from the binlog, so new/edited/deleted rows usually never reach the mirror. Set binlog_format=ROW on the RDS/MySQL instance (DB parameter group)."
-                            },
-                        }),
-                    );
-                }
-            }
-        }
-
-        profiles.push(serde_json::Value::Object(obj));
+#[debug_handler]
+async fn handle_public_request(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    extensions: axum::http::Extensions,
+    method: Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let path = uri.path();
+    if path.starts_with("/_") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "detail": format!(
+                    "Use the admin HTTP port ({}) for paths starting with /_ (e.g. POST /_config to create queries).",
+                    HTTP_ADMIN_API_PORT
+                ),
+            })),
+        )
+            .into_response();
     }
-
-    serde_json::json!({
-        "profiles": profiles,
-        "data_root": crate::core::data_paths::resolved_data_root().to_string_lossy(),
-        "cdc_autostart": cdc_autostart_enabled(),
-        "BITTICE_CDC_LOG_ROW_EVENTS": std::env::var("BITTICE_CDC_LOG_ROW_EVENTS").unwrap_or_default(),
-        "BITTICE_CDC_REQUIRE_ROW": std::env::var("BITTICE_CDC_REQUIRE_ROW").unwrap_or_default(),
-        "hint": "For live INSERT/UPDATE/DELETE in Bittice queries, MySQL @@GLOBAL.binlog_format must be ROW (RDS: custom DB parameter group). Each profile lists transactional_queries_match_mysql. BITTICE_CDC_REQUIRE_ROW=1 disables streaming when not ROW."
-    })
+    handle_request(State(state), headers, extensions, method, uri, body)
+        .await
+        .into_response()
 }
 
 #[debug_handler]
@@ -527,33 +558,6 @@ async fn handle_request(
         }
     };
     let ops_load_ms = start_total.elapsed().as_secs_f64() * 1000.0;
-
-    // Internal endpoints
-    if path == "/_debug" {
-        let mut debug_info = serde_json::Map::new();
-        debug_info.insert("ops_loaded".to_string(), serde_json::json!(ops.len()));
-        let entities: Vec<String> = crate::core::data_paths::iter_mirror_entity_paths()
-            .into_iter()
-            .filter_map(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
-            .collect();
-        debug_info.insert("entities_on_disk".to_string(), serde_json::json!(entities));
-        debug_info.insert(
-            "cdc".to_string(),
-            cdc_binlog_status_snapshot(),
-        );
-        return (StatusCode::OK, Json(serde_json::Value::Object(debug_info))).into_response();
-    }
-
-    if path == "/_cdc/state" && method == Method::GET {
-        return (
-            StatusCode::OK,
-            Json(cdc_binlog_status_snapshot()),
-        )
-            .into_response();
-    }
 
     if path == "/_entities" {
         let mut catalog = serde_json::Map::new();

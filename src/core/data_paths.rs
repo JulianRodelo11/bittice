@@ -4,11 +4,47 @@
 //! - `vpn/`, `server.log`, `.bittice_ops.json` remain at the data root.
 //!
 //! Legacy flat layout (`data/<entity>/` mixing profiles and mirrors) is migrated once using `.layout_v2`.
+//!
+//! **`BITTICE_DATA_ROOT`** (absolute or relative path) overrides automatic root selection.
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
+
+pub const ENV_DATA_ROOT: &str = "BITTICE_DATA_ROOT";
+
+fn collect_entities_with_cdc_config(root: &Path) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    let prof = root.join(PROFILES);
+    if prof.is_dir() {
+        if let Ok(rd) = fs::read_dir(&prof) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && e.path().join("cdc_config.json").is_file()
+                {
+                    keys.insert(e.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    if let Ok(rd) = fs::read_dir(root) {
+        for e in rd.flatten() {
+            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if reserved_root_dir(&name) {
+                continue;
+            }
+            if e.path().join("cdc_config.json").is_file() && !keys.contains(&name) {
+                keys.insert(name);
+            }
+        }
+    }
+    keys
+}
 
 pub const DATA_DIR_NAME: &str = "data";
 pub const ALT_DATA_PREFIX: &str = "bittice/data";
@@ -16,13 +52,53 @@ pub const PROFILES: &str = "profiles";
 pub const MIRROR: &str = "mirror";
 pub const LAYOUT_MARKER: &str = ".layout_v2";
 
-/// Prefer nested dev layout when it exists (`bittice/data`).
+/// Resolves the storage root used for profiles, mirrors, logging, and CDC state.
+///
+/// When **both** `./data` and `./bittice/data` exist (common after tooling creates an empty nested tree),
+/// we pick whichever subtree actually contains CDC profiles so mirroring does not silently target an empty tree.
 pub fn resolved_data_root() -> PathBuf {
+    if let Ok(v) = std::env::var(ENV_DATA_ROOT) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+
     let alt = PathBuf::from(ALT_DATA_PREFIX);
-    if alt.exists() && alt.is_dir() {
+    let primary = PathBuf::from(DATA_DIR_NAME);
+    let alt_ok = alt.is_dir();
+    let pri_ok = primary.is_dir();
+
+    if alt_ok && pri_ok {
+        let alt_n = collect_entities_with_cdc_config(&alt).len();
+        let pri_n = collect_entities_with_cdc_config(&primary).len();
+
+        if alt_n != pri_n && (alt_n + pri_n) > 0 {
+            tracing::warn!(
+                "Both '{}' ({}) and '{}' ({}) contain CDC configs under different roots — using '{}' (tie favors {}). Set {} to force one tree.",
+                ALT_DATA_PREFIX,
+                alt_n,
+                DATA_DIR_NAME,
+                pri_n,
+                if pri_n >= alt_n {
+                    DATA_DIR_NAME
+                } else {
+                    ALT_DATA_PREFIX
+                },
+                DATA_DIR_NAME,
+                ENV_DATA_ROOT
+            );
+        }
+
+        if pri_n >= alt_n {
+            primary
+        } else {
+            alt
+        }
+    } else if alt_ok {
         alt
     } else {
-        PathBuf::from(DATA_DIR_NAME)
+        primary
     }
 }
 

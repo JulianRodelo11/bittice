@@ -8,7 +8,7 @@ This directory holds the image definition, compose files, and scripts to run Bit
 |------|---------|
 | `Dockerfile` | Minimal Debian image that copies a pre-built **Linux** binary (same as the `docker` CI job). |
 | `Dockerfile.from-source` | Builds the engine with `cargo` inside the image; useful for local tests without cross-compilation. |
-| `docker-compose.production.yaml` | Service with restart policy, ports 3000/50051, named volume for `/app/data`. |
+| `docker-compose.production.yaml` | Service with restart policy, ports **3000** (saved queries), **8080** (admin), **50051** (gRPC), named volume for `/app/data`. |
 | `docker-compose.vpn.yaml` | Optional OpenVPN overlay (`/dev/net/tun`, `.ovpn` volume). |
 | `docker-compose.bundled.yaml` | Same stack as `production` + VPN with bind mounts for `./data` and `./vpn` (see *Deploy with pre-configured local profile* below). |
 | `scripts/build-image-from-source.sh` | `docker build` using `Dockerfile.from-source`. |

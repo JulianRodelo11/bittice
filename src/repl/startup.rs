@@ -334,31 +334,9 @@ fn list_synced_entities() -> Vec<String> {
     entities
 }
 
-/// Direct children of the data root (`data/`): profiles, mirror, vpn, logs, etc.
-fn list_data_entity_roots() -> Vec<String> {
-    let data_dir = crate::core::data_paths::resolved_data_root();
-    let mut roots = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(data_dir) {
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            roots.push(name);
-        }
-    }
-
-    roots.sort();
-    roots
-}
-
-/// Show the Deploy entry once there is at least one subtree under `data/` (mirror data, profiles, etc.).
-fn deploy_menu_eligible() -> bool {
-    !list_data_entity_roots().is_empty()
+/// Deploy / “use synced DBs” only after at least one CDC entity exists (`cdc_config.json` under data).
+fn synced_workspace_ready() -> bool {
+    !list_synced_entities().is_empty()
 }
 
 /// Follow engine log file on stdout (filtered). Caller must kill the child on exit. Unix only.
@@ -421,7 +399,7 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
     });
 
     let sync_mode: u8 = interact_or_cancel!({
-        println!("\x1b[90m│\x1b[0m  \x1b[90m“All DBs”: one CDC; each schema is stored under data/mirror/<schema>/\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[90m“All databases”: one CDC; each stored schema\x1b[0m");
         select("What should be synchronized?")
             .item(0u8, "All user databases on this host", "")
             .item(1u8, "A single database only", "")
@@ -644,21 +622,20 @@ async fn run_cdc_initial_sync(cdc_info: &CdcInfo) -> Result<()> {
 
 pub async fn run_startup_cliclack() -> Result<()> {
     intro("Bittice")?;
-    println!("\x1b[90m│\x1b[0m  \x1b[90mTip: In lists, choose « Back or Exit when you see them. Esc / Ctrl+C also cancel prompts when the terminal forwards those keys.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mFrom the live monitor, press Ctrl+C to return to this menu (engine keeps running). Esc is not used there.\x1b[0m");
 
     'session: loop {
     let (option, monitor_scope): (u8, String) = 'main: loop {
-        let deploy_ok = deploy_menu_eligible();
-        let mut main_sel = select("Select operation mode")
-            .item(0u8, "Connect and sync to a database", "")
-            .item(1u8, "Use Bittice with synced databases", "");
+        let synced_ok = synced_workspace_ready();
+        let mut main_sel =
+            select("Select operation mode").item(0u8, "Connect and sync to a database", "");
 
-        if deploy_ok {
-            main_sel = main_sel.item(2u8, "Deploy (Docker / server bundle)", "");
+        if synced_ok {
+            main_sel = main_sel
+                .item(1u8, "Use Bittice with synced databases", "")
+                .item(2u8, "Deploy (Docker / server bundle)", "");
         }
 
-        let exit_id: u8 = if deploy_ok { 3 } else { 2 };
+        let exit_id: u8 = if synced_ok { 3 } else { 1 };
         main_sel = main_sel.item(exit_id, "Exit", "");
 
         let choice = match main_sel.interact() {
@@ -711,6 +688,9 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 );
             }
             2u8 => {
+                if !synced_ok {
+                    continue 'main;
+                }
                 if let Err(e) = run_deploy_flow().await {
                     return Err(e);
                 }
@@ -732,14 +712,13 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m");
     println!("\x1b[32m◆\x1b[0m  \x1b[1mLive Monitor\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for {} in real-time.\x1b[0m", monitor_scope);
-    println!("\x1b[90m│\x1b[0m  \x1b[90mPress Ctrl+C to return to the main menu.\x1b[0m");
     println!("\x1b[90m│\x1b[0m");
 
     let is_docker_only = std::path::Path::new("/.dockerenv").exists();
 
     if is_docker_only {
         let client = reqwest::Client::new();
-        let _ = client.post("http://localhost:3000/_config/reload")
+        let _ = client.post(crate::server::http_config_reload_url())
             .send()
             .await;
 
@@ -760,23 +739,11 @@ pub async fn run_startup_cliclack() -> Result<()> {
         }
     }
 
-    let log_path = crate::core::data_paths::server_log_path();
-    let log_path_s = log_path.to_string_lossy().into_owned();
-    println!("\x1b[90m│\x1b[0m");
-    println!(
-        "\x1b[90m│\x1b[0m  \x1b[90mSync:\x1b[0m MySQL → local tables runs in the engine (binlog CDC). Engine logs go to \x1b[1m{}\x1b[0m\x1b[90m; filtered lines stream below when available.\x1b[0m",
-        log_path.display()
-    );
-    println!("\x1b[90m│\x1b[0m  \x1b[90mIf nothing new appears, you are usually caught up or there is no MySQL traffic yet.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m");
+    let log_path_s = crate::core::data_paths::server_log_path()
+        .to_string_lossy()
+        .into_owned();
 
     let mut tail_child = spawn_server_log_tail_follow(&log_path_s);
-    if tail_child.is_none() {
-        println!(
-            "\x1b[90m│\x1b[0m  \x1b[90m(Log follow not started — open \x1b[0m{}\x1b[90m in another terminal, or use Unix/macOS for inline tail.)\x1b[0m",
-            log_path.display()
-        );
-    }
 
     tokio::signal::ctrl_c().await?;
     if let Some(mut c) = tail_child.take() {

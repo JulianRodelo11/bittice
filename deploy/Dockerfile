@@ -22,6 +22,6 @@ WORKDIR /app
 COPY ${BINARY_PATH} /usr/local/bin/bittice
 RUN chmod +x /usr/local/bin/bittice
 
-EXPOSE 3000 50051
+EXPOSE 3000 8080 50051
 
 ENTRYPOINT ["bittice"]
