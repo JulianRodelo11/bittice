@@ -46,9 +46,18 @@ fi
 mkdir -p "$OUT_ABS"
 OUT_ABS="$(cd "$OUT_ABS" && pwd)"
 
-# Data tree: includes data/<entity>/cdc_config.json, tables, data/vpn/, etc.
-# tar preserves attributes
-tar -C "$WORK_ROOT" -cf - data | tar -C "$OUT_ABS" -xf -
+# For full bundles (zip / manual upload): copy entire data/. For SSH deploy the Rust pipeline sets
+# BITTICE_EXPORT_BUNDLE_SKIP_DATA=1 and streams data/ separately with rsync (multi‑GB mirrors).
+SKIP_DATA_COPY="${BITTICE_EXPORT_BUNDLE_SKIP_DATA:-}"
+if [[ -n "$SKIP_DATA_COPY" ]]; then
+  mkdir -p "$OUT_ABS/data"
+  echo "Skipping embedded data/ copy (BITTICE_EXPORT_BUNDLE_SKIP_DATA). Validation uses \$WORK_ROOT/data." >&2
+  export BITTICE_BUNDLE_VALIDATE_DATA="$WORK_ROOT/data"
+else
+  # Data tree: includes data/<entity>/cdc_config.json, tables, data/vpn/, etc.
+  tar -C "$WORK_ROOT" -cf - data | tar -C "$OUT_ABS" -xf -
+  export BITTICE_BUNDLE_VALIDATE_DATA="$OUT_ABS/data"
+fi
 
 mkdir -p "$OUT_ABS/vpn"
 
@@ -85,6 +94,7 @@ fi
   echo "BITTICE_GRPC_PORT=$BITTICE_GRPC_PORT"
   echo "BITTICE_VPN_DIR=/app/vpn"
   echo "BITTICE_VPN_SPLIT_TUNNEL=true"
+  echo "BITTICE_ENGINE_ONLY=1"
 } > "$OUT_ABS/.env"
 
 cat > "$OUT_ABS/README-DEPLOY.txt" <<'EOF'
@@ -108,7 +118,7 @@ from pathlib import Path
 
 out = Path(r"""$OUT_ABS""")
 vpn_in_pack = (out / "vpn")
-data_in_pack = (out / "data")
+data_in_pack = Path(os.environ["BITTICE_BUNDLE_VALIDATE_DATA"])
 
 ok = True
 def has_ovpn(basename: str) -> bool:

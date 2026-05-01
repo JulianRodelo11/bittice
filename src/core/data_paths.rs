@@ -229,9 +229,9 @@ pub fn migrate_legacy_layout() -> Result<()> {
     Ok(())
 }
 
-/// Every `cdc_config.json` path (profiles first, then legacy flat discover).
-pub fn scan_all_cdc_config_paths() -> Vec<PathBuf> {
-    let root = resolved_data_root();
+/// Every `cdc_config.json` path under `data_root` (`profiles/*/`, legacy entity dirs).
+pub fn scan_all_cdc_config_paths_in_data_root(data_root: &Path) -> Vec<PathBuf> {
+    let root = data_root;
     let mut out = Vec::new();
 
     let prof = root.join(PROFILES);
@@ -248,7 +248,7 @@ pub fn scan_all_cdc_config_paths() -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(rd) = fs::read_dir(&root) {
+    if let Ok(rd) = fs::read_dir(root) {
         for e in rd.flatten() {
             if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -267,6 +267,11 @@ pub fn scan_all_cdc_config_paths() -> Vec<PathBuf> {
     out.sort();
     out.dedup();
     out
+}
+
+/// Every `cdc_config.json` path (profiles first, then legacy flat discover).
+pub fn scan_all_cdc_config_paths() -> Vec<PathBuf> {
+    scan_all_cdc_config_paths_in_data_root(&resolved_data_root())
 }
 
 pub fn server_log_path() -> PathBuf {

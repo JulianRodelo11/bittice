@@ -20,6 +20,7 @@ services:
       - "${BITTICE_GRPC_PORT:-50051}:50051"
     environment:
       BITTICE_HOST: ${BITTICE_HOST:-0.0.0.0}
+      BITTICE_ENGINE_ONLY: ${BITTICE_ENGINE_ONLY:-1}
     volumes:
       - bittice-data:/app/data
 

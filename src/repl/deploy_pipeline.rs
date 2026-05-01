@@ -1,5 +1,11 @@
-//! Full local deploy: build image from `Dockerfile.from-source`, export bundle, `docker save` to remote, extract, `docker compose up`.
-//! Requires Docker, OpenSSH (ssh, scp), bash, and tar on the path.
+//! Full local deploy: build image from `Dockerfile.from-source`, `docker save` to remote, export a **small**
+//! bundle (compose + `.env` + VPN dir — no embedded `data/`), **`rsync` `data/`** (incremental / resumable for
+//! large mirrors), `docker compose up`, brief stop, **delta `rsync`**, start again.
+//!
+//! **Networking:** sync profiles **without** `vpn_file` need nothing extra for EC2. If `vpn_file` is set,
+//! only **OpenVPN** `.ovpn` profiles are supported today — those files must live under `data/vpn/` or repo `vpn/`
+//! before deploy so the bundle mounts `./vpn` correctly.
+//! Requires Docker, OpenSSH (`ssh`), **`rsync`**, bash, tar, and python3 on the path.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -53,7 +59,7 @@ fn which_ok(cmd: &str) -> bool {
 }
 
 pub fn check_prerequisites() -> Result<()> {
-    for c in ["docker", "ssh", "bash", "tar", "python3"] {
+    for c in ["docker", "ssh", "rsync", "bash", "tar", "python3"] {
         if !which_ok(c) {
             bail!("`{c}` is not on PATH. Install it and try again.");
         }
@@ -90,6 +96,96 @@ fn run_ssh(ssh: &str, remote_shell: &str) -> Result<()> {
         bail!("ssh command failed: {s}");
     }
     Ok(())
+}
+
+/// Data directory used for deploy (honours `BITTICE_DATA_ROOT`, otherwise `<project>/data`).
+fn resolve_deploy_data_root(project_root: &Path) -> PathBuf {
+    std::env::var(crate::core::data_paths::ENV_DATA_ROOT)
+        .ok()
+        .and_then(|v| {
+            let t = v.trim();
+            if t.is_empty() {
+                return None;
+            }
+            let p = PathBuf::from(t);
+            Some(if p.is_absolute() {
+                p
+            } else {
+                project_root.join(p)
+            })
+        })
+        .unwrap_or_else(|| project_root.join("data"))
+}
+
+/// When **`vpn_file` is set** in `cdc_config.json`, checks that the referenced `.ovpn` exists under
+/// `data/vpn/` or repo `vpn/` so EC2 receives it (`./vpn` + rsync). Profiles **without** `vpn_file` are ignored.
+/// Supported tunnel today: **OpenVPN only**.
+fn ensure_openvpn_profiles_for_ec2_deploy(project_root: &Path) -> Result<()> {
+    let data_root = resolve_deploy_data_root(project_root);
+    let configs =
+        crate::core::data_paths::scan_all_cdc_config_paths_in_data_root(&data_root);
+
+    let mut errors: Vec<String> = Vec::new();
+
+    for cfg_path in configs {
+        let txt = match std::fs::read_to_string(&cfg_path) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(format!("{} (read failed: {e})", cfg_path.display()));
+                continue;
+            }
+        };
+        let j: serde_json::Value = match serde_json::from_str(&txt) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(format!("{} (invalid JSON: {e})", cfg_path.display()));
+                continue;
+            }
+        };
+
+        let Some(vpn_raw) = j.get("vpn_file").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+
+        let basename = Path::new(vpn_raw)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(vpn_raw);
+
+        let in_data_vpn = data_root.join("vpn").join(basename).is_file();
+        let in_repo_vpn = project_root.join("vpn").join(basename).is_file();
+        if in_data_vpn || in_repo_vpn {
+            continue;
+        }
+
+        let raw_exists = Path::new(vpn_raw).is_file();
+        if raw_exists {
+            errors.push(format!(
+                "{} — uses OpenVPN (`vpn_file`) on EC2; put '{}' in data/vpn/ (Deploy → Add OpenVPN profile) or repo vpn/ — file is only at {}",
+                cfg_path.display(),
+                basename,
+                vpn_raw
+            ));
+        } else {
+            errors.push(format!(
+                "{} — `vpn_file` references '{}' but that OpenVPN profile is missing; add it via Deploy → Add OpenVPN profile (stores under data/vpn/)",
+                cfg_path.display(),
+                vpn_raw
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "Some CDC profiles use OpenVPN (`vpn_file` set) but the .ovpn is not packaged for EC2:\n\n{}\n\n\
+         Connections **without** `vpn_file` do not need VPN files.\n\
+         When `vpn_file` is set, only OpenVPN profiles are supported — copy each .ovpn into data/vpn/ (Deploy menu) or repo vpn/ before deploy.",
+        errors.join("\n")
+    )
 }
 
 /// Build a runtime image. Uses buildx for non-native Linux targets.
@@ -154,10 +250,12 @@ pub fn docker_build_from_source(
 }
 
 /// Runs `export-server-bundle.sh` with `BITTICE_IMAGE` set. Destroys `out_dir` if it exists, then recreates.
+/// When `skip_data_copy`, the bundle omits mirroring `data/` (SSH deploy streams it with `rsync` instead).
 pub fn run_export_server_bundle(
     project_root: &Path,
     out_dir: &Path,
     bitice_image: &str,
+    skip_data_copy: bool,
 ) -> Result<()> {
     let script = project_root
         .join("deploy")
@@ -172,14 +270,16 @@ pub fn run_export_server_bundle(
     }
     std::fs::create_dir_all(out_dir).context("create bundle dir")?;
 
-    let s = std::process::Command::new("bash")
-        .arg(script.to_string_lossy().as_ref())
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(script.to_string_lossy().as_ref())
         .arg(out_dir.as_os_str())
         .env("BITTICE_IMAGE", bitice_image)
         .env("BITTICE_PROJECT_ROOT", project_root)
-        .current_dir(project_root)
-        .status()
-        .context("export-server-bundle.sh")?;
+        .current_dir(project_root);
+    if skip_data_copy {
+        cmd.env("BITTICE_EXPORT_BUNDLE_SKIP_DATA", "1");
+    }
+    let s = cmd.status().context("export-server-bundle.sh")?;
     if !s.success() {
         bail!("export-server-bundle.sh failed with {s}");
     }
@@ -256,12 +356,65 @@ pub fn start_compose_on_remote(ssh: &str, remote_subdir: &str) -> Result<()> {
     run_ssh(ssh, &cmd)
 }
 
-/// Full pipeline: build → export → save|load → tar bundle → compose up.
+/// Stops compose services so filesystem mirrors under `data/` can be replaced safely.
+pub fn stop_compose_on_remote(ssh: &str, remote_subdir: &str) -> Result<()> {
+    let cmd = format!(
+        "cd $HOME/{} && docker compose -f docker-compose.yaml --env-file .env stop",
+        remote_subdir
+    );
+    run_ssh(ssh, &cmd)
+}
+
+/// `rsync` `project_root/data/` → `~/remote_subdir/data/`. Incremental and resumable (`--partial`); large
+/// files use `--inplace` on the remote to reduce spare disk spikes. Runs twice in [`run_full_deploy`]:
+/// once before compose, once after `compose stop` for a delta.
+pub fn rsync_project_data_dir_to_remote(
+    ssh: &str,
+    project_root: &Path,
+    remote_subdir: &str,
+    phase: &str,
+) -> Result<()> {
+    let data_dir = project_root.join("data");
+    if !data_dir.is_dir() {
+        bail!(
+            "No data/ directory under {}",
+            project_root.display()
+        );
+    }
+
+    println!(
+        "\n\x1b[34m→\x1b[0m  rsync data/ → server ({phase}) — large trees resume if interrupted…\n"
+    );
+
+    let remote_prep = format!("mkdir -p $HOME/{}/data", remote_subdir);
+    run_ssh(ssh, &remote_prep)?;
+
+    let dest = format!("{ssh}:~/{remote_subdir}/data/");
+    run_status(
+        "rsync",
+        &[
+            "-a",
+            "--partial",
+            "--inplace",
+            "--info=progress2",
+            "-e",
+            "ssh",
+            "data/",
+            dest.as_str(),
+        ],
+        project_root,
+    )?;
+    Ok(())
+}
+
+fn verify_remote_toolchain(ssh: &str) -> Result<()> {
+    let cmd = "command -v rsync >/dev/null 2>&1 || { echo 'remote host: install rsync (e.g. sudo apt install rsync / sudo yum install rsync)' >&2; exit 1; }";
+    run_ssh(ssh, cmd)
+}
+
+/// Full pipeline: build → save|load → lite bundle → tar bundle → rsync data → compose up → stop → rsync delta → start.
 pub fn run_full_deploy(cfg: &FullDeployConfig) -> Result<()> {
     check_prerequisites()?;
-    if !cfg.project_root.join("data").is_dir() {
-        bail!("No data/ directory in {}. Sync at least one entity first.", cfg.project_root.display());
-    }
     for s in [cfg.ssh_target.as_str(), &cfg.local_image, &cfg.remote_subdir] {
         if s.contains('\'') || s.contains('\"') {
             bail!("Invalid characters in parameters (no quotes).");
@@ -271,6 +424,16 @@ pub fn run_full_deploy(cfg: &FullDeployConfig) -> Result<()> {
         bail!("Use only letters, digits, - and _ for the remote directory name.");
     }
 
+    let deploy_data = resolve_deploy_data_root(&cfg.project_root);
+    if !deploy_data.is_dir() {
+        bail!(
+            "No data directory at {}. Sync at least one entity first.",
+            deploy_data.display()
+        );
+    }
+
+    ensure_openvpn_profiles_for_ec2_deploy(&cfg.project_root)?;
+
     let staging = cfg
         .project_root
         .join(".bittice-ssh-staging");
@@ -278,19 +441,39 @@ pub fn run_full_deploy(cfg: &FullDeployConfig) -> Result<()> {
         let _ = std::fs::remove_dir_all(&staging);
     }
 
+    verify_remote_toolchain(&cfg.ssh_target)?;
+
     docker_build_from_source(&cfg.project_root, &cfg.local_image, cfg.platform)?;
+    // Large upload first; bundle export runs afterward so data/vpn/query snapshots are fresher than the old order.
+    transfer_image_to_remote(&cfg.ssh_target, &cfg.local_image)?;
     run_export_server_bundle(
         &cfg.project_root,
         &staging,
         &cfg.local_image,
+        true,
     )?;
-    transfer_image_to_remote(&cfg.ssh_target, &cfg.local_image)?;
     copy_bundle_to_remote(
         &cfg.ssh_target,
         &staging,
         &cfg.remote_subdir,
     )?;
+    rsync_project_data_dir_to_remote(
+        &cfg.ssh_target,
+        &cfg.project_root,
+        &cfg.remote_subdir,
+        "initial — mirrors + queries before first start",
+    )?;
     println!("\n\x1b[34m→\x1b[0m  docker compose on remote…\n");
+    start_compose_on_remote(&cfg.ssh_target, &cfg.remote_subdir)?;
+
+    stop_compose_on_remote(&cfg.ssh_target, &cfg.remote_subdir)?;
+    rsync_project_data_dir_to_remote(
+        &cfg.ssh_target,
+        &cfg.project_root,
+        &cfg.remote_subdir,
+        "delta — changes during image upload / first sync",
+    )?;
+    println!("\n\x1b[34m→\x1b[0m  Starting containers again after data refresh…\n");
     start_compose_on_remote(&cfg.ssh_target, &cfg.remote_subdir)?;
 
     let _ = std::fs::remove_dir_all(&staging);

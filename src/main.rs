@@ -6,28 +6,45 @@ use tracing::info;
 // Import modules from the library (package name: bittice)
 use bittice::cli::{Cli, Commands};
 
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
     let args_len = std::env::args().len();
     let is_docker_env = std::path::Path::new("/.dockerenv").exists();
     let is_pid1 = std::process::id() == 1;
-    let is_docker_pid1_engine =
-        is_docker_env && is_pid1 && args_len == 1 && env_entity.is_none();
-    let tracing_quiet_stdout = (!is_docker_pid1_engine && args_len == 1 && env_entity.is_none())
+
+    // EC2/server images: run only the engine against mounted `data/` (no connect/sync wizard).
+    // PID 1 keeps backwards compatibility; BITTICE_ENGINE_ONLY is set in official compose files when PID≠1.
+    let docker_engine_mode = is_docker_env
+        && args_len == 1
+        && env_entity.is_none()
+        && !env_truthy("BITTICE_CLI_MENU")
+        && (is_pid1 || env_truthy("BITTICE_ENGINE_ONLY"));
+
+    let tracing_quiet_stdout = (!docker_engine_mode && args_len == 1 && env_entity.is_none())
         || (std::env::args().nth(1).as_deref() == Some("setup"));
     logging::init_logging(tracing_quiet_stdout);
 
-    // Flow decision:
-    // 1. Docker Background Engine: PID 1 in Docker always starts servers.
-    if is_docker_env && is_pid1 {
-        if std::env::args().len() == 1 && env_entity.is_none() {
-            info!("Docker Engine: Starting Bittice (PID 1)...");
-            return bittice::server::start_all_servers(None, true).await;
-        }
+    if docker_engine_mode {
+        info!(
+            "Docker: engine-only startup — HTTP/gRPC + CDC from existing data (/app/data). \
+             Interactive sync/setup runs on your workstation (`bittice` or `bittice setup`), not in this container."
+        );
+        return bittice::server::start_all_servers(None, true).await;
     }
 
-    // 2. CLI / Command mode
+    // CLI / Command mode (includes `bittice setup`, `bittice cdc`, …)
     if std::env::args().len() > 1 || env_entity.is_some() {
         let cli = Cli::parse();
         match cli.command {
@@ -79,8 +96,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        // Run startup flow with Cliclack
-        // This flow handles its own execution and server startup
+        // Local workstation: interactive wizard when launched with no args.
         let _ = bittice::repl::startup::run_startup_cliclack().await?;
     }
 

@@ -181,7 +181,8 @@ async fn read_ovpn_source_interactive() -> io::Result<String> {
 async fn add_ovpn_profile_to_storage_for_deploy() -> Result<()> {
     let vpn_storage = VpnManager::storage_dir();
     std::fs::create_dir_all(&vpn_storage)?;
-    println!("\x1b[90m│\x1b[0m  \x1b[90mFiles are stored under {} for export to the server.\x1b[0m", vpn_storage.display());
+    println!("\x1b[90m│\x1b[0m  \x1b[90mOnly needed when a sync profile has OpenVPN (`vpn_file` in cdc_config); skip if RDS/MySQL is reachable directly from EC2.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mStores under {} — shipped as ./vpn on EC2 and under data/vpn via rsync.\x1b[0m", vpn_storage.display());
     let input_val: String = match read_ovpn_source_interactive().await {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
@@ -205,7 +206,8 @@ fn print_deploy_instructions() {
 }
 
 async fn run_interactive_full_ssh_deploy() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90mThis builds the image in Docker, exports data/vpn, streams the image to the server, and runs compose over SSH. Requires: Docker, ssh, keys, and python3. Can take 10+ minutes the first time.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mVPN is optional: only profiles with `vpn_file` need .ovpn files in data/vpn/ before deploy (OpenVPN only).\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mBuilds the image in Docker, pushes it over SSH, uploads compose + vpn/, rsyncs data/ twice for large mirrors, then compose up. Requires: Docker, rsync, ssh, keys, python3.\x1b[0m");
     let default_root = deploy_pipeline::find_bittice_project_root()
         .or_else(|| std::env::current_dir().ok())
         .map(|p| p.to_string_lossy().to_string())
@@ -287,9 +289,10 @@ async fn run_interactive_full_ssh_deploy() -> Result<()> {
 }
 
 async fn run_deploy_flow() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90m(1) Adds a .ovpn to VPN storage; (2) “Full SSH” builds the image, ships data, and runs on the instance.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mDirect DB access: no VPN setup required. OpenVPN `.ovpn` only when `vpn_file` is set on a profile.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90m(1) Optional — add OpenVPN profiles when needed for EC2; (2) Full SSH deploy builds the image, ships compose + vpn/, rsyncs data.\x1b[0m");
     let first: u8 = match select("Deploy to a server (Docker)")
-        .item(0u8, "Add OpenVPN profile (for server export)", "")
+        .item(0u8, "Add OpenVPN profile (only if sync uses VPN — OpenVPN → data/vpn/)", "")
         .item(1u8, "Build image + bundle + deploy over SSH (full)", "")
         .item(2u8, "Show deployment instructions only", "")
         .item(SEL_BACK_MAIN, "« Back to main menu", "")

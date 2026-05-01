@@ -11,6 +11,7 @@ BITTICE_IMAGE="ghcr.io/OWNER/bittice:v0.0.0"
 mkdir -p /opt/bittice
 cat >/opt/bittice/bittice.env <<EOF
 BITTICE_HOST=0.0.0.0
+BITTICE_ENGINE_ONLY=1
 EOF
 
 # GHCR auth (PAT with read:packages) if the package is private

@@ -258,6 +258,7 @@ jobs:
             echo "BITTICE_REST_PORT=3000"
             echo "BITTICE_REST_ADMIN_PORT=8080"
             echo "BITTICE_GRPC_PORT=50051"
+            echo "BITTICE_ENGINE_ONLY=1"
           } > server-bundle/.env
           zip -r "bittice-server-${REF_NAME}.zip" server-bundle
           rm -rf server-bundle

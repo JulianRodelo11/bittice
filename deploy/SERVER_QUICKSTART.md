@@ -58,6 +58,7 @@ docker pull ghcr.io/<owner>/<repo>:<tag>
 docker run -d --name bittice --restart always \
   -p 3000:3000 -p 8080:8080 -p 50051:50051 \
   -e BITTICE_HOST=0.0.0.0 \
+  -e BITTICE_ENGINE_ONLY=1 \
   -v bittice-data:/app/data \
   ghcr.io/<owner>/<repo>:<tag>
 ```
