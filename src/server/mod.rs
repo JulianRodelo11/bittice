@@ -121,7 +121,11 @@ pub fn show_banner() {
 /// When true, CDC workers should exit their main loops (REPL back to menu or engine shutdown).
 static ENGINE_HALT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-static REPL_ENGINE_SHUTDOWN_NOTIFY: Mutex<Option<Arc<Notify>>> = Mutex::new(None);
+/// Shared with [`start_all_servers`]: notified when the REPL stops the engine **or** CDC requests a fatal shutdown.
+static ENGINE_SHUTDOWN_NOTIFY: Mutex<Option<Arc<Notify>>> = Mutex::new(None);
+
+/// Set by [`request_engine_shutdown_from_cdc`] so shutdown banners distinguish user stop vs fatal binlog loss.
+static ENGINE_SHUTDOWN_FROM_CDC: AtomicBool = AtomicBool::new(false);
 
 static CDC_BACKGROUND_THREAD_HANDLES: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 
@@ -141,29 +145,68 @@ fn join_all_cdc_background_threads() {
     }
 }
 
+fn print_shutdown_banner_after_notify(from_cdc: bool) {
+    if from_cdc {
+        println!("\x1b[34m│\x1b[0m");
+        println!("\x1b[33m▲\x1b[0m  \x1b[1mShutting down\x1b[0m");
+        println!("\x1b[34m│\x1b[0m  \x1b[90mCDC lost the live binlog stream; stopping the engine...\x1b[0m");
+        println!("\x1b[34m└\x1b[0m\n");
+    } else {
+        println!("\x1b[34m│\x1b[0m");
+        println!("\x1b[33m▲\x1b[0m  \x1b[1mShutting down\x1b[0m");
+        println!("\x1b[34m│\x1b[0m  \x1b[90mStopping Bittice engine safely...\x1b[0m");
+        println!("\x1b[34m└\x1b[0m\n");
+    }
+}
+
+fn finalize_shared_engine_shutdown(shutdown_notify: &Arc<Notify>) {
+    ENGINE_HALT_REQUESTED.store(true, AtomicOrdering::SeqCst);
+    shutdown_notify.notify_waiters();
+    join_all_cdc_background_threads();
+    ENGINE_HALT_REQUESTED.store(false, AtomicOrdering::SeqCst);
+}
+
 /// Full engine teardown for the interactive REPL: request CDC stop, unblock HTTP/gRPC, then join CDC threads.
 ///
 /// **Order matters:** notify HTTP/gRPC waiters *before* joining CDC threads, so nested Tokio runtimes in
 /// worker threads cannot deadlock with the main runtime while tearing down.
 pub fn repl_stop_engine_and_join_cdc() {
     ENGINE_HALT_REQUESTED.store(true, AtomicOrdering::SeqCst);
-    if let Some(n) = REPL_ENGINE_SHUTDOWN_NOTIFY.lock().unwrap().take() {
+    if let Some(n) = ENGINE_SHUTDOWN_NOTIFY.lock().unwrap().as_ref() {
         n.notify_waiters();
     }
     join_all_cdc_background_threads();
     ENGINE_HALT_REQUESTED.store(false, AtomicOrdering::SeqCst);
 }
 
-pub(crate) async fn wait_for_exit(shutdown_notify: Arc<Notify>) -> anyhow::Result<()> {
-    tokio::signal::ctrl_c().await?;
-    println!("\x1b[34m│\x1b[0m");
-    println!("\x1b[33m▲\x1b[0m  \x1b[1mShutting down\x1b[0m");
-    println!("\x1b[34m│\x1b[0m  \x1b[90mStopping Bittice engine safely...\x1b[0m");
-    println!("\x1b[34m└\x1b[0m\n");
+/// Fatal streaming failure: stop HTTP/gRPC and unblock the main `start_all_servers` wait (REPL menu or process exit).
+pub fn request_engine_shutdown_from_cdc(reason: &str) {
+    error!(
+        "CDC: Live binlog stream failed — {}; stopping the engine.",
+        reason
+    );
+    ENGINE_SHUTDOWN_FROM_CDC.store(true, AtomicOrdering::SeqCst);
     ENGINE_HALT_REQUESTED.store(true, AtomicOrdering::SeqCst);
-    shutdown_notify.notify_waiters();
-    join_all_cdc_background_threads();
-    ENGINE_HALT_REQUESTED.store(false, AtomicOrdering::SeqCst);
+    if let Some(n) = ENGINE_SHUTDOWN_NOTIFY.lock().unwrap().as_ref() {
+        n.notify_waiters();
+    }
+}
+
+pub(crate) async fn wait_for_exit(shutdown_notify: Arc<Notify>) -> anyhow::Result<()> {
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => {
+            res?;
+            println!("\x1b[34m│\x1b[0m");
+            println!("\x1b[33m▲\x1b[0m  \x1b[1mShutting down\x1b[0m");
+            println!("\x1b[34m│\x1b[0m  \x1b[90mStopping Bittice engine safely...\x1b[0m");
+            println!("\x1b[34m└\x1b[0m\n");
+        }
+        _ = shutdown_notify.notified() => {
+            let from_cdc = ENGINE_SHUTDOWN_FROM_CDC.swap(false, AtomicOrdering::SeqCst);
+            print_shutdown_banner_after_notify(from_cdc);
+        }
+    }
+    finalize_shared_engine_shutdown(&shutdown_notify);
     Ok(())
 }
 /// When `shutdown_on_ctrl_c` is `false`, the REPL (or tests) owns shutdown via [`repl_stop_engine_and_join_cdc`]
@@ -173,6 +216,7 @@ pub async fn start_all_servers(
     shutdown_on_ctrl_c: bool,
 ) -> anyhow::Result<()> {
     let shutdown_notify = Arc::new(Notify::new());
+    *ENGINE_SHUTDOWN_NOTIFY.lock().unwrap() = Some(shutdown_notify.clone());
     let table_manager = Arc::new(TableManager::new());
     let active_workers = Arc::new(StdRwLock::new(HashSet::new()));
     
@@ -196,8 +240,15 @@ pub async fn start_all_servers(
             let tm = table_manager.clone();
             let aw = active_workers.clone();
             match tokio::task::spawn_blocking(move || run_cdc_staged_sequential(tm, aw, specs)).await {
-                Ok(()) => {}
-                Err(e) => error!("CDC: staged startup task join failed: {}", e),
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("CDC: staged startup aborted: {:#}", e);
+                    return Err(e);
+                }
+                Err(e) => {
+                    error!("CDC: staged startup task join failed: {}", e);
+                    return Err(anyhow::anyhow!("staged CDC join failed: {}", e));
+                }
             }
         }
     } else {
@@ -205,10 +256,6 @@ pub async fn start_all_servers(
     }
 
     crate::server::auto_update_hint::spawn_if_configured();
-
-    if !shutdown_on_ctrl_c {
-        *REPL_ENGINE_SHUTDOWN_NOTIFY.lock().unwrap() = Some(shutdown_notify.clone());
-    }
 
     let http_tm = table_manager.clone();
     let http_filter = entity_filter.clone();
@@ -231,6 +278,11 @@ pub async fn start_all_servers(
         wait_for_exit(shutdown_notify).await
     } else {
         shutdown_notify.notified().await;
+        let from_cdc = ENGINE_SHUTDOWN_FROM_CDC.swap(false, AtomicOrdering::SeqCst);
+        if from_cdc {
+            print_shutdown_banner_after_notify(true);
+            finalize_shared_engine_shutdown(&shutdown_notify);
+        }
         Ok(())
     }
 }
@@ -441,6 +493,10 @@ fn spawn_cdc_worker_thread(
         );
         if let Err(e) = rt.block_on(worker.run()) {
             error!("CDC: Worker for '{}' failed: {:#}", db_name_for_log, e);
+            crate::server::request_engine_shutdown_from_cdc(&format!(
+                "CDC worker '{}' failed: {:#}",
+                db_name_for_log, e
+            ));
         }
         let mut active = cleanup_active_workers.write().unwrap();
         active.remove(&cleanup_entity_key);
@@ -455,7 +511,7 @@ fn run_cdc_staged_sequential(
     table_manager: Arc<TableManager>,
     active_workers: Arc<StdRwLock<HashSet<String>>>,
     specs: Vec<CdcSpawnSpec>,
-) {
+) -> anyhow::Result<()> {
     use crate::core::cdc::CdcStartupOutcome;
 
     let total = specs.len();
@@ -488,23 +544,24 @@ fn run_cdc_staged_sequential(
                     );
                 }
                 CdcStartupOutcome::StaticMirror => {
-                    warn!(
-                        "CDC: Profile '{}' is on a static mirror (live CDC inactive). HTTP can still serve snapshots.",
+                    anyhow::bail!(
+                        "CDC profile '{}' reported static mirror; engine exits on any CDC degradation.",
                         report.entity
                     );
                 }
                 CdcStartupOutcome::Failed(msg) => {
-                    error!(
-                        "CDC: Profile '{}' reported failure during startup: {}",
+                    anyhow::bail!(
+                        "CDC profile '{}' failed during startup: {}",
                         report.entity, msg
                     );
                 }
             },
             Err(_) => {
-                error!("CDC: Worker for staged profile exited without a readiness report.");
+                anyhow::bail!("CDC worker for staged profile exited without a readiness report.");
             }
         }
     }
+    Ok(())
 }
 
 pub struct ServerState {

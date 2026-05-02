@@ -37,6 +37,14 @@ impl Wal {
         let len = encoded.len() as u64;
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&encoded)?;
+        if crate::core::cdc_durability::wal_sync_each_append() {
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Persist buffered WAL bytes before truncating (required when [`Wal::append`] omits per-op flush).
+    pub fn flush_writes(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
     }

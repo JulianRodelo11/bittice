@@ -214,15 +214,29 @@ impl Table {
     }
 
     /// Full row as map by primary key value (for CDC merge on partial binlog UPDATE images).
-    pub fn get_row_as_map(&self, pk_val: &str) -> Result<Option<HashMap<String, String>>> {
-        let Some((seg_id, local_id)) = self.primary_index.get(pk_val) else {
+    ///
+    /// Takes `&mut self` so it can flush the active-segment BufWriters when the target row
+    /// lives in the currently-dirty active segment.  Without this flush the mmap maps a
+    /// shorter (stale) version of the file and every field reads back as an empty string,
+    /// which then gets written verbatim by the UPDATE merge — losing all existing field values.
+    pub fn get_row_as_map(&mut self, pk_val: &str) -> Result<Option<HashMap<String, String>>> {
+        let Some((seg_id, local_id)) = self.primary_index.get(pk_val).copied() else {
             return Ok(None);
         };
         let fields = &self.manifest.original_fields;
         if fields.is_empty() {
             return Ok(None);
         }
-        let rows = self.get_rows_batch(fields, &[(*seg_id, *local_id)])?;
+        // If the row sits in the active segment and the writer still has unflushed buffer
+        // data, the mmap will map a shorter file and return empty strings for all fields.
+        // Flush the BufWriters to the OS page cache before creating/using the mmap.
+        if let Some(writer) = &mut self.active_segment {
+            if writer.segment.id == seg_id && writer.dirty {
+                writer.flush_buffers()?;
+            }
+        }
+        let fields = self.manifest.original_fields.clone();
+        let rows = self.get_rows_batch(&fields, &[(seg_id, local_id)])?;
         let Some(vals) = rows.first() else {
             return Ok(None);
         };
@@ -268,6 +282,17 @@ impl Table {
         Ok(())
     }
 
+    /// Flush the active segment's BufWriters to the OS page cache without rotating the segment.
+    /// Cheaper than `flush_active_segment` (no bitmap serialisation, no segment rotation).
+    /// Call after any CDC write when the full flush is batched, so concurrent mmap readers see
+    /// the new row data immediately.
+    pub fn flush_active_segment_buffers(&mut self) -> Result<()> {
+        if let Some(writer) = &mut self.active_segment {
+            writer.flush_buffers()?;
+        }
+        Ok(())
+    }
+
     pub fn flush_active_segment(&mut self) -> Result<()> {
         if let Some(mut writer) = self.active_segment.take() {
             writer.flush()?;
@@ -278,6 +303,7 @@ impl Table {
             self.manifest.last_sequence_number += 1; 
             self.save_manifest()?;
             self.save_primary_index()?;
+            self.wal.flush_writes()?;
             self.wal.truncate()?;
             let mut immutable_seg = writer.segment;
             immutable_seg.is_immutable = true;
@@ -332,7 +358,7 @@ impl Table {
                                 }
                             }
                             let val = if let Some(mmap_pair) = last_mmap {
-                                unsafe { Segment::read_value_unchecked(mmap_pair, *local_id) }
+                                Segment::read_value_from_mmap(mmap_pair, *local_id)
                             } else { String::new() };
                             col_values.push(val);
                         }

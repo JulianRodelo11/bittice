@@ -11,6 +11,7 @@ pub mod core {
     pub mod types;
     pub mod expression;
     pub mod cdc;
+    pub mod cdc_durability;
     pub mod update;
     pub mod uninstall;
     pub mod vpn;

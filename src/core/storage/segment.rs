@@ -162,37 +162,39 @@ impl Segment {
         Ok(())
     }
 
+    /// Drop cached mmaps so the next read remaps `.dat`/`.offsets` at their current file size.
+    ///
+    /// **Required** after the writer appends rows: otherwise existing maps may not cover new bytes and
+    /// readers can hit **SIGBUS** (especially on macOS) when accessing grown files.
+    pub fn invalidate_mmap_cache(&self) {
+        self.mmap_cache.write().unwrap().clear();
+    }
+
     pub fn get_mmap_pair(&self, field: &str) -> Result<Arc<(Mmap, Mmap)>> {
-        let mmap_pair = {
-            let cache = self.mmap_cache.read().unwrap();
-            cache.get(field).cloned()
-        };
-
-        if let Some(p) = mmap_pair {
-            Ok(p)
-        } else {
-            let dat_path = self.path.join(format!("{}.dat", field));
-            let off_path = self.path.join(format!("{}.offsets", field));
-
-            if !dat_path.exists() || !off_path.exists() {
-                return Err(anyhow::anyhow!("Field files not found"));
-            }
-
-            let dat_file = File::open(&dat_path)?;
-            let off_file = File::open(&off_path)?;
-            
-            let pair = Arc::new((
-                unsafe { Mmap::map(&dat_file)? },
-                unsafe { Mmap::map(&off_file)? }
-            ));
-
-            let mut cache = self.mmap_cache.write().unwrap();
-            if let Some(p) = cache.get(field) {
-                return Ok(p.clone());
-            }
-            cache.insert(field.to_string(), pair.clone());
-            Ok(pair)
+        let mut cache = self.mmap_cache.write().unwrap();
+        if let Some(p) = cache.get(field) {
+            return Ok(p.clone());
         }
+        let dat_path = self.path.join(format!("{}.dat", field));
+        let off_path = self.path.join(format!("{}.offsets", field));
+
+        if !dat_path.exists() || !off_path.exists() {
+            return Err(anyhow::anyhow!("Field files not found"));
+        }
+
+        let dat_file = File::open(&dat_path)?;
+        let off_file = File::open(&off_path)?;
+
+        let pair = Arc::new((
+            unsafe { Mmap::map(&dat_file)? },
+            unsafe { Mmap::map(&off_file)? },
+        ));
+
+        if let Some(p) = cache.get(field) {
+            return Ok(p.clone());
+        }
+        cache.insert(field.to_string(), pair.clone());
+        Ok(pair)
     }
 
     /// Retrieve multiple mmap pairs at once with a single read lock.
@@ -282,23 +284,23 @@ impl Segment {
         Ok(result_bitmap)
     }
 
-    /// Unsafe: Does not check bounds. Caller ensures local_id is valid.
-    pub unsafe fn read_value_unchecked(mmaps: &(Mmap, Mmap), local_id: u32) -> String {
+    /// Read a cell from mmaps; returns empty string on out-of-bounds (stale maps or index skew).
+    pub fn read_value_from_mmap(mmaps: &(Mmap, Mmap), local_id: u32) -> String {
         let (dat, off) = mmaps;
-        
-        let off_offset = (local_id as usize) << 3;
-        let off_ptr = off.as_ptr().add(off_offset);
-        let start_pos = u64::from_le((off_ptr as *const u64).read_unaligned()) as usize;
-        
-        let dat_ptr = dat.as_ptr().add(start_pos);
-        let len = u64::from_le((dat_ptr as *const u64).read_unaligned()) as usize;
-        
-        let bytes_ptr = dat_ptr.add(8);
-        let bytes = std::slice::from_raw_parts(bytes_ptr, len);
-        
-        // Performance: Since we wrote this as a String, it's guaranteed to be valid UTF-8.
-        // from_utf8_unchecked avoids the scanning overhead.
-        String::from_utf8_unchecked(bytes.to_vec())
+        let start_idx = (local_id as usize) << 3;
+        if start_idx + 8 > off.len() {
+            return String::new();
+        }
+        let start_pos = u64::from_le_bytes(off[start_idx..start_idx + 8].try_into().unwrap()) as usize;
+        if start_pos + 8 > dat.len() {
+            return String::new();
+        }
+        let len = u64::from_le_bytes(dat[start_pos..start_pos + 8].try_into().unwrap()) as usize;
+        if start_pos + 8 + len > dat.len() {
+            return String::new();
+        }
+        let bytes = &dat[start_pos + 8..start_pos + 8 + len];
+        String::from_utf8_lossy(bytes).into_owned()
     }
 
     pub fn get_row_values_from_mmaps(&self, local_id: u32, mmaps: &[Option<Arc<(Mmap, Mmap)>>]) -> Vec<String> {
@@ -412,14 +414,21 @@ impl Segment {
             })
             .collect();
 
-        // 3. Insert into cache (Write Lock - Once)
+        // 3. Insert into cache (Write Lock). If files grew during parallel I/O, remap at current size.
         let mut cache = self.mmap_cache.write().unwrap();
         for res in results {
-            match res {
-                Ok((field, pair)) => {
-                    cache.entry(field).or_insert(pair);
-                }
-                Err(_) => { }
+            if let Ok((field, pair)) = res {
+                let dat_path = self.path.join(format!("{}.dat", field));
+                let off_path = self.path.join(format!("{}.offsets", field));
+                let cur_dat = fs::metadata(&dat_path).map(|m| m.len()).unwrap_or(0);
+                let pair = if pair.0.len() as u64 != cur_dat {
+                    let df = File::open(&dat_path)?;
+                    let of = File::open(&off_path)?;
+                    Arc::new((unsafe { Mmap::map(&df)? }, unsafe { Mmap::map(&of)? }))
+                } else {
+                    pair
+                };
+                cache.entry(field).or_insert(pair);
             }
         }
         Ok(())
@@ -489,6 +498,21 @@ impl SegmentWriter {
         }
         self.segment.record_count += 1;
         self.dirty = true;
+        // Writer extended `.dat` / `.offsets`; cached maps would still end at the old file length.
+        self.segment.invalidate_mmap_cache();
+        Ok(())
+    }
+
+    /// Flush only the per-field BufWriters to the OS page cache so that mmaps created by
+    /// subsequent reads see the current on-disk state.  Does NOT serialize bitmaps or metadata;
+    /// call `flush` (full flush) for those.
+    pub fn flush_buffers(&mut self) -> Result<()> {
+        for (dat, off, _) in self.writers.values_mut() {
+            dat.flush()?;
+            off.flush()?;
+        }
+        // Mmap must be recreated now that the files have grown.
+        self.segment.invalidate_mmap_cache();
         Ok(())
     }
 
@@ -505,6 +529,8 @@ impl SegmentWriter {
             bincode::serialize_into(file, map)?;
         }
         self.dirty = false;
+        // Files are now fully flushed on disk; drop maps so readers remap the final size.
+        self.segment.invalidate_mmap_cache();
         Ok(())
     }
 

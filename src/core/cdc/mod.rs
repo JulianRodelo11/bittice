@@ -53,6 +53,9 @@ pub struct CdcState {
     /// Rolling GTID set aligned with processed transactions (bootstrap snapshot plus merges from binlog `GtidEvent`s).
     #[serde(default)]
     pub gtid_executed: String,
+    /// When true, MVCC bootstrap still needs binlog catch-up before the mirror matches MySQL at snapshot end.
+    #[serde(default)]
+    pub mvcc_snapshot_catchup_pending: bool,
     /// Last values seen from MySQL at CDC startup (persisted in `cdc_state.json`).
     #[serde(default)]
     pub observed_binlog_format_global: Option<String>,
@@ -87,12 +90,15 @@ pub struct CdcWorker {
     enum_maps: Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>, // table -> column -> values
     table_map_events: Arc<RwLock<HashMap<u64, TableMapEvent<'static>>>>,
     log_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    /// When true, return after bootstrap + `CDC_READY` instead of entering the live binlog loop.
-    /// Used by the connect wizard so only the HTTP engine owns long-running CDC (avoids two workers per profile).
+    /// When true, after bootstrap open the binlog, apply the snapshot backlog until the mirror reaches the
+    /// master tip (idle poll + coordinate check), emit `CDC_READY`, then return. The connect wizard uses this
+    /// so the CLI does not hold a permanent binlog connection; the server should run continuous CDC next.
     exit_after_cdc_ready: bool,
     /// When set, signals once when Phase 4 completes (live), static fallback activates, or the worker fatally errors.
     startup_report_tx: Option<std::sync::mpsc::Sender<CdcStartupReport>>,
     startup_report_sent: AtomicBool,
+    /// Per-mirror-table key `entity/table_dir`: row batches applied since last `flush_active_segment`.
+    cdc_mirror_flush_ticks: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl CdcWorker {
@@ -160,6 +166,7 @@ impl CdcWorker {
             exit_after_cdc_ready,
             startup_report_tx,
             startup_report_sent: AtomicBool::new(false),
+            cdc_mirror_flush_ticks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -339,23 +346,14 @@ impl CdcWorker {
         }
     }
 
+    /// Any condition that used to fall back to a static mirror now stops the whole engine instead.
     async fn enter_static_mode(&self, reason: String) -> Result<()> {
-        self.log_warn(reason);
-        self.emit_startup_report(CdcStartupOutcome::StaticMirror);
-        self.log_info("CDC: Real-time sync inactive. Operating with static data only.".to_string());
+        self.emit_startup_report(CdcStartupOutcome::Failed(reason.clone()));
         if let Some(tx) = &self.log_tx {
             let _ = tx.try_send("CDC_DISABLED".to_string());
         }
-        loop {
-            if crate::server::engine_halt_requested() {
-                self.log_info(format!(
-                    "CDC: Worker '{}' stopping (engine shutdown).",
-                    self.entity
-                ));
-                return Ok(());
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-        }
+        crate::server::request_engine_shutdown_from_cdc(&reason);
+        Ok(())
     }
 
     fn empty_cdc_state() -> CdcState {
@@ -365,6 +363,7 @@ impl CdcWorker {
             bootstrapped_tables: Vec::new(),
             pk_map: HashMap::new(),
             gtid_executed: String::new(),
+            mvcc_snapshot_catchup_pending: false,
             observed_binlog_format_global: None,
             observed_binlog_format_session: None,
             last_mirror_batch_unix_ms: None,
@@ -468,6 +467,13 @@ impl CdcWorker {
             .unwrap_or(false)
     }
 
+    #[inline]
+    fn apply_binlog_file_pos(state: &mut CdcState, next_pos: u32) {
+        if next_pos > 0 {
+            state.binlog_pos = next_pos;
+        }
+    }
+
     /// When the mirror missed an INSERT (bootstrap / binlog gap), apply UPDATE by doing a targeted
     /// `SELECT * … WHERE pk=?` unless `BITTICE_CDC_SKIP_UPDATE_HYDRATE=1`.
     fn cdc_update_hydrate_enabled() -> bool {
@@ -560,6 +566,30 @@ impl CdcWorker {
             }
         }
         Ok(None)
+    }
+
+    /// `SHOW BINARY LOG STATUS` using a pool connection scoped like the CDC worker (schema selection).
+    async fn query_master_coordinates_pool(&self, pool: &Pool) -> Result<Option<(String, u32)>> {
+        let mut c = pool.get_conn().await?;
+        if self.sync_all_databases {
+            c.query_drop("USE information_schema").await?;
+        } else {
+            c.query_drop(format!("USE {}", Self::mysql_ident(&self.database)))
+                .await?;
+        }
+        Self::query_master_coordinates(&mut c).await
+    }
+
+    /// Whether persisted replication coordinates are at or past `(tip_file, tip_pos)` from `SHOW BINARY LOG STATUS`.
+    fn cdc_replication_caught_up_to_tip(state: &CdcState, tip_file: &str, tip_pos: u32) -> bool {
+        if state.binlog_file.is_empty() || tip_file.is_empty() {
+            return false;
+        }
+        match state.binlog_file.as_str().cmp(tip_file) {
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => state.binlog_pos >= tip_pos,
+        }
     }
 
     /// Full current row from MySQL (same shape as bootstrap `SELECT *`) for self-healing CDC gaps.
@@ -1064,7 +1094,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         &self,
         pool: &Pool,
         state: &mut CdcState,
-        master_gtid_enabled: bool,
+        _master_gtid_enabled: bool,
     ) -> Result<()> {
         self.log_warn(
             "CDC: Rebuilding mirrors after checkpoint loss — InnoDB snapshot + full SELECT * per bootstrapped table."
@@ -1136,8 +1166,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         state.binlog_file = coords.0;
         state.binlog_pos = coords.1;
         state.gtid_executed.clear();
-        self.maybe_capture_gtid_executed(&mut conn, state, master_gtid_enabled)
-            .await?;
+        state.mvcc_snapshot_catchup_pending = true;
 
         Ok(())
     }
@@ -1292,6 +1321,14 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         };
 
         self.log_info("CDC: Successfully connected. Checking Binlog status...".to_string());
+        let d = crate::core::cdc_durability::durability();
+        let n = crate::core::cdc_durability::mirror_flush_every_n_batches();
+        let wal = crate::core::cdc_durability::wal_sync_each_append();
+        self.log_info(format!(
+            "CDC: durability profile={:?} (mirror_flush_every_n_batches={n}, wal_sync_each_append={wal}); \
+set BITTICE_CDC_DURABILITY=strict|balanced|throughput",
+            d
+        ));
         self.log_phase(1, "Connection, scope, and binlog policy");
 
         if self.sync_all_databases {
@@ -1311,6 +1348,10 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         let master_gtid_enabled = !server_is_mariadb && Self::global_gtid_mode_on(&mut conn).await;
 
         let mut state = self.load_state();
+        // If `cdc_state.json` already had binlog coordinates when this worker started, never substitute
+        // `@@GLOBAL.gtid_executed` into an empty `gtid_executed` — the server would skip transactions the mirror
+        // never applied (data loss after restarts).
+        let had_checkpoint_at_start = !state.binlog_file.is_empty();
         if self.sync_all_databases {
             let all_simple = !state.bootstrapped_tables.is_empty()
                 && state.bootstrapped_tables.iter().all(|k| !k.contains('.'));
@@ -1366,6 +1407,7 @@ Then restart Bittice.",
         self.log_phase(2, "Mirror snapshot (discovery and initial copy)");
 
         // InnoDB-only: single MVCC snapshot + binlog coords **before** bulk `SELECT *`, matching mysqldump `--single-transaction` semantics.
+        let requires_lossless_mvcc_bootstrap = state.binlog_file.is_empty();
         let mut rr_snapshot_active = false;
         let mut coords_pre_bootstrap: Option<(String, u32)> = None;
 
@@ -1401,6 +1443,29 @@ Then restart Bittice.",
                         e
                     ));
                 }
+            }
+        }
+
+        if requires_lossless_mvcc_bootstrap {
+            if !rr_snapshot_active {
+                return self
+                    .enter_static_mode(
+                        "CDC: Lossless initial sync requires START TRANSACTION WITH CONSISTENT SNAPSHOT (InnoDB). \
+The server rejected it or the session could not open a snapshot. Use a primary/writer (not a read replica) and InnoDB tables."
+                            .to_string(),
+                    )
+                    .await;
+            }
+            if coords_pre_bootstrap.is_none() {
+                Self::rollback_consistent_snapshot(&mut conn, true).await;
+                return self
+                    .enter_static_mode(
+                        "CDC: Lossless initial sync requires binary log coordinates inside the consistent snapshot \
+(SHOW BINARY LOG STATUS or SHOW MASTER STATUS). Enable binary logging on MySQL/RDS and grant REPLICATION CLIENT (or equivalent) \
+so the account can read coordinates."
+                            .to_string(),
+                    )
+                    .await;
             }
         }
 
@@ -1457,7 +1522,7 @@ Then restart Bittice.",
                             Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                             return self
                                 .enter_static_mode(format!(
-                                    "Bootstrap failed for '{}': {}. Falling back to static data mode.",
+                                    "Bootstrap failed for '{}': {}.",
                                     qkey, e
                                 ))
                                 .await;
@@ -1474,7 +1539,7 @@ Then restart Bittice.",
                                 Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                                 return self
                                     .enter_static_mode(format!(
-                                        "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
+                                        "Failed to refresh schema for '{}': {}.",
                                         qkey, e
                                     ))
                                     .await;
@@ -1519,11 +1584,11 @@ Then restart Bittice.",
                         .await
                     {
                         Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
-                        return self
-                            .enter_static_mode(format!(
-                                "Bootstrap failed for '{}': {}. Falling back to static data mode.",
-                                table_name, e
-                            ))
+                            return self
+                                .enter_static_mode(format!(
+                                    "Bootstrap failed for '{}': {}.",
+                                    table_name, e
+                                ))
                             .await;
                     }
                     state.bootstrapped_tables.push(qkey.clone());
@@ -1543,7 +1608,7 @@ Then restart Bittice.",
                             Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                             return self
                                 .enter_static_mode(format!(
-                                    "Failed to refresh schema for '{}': {}. Falling back to static data mode.",
+                                    "Failed to refresh schema for '{}': {}.",
                                     table_name, e
                                 ))
                                 .await;
@@ -1571,21 +1636,40 @@ Then restart Bittice.",
 
         self.log_phase(3, "Replication checkpoint (binlog position and safety checks)");
 
-        if rr_snapshot_active && coords_pre_bootstrap.is_some() && Self::env_truthy("BITTICE_CDC_SKIP_BINLOG_BACKLOG") {
-            match Self::query_master_coordinates(&mut conn).await {
-                Ok(Some((f, p))) if !f.is_empty() => {
-                    coords_pre_bootstrap = Some((f, p));
-                    self.log_warn(
-                        "CDC: BITTICE_CDC_SKIP_BINLOG_BACKLOG is set — streaming from current binlog tip after bootstrap. \
-Commits during the bulk snapshot window may be missed; use only when that gap is acceptable (typical dev)."
-                            .to_string(),
-                    );
-                }
-                Ok(_) | Err(_) => {
-                    self.log_warn(
-                        "CDC: BITTICE_CDC_SKIP_BINLOG_BACKLOG set but tip coordinates unreadable; keeping snapshot coordinates."
-                            .to_string(),
-                    );
+        // After `START TRANSACTION WITH CONSISTENT SNAPSHOT`, binlog file/pos were taken at the **start** of the bulk
+        // `SELECT *` pass. Commits on any table during that window must be replayed from the binlog. If we instead
+        // seed `gtid_executed` from `@@GLOBAL.gtid_executed` **after** the copy, the server assumes we already applied
+        // those GTIDs and skips events — rows can disappear from the mirror while MySQL has them.
+        let mut replay_binlog_backlog_after_mvcc =
+            rr_snapshot_active && coords_pre_bootstrap.is_some();
+
+        if rr_snapshot_active
+            && coords_pre_bootstrap.is_some()
+            && Self::env_truthy("BITTICE_CDC_SKIP_BINLOG_BACKLOG")
+        {
+            if !Self::env_truthy("BITTICE_CDC_ACCEPT_SNAPSHOT_GAP") {
+                self.log_warn(
+                    "CDC: BITTICE_CDC_SKIP_BINLOG_BACKLOG ignored — lossless bootstrap replays the binlog from the snapshot coordinates. \
+Set BITTICE_CDC_ACCEPT_SNAPSHOT_GAP=1 together with SKIP to jump to the current tip (commits during the snapshot window can be missing)."
+                        .to_string(),
+                );
+            } else {
+                match Self::query_master_coordinates(&mut conn).await {
+                    Ok(Some((f, p))) if !f.is_empty() => {
+                        coords_pre_bootstrap = Some((f, p));
+                        replay_binlog_backlog_after_mvcc = false;
+                        self.log_warn(
+                            "CDC: BITTICE_CDC_SKIP_BINLOG_BACKLOG + ACCEPT_SNAPSHOT_GAP — streaming from current binlog tip after bootstrap. \
+Commits during the bulk snapshot window may be missing."
+                                .to_string(),
+                        );
+                    }
+                    Ok(_) | Err(_) => {
+                        self.log_warn(
+                            "CDC: SKIP_BINLOG_BACKLOG set but tip coordinates unreadable; keeping snapshot coordinates."
+                                .to_string(),
+                        );
+                    }
                 }
             }
         }
@@ -1593,8 +1677,19 @@ Commits during the bulk snapshot window may be missed; use only when that gap is
         if let Some((f, p)) = coords_pre_bootstrap.take() {
             state.binlog_file = f;
             state.binlog_pos = p;
-            self.maybe_capture_gtid_executed(&mut conn, &mut state, master_gtid_enabled)
-                .await?;
+            if replay_binlog_backlog_after_mvcc {
+                state.gtid_executed.clear();
+                state.mvcc_snapshot_catchup_pending = true;
+                self.log_info(
+                    "CDC: MVCC bootstrap — replaying from snapshot binlog coordinates with empty gtid_executed \
+so writes during the bulk copy are not skipped by GTID; gtid_executed is rebuilt from streamed GtidEvent(s)."
+                        .to_string(),
+                );
+            } else {
+                state.mvcc_snapshot_catchup_pending = false;
+                self.maybe_capture_gtid_executed(&mut conn, &mut state, master_gtid_enabled)
+                    .await?;
+            }
             let _ = self.save_state(&state);
         }
 
@@ -1605,11 +1700,14 @@ Commits during the bulk snapshot window may be missed; use only when that gap is
             return self.enter_static_mode("CDC is not enabled on server.".to_string()).await;
         }
 
-        // RDS/Aurora often runs with @@GLOBAL.GTID_MODE=ON. If our persisted `gtid_executed` is empty (common after
-        // upgrades, permission gaps, or first-run snapshots that skipped capture), mysql_async may open the binlog
-        // stream file/position-only — that combination has been observed to stall after rotate while ROW events keep
-        // flowing on the writer. Refresh GTID once before live streaming whenever GTID is enabled but state is empty.
-        if master_gtid_enabled && state.gtid_executed.trim().is_empty() {
+        // RDS/Aurora: seeding from @@GLOBAL.gtid_executed is only safe before any replication coordinates exist on disk.
+        // If we resumed with a saved `binlog_file`/`binlog_pos` but empty `gtid_executed`, file/position mode replays
+        // correctly; copying the server's full GTID set would skip transactions the mirror never received.
+        if master_gtid_enabled
+            && state.gtid_executed.trim().is_empty()
+            && !replay_binlog_backlog_after_mvcc
+            && !had_checkpoint_at_start
+        {
             self.log_warn(
                 "CDC: GTID_MODE=ON but saved gtid_executed is empty — fetching @@GLOBAL.gtid_executed before binlog stream."
                     .to_string(),
@@ -1617,6 +1715,12 @@ Commits during the bulk snapshot window may be missed; use only when that gap is
             self.maybe_capture_gtid_executed(&mut conn, &mut state, master_gtid_enabled)
                 .await?;
             let _ = self.save_state(&state);
+        }
+        if master_gtid_enabled && state.gtid_executed.trim().is_empty() && had_checkpoint_at_start {
+            self.log_info(
+                "CDC: Resuming with empty gtid_executed — using filename/position replication only until the stream repopulates GTIDs (avoids skipping events vs @@GLOBAL.gtid_executed)."
+                    .to_string(),
+            );
         }
 
         let global_binlog_is_row = state
@@ -1644,19 +1748,6 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
             self.log_info(
                 "CDC: Sync-all mode".to_string(),
             );
-        }
-
-        if self.exit_after_cdc_ready {
-            self.log_phase(4, "Live binlog stream (real-time replication)");
-            if let Some(tx) = &self.log_tx {
-                let _ = tx.try_send("CDC_READY".to_string());
-            }
-            self.emit_startup_report(CdcStartupOutcome::LiveReplication);
-            self.log_info(
-                "CDC: Initial sync finished — releasing binlog consumer so the query engine can take over live CDC."
-                    .to_string(),
-            );
-            return Ok(());
         }
 
         let pool = pool.clone();
@@ -1700,12 +1791,6 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                         )
                         .await;
                 }
-            }
-
-            if !live_startup_reported {
-                live_startup_reported = true;
-                self.log_phase(4, "Live binlog stream (real-time replication)");
-                self.emit_startup_report(CdcStartupOutcome::LiveReplication);
             }
 
             self.log_info(format!(
@@ -1817,13 +1902,22 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                         self.save_state(&state)?;
                         continue 'binlog_retry;
                     }
-                    return self.enter_static_mode(format!(
-                        "Binlog stream unavailable: {}. Falling back to static data mode.",
-                        msg
-                    )).await;
+                    let _ = self.save_state(&state);
+                    return self
+                        .enter_static_mode(format!("Binlog stream unavailable: {}.", msg))
+                        .await;
                 }
             };
 
+            let needs_catchup_before_live =
+                state.mvcc_snapshot_catchup_pending || self.exit_after_cdc_ready;
+            if !needs_catchup_before_live && !live_startup_reported {
+                live_startup_reported = true;
+                self.log_phase(4, "Live binlog stream (real-time replication)");
+                self.emit_startup_report(CdcStartupOutcome::LiveReplication);
+            }
+
+            let mut repl_caught_up_streak: u32 = 0;
             loop {
                 if crate::server::engine_halt_requested() {
                     self.log_info(format!(
@@ -1837,6 +1931,57 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                     biased;
                     opt = stream.next() => opt,
                     _ = tokio::time::sleep(CDC_ENGINE_HALT_POLL) => {
+                        if self.exit_after_cdc_ready || state.mvcc_snapshot_catchup_pending {
+                            match self.query_master_coordinates_pool(&pool).await {
+                                Ok(Some((mf, mp))) if !mf.is_empty() => {
+                                    if Self::cdc_replication_caught_up_to_tip(&state, mf.as_str(), mp) {
+                                        repl_caught_up_streak =
+                                            repl_caught_up_streak.saturating_add(1);
+                                        if repl_caught_up_streak >= 2 {
+                                            state.mvcc_snapshot_catchup_pending = false;
+                                            let _ = self.save_state(&state);
+                                            if self.exit_after_cdc_ready {
+                                                // Flush all open mirror tables so binlog rows applied
+                                                // during the snapshot catchup window (e.g. inserts that
+                                                // arrived while the bulk SELECT * was running) are
+                                                // durably written to disk before this process exits.
+                                                // Without this, the active segment, primary.idx, and
+                                                // bitmaps are never persisted and the server restart
+                                                // silently loses those rows.
+                                                {
+                                                    let tables = self.table_manager.tables.read().unwrap();
+                                                    for table_arc in tables.values() {
+                                                        if let Ok(mut t) = table_arc.write() {
+                                                            let _ = t.flush_active_segment();
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(tx) = &self.log_tx {
+                                                    let _ = tx.try_send("CDC_READY".to_string());
+                                                }
+                                                self.log_info(
+                                                    "CDC: Snapshot backlog drained — mirror coordinates caught up to master tip before CLI handoff."
+                                                        .to_string(),
+                                                );
+                                                return Ok(());
+                                            }
+                                            if !live_startup_reported {
+                                                live_startup_reported = true;
+                                                self.log_phase(
+                                                    4,
+                                                    "Live binlog stream (real-time replication)",
+                                                );
+                                                self.emit_startup_report(CdcStartupOutcome::LiveReplication);
+                                            }
+                                            repl_caught_up_streak = 0;
+                                        }
+                                    } else {
+                                        repl_caught_up_streak = 0;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         continue;
                     }
                 };
@@ -1844,7 +1989,12 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                     break;
                 };
                 let event = match event {
-                    Ok(e) => e,
+                    Ok(e) => {
+                        if self.exit_after_cdc_ready || state.mvcc_snapshot_catchup_pending {
+                            repl_caught_up_streak = 0;
+                        }
+                        e
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if Self::is_stale_saved_binlog_error(&msg) {
@@ -1892,18 +2042,14 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                             self.save_state(&state)?;
                             continue 'binlog_retry;
                         }
-                        return self.enter_static_mode(format!(
-                            "Binlog stream error: {}. Falling back to static data mode.",
-                            msg
-                        )).await;
+                        let _ = self.save_state(&state);
+                        return self
+                            .enter_static_mode(format!("Binlog stream error: {}.", msg))
+                            .await;
                     }
                 };
                 let header = event.header();
                 let next_pos = header.log_pos();
-
-                if next_pos > 0 {
-                    state.binlog_pos = next_pos;
-                }
 
                 let data = event.read_data()?;
                 let checkpoint_rotate =
@@ -1919,10 +2065,12 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                             Ok(merged) => state.gtid_executed = merged,
                             Err(e) => warn!("CDC: gtid_executed merge failed: {}", e),
                         }
+                        Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     Some(EventData::TableMapEvent(tm)) => {
                         let mut map = self.table_map_events.write().unwrap();
                         map.insert(tm.table_id(), tm.into_owned());
+                        Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     Some(EventData::RowsEvent(rows_data)) => {
                         if let Ok(tm_probe) = self.resolve_rows_table_map(&rows_data, &stream) {
@@ -1971,6 +2119,7 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                             }
                         }
                         self.handle_rows_event(&pool, rows_data, &mut state, &stream).await?;
+                        Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     Some(EventData::RotateEvent(rotate_data)) => {
                         if !rotate_data.is_fake() {
@@ -1979,7 +2128,9 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                         state.binlog_file = rotate_data.name().to_string();
                         state.binlog_pos = rotate_data.position() as u32;
                     }
-                    _ => {}
+                    _ => {
+                        Self::apply_binlog_file_pos(&mut state, next_pos);
+                    }
                 }
 
                 events_since_save = events_since_save.saturating_add(1);
@@ -1993,12 +2144,12 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
             }
 
             self.save_state(&state)?;
-            warn!(
-                "CDC: Binlog stream ended unexpectedly for entity '{}'; reconnecting.",
-                self.entity
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            continue 'binlog_retry;
+            return self
+                .enter_static_mode(format!(
+                    "CDC: Binlog stream ended unexpectedly for entity '{}'.",
+                    self.entity
+                ))
+                .await;
         }
     }
 
@@ -2398,7 +2549,30 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
             ),
         };
 
-        table.flush_active_segment()?;
+        if applied > 0 {
+            let n_flush = crate::core::cdc_durability::mirror_flush_every_n_batches();
+            let do_flush = if n_flush <= 1 {
+                true
+            } else {
+                let k = format!("{}/{}", disk_entity, mirror_table);
+                let mut ticks = self.cdc_mirror_flush_ticks.write().unwrap();
+                let t = ticks.entry(k).or_insert(0);
+                *t = t.saturating_add(1);
+                if *t >= n_flush {
+                    *t = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+            if do_flush {
+                table.flush_active_segment()?;
+            } else {
+                // Even when the full segment rotation is batched, flush the BufWriters so that
+                // concurrent HTTP readers (who mmap the same files) see the new/updated data.
+                table.flush_active_segment_buffers()?;
+            }
+        }
         self.maybe_log_mysql_row_batch(
             op_label,
             &schema,
