@@ -6,16 +6,13 @@ use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
 use crate::core::vpn::VpnManager;
-use tracing::info;
+use tracing::{info, warn};
 use std::process::{Command, Stdio};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use super::deploy_pipeline::{self, BuildPlatform, FullDeployConfig};
-
-/// Set after the first local `start_all_servers` spawn so returning to the menu does not start duplicate listeners.
-static LOCAL_ENGINE_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CdcInfo {
@@ -623,6 +620,7 @@ async fn run_cdc_initial_sync(cdc_info: &CdcInfo) -> Result<()> {
             Some(log_tx),
             worker_sync_all,
             true,
+            None,
         );
         let _ = rt.block_on(worker.run());
     });
@@ -753,6 +751,13 @@ pub async fn run_startup_cliclack() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mMonitoring events for {} in real-time.\x1b[0m", monitor_scope);
     println!("\x1b[90m│\x1b[0m");
 
+    let log_path_s = crate::core::data_paths::server_log_path()
+        .to_string_lossy()
+        .into_owned();
+    // Start tail before the local engine so lines like `CDC: entity='…'` are not missed (`tail -n 0`
+    // only shows bytes appended after tail opens).
+    let mut tail_child = spawn_server_log_tail_follow(&log_path_s);
+
     let is_docker_only = std::path::Path::new("/.dockerenv").exists();
 
     if is_docker_only {
@@ -767,31 +772,83 @@ pub async fn run_startup_cliclack() -> Result<()> {
         println!("\x1b[90m│\x1b[0m");
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     } else {
-        let first_local_start = !LOCAL_ENGINE_STARTED.swap(true, Ordering::SeqCst);
-        if first_local_start {
-            tokio::spawn(async move {
-                let _ = crate::server::start_all_servers(None, false).await;
-            });
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        } else {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        if let Err(e) =
+            tokio::task::spawn_blocking(|| crate::server::repl_stop_engine_and_join_cdc()).await
+        {
+            warn!("Pre-start engine shutdown task failed: {}", e);
         }
+        tokio::spawn(async move {
+            let _ = crate::server::start_all_servers(None, false).await;
+        });
     }
 
-    let log_path_s = crate::core::data_paths::server_log_path()
-        .to_string_lossy()
-        .into_owned();
-
-    let mut tail_child = spawn_server_log_tail_follow(&log_path_s);
-
     tokio::signal::ctrl_c().await?;
+
     if let Some(mut c) = tail_child.take() {
         let _ = c.kill();
     }
 
-    println!("\x1b[90m│\x1b[0m");
-    println!("\x1b[32m◆\x1b[0m  \x1b[1mBack to main menu\x1b[0m  \x1b[90m(HTTP/gRPC engine keeps running)\x1b[0m");
-    println!("\x1b[90m│\x1b[0m");
+    // One-line spinner; cleared when shutdown completes (no extra │ / ◆ banners).
+    println!();
+    const SPIN_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+    if is_docker_only {
+        let mut interval = tokio::time::interval(Duration::from_millis(90));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(360) {
+            interval.tick().await;
+            let i = (start.elapsed().as_millis() / 90) as usize;
+            print!(
+                "\r\x1b[2K\x1b[35m{}\x1b[0m  Leaving Live Monitor…",
+                SPIN_FRAMES[i % 4]
+            );
+            let _ = io::stdout().flush();
+        }
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(120),
+            async {
+                let mut shutdown = tokio::task::spawn_blocking(|| {
+                    crate::server::repl_stop_engine_and_join_cdc()
+                });
+                let mut interval = tokio::time::interval(Duration::from_millis(90));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut frame: usize = 0;
+                loop {
+                    tokio::select! {
+                        res = &mut shutdown => {
+                            res.map_err(|e| anyhow::anyhow!(e))?;
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        _ = interval.tick() => {
+                            print!(
+                                "\r\x1b[2K\x1b[35m{}\x1b[0m  Leaving Live Monitor…",
+                                SPIN_FRAMES[frame % 4]
+                            );
+                            let _ = io::stdout().flush();
+                            frame += 1;
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Engine shutdown: {}", e),
+            Err(_) => {
+                warn!(
+                    "Engine shutdown still running after 120s (CDC may be finishing a long query). \
+Returning to menu; stop orphaned workers with: kill bittice or restart the terminal session."
+                );
+            }
+        }
+    }
+
+    print!("\r\x1b[2K");
+    let _ = io::stdout().flush();
+    println!();
     continue 'session;
     }
 

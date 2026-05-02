@@ -1,6 +1,6 @@
 use bittice_proto::database_server::DatabaseServer;
 use tonic::{Request, Response, Status};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1137,10 +1137,17 @@ impl Database for MyDatabase {
 
 pub async fn start_grpc_server(port: u16, entity_filter: Option<String>) -> anyhow::Result<()> {
     let table_manager = Arc::new(TableManager::new());
-    start_grpc_server_with_manager(port, table_manager, entity_filter, None).await
+    let never = Arc::new(Notify::new());
+    start_grpc_server_with_manager(port, table_manager, entity_filter, None, never).await
 }
 
-pub async fn start_grpc_server_with_manager(port: u16, table_manager: Arc<TableManager>, entity_filter: Option<String>, _log_tx: Option<mpsc::Sender<String>>) -> anyhow::Result<()> {
+pub async fn start_grpc_server_with_manager(
+    port: u16,
+    table_manager: Arc<TableManager>,
+    entity_filter: Option<String>,
+    _log_tx: Option<mpsc::Sender<String>>,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<()> {
     let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let addr = format!("{}:{}", host, port).parse()?;
     
@@ -1150,7 +1157,10 @@ pub async fn start_grpc_server_with_manager(port: u16, table_manager: Arc<TableM
 
     tonic::transport::Server::builder()
         .add_service(DatabaseServer::new(db))
-        .serve(addr)
+        .serve_with_shutdown(addr, async move {
+            shutdown.notified().await;
+            info!("gRPC server shut down");
+        })
         .await?;
 
     Ok(())

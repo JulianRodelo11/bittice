@@ -19,10 +19,26 @@ use crate::server::table_manager::{TableManager, TableUpdateEvent};
 use crate::core::date_utils::{extract_day, extract_month, extract_hour_bucket, is_date_format, has_time_component};
 use tracing::{info, debug, warn, error};
 
+/// Result of the staged CDC pipeline used to gate HTTP until each profile finishes Phase 4 (or static/fail).
+#[derive(Debug, Clone)]
+pub struct CdcStartupReport {
+    pub entity: String,
+    pub outcome: CdcStartupOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub enum CdcStartupOutcome {
+    LiveReplication,
+    StaticMirror,
+    Failed(String),
+}
+
 /// Upper bound on replay lag after crash during CDC (wall clock).
 const CDC_STATE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Cap burst writes when many small binlog events arrive within [`CDC_STATE_SAVE_INTERVAL`].
 const CDC_STATE_SAVE_EVENT_BURST: u32 = 1024;
+/// Wake `binlog` `stream.next()` waits periodically so [`crate::server::engine_halt_requested`] is honored even when the server is quiet.
+const CDC_ENGINE_HALT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Guard for the one-line startup hint when `BITTICE_CDC_LOG_ROW_EVENTS` is enabled.
 static CDC_ROW_TRACE_BANNER_EMITTED: AtomicBool = AtomicBool::new(false);
@@ -74,6 +90,9 @@ pub struct CdcWorker {
     /// When true, return after bootstrap + `CDC_READY` instead of entering the live binlog loop.
     /// Used by the connect wizard so only the HTTP engine owns long-running CDC (avoids two workers per profile).
     exit_after_cdc_ready: bool,
+    /// When set, signals once when Phase 4 completes (live), static fallback activates, or the worker fatally errors.
+    startup_report_tx: Option<std::sync::mpsc::Sender<CdcStartupReport>>,
+    startup_report_sent: AtomicBool,
 }
 
 impl CdcWorker {
@@ -91,6 +110,7 @@ impl CdcWorker {
             None,
             true,
             false,
+            None,
         )
     }
 
@@ -103,11 +123,12 @@ impl CdcWorker {
             log_tx,
             false,
             false,
+            None,
         )
     }
 
     pub fn with_manager(url: String, entity: String, database: String, table_manager: Arc<TableManager>) -> Self {
-        Self::with_manager_and_log(url, entity, database, table_manager, None, false, false)
+        Self::with_manager_and_log(url, entity, database, table_manager, None, false, false, None)
     }
 
     pub fn with_manager_and_log(
@@ -118,6 +139,7 @@ impl CdcWorker {
         log_tx: Option<tokio::sync::mpsc::Sender<String>>,
         sync_all_databases: bool,
         exit_after_cdc_ready: bool,
+        startup_report_tx: Option<std::sync::mpsc::Sender<CdcStartupReport>>,
     ) -> Self {
         let state_path = crate::core::data_paths::profile_dir(&entity)
             .join("cdc_state.json")
@@ -136,6 +158,8 @@ impl CdcWorker {
             table_map_events: Arc::new(RwLock::new(HashMap::new())),
             log_tx,
             exit_after_cdc_ready,
+            startup_report_tx,
+            startup_report_sent: AtomicBool::new(false),
         }
     }
 
@@ -292,13 +316,44 @@ impl CdcWorker {
         }
     }
 
+    fn log_phase(&self, phase: u8, title: &str) {
+        const TOTAL: u8 = 4;
+        self.log_info(format!(
+            "CDC: [{}] Phase {}/{}: {}",
+            self.entity, phase, TOTAL, title
+        ));
+    }
+
+    fn emit_startup_report(&self, outcome: CdcStartupOutcome) {
+        if let Some(tx) = &self.startup_report_tx {
+            if self
+                .startup_report_sent
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = tx.send(CdcStartupReport {
+                    entity: self.entity.clone(),
+                    outcome,
+                });
+            }
+        }
+    }
+
     async fn enter_static_mode(&self, reason: String) -> Result<()> {
         self.log_warn(reason);
+        self.emit_startup_report(CdcStartupOutcome::StaticMirror);
         self.log_info("CDC: Real-time sync inactive. Operating with static data only.".to_string());
         if let Some(tx) = &self.log_tx {
             let _ = tx.try_send("CDC_DISABLED".to_string());
         }
         loop {
+            if crate::server::engine_halt_requested() {
+                self.log_info(format!(
+                    "CDC: Worker '{}' stopping (engine shutdown).",
+                    self.entity
+                ));
+                return Ok(());
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     }
@@ -1018,6 +1073,11 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
 
         self.wipe_bootstrapped_mirror_tables(state)?;
 
+        self.log_warn(
+            "CDC: Mirrors for this profile were wiped — queries against local mirrors may return empty or stale rows until every bootstrapped table finishes SELECT * (can take a long time with sync-all)."
+                .to_string(),
+        );
+
         let mut conn = pool.get_conn().await?;
         if self.sync_all_databases {
             conn.query_drop("USE information_schema").await?;
@@ -1167,17 +1227,30 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
                 e
             );
         }
+        match self.run_impl().await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.emit_startup_report(CdcStartupOutcome::Failed(format!("{:#}", e)));
+                Err(e)
+            }
+        }
+    }
+
+    async fn run_impl(&self) -> Result<()> {
         let data_root = crate::core::data_paths::resolved_data_root();
         let root_disp = std::fs::canonicalize(&data_root).unwrap_or_else(|_| data_root.clone());
         let state_pb = Path::new(&self.state_path);
         let state_disp = std::fs::canonicalize(state_pb).unwrap_or_else(|_| state_pb.to_path_buf());
-        self.log_info(format!(
-            "CDC: entity='{}' sync_all={} data_root={} cdc_state_path={}",
-            self.entity,
-            self.sync_all_databases,
-            root_disp.display(),
-            state_disp.display()
-        ));
+        // Staged engine startup logs paths next to "Staged profile N/M" to avoid duplicate / ordering confusion.
+        if self.startup_report_tx.is_none() {
+            self.log_info(format!(
+                "CDC: entity='{}' sync_all={} data_root={} cdc_state_path={}",
+                self.entity,
+                self.sync_all_databases,
+                root_disp.display(),
+                state_disp.display()
+            ));
+        }
 
         if self.sync_all_databases {
             self.log_info("CDC: Connecting to MySQL (sync all databases on server)...".to_string());
@@ -1219,6 +1292,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         };
 
         self.log_info("CDC: Successfully connected. Checking Binlog status...".to_string());
+        self.log_phase(1, "Connection, scope, and binlog policy");
 
         if self.sync_all_databases {
             if let Err(e) = conn.query_drop("USE information_schema").await {
@@ -1289,6 +1363,8 @@ Then restart Bittice.",
         }
         let _ = self.save_state(&state);
 
+        self.log_phase(2, "Mirror snapshot (discovery and initial copy)");
+
         // InnoDB-only: single MVCC snapshot + binlog coords **before** bulk `SELECT *`, matching mysqldump `--single-transaction` semantics.
         let mut rr_snapshot_active = false;
         let mut coords_pre_bootstrap: Option<(String, u32)> = None;
@@ -1342,6 +1418,13 @@ Then restart Bittice.",
                 schemas.len()
             ));
             for schema in schemas {
+                if crate::server::engine_halt_requested() {
+                    self.log_info(format!(
+                        "CDC: Worker '{}' snapshot interrupted (engine shutdown).",
+                        self.entity
+                    ));
+                    return Ok(());
+                }
                 let tables = match Self::fetch_all_tables_in_schema(&mut conn, &schema).await {
                     Ok(t) => t,
                     Err(e) => {
@@ -1358,6 +1441,13 @@ Then restart Bittice.",
                     tables.len()
                 ));
                 for table_name in &tables {
+                    if crate::server::engine_halt_requested() {
+                        self.log_info(format!(
+                            "CDC: Worker '{}' snapshot interrupted (engine shutdown).",
+                            self.entity
+                        ));
+                        return Ok(());
+                    }
                     let qkey = Self::qualified_table_key(true, &schema, table_name);
                     if !state.bootstrapped_tables.contains(&qkey) {
                         if let Err(e) = self
@@ -1415,6 +1505,13 @@ Then restart Bittice.",
             ));
 
             for table_name in &tables {
+                if crate::server::engine_halt_requested() {
+                    self.log_info(format!(
+                        "CDC: Worker '{}' snapshot interrupted (engine shutdown).",
+                        self.entity
+                    ));
+                    return Ok(());
+                }
                 let qkey = Self::qualified_table_key(false, &self.database, table_name);
                 if !state.bootstrapped_tables.contains(&qkey) {
                     if let Err(e) = self
@@ -1471,6 +1568,8 @@ Then restart Bittice.",
                 return Err(e.into());
             }
         }
+
+        self.log_phase(3, "Replication checkpoint (binlog position and safety checks)");
 
         if rr_snapshot_active && coords_pre_bootstrap.is_some() && Self::env_truthy("BITTICE_CDC_SKIP_BINLOG_BACKLOG") {
             match Self::query_master_coordinates(&mut conn).await {
@@ -1541,10 +1640,6 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
             );
         }
 
-        // Notify UI that bootstrap is complete and we are entering live mode
-        if let Some(tx) = &self.log_tx {
-            let _ = tx.try_send("CDC_READY".to_string());
-        }
         if self.sync_all_databases {
             self.log_info(
                 "CDC: Sync-all mode".to_string(),
@@ -1552,6 +1647,11 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
         }
 
         if self.exit_after_cdc_ready {
+            self.log_phase(4, "Live binlog stream (real-time replication)");
+            if let Some(tx) = &self.log_tx {
+                let _ = tx.try_send("CDC_READY".to_string());
+            }
+            self.emit_startup_report(CdcStartupOutcome::LiveReplication);
             self.log_info(
                 "CDC: Initial sync finished — releasing binlog consumer so the query engine can take over live CDC."
                     .to_string(),
@@ -1562,8 +1662,17 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
         let pool = pool.clone();
         let mut last_state_save = std::time::Instant::now();
         let mut events_since_save: u32 = 0;
+        let mut live_startup_reported = false;
 
         'binlog_retry: loop {
+            if crate::server::engine_halt_requested() {
+                self.log_info(format!(
+                    "CDC: Worker '{}' stopping before binlog stream (engine shutdown).",
+                    self.entity
+                ));
+                let _ = self.save_state(&state);
+                return Ok(());
+            }
             if Self::env_truthy("BITTICE_CDC_LOG_ROW_EVENTS")
                 && !CDC_ROW_TRACE_BANNER_EMITTED.swap(true, Ordering::SeqCst)
             {
@@ -1591,6 +1700,12 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                         )
                         .await;
                 }
+            }
+
+            if !live_startup_reported {
+                live_startup_reported = true;
+                self.log_phase(4, "Live binlog stream (real-time replication)");
+                self.emit_startup_report(CdcStartupOutcome::LiveReplication);
             }
 
             self.log_info(format!(
@@ -1709,7 +1824,25 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                 }
             };
 
-            while let Some(event) = stream.next().await {
+            loop {
+                if crate::server::engine_halt_requested() {
+                    self.log_info(format!(
+                        "CDC: Worker '{}' leaving live binlog stream (engine shutdown).",
+                        self.entity
+                    ));
+                    let _ = self.save_state(&state);
+                    return Ok(());
+                }
+                let next_item = tokio::select! {
+                    biased;
+                    opt = stream.next() => opt,
+                    _ = tokio::time::sleep(CDC_ENGINE_HALT_POLL) => {
+                        continue;
+                    }
+                };
+                let Some(event) = next_item else {
+                    break;
+                };
                 let event = match event {
                     Ok(e) => e,
                     Err(e) => {

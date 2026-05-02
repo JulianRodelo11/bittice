@@ -15,7 +15,10 @@ use axum::{
 use axum::extract::Request;
 use std::sync::{Arc};
 use std::time::Instant;
-use tokio::sync::{oneshot, RwLock as TokioRwLock, Notify};
+use tokio::sync::{RwLock as TokioRwLock, Notify};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Mutex;
+use std::thread::JoinHandle;
 use tower_http::trace::TraceLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use crate::core::saved_queries::{load_operations, SavedCollectAggregation, SavedOperation};
@@ -115,24 +118,61 @@ pub fn show_banner() {
     show_banner_with_filter(None);
 }
 
-pub(crate) async fn wait_for_exit(shutdown_tx: Option<oneshot::Sender<()>>) -> anyhow::Result<()> {
+/// When true, CDC workers should exit their main loops (REPL back to menu or engine shutdown).
+static ENGINE_HALT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+static REPL_ENGINE_SHUTDOWN_NOTIFY: Mutex<Option<Arc<Notify>>> = Mutex::new(None);
+
+static CDC_BACKGROUND_THREAD_HANDLES: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+#[inline]
+pub fn engine_halt_requested() -> bool {
+    ENGINE_HALT_REQUESTED.load(AtomicOrdering::SeqCst)
+}
+
+pub(crate) fn register_cdc_background_handle(handle: JoinHandle<()>) {
+    CDC_BACKGROUND_THREAD_HANDLES.lock().unwrap().push(handle);
+}
+
+fn join_all_cdc_background_threads() {
+    let handles: Vec<_> = std::mem::take(&mut *CDC_BACKGROUND_THREAD_HANDLES.lock().unwrap());
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Full engine teardown for the interactive REPL: request CDC stop, unblock HTTP/gRPC, then join CDC threads.
+///
+/// **Order matters:** notify HTTP/gRPC waiters *before* joining CDC threads, so nested Tokio runtimes in
+/// worker threads cannot deadlock with the main runtime while tearing down.
+pub fn repl_stop_engine_and_join_cdc() {
+    ENGINE_HALT_REQUESTED.store(true, AtomicOrdering::SeqCst);
+    if let Some(n) = REPL_ENGINE_SHUTDOWN_NOTIFY.lock().unwrap().take() {
+        n.notify_waiters();
+    }
+    join_all_cdc_background_threads();
+    ENGINE_HALT_REQUESTED.store(false, AtomicOrdering::SeqCst);
+}
+
+pub(crate) async fn wait_for_exit(shutdown_notify: Arc<Notify>) -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     println!("\x1b[34m│\x1b[0m");
     println!("\x1b[33m▲\x1b[0m  \x1b[1mShutting down\x1b[0m");
     println!("\x1b[34m│\x1b[0m  \x1b[90mStopping Bittice engine safely...\x1b[0m");
     println!("\x1b[34m└\x1b[0m\n");
-    if let Some(tx) = shutdown_tx {
-        let _ = tx.send(());
-    }
+    ENGINE_HALT_REQUESTED.store(true, AtomicOrdering::SeqCst);
+    shutdown_notify.notify_waiters();
+    join_all_cdc_background_threads();
+    ENGINE_HALT_REQUESTED.store(false, AtomicOrdering::SeqCst);
     Ok(())
 }
-/// When `shutdown_on_ctrl_c` is `false`, the HTTP engine keeps running and this call does **not**
-/// register a Ctrl+C handler (for interactive REPL: the caller owns Ctrl+C so “back to menu” works).
+/// When `shutdown_on_ctrl_c` is `false`, the REPL (or tests) owns shutdown via [`repl_stop_engine_and_join_cdc`]
+/// with Ctrl+C on the Live Monitor; this call blocks until then.
 pub async fn start_all_servers(
     entity_filter: Option<String>,
     shutdown_on_ctrl_c: bool,
 ) -> anyhow::Result<()> {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown_notify = Arc::new(Notify::new());
     let table_manager = Arc::new(TableManager::new());
     let active_workers = Arc::new(StdRwLock::new(HashSet::new()));
     
@@ -145,55 +185,81 @@ pub async fn start_all_servers(
         debug!("No entity filter applied (loading all)");
     }
     
-    // --- AUTO-START CDC WORKERS ---
+    // --- AUTO-START CDC WORKERS (sequential: HTTP only after each profile signals Phase 4) ---
     if cdc_autostart_enabled() {
-        scan_and_start_cdc(table_manager.clone(), entity_filter.clone(), active_workers.clone());
+        let specs = collect_cdc_spawn_specs(&entity_filter, &active_workers);
+        if !specs.is_empty() {
+            info!(
+                "CDC: Staged startup — {} profile(s) run one after another; ports 3000/8080 open only after each finishes Phase 4.",
+                specs.len()
+            );
+            let tm = table_manager.clone();
+            let aw = active_workers.clone();
+            match tokio::task::spawn_blocking(move || run_cdc_staged_sequential(tm, aw, specs)).await {
+                Ok(()) => {}
+                Err(e) => error!("CDC: staged startup task join failed: {}", e),
+            }
+        }
     } else {
         info!("CDC autostart disabled. Running with static local data only.");
     }
 
     crate::server::auto_update_hint::spawn_if_configured();
 
+    if !shutdown_on_ctrl_c {
+        *REPL_ENGINE_SHUTDOWN_NOTIFY.lock().unwrap() = Some(shutdown_notify.clone());
+    }
+
     let http_tm = table_manager.clone();
     let http_filter = entity_filter.clone();
     let http_active = active_workers.clone();
+    let sn_http = shutdown_notify.clone();
     tokio::spawn(async move {
-        start_server(http_tm, http_filter, http_active, shutdown_rx).await;
+        start_server(http_tm, http_filter, http_active, sn_http).await;
     });
 
     let grpc_tm = table_manager.clone();
     let grpc_filter = entity_filter.clone();
+    let sn_grpc = shutdown_notify.clone();
     tokio::spawn(async move {
-        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter, None).await;
+        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter, None, sn_grpc)
+            .await;
     });
 
     if shutdown_on_ctrl_c {
         show_banner();
-        wait_for_exit(Some(shutdown_tx)).await
+        wait_for_exit(shutdown_notify).await
     } else {
-        std::future::pending::<()>().await;
+        shutdown_notify.notified().await;
         Ok(())
     }
 }
 
 use std::collections::HashSet;
+use std::sync::mpsc;
 use std::sync::RwLock as StdRwLock;
 
-pub struct ServerState {
-    pub table_manager: Arc<TableManager>,
-    pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
-    pub entity_filter: Option<String>,
-    pub auth_service: crate::core::auth::AuthService,
-    pub active_workers: Arc<StdRwLock<HashSet<String>>>,
+#[derive(Clone)]
+struct CdcSpawnSpec {
+    entity: String,
+    entity_key: String,
+    worker_db: String,
+    url: String,
+    sync_all: bool,
+    cleanup_single_db_lock: Option<String>,
+    db_name_for_log: String,
+    vpn_file: Option<String>,
+    vpn_host: String,
 }
 
-pub fn scan_and_start_cdc(
-    table_manager: Arc<TableManager>, 
-    entity_filter: Option<String>,
-    active_workers: Arc<StdRwLock<HashSet<String>>>
-) {
+/// Build launch plans for every CDC profile that should auto-start (same rules as historical `scan_and_start_cdc`).
+fn collect_cdc_spawn_specs(
+    entity_filter: &Option<String>,
+    active_workers: &Arc<StdRwLock<HashSet<String>>>,
+) -> Vec<CdcSpawnSpec> {
     const SINGLE_DB_WORKER_LOCK_PREFIX: &str = "__single_db_worker_lock__";
-    
+    let mut out = Vec::new();
+
     for config_path in crate::core::data_paths::scan_all_cdc_config_paths() {
         let entity_folder_name = config_path
             .parent()
@@ -205,146 +271,258 @@ pub fn scan_and_start_cdc(
             continue;
         }
 
-        // If a filter is provided, skip this directory if it doesn't match
         if let Some(ref filter) = entity_filter {
             if entity_folder_name.to_lowercase() != *filter {
                 continue;
             }
         }
 
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-                        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                            let user = config["user"].as_str().unwrap_or_default().to_string();
-                            let pass = config["pass"].as_str().unwrap_or_default().to_string();
-                            let mut host = config["host"].as_str().unwrap_or_default().to_string();
-                            let sync_all = config["sync_all_databases"].as_bool().unwrap_or(false);
-                            let db = config["database"].as_str().unwrap_or_default().to_string();
-                            let entity = config["entity"].as_str().unwrap_or(&entity_folder_name).to_string();
-                            
-                            // Check if worker is already active
-                            let entity_key = entity.clone();
-                            {
-                                let active = active_workers.read().unwrap();
-                                if active.contains(&entity_key) {
-                                    continue;
-                                }
-                            }
+        let Ok(content) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
 
-                            // If a filter is provided, also check against the 'entity' field in JSON
-                            if let Some(ref filter) = entity_filter {
-                                if entity.to_lowercase() != *filter {
-                                    continue;
-                                }
-                            }
+        let user = config["user"].as_str().unwrap_or_default().to_string();
+        let pass = config["pass"].as_str().unwrap_or_default().to_string();
+        let mut host = config["host"].as_str().unwrap_or_default().to_string();
+        let sync_all = config["sync_all_databases"].as_bool().unwrap_or(false);
+        let db = config["database"].as_str().unwrap_or_default().to_string();
+        let entity = config["entity"]
+            .as_str()
+            .unwrap_or(&entity_folder_name)
+            .to_string();
 
-                            let port = if let Some(p) = config["port"].as_str() {
-                                p.to_string()
-                            } else if let Some(p) = config["port"].as_u64() {
-                                p.to_string()
-                            } else {
-                                "3306".to_string()
-                            };
+        let entity_key = entity.clone();
+        {
+            let active = active_workers.read().unwrap();
+            if active.contains(&entity_key) {
+                continue;
+            }
+        }
 
-                            if let Some(vpn_path) = config["vpn_file"].as_str() {
-                                if !vpn_path.trim().is_empty() {
-                                    info!("CDC: Auto-starting VPN from saved config for entity '{}'...", entity);
-                                    match crate::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &host) {
-                                        Ok(prepared) => {
-                                            if let Err(e) = crate::core::vpn::VpnManager::start(&prepared) {
-                                                warn!("CDC: Failed to start VPN for entity '{}': {}", entity, e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("CDC: Failed to prepare VPN file for entity '{}': {}", entity, e);
-                                        }
-                                    }
-                                }
-                            }
+        if let Some(ref filter) = entity_filter {
+            if entity.to_lowercase() != *filter {
+                continue;
+            }
+        }
 
-                            let is_docker = std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
-                            if (host == "localhost" || host == "0.0.0.0") && is_docker {
-                                host = "host.docker.internal".to_string();
-                            }
-                            let single_db_lock_key = format!(
-                                "{}:{}:{}",
-                                SINGLE_DB_WORKER_LOCK_PREFIX,
-                                host.to_lowercase(),
-                                port
-                            );
+        let port = if let Some(p) = config["port"].as_str() {
+            p.to_string()
+        } else if let Some(p) = config["port"].as_u64() {
+            p.to_string()
+        } else {
+            "3306".to_string()
+        };
 
-                            if !sync_all {
-                                let active = active_workers.read().unwrap();
-                                if active.contains(&single_db_lock_key) {
-                                    warn!(
-                                        "CDC: Skipping entity '{}' — another profile already owns single-database CDC for {}:{}. \
+        let vpn_file = config["vpn_file"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string());
+
+        let is_docker =
+            std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
+        if (host == "localhost" || host == "0.0.0.0") && is_docker {
+            host = "host.docker.internal".to_string();
+        }
+        let vpn_host = host.clone();
+
+        let single_db_lock_key = format!(
+            "{}:{}:{}",
+            SINGLE_DB_WORKER_LOCK_PREFIX,
+            host.to_lowercase(),
+            port
+        );
+
+        if !sync_all {
+            let active = active_workers.read().unwrap();
+            if active.contains(&single_db_lock_key) {
+                warn!(
+                    "CDC: Skipping entity '{}' — another profile already owns single-database CDC for {}:{}. \
 MySQL publishes one binlog per server; Bittice allows only one single-DB worker per host:port. \
 Mirror '{}' will stay static unless you enable sync_all_databases on one profile for this server (covers all schemas in one stream) or use separate MySQL instances.",
-                                        entity,
-                                        host,
-                                        port,
-                                        entity,
-                                    );
-                                    continue;
-                                }
-                            }
+                    entity,
+                    host,
+                    port,
+                    entity,
+                );
+                continue;
+            }
+        }
 
-                            let url = if sync_all {
-                                format!("mysql://{}:{}@{}:{}/", user, pass, host, port)
-                            } else {
-                                format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db)
-                            };
-                            let worker_tm = table_manager.clone();
-                            let worker_entity = entity.clone();
-                            let worker_db = if sync_all {
-                                String::new()
-                            } else {
-                                db.clone()
-                            };
-                            let cleanup_entity_key = entity_key.clone();
-                            let cleanup_single_db_lock = if sync_all {
-                                None
-                            } else {
-                                Some(single_db_lock_key.clone())
-                            };
-                            let cleanup_active_workers = active_workers.clone();
+        let url = if sync_all {
+            format!("mysql://{}:{}@{}:{}/", user, pass, host, port)
+        } else {
+            format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db)
+        };
+        let worker_db = if sync_all {
+            String::new()
+        } else {
+            db.clone()
+        };
+        let db_name_for_log = if sync_all {
+            entity.clone()
+        } else {
+            worker_db.clone()
+        };
 
-                            // Mark as active
-                            {
-                                let mut active = active_workers.write().unwrap();
-                                active.insert(entity_key);
-                                if !sync_all {
-                                    active.insert(single_db_lock_key);
-                                }
-                            }
+        out.push(CdcSpawnSpec {
+            entity,
+            entity_key,
+            worker_db,
+            url,
+            sync_all,
+            cleanup_single_db_lock: if sync_all {
+                None
+            } else {
+                Some(single_db_lock_key)
+            },
+            db_name_for_log,
+            vpn_file,
+            vpn_host,
+        });
+    }
 
-                            std::thread::spawn(move || {
-                                let rt = tokio::runtime::Runtime::new().unwrap();
-                                let db_name_for_log = if sync_all {
-                                    worker_entity.clone()
-                                } else {
-                                    worker_db.clone()
-                                };
-                                let worker = crate::core::cdc::CdcWorker::with_manager_and_log(
-                                    url,
-                                    worker_entity,
-                                    worker_db,
-                                    worker_tm,
-                                    None,
-                                    sync_all,
-                                    false,
-                                );
-                                if let Err(e) = rt.block_on(worker.run()) {
-                                    // `{:#}` prints anyhow's full chain (e.g. path context); `{}` often hides the root cause.
-                                    error!("CDC: Worker for '{}' failed: {:#}", db_name_for_log, e);
-                                }
-                                let mut active = cleanup_active_workers.write().unwrap();
-                                active.remove(&cleanup_entity_key);
-                                if let Some(lock_key) = cleanup_single_db_lock {
-                                    active.remove(&lock_key);
-                                }
-                            });
-                        }
-                    }
+    out
+}
+
+fn spawn_cdc_worker_thread(
+    spec: CdcSpawnSpec,
+    table_manager: Arc<TableManager>,
+    active_workers: Arc<StdRwLock<HashSet<String>>>,
+    startup_report_tx: Option<mpsc::Sender<crate::core::cdc::CdcStartupReport>>,
+) {
+    if let Some(ref vpn_path) = spec.vpn_file {
+        info!(
+            "CDC: Auto-starting VPN from saved config for entity '{}'...",
+            spec.entity
+        );
+        match crate::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &spec.vpn_host) {
+            Ok(prepared) => {
+                if let Err(e) = crate::core::vpn::VpnManager::start(&prepared) {
+                    warn!("CDC: Failed to start VPN for entity '{}': {}", spec.entity, e);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "CDC: Failed to prepare VPN file for entity '{}': {}",
+                    spec.entity, e
+                );
+            }
+        }
+    }
+
+    let cleanup_entity_key = spec.entity_key.clone();
+    let cleanup_single_db_lock = spec.cleanup_single_db_lock.clone();
+    let cleanup_active_workers = active_workers.clone();
+
+    {
+        let mut active = active_workers.write().unwrap();
+        active.insert(spec.entity_key.clone());
+        if let Some(ref lock_key) = spec.cleanup_single_db_lock {
+            active.insert(lock_key.clone());
+        }
+    }
+
+    let db_name_for_log = spec.db_name_for_log.clone();
+
+    let h = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let worker = crate::core::cdc::CdcWorker::with_manager_and_log(
+            spec.url,
+            spec.entity,
+            spec.worker_db,
+            table_manager,
+            None,
+            spec.sync_all,
+            false,
+            startup_report_tx,
+        );
+        if let Err(e) = rt.block_on(worker.run()) {
+            error!("CDC: Worker for '{}' failed: {:#}", db_name_for_log, e);
+        }
+        let mut active = cleanup_active_workers.write().unwrap();
+        active.remove(&cleanup_entity_key);
+        if let Some(lock_key) = cleanup_single_db_lock {
+            active.remove(&lock_key);
+        }
+    });
+    register_cdc_background_handle(h);
+}
+
+fn run_cdc_staged_sequential(
+    table_manager: Arc<TableManager>,
+    active_workers: Arc<StdRwLock<HashSet<String>>>,
+    specs: Vec<CdcSpawnSpec>,
+) {
+    use crate::core::cdc::CdcStartupOutcome;
+
+    let total = specs.len();
+    for (idx, spec) in specs.into_iter().enumerate() {
+        info!(
+            "CDC: ─── Staged profile {}/{}: '{}' ───",
+            idx + 1,
+            total,
+            spec.entity
+        );
+        let data_root = crate::core::data_paths::resolved_data_root();
+        let root_disp = std::fs::canonicalize(&data_root).unwrap_or_else(|_| data_root.clone());
+        let state_pb = crate::core::data_paths::profile_dir(&spec.entity).join("cdc_state.json");
+        let state_disp = std::fs::canonicalize(&state_pb).unwrap_or_else(|_| state_pb.clone());
+        info!(
+            "CDC: [{}] sync_all={} data_root={} cdc_state_path={}",
+            spec.entity,
+            spec.sync_all,
+            root_disp.display(),
+            state_disp.display()
+        );
+        let (tx, rx) = mpsc::channel();
+        spawn_cdc_worker_thread(spec, table_manager.clone(), active_workers.clone(), Some(tx));
+        match rx.recv() {
+            Ok(report) => match report.outcome {
+                CdcStartupOutcome::LiveReplication => {
+                    info!(
+                        "CDC: Profile '{}' finished Phase 4 — live replication running.",
+                        report.entity
+                    );
+                }
+                CdcStartupOutcome::StaticMirror => {
+                    warn!(
+                        "CDC: Profile '{}' is on a static mirror (live CDC inactive). HTTP can still serve snapshots.",
+                        report.entity
+                    );
+                }
+                CdcStartupOutcome::Failed(msg) => {
+                    error!(
+                        "CDC: Profile '{}' reported failure during startup: {}",
+                        report.entity, msg
+                    );
+                }
+            },
+            Err(_) => {
+                error!("CDC: Worker for staged profile exited without a readiness report.");
+            }
+        }
+    }
+}
+
+pub struct ServerState {
+    pub table_manager: Arc<TableManager>,
+    pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
+    pub entity_filter: Option<String>,
+    pub auth_service: crate::core::auth::AuthService,
+    pub active_workers: Arc<StdRwLock<HashSet<String>>>,
+}
+
+pub fn scan_and_start_cdc(
+    table_manager: Arc<TableManager>,
+    entity_filter: Option<String>,
+    active_workers: Arc<StdRwLock<HashSet<String>>>,
+) {
+    let specs = collect_cdc_spawn_specs(&entity_filter, &active_workers);
+    for spec in specs {
+        spawn_cdc_worker_thread(spec, table_manager.clone(), active_workers.clone(), None);
     }
 }
 
@@ -361,7 +539,7 @@ pub async fn start_server(
     table_manager: Arc<TableManager>, 
     entity_filter: Option<String>, 
     active_workers: Arc<StdRwLock<HashSet<String>>>,
-    shutdown_rx: oneshot::Receiver<()>
+    shutdown_notify: Arc<Notify>
 ) {
     let state = Arc::new(ServerState {
         table_manager: table_manager.clone(),
@@ -446,13 +624,6 @@ pub async fn start_server(
         "HTTP query API (saved operations only; /_* → 404) on http://{}",
         public_bind
     );
-
-    let shutdown_notify = Arc::new(Notify::new());
-    let shutdown_notify_spawn = shutdown_notify.clone();
-    tokio::spawn(async move {
-        let _ = shutdown_rx.await;
-        shutdown_notify_spawn.notify_waiters();
-    });
 
     let _ = tokio::join!(
         axum::serve(listener_internal, app_internal).with_graceful_shutdown({
