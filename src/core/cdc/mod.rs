@@ -39,6 +39,12 @@ const CDC_STATE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 const CDC_STATE_SAVE_EVENT_BURST: u32 = 1024;
 /// Wake `binlog` `stream.next()` waits periodically so [`crate::server::engine_halt_requested`] is honored even when the server is quiet.
 const CDC_ENGINE_HALT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+/// While the binlog stream is idle, periodically verify MySQL still answers on a fresh pooled connection.
+const CDC_IDLE_LIVENESS_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Fail fast when MySQL does not answer a simple probe within this bound.
+const CDC_IDLE_LIVENESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// One timed-out/failed probe is enough to treat the CDC stream as lost and stop the engine.
+const CDC_IDLE_LIVENESS_PROBE_FAILURES: u32 = 1;
 
 /// Guard for the one-line startup hint when `BITTICE_CDC_LOG_ROW_EVENTS` is enabled.
 static CDC_ROW_TRACE_BANNER_EMITTED: AtomicBool = AtomicBool::new(false);
@@ -416,6 +422,15 @@ impl CdcWorker {
         Ok(())
     }
 
+    /// Persist only the conservative restart checkpoint.
+    fn save_resume_checkpoint(&self, state: &CdcState) -> Result<()> {
+        let mut checkpoint = state.clone();
+        if !checkpoint.binlog_file.is_empty() {
+            checkpoint.gtid_executed.clear();
+        }
+        self.save_state(&checkpoint)
+    }
+
     /// Replace `dst` with `src` atomically where the platform allows it.
     fn atomic_rename_into_place(src: &Path, dst: &Path) -> Result<()> {
         #[cfg(unix)]
@@ -578,6 +593,22 @@ impl CdcWorker {
                 .await?;
         }
         Self::query_master_coordinates(&mut c).await
+    }
+
+    /// Cheap runtime liveness check used when the binlog stream is idle but should still be connected.
+    async fn probe_mysql_liveness(&self, pool: &Pool) -> Result<()> {
+        let probe = async {
+            let mut conn = pool.get_conn().await?;
+            conn.query_drop("SELECT 1").await?;
+            Result::<()>::Ok(())
+        };
+        tokio::time::timeout(CDC_IDLE_LIVENESS_PROBE_TIMEOUT, probe)
+            .await
+            .map_err(|_| anyhow::anyhow!(
+                "CDC idle liveness probe timed out after {}s",
+                CDC_IDLE_LIVENESS_PROBE_TIMEOUT.as_secs()
+            ))??;
+        Ok(())
     }
 
     /// Whether persisted replication coordinates are at or past `(tip_file, tip_pos)` from `SHOW BINARY LOG STATUS`.
@@ -1838,7 +1869,8 @@ replaying missed events before declaring live (data added while Bittice was offl
             let filename_b = state.binlog_file.as_bytes();
             let pos_u64 = state.binlog_pos as u64;
 
-            let use_gtid_dump = master_gtid_enabled && !state.gtid_executed.trim().is_empty();
+            let use_gtid_dump =
+                master_gtid_enabled && !had_checkpoint_at_start && !state.gtid_executed.trim().is_empty();
 
             let binlog_open_result = if use_gtid_dump {
                 match Self::split_gtid_executed_chunks(state.gtid_executed.trim()) {
@@ -1932,7 +1964,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                         self.save_state(&state)?;
                         continue 'binlog_retry;
                     }
-                    let _ = self.save_state(&state);
+                    let _ = self.save_resume_checkpoint(&state);
                     return self
                         .enter_static_mode(format!("Binlog stream unavailable: {}.", msg))
                         .await;
@@ -1948,19 +1980,54 @@ replaying missed events before declaring live (data added while Bittice was offl
             }
 
             let mut repl_caught_up_streak: u32 = 0;
+            let mut last_idle_liveness_probe = std::time::Instant::now();
+            let mut consecutive_idle_liveness_failures: u32 = 0;
             loop {
                 if crate::server::engine_halt_requested() {
                     self.log_info(format!(
                         "CDC: Worker '{}' leaving live binlog stream (engine shutdown).",
                         self.entity
                     ));
-                    let _ = self.save_state(&state);
+                    let _ = self.save_resume_checkpoint(&state);
                     return Ok(());
                 }
                 let next_item = tokio::select! {
                     biased;
                     opt = stream.next() => opt,
                     _ = tokio::time::sleep(CDC_ENGINE_HALT_POLL) => {
+                        if !self.exit_after_cdc_ready
+                            && !state.mvcc_snapshot_catchup_pending
+                            && last_idle_liveness_probe.elapsed() >= CDC_IDLE_LIVENESS_PROBE_INTERVAL
+                        {
+                            last_idle_liveness_probe = std::time::Instant::now();
+                            match self.probe_mysql_liveness(&pool).await {
+                                Ok(()) => {
+                                    consecutive_idle_liveness_failures = 0;
+                                }
+                                Err(e) => {
+                                    consecutive_idle_liveness_failures =
+                                        consecutive_idle_liveness_failures.saturating_add(1);
+                                    self.log_warn(format!(
+                                        "CDC: idle liveness probe failed for '{}' ({}/{}): {}",
+                                        self.entity,
+                                        consecutive_idle_liveness_failures,
+                                        CDC_IDLE_LIVENESS_PROBE_FAILURES,
+                                        e
+                                    ));
+                                    if consecutive_idle_liveness_failures
+                                        >= CDC_IDLE_LIVENESS_PROBE_FAILURES
+                                    {
+                                        let _ = self.save_resume_checkpoint(&state);
+                                        return self
+                                            .enter_static_mode(format!(
+                                                "CDC: lost MySQL connectivity while the live binlog stream was idle ({}). Restart Bittice to resynchronize from the saved checkpoint.",
+                                                e
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
                         if self.exit_after_cdc_ready || state.mvcc_snapshot_catchup_pending {
                             match self.query_master_coordinates_pool(&pool).await {
                                 Ok(Some((mf, mp))) if !mf.is_empty() => {
@@ -1969,7 +2036,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                                             repl_caught_up_streak.saturating_add(1);
                                         if repl_caught_up_streak >= 2 {
                                             state.mvcc_snapshot_catchup_pending = false;
-                                            let _ = self.save_state(&state);
+                                            let _ = self.save_resume_checkpoint(&state);
                                             if self.exit_after_cdc_ready {
                                                 // Flush all open mirror tables so binlog rows applied
                                                 // during the snapshot catchup window (e.g. inserts that
@@ -2031,6 +2098,8 @@ replaying missed events before declaring live (data added while Bittice was offl
                 };
                 let event = match event {
                     Ok(e) => {
+                        consecutive_idle_liveness_failures = 0;
+                        last_idle_liveness_probe = std::time::Instant::now();
                         if self.exit_after_cdc_ready || state.mvcc_snapshot_catchup_pending {
                             repl_caught_up_streak = 0;
                         }
@@ -2083,7 +2152,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                             self.save_state(&state)?;
                             continue 'binlog_retry;
                         }
-                        let _ = self.save_state(&state);
+                        let _ = self.save_resume_checkpoint(&state);
                         return self
                             .enter_static_mode(format!("Binlog stream error: {}.", msg))
                             .await;
@@ -2106,12 +2175,10 @@ replaying missed events before declaring live (data added while Bittice was offl
                             Ok(merged) => state.gtid_executed = merged,
                             Err(e) => warn!("CDC: gtid_executed merge failed: {}", e),
                         }
-                        Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     Some(EventData::TableMapEvent(tm)) => {
                         let mut map = self.table_map_events.write().unwrap();
                         map.insert(tm.table_id(), tm.into_owned());
-                        Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     Some(EventData::RowsEvent(rows_data)) => {
                         if let Ok(tm_probe) = self.resolve_rows_table_map(&rows_data, &stream) {
@@ -2169,22 +2236,20 @@ replaying missed events before declaring live (data added while Bittice was offl
                         state.binlog_file = rotate_data.name().to_string();
                         state.binlog_pos = rotate_data.position() as u32;
                     }
-                    _ => {
-                        Self::apply_binlog_file_pos(&mut state, next_pos);
-                    }
+                    _ => {}
                 }
 
                 events_since_save = events_since_save.saturating_add(1);
                 let periodic_save = last_state_save.elapsed() >= CDC_STATE_SAVE_INTERVAL
                     || events_since_save >= CDC_STATE_SAVE_EVENT_BURST;
                 if checkpoint_rotate || periodic_save {
-                    self.save_state(&state)?;
+                    self.save_resume_checkpoint(&state)?;
                     events_since_save = 0;
                     last_state_save = std::time::Instant::now();
                 }
             }
 
-            self.save_state(&state)?;
+            self.save_resume_checkpoint(&state)?;
             return self
                 .enter_static_mode(format!(
                     "CDC: Binlog stream ended unexpectedly for entity '{}'.",
