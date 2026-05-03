@@ -1750,6 +1750,36 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
             );
         }
 
+        // Resume-with-gap detection: when we have a saved binlog position from a previous session
+        // and that position is behind the current master tip, events that occurred while Bittice was
+        // offline (e.g. the user went to the main menu to connect a new RDS) must be replayed before
+        // the engine is considered "live".  Setting mvcc_snapshot_catchup_pending here re-uses the
+        // existing backlog-drain mechanism so that:
+        //   • run_cdc_staged_sequential waits for the catchup to finish before opening HTTP,
+        //   • tables are flushed durably once the gap is closed.
+        // We only do this check when NOT already pending (fresh bootstrap sets it independently).
+        if !state.mvcc_snapshot_catchup_pending
+            && had_checkpoint_at_start
+            && !requires_lossless_mvcc_bootstrap
+        {
+            match self.query_master_coordinates_pool(&pool).await {
+                Ok(Some((tip_file, tip_pos))) if !tip_file.is_empty() => {
+                    if !Self::cdc_replication_caught_up_to_tip(&state, &tip_file, tip_pos) {
+                        state.mvcc_snapshot_catchup_pending = true;
+                        self.log_info(format!(
+                            "CDC: [{}] Resume gap detected — saved {}:{} is behind master {}:{}; \
+replaying missed events before declaring live (data added while Bittice was offline will be recovered).",
+                            self.entity,
+                            state.binlog_file, state.binlog_pos,
+                            tip_file, tip_pos,
+                        ));
+                        let _ = self.save_state(&state);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let pool = pool.clone();
         let mut last_state_save = std::time::Instant::now();
         let mut events_since_save: u32 = 0;
@@ -1966,6 +1996,17 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
                                                 return Ok(());
                                             }
                                             if !live_startup_reported {
+                                                // Flush all open mirror tables durably so that
+                                                // primary.idx and bitmaps reflect the replayed rows
+                                                // before HTTP requests can read them.
+                                                {
+                                                    let tables = self.table_manager.tables.read().unwrap();
+                                                    for table_arc in tables.values() {
+                                                        if let Ok(mut t) = table_arc.write() {
+                                                            let _ = t.flush_active_segment();
+                                                        }
+                                                    }
+                                                }
                                                 live_startup_reported = true;
                                                 self.log_phase(
                                                     4,
