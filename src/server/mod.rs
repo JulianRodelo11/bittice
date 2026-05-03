@@ -1843,18 +1843,23 @@ fn group_rows_by_field(
             }
             row
         };
-        let item = serde_json::Value::Object(item_row);
+        let is_empty = item_row.values().all(|v| {
+            v.as_str().map_or(false, str::is_empty) || v.is_null()
+        });
 
         if let Some(existing_index) = index.get(&key).copied() {
-            let group = grouped.get_mut(existing_index).unwrap();
-            let items = group.get_mut(&grouping.items_as).and_then(|value| value.as_array_mut()).ok_or_else(|| "Invalid grouped response state".to_string())?;
-            items.push(item);
+            if !is_empty {
+                let group = grouped.get_mut(existing_index).unwrap();
+                let items = group.get_mut(&grouping.items_as).and_then(|value| value.as_array_mut()).ok_or_else(|| "Invalid grouped response state".to_string())?;
+                items.push(serde_json::Value::Object(item_row));
+            }
         } else {
             let mut group = serde_json::Map::new();
             for (field, value) in parent_fields {
                 group.insert(field, value);
             }
-            group.insert(grouping.items_as.clone(), serde_json::Value::Array(vec![item]));
+            let items = if is_empty { Vec::new() } else { vec![serde_json::Value::Object(item_row)] };
+            group.insert(grouping.items_as.clone(), serde_json::Value::Array(items));
             index.insert(key, grouped.len());
             grouped.push(group);
         }

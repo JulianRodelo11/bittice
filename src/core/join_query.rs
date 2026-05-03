@@ -128,9 +128,20 @@ pub fn execute_join_query(
     let resolved_order_by = resolve_order_by(&query.order_by, &base_alias, &computed_headers)?;
     let resolved_aggregations = resolve_aggregations(&query.aggregations, params_map)?;
     let joins = resolve_joins(query, &base_alias)?;
+    let left_join_aliases: HashSet<String> = joins
+        .iter()
+        .filter(|j| j.kind == JoinKind::Left)
+        .map(|j| j.alias.clone())
+        .collect();
+    let post_join_filters: Vec<ResolvedFilter> = resolved_filters
+        .iter()
+        .filter(|f| !left_join_aliases.contains(&f.field.alias))
+        .cloned()
+        .collect();
     let mut available_aliases = HashSet::new();
     available_aliases.insert(base_alias.clone());
     let mut filters_applied_early = false;
+    let mut total_found = 0usize;
 
     if projections.is_empty() && resolved_aggregations.is_empty() {
         bail!("multi-table queries require selected fields, select projections, or aggregations");
@@ -170,7 +181,7 @@ pub fn execute_join_query(
         // trim early to avoid expensive enrichment joins on rows that won't be returned.
         if !filters_applied_early
             && can_apply_early_window(
-                &resolved_filters,
+                &post_join_filters,
                 resolved_filter_tree.as_ref(),
                 &resolved_order_by,
                 &resolved_aggregations,
@@ -178,10 +189,11 @@ pub fn execute_join_query(
                 &joins[idx + 1..],
             )
         {
-            current_rows = apply_filters(current_rows, &resolved_filters, &filters_op);
+            current_rows = apply_filters(current_rows, &post_join_filters, &filters_op);
             filters_applied_early = true;
             if !resolved_order_by.is_empty() {
                 current_rows.sort_by(|left, right| compare_rows(left, right, &resolved_order_by));
+                total_found = current_rows.len();
                 let capped_limit = limit.min(100);
                 let early_window = offset.saturating_add(capped_limit);
                 if early_window > 0 && current_rows.len() > early_window {
@@ -192,7 +204,7 @@ pub fn execute_join_query(
     }
 
     if !filters_applied_early {
-        current_rows = apply_filters(current_rows, &resolved_filters, &filters_op);
+        current_rows = apply_filters(current_rows, &post_join_filters, &filters_op);
     }
     if let Some(filter_tree) = &resolved_filter_tree {
         current_rows = apply_filter_tree(current_rows, filter_tree);
@@ -200,7 +212,9 @@ pub fn execute_join_query(
     if projections.iter().any(|projection| matches!(projection.kind, ProjectionKind::Computed { .. })) {
         enrich_rows_with_computed(&mut current_rows, &projections);
     }
-    let total_found = current_rows.len();
+    if total_found == 0 {
+        total_found = current_rows.len();
+    }
     let aggregation_results = if resolved_aggregations.is_empty() {
         None
     } else {
