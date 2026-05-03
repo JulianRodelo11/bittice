@@ -7,8 +7,11 @@ use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
 use crate::core::vpn::VpnManager;
 use tracing::{info, warn};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 

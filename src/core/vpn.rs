@@ -1,10 +1,13 @@
 use anyhow::Result;
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::info;
+#[cfg(not(target_os = "macos"))]
+use tracing::warn;
 
 pub struct VpnManager;
 

@@ -443,6 +443,7 @@ impl Segment {
         let cache = self.mmap_cache.read().unwrap();
         for field in fields {
             if let Some(pair) = cache.get(field) {
+                #[allow(unused_variables)]
                 let (dat, off) = &**pair;
                 // Safe: advise does not mutate data, only hints kernel
                 #[cfg(not(windows))]
