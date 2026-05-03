@@ -14,6 +14,58 @@ $installDir = if ($env:BITTICE_INSTALL_DIR) {
     Join-Path $env:LOCALAPPDATA "Programs\Bittice"
 }
 
+function Write-Rule {
+    Write-Host "============================================================" -ForegroundColor DarkGray
+}
+
+function Write-BitticeBanner {
+    Write-Rule
+    Write-Host "BITTICE installer" -ForegroundColor Cyan
+    Write-Host "Fast setup for Windows workstations" -ForegroundColor DarkGray
+    Write-Rule
+    Write-Host "destination $installDir" -ForegroundColor Green
+    Write-Rule
+}
+
+function Write-Step {
+    param([string]$Message)
+    Write-Host ""
+    Write-Host ">> $Message" -ForegroundColor Cyan
+}
+
+function Write-InfoLine {
+    param([string]$Message)
+    Write-Host "  [..] $Message" -ForegroundColor Blue
+}
+
+function Write-OkLine {
+    param([string]$Message)
+    Write-Host "  [ok] $Message" -ForegroundColor Green
+}
+
+function Write-WarnLine {
+    param([string]$Message)
+    Write-Host "  [!!] $Message" -ForegroundColor Yellow
+}
+
+function Write-FailLine {
+    param([string]$Message)
+    Write-Host "  [x] $Message" -ForegroundColor Red
+}
+
+function Write-InstallSummary {
+    param(
+        [string]$BinaryPath,
+        [string]$NextStep
+    )
+
+    Write-Rule
+    Write-Host "Bittice is ready." -ForegroundColor Green
+    Write-Host "binary      $BinaryPath" -ForegroundColor Gray
+    Write-Host "next        $NextStep" -ForegroundColor Gray
+    Write-Rule
+}
+
 function Notify-EnvironmentChange {
     try {
         if (-not ('BitticeInstallerEnvNotify' -as [type])) {
@@ -49,7 +101,7 @@ function Add-BitticeToUserPath {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr = New-Object Security.Principal.WindowsPrincipal($id)
     if ($pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host "Running as Administrator: user PATH is for $($id.Name). Prefer a normal shell if you usually work without admin." -ForegroundColor Yellow
+        Write-WarnLine "Running as Administrator: user PATH is for $($id.Name). Prefer a normal shell if you usually work without admin."
     }
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -65,7 +117,7 @@ function Add-BitticeToUserPath {
             if (Test-Path -LiteralPath $cmp) { $cmp = (Resolve-Path -LiteralPath $cmp).Path.TrimEnd('\') }
         } catch { }
         if ([string]::Equals($add, $cmp, [StringComparison]::OrdinalIgnoreCase)) {
-            Write-Host "Install directory already on your user PATH." -ForegroundColor DarkGray
+            Write-OkLine "PATH already includes $add."
             $env:Path = "$add;$env:Path"
             return
         }
@@ -78,7 +130,7 @@ function Add-BitticeToUserPath {
     try {
         Set-ItemProperty -LiteralPath 'HKCU:\Environment' -Name 'Path' -Value $joined -Type ExpandString -Force
     } catch {
-        Write-Host "Could not write HKCU:\Environment\Path (try signing out and in)." -ForegroundColor Yellow
+        Write-WarnLine "Could not write HKCU:\Environment\Path (try signing out and in)."
     }
 
     Notify-EnvironmentChange
@@ -90,38 +142,42 @@ function Add-BitticeToUserPath {
         if ([string]::Equals($t, $add, [StringComparison]::OrdinalIgnoreCase)) { $ok = $true; break }
     }
     if (-not $ok) {
-        Write-Host "PATH may not have saved correctly. Add this folder in Settings: $add" -ForegroundColor Red
+        Write-FailLine "PATH may not have saved correctly. Add this folder in Settings: $add"
     } else {
-        Write-Host "Added to user PATH: $add" -ForegroundColor Green
+        Write-OkLine "Added to user PATH: $add"
     }
     $env:Path = "$add;$env:Path"
 }
 
-Write-Host "--- Bittice installer (Windows) ---" -ForegroundColor Blue
+Write-BitticeBanner
+Write-Step "Inspecting host platform"
 
 # 1. Architecture (standalone asset name; bundle currently ships x86_64 bittice.exe)
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "AMD64") { "x86_64" } elseif ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
 $standaloneTarget = "bittice-windows-x86_64.exe"
+Write-OkLine "Target platform: windows / $arch"
 
 # 2. Release tag: pinned via BITTICE_VERSION or latest from GitHub
+Write-Step "Resolving release"
 $latestTag = $null
 if ($env:BITTICE_VERSION) {
     $latestTag = $env:BITTICE_VERSION.Trim()
-    Write-Host "Using release tag from BITTICE_VERSION: $latestTag" -ForegroundColor Cyan
+    Write-InfoLine "Using release tag from BITTICE_VERSION: $latestTag"
 } else {
-    Write-Host "Fetching latest release from GitHub..."
+    Write-InfoLine "Fetching latest release from GitHub..."
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest"
     $latestTag = $release.tag_name
 }
 
 if (-not $latestTag) {
-    Write-Host "No published release found." -ForegroundColor Red
+    Write-FailLine "No published release found."
     exit 1
 }
 
-Write-Host "Installing $latestTag (prefer OS bundle; arch hint: $arch)..." -ForegroundColor Green
+Write-OkLine "Installing $latestTag for windows ($arch)."
 
 # 3. Download: try per-OS zip first, then legacy standalone .exe
+Write-Step "Downloading package"
 $tempFile = "$env:TEMP\bittice_temp.exe"
 $bundle = "bittice-$latestTag-windows.zip"
 $bundleUrl = "https://github.com/$repo/releases/download/$latestTag/$bundle"
@@ -139,13 +195,16 @@ try {
     Remove-Item -Recurse -Force $expand -ErrorAction SilentlyContinue
     Remove-Item $zipPath -ErrorAction SilentlyContinue
     $usedBundle = $true
+    Write-OkLine "Downloaded OS bundle $bundle"
 } catch {
-    Write-Host "Bundle not available ($bundle); using standalone $standaloneTarget ..." -ForegroundColor Yellow
+    Write-WarnLine "Bundle not available ($bundle); using standalone $standaloneTarget"
     $downloadUrl = "https://github.com/$repo/releases/download/$latestTag/$standaloneTarget"
     Invoke-WebRequest -Uri $downloadUrl -OutFile $tempFile
+    Write-OkLine "Downloaded standalone asset $standaloneTarget"
 }
 
 # 4. Install
+Write-Step "Installing binary"
 if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
@@ -154,8 +213,7 @@ Move-Item -Path $tempFile -Destination (Join-Path $installDir $binaryName) -Forc
 
 Add-BitticeToUserPath -BinDir $installDir
 
-Write-Host "Bittice ($latestTag) installed successfully." -ForegroundColor Green
-Write-Host "Installed to: $(Join-Path $installDir $binaryName)" -ForegroundColor DarkGray
-if ($usedBundle) { Write-Host "Installed from OS bundle: $bundle" -ForegroundColor DarkGray }
-Write-Host "Close this window, open a new terminal, then run: bittice --help" -ForegroundColor Blue
-Write-Host "(If cmd still does not find it, sign out and back in once so PATH refreshes.)" -ForegroundColor DarkGray
+Write-Step "Final summary"
+if ($usedBundle) { Write-InfoLine "Installed from OS bundle: $bundle" }
+Write-InstallSummary -BinaryPath (Join-Path $installDir $binaryName) -NextStep "Open a new terminal, then run: bittice --help"
+Write-InfoLine "If cmd still does not find it, sign out and back in once so PATH refreshes."

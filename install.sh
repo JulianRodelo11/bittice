@@ -20,10 +20,55 @@ DEFAULT_CLOUD_APP_DIR="${HOME}/.bittice"
 # - BITTICE_INSTALL_DIR / BITTICE_LIBEXEC_DIR: full override of install paths
 
 # Terminal colors
+YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
+DIM='\033[0;90m'
+BOLD='\033[1m'
 NC='\033[0m' # No Color
+
+print_rule() {
+    printf '%b\n' "${DIM}============================================================${NC}"
+}
+
+installer_banner() {
+    print_rule
+    printf '%b\n' "${BOLD}${BLUE}BITTICE${NC} ${DIM}installer${NC}"
+    printf '%b\n' "${DIM}Fast setup for local machines and cloud hosts${NC}"
+    print_rule
+    printf '%b\n' "${DIM}destination${NC} ${GREEN}$INSTALL_DIR${NC}"
+    printf '%b\n' "${DIM}libexec    ${NC} ${GREEN}$LIBEXEC_DIR${NC}"
+    print_rule
+}
+
+installer_step() {
+    printf '\n%b\n' "${BOLD}${BLUE}==>${NC} ${BOLD}$1${NC}"
+}
+
+installer_info() {
+    printf '%b\n' "${BLUE}  [..]${NC} $1"
+}
+
+installer_ok() {
+    printf '%b\n' "${GREEN}  [ok]${NC} $1"
+}
+
+installer_warn() {
+    printf '%b\n' "${YELLOW}  [!!]${NC} $1"
+}
+
+installer_error() {
+    printf '%b\n' "${RED}  [x]${NC} $1"
+}
+
+installer_success() {
+    print_rule
+    printf '%b\n' "${BOLD}${GREEN}Bittice is ready.${NC}"
+    printf '%b\n' "${DIM}binary${NC}      ${BLUE}$1${NC}"
+    printf '%b\n' "${DIM}next${NC}        $2"
+    print_rule
+}
 
 is_true() {
     case "${1:-}" in
@@ -146,7 +191,7 @@ configure_path_for_workstation() {
         return 0
     fi
     case ":${PATH:-}:" in *:"$INSTALL_DIR":*)
-        echo -e "${GREEN}$INSTALL_DIR is already in your PATH.${NC}"
+        installer_ok "PATH already includes $INSTALL_DIR."
         return 0
         ;;
     esac
@@ -164,8 +209,8 @@ configure_path_for_workstation() {
             return 0
         fi
         printf '\n%s\nexport PATH="%s:$PATH"\n' "$marker" "$INSTALL_DIR" >>"$rcfile"
-        echo -e "${GREEN}Added ${BLUE}$INSTALL_DIR${NC} to PATH via ${BLUE}$rcfile${NC}"
-        echo -e "  Open a ${BLUE}new terminal${NC}, or run: ${BLUE}source \"$rcfile\"${NC}"
+        installer_ok "Added $INSTALL_DIR to PATH via $rcfile."
+        installer_info "Open a new terminal, or run: source \"$rcfile\""
     }
     if [ "$(uname -s)" = "Darwin" ]; then
         append_hook "${HOME}/.zshrc" 1
@@ -175,8 +220,8 @@ configure_path_for_workstation() {
     fi
 }
 
-echo -e "${BLUE}--- Bittice Installer ---${NC}"
-echo -e "Install directory: ${GREEN}$INSTALL_DIR${NC}  (libexec: ${GREEN}$LIBEXEC_DIR${NC})"
+installer_banner
+installer_step "Inspecting host platform"
 
 # 1. Detect Operating System
 OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -185,15 +230,17 @@ ARCH_TYPE=$(uname -m)
 case "$OS_TYPE" in
     linux*)     OS="linux" ;;
     darwin*)    OS="macos" ;;
-    *)          echo -e "${RED}Error: Operating system not supported by this script: $OS_TYPE${NC}"; exit 1 ;;
+    *)          installer_error "Operating system not supported by this script: $OS_TYPE"; exit 1 ;;
 esac
 
 # 2. Detect Architecture
 case "$ARCH_TYPE" in
     x86_64)     ARCH="x86_64" ;;
     arm64|aarch64) ARCH="aarch64" ;;
-    *)          echo -e "${RED}Error: Architecture not supported: $ARCH_TYPE${NC}"; exit 1 ;;
+    *)          installer_error "Architecture not supported: $ARCH_TYPE"; exit 1 ;;
 esac
+
+installer_ok "Target platform: $OS / $ARCH"
 
 TARGET="bittice-${OS}-${ARCH}"
 
@@ -219,23 +266,25 @@ bundle_member_for_arch() {
 }
 
 # 3. Resolve version tag
+installer_step "Resolving release"
 if [ -n "${BITTICE_VERSION:-}" ]; then
     LATEST_TAG="$BITTICE_VERSION"
-    echo -e "Using requested version tag: ${GREEN}$LATEST_TAG${NC}"
+    installer_info "Using requested version tag: $LATEST_TAG"
 else
-    echo -e "Checking for latest version on GitHub..."
+    installer_info "Checking for latest version on GitHub..."
     # Robust extraction of the first tag_name found in the releases list
     LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO/releases" | grep '"tag_name":' | head -n 1 | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
 fi
 
 if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ] || [[ "$LATEST_TAG" == http* ]]; then
-    echo -e "${RED}Error: Could not determine the latest version tag ($LATEST_TAG).${NC}"
+    installer_error "Could not determine the latest version tag ($LATEST_TAG)."
     exit 1
 fi
 
-echo -e "Installing version ${GREEN}$LATEST_TAG${NC} for ${GREEN}$OS ($ARCH)${NC}..."
+installer_ok "Installing $LATEST_TAG for $OS ($ARCH)."
 
 # 4. Download binary (prefer per-OS bundle; fallback to legacy standalone asset name)
+installer_step "Downloading package"
 TEMP_FILE=$(mktemp)
 
 download_via_bundle() {
@@ -279,32 +328,35 @@ download_via_bundle() {
 if is_true "${BITTICE_USE_LEGACY_ASSET:-0}"; then
     DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$TARGET"
     if ! curl -sSLf "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
-        echo -e "${RED}Error: Failed to download binary from $DOWNLOAD_URL${NC}"
+        installer_error "Failed to download binary from $DOWNLOAD_URL"
         exit 1
     fi
     chmod +x "$TEMP_FILE"
+    installer_ok "Downloaded standalone asset $TARGET."
 else
     if download_via_bundle; then
-        echo -e "Downloaded OS bundle for ${GREEN}$OS${NC} (${GREEN}$ARCH${NC})."
+        installer_ok "Downloaded OS bundle for $OS ($ARCH)."
     else
-        echo -e "${BLUE}Bundle not available; trying standalone asset ${TARGET}...${NC}"
+        installer_warn "Bundle not available; trying standalone asset $TARGET."
         DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$TARGET"
         if ! curl -sSLf "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
-            echo -e "${RED}Error: Failed to download from bundle and from $DOWNLOAD_URL${NC}"
-            echo -e "Ensure release $LATEST_TAG finished building, or set BITTICE_USE_LEGACY_ASSET=1."
+            installer_error "Failed to download from bundle and from $DOWNLOAD_URL"
+            installer_info "Ensure release $LATEST_TAG finished building, or set BITTICE_USE_LEGACY_ASSET=1."
             exit 1
         fi
         chmod +x "$TEMP_FILE"
+        installer_ok "Downloaded standalone asset $TARGET."
     fi
 fi
 
 # 5. Install binary (chmod is applied here and in finalize; sudo only if the directory is not writable)
 ensure_dir "$INSTALL_DIR"
-echo -e "${BLUE}Installing ${BINARY_NAME} to ${GREEN}$INSTALL_DIR${NC}..."
+installer_step "Installing binary"
+installer_info "Copying $BINARY_NAME into $INSTALL_DIR"
 if mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null; then
     :
 else
-    echo -e "${BLUE}Requesting elevated permissions once (sudo) to write under ${INSTALL_DIR}...${NC}"
+    installer_warn "Requesting elevated permissions once (sudo) to write under $INSTALL_DIR."
     sudo mv "$TEMP_FILE" "$INSTALL_DIR/$BINARY_NAME"
 fi
 chmod +x "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null || sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
@@ -318,14 +370,14 @@ configure_path_for_workstation
 
 # 6. Instance Flow (Cloud Detection)
 if is_cloud_instance; then
-    echo -e "\n${BLUE}--- Cloud Instance Detected ---${NC}"
-    echo -e "This system looks like a cloud server (AWS, GCP, or Azure)."
+    installer_step "Configuring cloud runtime"
+    installer_info "This system looks like a cloud server (AWS, GCP, or Azure)."
     SETUP_DOCKER=""
     if [ -n "${BITTICE_SETUP_DOCKER:-}" ]; then
         SETUP_DOCKER="$BITTICE_SETUP_DOCKER"
     elif is_true "${BITTICE_CLOUD_AUTO:-}" || [ ! -t 0 ]; then
         SETUP_DOCKER="true"
-        echo -e "Cloud auto mode enabled: Docker setup selected by default."
+        installer_info "Cloud auto mode enabled: Docker setup selected by default."
     else
         echo -ne "Would you like to set up Docker for background execution? [Y/n]: "
         if [ -e /dev/tty ]; then
@@ -343,24 +395,24 @@ if is_cloud_instance; then
     if is_true "$SETUP_DOCKER"; then
         # Install Docker if missing
         if ! command -v docker &> /dev/null; then
-            echo -e "Docker not found. ${BLUE}Installing Docker...${NC}"
+            installer_warn "Docker not found. Installing Docker..."
             curl -fsSL https://get.docker.com | sh
             sudo usermod -aG docker "$(install_owner)"
-            echo -e "${GREEN}Docker installed.${NC} (Note: you may need to re-login for group permissions)."
+            installer_ok "Docker installed. You may need to re-login for group permissions."
         fi
 
         # Install Docker Compose if missing
         if ! command -v docker-compose &> /dev/null; then
-             echo -e "${BLUE}Installing docker-compose...${NC}"
+             installer_info "Installing docker-compose..."
              sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
              sudo chmod +x /usr/local/bin/docker-compose
         fi
 
         # 1. Pull official image from GHCR
         IMAGE_NAME="ghcr.io/julianrodelo11/bittice:${LATEST_TAG}"
-        echo -e "${BLUE}Pulling official Bittice image: $IMAGE_NAME...${NC}"
+        installer_info "Pulling official Bittice image: $IMAGE_NAME"
         if ! docker pull "$IMAGE_NAME"; then
-            echo -e "${RED}Error: Could not pull image $IMAGE_NAME. Using local build as fallback...${NC}"
+            installer_warn "Could not pull image $IMAGE_NAME. Using local build as fallback."
             # Fallback to local build if tag is not yet available in GHCR
             cat > Dockerfile.local <<EOF
 FROM debian:bookworm-slim
@@ -444,29 +496,29 @@ EOF
                 fi
 
                 write_text_file "$COMPOSE_FILE" "$COMPOSE_CONTENT"
-                echo -e "${GREEN}Cloud compose ready at $COMPOSE_FILE (vpn_mode=$VPN_MODE).${NC}"
+        installer_ok "Cloud compose ready at $COMPOSE_FILE (vpn_mode=$VPN_MODE)."
 
         # 3. Start/Restart Bittice Service immediately
-        echo -e "${BLUE}Starting Bittice Engine...${NC}"
+    installer_info "Starting Bittice Engine..."
         # Stop everything first to ensure a clean state
         if command -v docker-compose &> /dev/null; then
                         docker-compose -f "$COMPOSE_FILE" down &> /dev/null || true
                         if ! docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans; then
-                echo -e "${RED}Error: Failed to start Bittice Engine with docker-compose.${NC}"
-                echo -e "Please check if ports 3000, 8080, or 50051 are already in use."
+        installer_error "Failed to start Bittice Engine with docker-compose."
+        installer_info "Please check if ports 3000, 8080, or 50051 are already in use."
                 exit 1
             fi
         else
                         docker compose -f "$COMPOSE_FILE" down &> /dev/null || true
                         if ! docker compose -f "$COMPOSE_FILE" up -d --remove-orphans; then
-                echo -e "${RED}Error: Failed to start Bittice Engine with docker compose.${NC}"
-                echo -e "Please check if ports 3000, 8080, or 50051 are already in use."
+        installer_error "Failed to start Bittice Engine with docker compose."
+        installer_info "Please check if ports 3000, 8080, or 50051 are already in use."
                 exit 1
             fi
         fi
 
         # 4. Create the 'bittice' command wrapper on the host
-        echo -e "${BLUE}Creating bittice command wrapper...${NC}"
+    installer_info "Creating bittice command wrapper..."
                 cat <<EOF | sudo tee /usr/local/bin/bittice > /dev/null
 #!/bin/bash
 # Bittice Docker Wrapper (host → container). Engine runs as PID 1; no interactive wizard on the server.
@@ -481,22 +533,21 @@ EOF
             sudo chown "$(install_owner):$(install_primary_group)" /usr/local/bin/bittice 2>/dev/null || true
         fi
 
-        echo -e "\n${GREEN}Bittice Engine is now running in the background!${NC}"
-        echo -e "To watch CDC and HTTP logs like on your PC: ${BLUE}bittice${NC} (runs docker logs -f)."
-        echo -e "Configure and sync databases from your workstation, then redeploy — not inside this container."
-                echo -e "Compose file: ${BLUE}$COMPOSE_FILE${NC}"
-                echo -e "Data dir: ${BLUE}$APP_DIR/data${NC}"
-                echo -e "VPN dir: ${BLUE}$APP_DIR/vpn${NC}"
+        installer_ok "Bittice Engine is now running in the background."
+        installer_info "To watch CDC and HTTP logs like on your PC: bittice"
+        installer_info "Configure and sync databases from your workstation, then redeploy."
+        installer_info "Compose file: $COMPOSE_FILE"
+        installer_info "Data dir: $APP_DIR/data"
+        installer_info "VPN dir: $APP_DIR/vpn"
         else
-                echo -e "Skipping Docker background setup on cloud instance."
+                installer_warn "Skipping Docker background setup on cloud instance."
     fi
 fi
 
 # 7. Finalize
-echo -e "\n${GREEN}Bittice ($LATEST_TAG) installed successfully!${NC}"
-echo -e "Binary: ${BLUE}$INSTALL_DIR/$BINARY_NAME${NC}"
+installer_step "Final summary"
 if command -v "$BINARY_NAME" &>/dev/null; then
-    echo -e "Run: ${BLUE}bittice${NC}"
+    installer_success "$INSTALL_DIR/$BINARY_NAME" "Run: bittice"
 else
-    echo -e "Open a ${BLUE}new terminal${NC} (PATH was updated), then run: ${BLUE}bittice${NC}"
+    installer_success "$INSTALL_DIR/$BINARY_NAME" "Open a new terminal, then run: bittice"
 fi
