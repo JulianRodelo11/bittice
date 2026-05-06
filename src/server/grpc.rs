@@ -23,18 +23,114 @@ fn query_uses_rest_only_aggregations(query: &SavedQuery) -> Result<bool, String>
     Ok(false)
 }
 
+fn grpc_param_key(raw: &str) -> Option<&str> {
+    raw.strip_prefix('$')
+        .and_then(|spec| spec.split('|').next())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+}
+
+/// Same limit / page / offset rules as `execute_query_result_internal`.
+fn saved_query_pagination_meta(
+    query: &SavedQuery,
+    params_map: &HashMap<String, String>,
+    limit_override: u32,
+    offset_override: u32,
+    total_found: usize,
+    headers_len: usize,
+) -> Option<PaginationMetadata> {
+    if total_found == 0 || headers_len == 0 {
+        return None;
+    }
+
+    let mut limit = if let Some(ref param) = query.limit_param {
+        let key = grpc_param_key(param).unwrap_or(param.as_str());
+        params_map
+            .get(key)
+            .and_then(|s| s.parse::<usize>().ok())
+            .or(query.limit)
+    } else {
+        query.limit
+    }
+    .unwrap_or(100)
+    .min(100);
+
+    if limit_override > 0 {
+        limit = limit_override as usize;
+    }
+
+    let page = if offset_override > 0 {
+        if limit > 0 {
+            (offset_override as usize / limit).saturating_add(1)
+        } else {
+            1
+        }
+    } else {
+        params_map
+            .get("page")
+            .and_then(|p| p.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    };
+
+    let total_items = total_found as u64;
+    let total_pages = if total_items == 0 {
+        1u64
+    } else if limit > 0 {
+        total_items.saturating_add(limit as u64 - 1) / limit as u64
+    } else {
+        1
+    };
+
+    Some(PaginationMetadata {
+        page: page.try_into().unwrap_or(u32::MAX),
+        per_page: limit.try_into().unwrap_or(u32::MAX),
+        total_pages: total_pages.try_into().unwrap_or(u32::MAX),
+        total_items,
+    })
+}
+
+fn ad_hoc_search_pagination_meta(
+    limit: usize,
+    offset: usize,
+    total_found: usize,
+    headers_len: usize,
+) -> Option<PaginationMetadata> {
+    if total_found == 0 || headers_len == 0 {
+        return None;
+    }
+    let limit = if limit > 0 { limit } else { 100 };
+    let page = if limit > 0 {
+        offset / limit + 1
+    } else {
+        1
+    };
+    let total_items = total_found as u64;
+    let total_pages = if total_items == 0 {
+        1u64
+    } else {
+        total_items.saturating_add(limit as u64 - 1) / limit as u64
+    };
+    Some(PaginationMetadata {
+        page: page.try_into().unwrap_or(u32::MAX),
+        per_page: limit.try_into().unwrap_or(u32::MAX),
+        total_pages: total_pages.try_into().unwrap_or(u32::MAX),
+        total_items,
+    })
+}
+
 pub mod bittice_proto {
     tonic::include_proto!("bittice");
 }
 
 use bittice_proto::database_server::{Database};
 use bittice_proto::{
-    SearchRequest, SearchResponse, SearchUnaryResponse, 
+    SearchRequest, SearchResponse, SearchUnaryResponse,
     Row as ProtoRow, AggregationResult as ProtoAggregationResult,
     search_response::Content, SearchMetadata, RowBatch,
     ComparisonOp as ProtoComparisonOp, LogicalOp as ProtoLogicalOp,
     SortDirection as ProtoSortDirection, FieldType as ProtoFieldType,
-    SavedQueryRequest
+    PaginationMetadata, SavedQueryRequest,
 };
 
 fn proto_comparison_op_to_str(op: i32) -> String {
@@ -491,6 +587,8 @@ async fn execute_query_unary_internal(
     offset_override: u32,
     auth_context: Option<crate::core::types::AuthContext>,
 ) -> Result<SearchUnaryResponse, Status> {
+    let query_meta = query.clone();
+    let params_meta = params_map.clone();
     match execute_query_result_internal(
         query,
         params_map,
@@ -518,6 +616,15 @@ async fn execute_query_unary_internal(
                 }
             }
 
+            let pagination = saved_query_pagination_meta(
+                &query_meta,
+                &params_meta,
+                limit_override,
+                offset_override,
+                query_result.total_found,
+                query_result.headers.len(),
+            );
+
             Ok(SearchUnaryResponse {
                 headers: query_result.headers,
                 rows: proto_rows,
@@ -525,7 +632,7 @@ async fn execute_query_unary_internal(
                 execution_time_micros: query_result.execution_time_micros as u64,
                 debug_info: "".to_string(),
                 aggregations: proto_aggs,
-                pagination: None,
+                pagination,
             })
         }
         Err(status) => Err(status),
@@ -718,13 +825,19 @@ impl Database for MyDatabase {
 
             match res {
                 Ok(query_result) => {
+                    let pagination = ad_hoc_search_pagination_meta(
+                        limit,
+                        offset,
+                        query_result.total_found,
+                        query_result.headers.len(),
+                    );
                     // Send metadata first
                     let metadata = SearchMetadata {
                         headers: query_result.headers.clone(),
                         total_found: query_result.total_found as u64,
                         execution_time_micros: query_result.execution_time_micros as u64,
                         debug_info: "".to_string(),
-                        pagination: None,
+                        pagination,
                     };
                     if let Err(_) = tx.send(Ok(SearchResponse {
                         content: Some(Content::Metadata(metadata)),
@@ -829,27 +942,41 @@ impl Database for MyDatabase {
 
         let auth_ctx = self.extract_auth_context(&metadata, query.auth_config.as_ref()).await;
 
+        let query_for_pagination = query.clone();
+        let params_for_pagination = req.params.clone();
+        let limit_override = req.limit_override;
+        let offset_override = req.offset_override;
+        let params = req.params;
+
         let table_manager = Arc::clone(&self.table_manager);
         let (tx, rx) = mpsc::channel(10);
 
         tokio::spawn(async move {
             let res = execute_query_result_internal(
                 query,
-                req.params,
+                params,
                 table_manager,
-                req.limit_override,
-                req.offset_override,
+                limit_override,
+                offset_override,
                 auth_ctx,
             ).await;
 
             match res {
                 Ok(query_result) => {
+                    let pagination = saved_query_pagination_meta(
+                        &query_for_pagination,
+                        &params_for_pagination,
+                        limit_override,
+                        offset_override,
+                        query_result.total_found,
+                        query_result.headers.len(),
+                    );
                     let metadata = SearchMetadata {
                         headers: query_result.headers.clone(),
                         total_found: query_result.total_found as u64,
                         execution_time_micros: query_result.execution_time_micros as u64,
                         debug_info: "".to_string(),
-                        pagination: None,
+                        pagination,
                     };
                     let _ = tx.send(Ok(SearchResponse {
                         content: Some(Content::Metadata(metadata)),
