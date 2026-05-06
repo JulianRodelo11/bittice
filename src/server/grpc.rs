@@ -893,6 +893,14 @@ async fn execute_split_enrichment_result(
         })
         .collect();
 
+    for add in &profile.additive_fields {
+        if !new_headers.contains(&add.target_field)
+            && enrich_headers.contains(&add.source_field)
+        {
+            new_headers.push(add.target_field.clone());
+        }
+    }
+
     let additive_info: Vec<(Option<usize>, Option<usize>, String)> = profile
         .additive_fields
         .iter()
@@ -970,9 +978,9 @@ async fn execute_split_enrichment_result(
 
             if let Some(enr) = enrich_row {
                 for (base_idx_opt, enrich_idx_opt, target_field) in &additive_info {
-                    if let (Some(bi), Some(ei)) = (base_idx_opt, enrich_idx_opt) {
-                        let base_val = base_row
-                            .get(*bi)
+                    if let Some(ei) = enrich_idx_opt {
+                        let base_val = base_idx_opt
+                            .and_then(|bi| base_row.get(bi))
                             .and_then(|v| v.parse::<f64>().ok())
                             .unwrap_or(0.0);
                         let enrich_val = enr
