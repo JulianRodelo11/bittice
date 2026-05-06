@@ -770,6 +770,245 @@ async fn execute_query_result_internal(
     .map_err(|e| Status::internal(e.to_string()))
 }
 
+fn format_grpc_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.is_finite() {
+        format!("{}", value as i64)
+    } else {
+        value.to_string()
+    }
+}
+
+async fn execute_split_enrichment_result(
+    query: &SavedQuery,
+    profile: &crate::core::saved_queries::SavedSplitExecutionProfile,
+    params: HashMap<String, String>,
+    table_manager: Arc<TableManager>,
+    limit_override: u32,
+    offset_override: u32,
+    auth_context: Option<crate::core::types::AuthContext>,
+) -> Result<QueryResult, Status> {
+    let mut base_query = query.clone();
+    if !profile.base_join_aliases.is_empty() {
+        base_query.joins.retain(|join| {
+            let alias = join.alias.as_deref().unwrap_or(join.table.as_str());
+            profile.base_join_aliases.iter().any(|a| a == alias)
+        });
+    }
+    if !profile.base_select_aliases.is_empty() {
+        base_query.select.retain(|field| {
+            field
+                .output_name
+                .as_ref()
+                .map(|name| profile.base_select_aliases.iter().any(|a| a == name))
+                .unwrap_or(false)
+        });
+    }
+    base_query.execution_profile = None;
+
+    let base_result = execute_query_result_internal(
+        base_query,
+        params.clone(),
+        table_manager.clone(),
+        limit_override,
+        offset_override,
+        auth_context.clone(),
+    )
+    .await?;
+
+    if base_result.rows.is_empty() {
+        return Ok(base_result);
+    }
+
+    let key_idx = match base_result.headers.iter().position(|h| h == &profile.key_field) {
+        Some(pos) => pos,
+        None => return Ok(base_result),
+    };
+
+    let key_values: Vec<String> = base_result
+        .rows
+        .iter()
+        .filter_map(|row| row.get(key_idx))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    if key_values.is_empty() {
+        return Ok(base_result);
+    }
+
+    let mut enrichment_params = params;
+    enrichment_params.insert(profile.ids_param.clone(), key_values.join(","));
+
+    let mut enrichment_query = (*profile.enrichment_query).clone();
+    enrichment_query.execution_profile = None;
+
+    let enrichment_result = execute_query_result_internal(
+        enrichment_query,
+        enrichment_params,
+        table_manager,
+        0,
+        0,
+        auth_context,
+    )
+    .await?;
+
+    let enrich_key_field = profile
+        .enrichment_key_field
+        .as_ref()
+        .unwrap_or(&profile.key_field);
+    let enrich_key_idx = match enrichment_result
+        .headers
+        .iter()
+        .position(|h| h == enrich_key_field)
+    {
+        Some(pos) => pos,
+        None => return Ok(base_result),
+    };
+
+    let mut enrich_lookup: HashMap<String, &Vec<String>> = HashMap::new();
+    for row in &enrichment_result.rows {
+        if let Some(key) = row.get(enrich_key_idx).map(|v| v.trim().to_string()) {
+            if !key.is_empty() && !enrich_lookup.contains_key(&key) {
+                enrich_lookup.insert(key, row);
+            }
+        }
+    }
+
+    let mut new_headers = base_result.headers.clone();
+    for field in &profile.merge_fields {
+        if !new_headers.contains(field) {
+            new_headers.push(field.clone());
+        }
+    }
+
+    let enrich_headers = &enrichment_result.headers;
+    let merge_indices: Vec<(usize, String)> = profile
+        .merge_fields
+        .iter()
+        .filter_map(|field| {
+            enrich_headers
+                .iter()
+                .position(|h| h == field)
+                .map(|idx| (idx, field.clone()))
+        })
+        .collect();
+
+    let additive_info: Vec<(Option<usize>, Option<usize>, String)> = profile
+        .additive_fields
+        .iter()
+        .map(|add| {
+            let base_idx = base_result
+                .headers
+                .iter()
+                .position(|h| h == &add.target_field);
+            let enrich_idx = enrich_headers.iter().position(|h| h == &add.source_field);
+            (base_idx, enrich_idx, add.target_field.clone())
+        })
+        .collect();
+
+    let defaults_str: HashMap<&String, String> = profile
+        .defaults
+        .iter()
+        .map(|(k, v)| {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => String::new(),
+            };
+            (k, s)
+        })
+        .collect();
+
+    let base_headers_len = base_result.headers.len();
+    let merged_rows: Vec<Vec<String>> = base_result
+        .rows
+        .iter()
+        .map(|base_row| {
+            let key = base_row
+                .get(key_idx)
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            let enrich_row = enrich_lookup.get(&key).copied();
+
+            let mut row: Vec<String> = base_row.clone();
+            row.resize(new_headers.len(), String::new());
+
+            for (i, header) in new_headers.iter().enumerate() {
+                if i < base_headers_len {
+                    if let Some(enr) = enrich_row {
+                        if let Some((e_idx, _)) =
+                            merge_indices.iter().find(|(_, f)| f == header)
+                        {
+                            if let Some(val) = enr.get(*e_idx) {
+                                if !val.is_empty() {
+                                    row[i] = val.clone();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if let Some(enr) = enrich_row {
+                        if let Some((e_idx, _)) =
+                            merge_indices.iter().find(|(_, f)| f == header)
+                        {
+                            if let Some(val) = enr.get(*e_idx) {
+                                row[i] = val.clone();
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (i, header) in new_headers.iter().enumerate() {
+                if row[i].is_empty() {
+                    if let Some(default) = defaults_str.get(header) {
+                        row[i] = default.clone();
+                    }
+                }
+            }
+
+            if let Some(enr) = enrich_row {
+                for (base_idx_opt, enrich_idx_opt, target_field) in &additive_info {
+                    if let (Some(bi), Some(ei)) = (base_idx_opt, enrich_idx_opt) {
+                        let base_val = base_row
+                            .get(*bi)
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let enrich_val = enr
+                            .get(*ei)
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let sum = base_val + enrich_val;
+                        if let Some(pos) = new_headers.iter().position(|h| h == target_field) {
+                            row[pos] = format_grpc_number(sum);
+                        }
+                    }
+                }
+            }
+
+            row
+        })
+        .collect();
+
+    let total_found = base_result.total_found;
+    let execution_time = base_result.execution_time_micros + enrichment_result.execution_time_micros;
+    let debug = match &profile.debug_label {
+        Some(label) => format!("split_mode: profile({})", label),
+        None => "split_mode: profile(split_enrichment)".to_string(),
+    };
+
+    Ok(QueryResult {
+        headers: new_headers,
+        rows: merged_rows,
+        row_ids: None,
+        total_found,
+        execution_time_micros: execution_time,
+        debug_info: Some(debug),
+        aggregations: None,
+    })
+}
+
 #[tonic::async_trait]
 impl Database for MyDatabase {
     type SearchStream = ReceiverStream<Result<SearchResponse, Status>>;
@@ -924,30 +1163,97 @@ impl Database for MyDatabase {
         let req = request.into_inner();
         let ops = self.get_operations().await;
         
-        let query = if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
-            if let SavedOperation::Read(q) = op {
-                if q.response_grouping.is_some() {
-                    return Err(Status::invalid_argument("response_grouping is currently supported only by the REST API"));
+        let (query, params, limit_override, offset_override) =
+            if let Some(op) = ops.iter().find(|o| o.name() == req.query_name) {
+                if let SavedOperation::Read(q) = op {
+                    if q.response_grouping.is_some() {
+                        return Err(Status::invalid_argument(
+                            "response_grouping is currently supported only by the REST API",
+                        ));
+                    }
+                    if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
+                        return Err(Status::invalid_argument(
+                            "Collect aggregation is currently supported only by the REST API",
+                        ));
+                    }
+
+                    if let Some(ref profile) = q.execution_profile {
+                        if let crate::core::saved_queries::SavedExecutionProfile::Split(split) =
+                            profile
+                        {
+                            if split.mode == "split_enrichment" {
+                                let auth_ctx = self
+                                    .extract_auth_context(&metadata, q.auth_config.as_ref())
+                                    .await;
+                                let result = execute_split_enrichment_result(
+                                    q,
+                                    split,
+                                    req.params.clone(),
+                                    Arc::clone(&self.table_manager),
+                                    req.limit_override,
+                                    req.offset_override,
+                                    auth_ctx,
+                                )
+                                .await?;
+
+                                let query_for_pagination = q.clone();
+                                let params_for_pagination = req.params.clone();
+                                let (tx, rx) = mpsc::channel(10);
+                                tokio::spawn(async move {
+                                    let pagination = saved_query_pagination_meta(
+                                        &query_for_pagination,
+                                        &params_for_pagination,
+                                        req.limit_override,
+                                        req.offset_override,
+                                        result.total_found,
+                                        result.headers.len(),
+                                    );
+                                    let metadata = SearchMetadata {
+                                        headers: result.headers.clone(),
+                                        total_found: result.total_found as u64,
+                                        execution_time_micros: result.execution_time_micros as u64,
+                                        debug_info: result.debug_info.unwrap_or_default(),
+                                        pagination,
+                                    };
+                                    let _ = tx
+                                        .send(Ok(SearchResponse {
+                                            content: Some(Content::Metadata(metadata)),
+                                        }))
+                                        .await;
+
+                                    for chunk in result.rows.chunks(BATCH_SIZE) {
+                                        let mut proto_rows = Vec::new();
+                                        for row in chunk {
+                                            proto_rows.push(ProtoRow {
+                                                values: row.clone(),
+                                            });
+                                        }
+                                        let _ = tx
+                                            .send(Ok(SearchResponse {
+                                                content: Some(Content::Rows(RowBatch {
+                                                    rows: proto_rows,
+                                                })),
+                                            }))
+                                            .await;
+                                    }
+                                });
+                                return Ok(Response::new(ReceiverStream::new(rx)));
+                            }
+                        }
+                    }
+
+                    (q.clone(), req.params, req.limit_override, req.offset_override)
+                } else {
+                    return Err(Status::invalid_argument("Not a read operation"));
                 }
-                if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
-                    return Err(Status::invalid_argument("Collect aggregation is currently supported only by the REST API"));
-                }
-                q.clone()
             } else {
-                return Err(Status::invalid_argument("Not a read operation"));
-            }
-        } else {
-            return Err(Status::not_found("Query not found"));
-        };
+                return Err(Status::not_found("Query not found"));
+            };
 
         let auth_ctx = self.extract_auth_context(&metadata, query.auth_config.as_ref()).await;
 
         let query_for_pagination = query.clone();
-        let params_for_pagination = req.params.clone();
-        let limit_override = req.limit_override;
-        let offset_override = req.offset_override;
-        let params = req.params;
-
+        let params_for_pagination = params.clone();
         let table_manager = Arc::clone(&self.table_manager);
         let (tx, rx) = mpsc::channel(10);
 
@@ -959,7 +1265,8 @@ impl Database for MyDatabase {
                 limit_override,
                 offset_override,
                 auth_ctx,
-            ).await;
+            )
+            .await;
 
             match res {
                 Ok(query_result) => {
@@ -978,18 +1285,24 @@ impl Database for MyDatabase {
                         debug_info: "".to_string(),
                         pagination,
                     };
-                    let _ = tx.send(Ok(SearchResponse {
-                        content: Some(Content::Metadata(metadata)),
-                    })).await;
+                    let _ = tx
+                        .send(Ok(SearchResponse {
+                            content: Some(Content::Metadata(metadata)),
+                        }))
+                        .await;
 
                     for chunk in query_result.rows.chunks(BATCH_SIZE) {
                         let mut proto_rows = Vec::new();
                         for row in chunk {
-                            proto_rows.push(ProtoRow { values: row.clone() });
+                            proto_rows.push(ProtoRow {
+                                values: row.clone(),
+                            });
                         }
-                        let _ = tx.send(Ok(SearchResponse {
-                            content: Some(Content::Rows(RowBatch { rows: proto_rows })),
-                        })).await;
+                        let _ = tx
+                            .send(Ok(SearchResponse {
+                                content: Some(Content::Rows(RowBatch { rows: proto_rows })),
+                            }))
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -1019,6 +1332,47 @@ impl Database for MyDatabase {
                         return Err(Status::invalid_argument("Collect aggregation is currently supported only by the REST API"));
                     }
                     let auth_ctx = self.extract_auth_context(&metadata, q.auth_config.as_ref()).await;
+
+                    if let Some(ref profile) = q.execution_profile {
+                        if let crate::core::saved_queries::SavedExecutionProfile::Split(split) = profile {
+                            if split.mode == "split_enrichment" {
+                                let result = execute_split_enrichment_result(
+                                    q,
+                                    split,
+                                    req.params.clone(),
+                                    Arc::clone(&self.table_manager),
+                                    req.limit_override,
+                                    req.offset_override,
+                                    auth_ctx,
+                                ).await?;
+
+                                let mut proto_rows = Vec::new();
+                                for row in result.rows {
+                                    proto_rows.push(ProtoRow { values: row });
+                                }
+
+                                let pagination = saved_query_pagination_meta(
+                                    q,
+                                    &req.params,
+                                    req.limit_override,
+                                    req.offset_override,
+                                    result.total_found,
+                                    result.headers.len(),
+                                );
+
+                                return Ok(Response::new(SearchUnaryResponse {
+                                    headers: result.headers,
+                                    rows: proto_rows,
+                                    total_found: result.total_found as u64,
+                                    execution_time_micros: result.execution_time_micros as u64,
+                                    debug_info: result.debug_info.unwrap_or_default(),
+                                    aggregations: vec![],
+                                    pagination,
+                                }));
+                            }
+                        }
+                    }
+
                     let resp = execute_query_unary_internal(
                         q.clone(), 
                         req.params, 
