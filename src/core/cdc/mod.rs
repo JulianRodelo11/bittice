@@ -38,7 +38,7 @@ const CDC_STATE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Cap burst writes when many small binlog events arrive within [`CDC_STATE_SAVE_INTERVAL`].
 const CDC_STATE_SAVE_EVENT_BURST: u32 = 1024;
 /// Wake `binlog` `stream.next()` waits periodically so [`crate::server::engine_halt_requested`] is honored even when the server is quiet.
-const CDC_ENGINE_HALT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+const CDC_ENGINE_HALT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Guard for the one-line startup hint when `BITTICE_CDC_LOG_ROW_EVENTS` is enabled.
 static CDC_ROW_TRACE_BANNER_EMITTED: AtomicBool = AtomicBool::new(false);
@@ -352,8 +352,31 @@ impl CdcWorker {
         if let Some(tx) = &self.log_tx {
             let _ = tx.try_send("CDC_DISABLED".to_string());
         }
+        self.flush_all_mirror_tables();
         crate::server::request_engine_shutdown_from_cdc(&reason);
         Ok(())
+    }
+
+    fn flush_all_mirror_tables(&self) {
+        self.table_manager.flush_dirty_tables();
+    }
+
+    fn fast_exit_flush(&self) {
+        let keys: Vec<String> = {
+            let mut dirty = self.table_manager.dirty_tables.write().unwrap();
+            dirty.drain().collect()
+        };
+        if keys.is_empty() {
+            return;
+        }
+        let cache = self.table_manager.tables.read().unwrap();
+        for key in &keys {
+            if let Some(table_arc) = cache.get(key) {
+                if let Ok(mut t) = table_arc.write() {
+                    let _ = t.flush_wal_only();
+                }
+            }
+        }
     }
 
     fn empty_cdc_state() -> CdcState {
@@ -1488,6 +1511,8 @@ so the account can read coordinates."
                         "CDC: Worker '{}' snapshot interrupted (engine shutdown).",
                         self.entity
                     ));
+                    self.fast_exit_flush();
+                    let _ = self.save_state(&state);
                     return Ok(());
                 }
                 let tables = match Self::fetch_all_tables_in_schema(&mut conn, &schema).await {
@@ -1511,6 +1536,8 @@ so the account can read coordinates."
                             "CDC: Worker '{}' snapshot interrupted (engine shutdown).",
                             self.entity
                         ));
+                        self.fast_exit_flush();
+                        let _ = self.save_state(&state);
                         return Ok(());
                     }
                     let qkey = Self::qualified_table_key(true, &schema, table_name);
@@ -1575,6 +1602,8 @@ so the account can read coordinates."
                         "CDC: Worker '{}' snapshot interrupted (engine shutdown).",
                         self.entity
                     ));
+                    self.fast_exit_flush();
+                    let _ = self.save_state(&state);
                     return Ok(());
                 }
                 let qkey = Self::qualified_table_key(false, &self.database, table_name);
@@ -1791,6 +1820,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                     "CDC: Worker '{}' stopping before binlog stream (engine shutdown).",
                     self.entity
                 ));
+                self.fast_exit_flush();
                 let _ = self.save_state(&state);
                 return Ok(());
             }
@@ -1954,6 +1984,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                         "CDC: Worker '{}' leaving live binlog stream (engine shutdown).",
                         self.entity
                     ));
+                    self.fast_exit_flush();
                     let _ = self.save_state(&state);
                     return Ok(());
                 }
@@ -1978,14 +2009,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                                                 // Without this, the active segment, primary.idx, and
                                                 // bitmaps are never persisted and the server restart
                                                 // silently loses those rows.
-                                                {
-                                                    let tables = self.table_manager.tables.read().unwrap();
-                                                    for table_arc in tables.values() {
-                                                        if let Ok(mut t) = table_arc.write() {
-                                                            let _ = t.flush_active_segment();
-                                                        }
-                                                    }
-                                                }
+                                                self.table_manager.flush_dirty_tables();
                                                 if let Some(tx) = &self.log_tx {
                                                     let _ = tx.try_send("CDC_READY".to_string());
                                                 }
@@ -1999,14 +2023,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                                                 // Flush all open mirror tables durably so that
                                                 // primary.idx and bitmaps reflect the replayed rows
                                                 // before HTTP requests can read them.
-                                                {
-                                                    let tables = self.table_manager.tables.read().unwrap();
-                                                    for table_arc in tables.values() {
-                                                        if let Ok(mut t) = table_arc.write() {
-                                                            let _ = t.flush_active_segment();
-                                                        }
-                                                    }
-                                                }
+                                                self.table_manager.flush_dirty_tables();
                                                 live_startup_reported = true;
                                                 self.log_phase(
                                                     4,
@@ -2178,6 +2195,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                 let periodic_save = last_state_save.elapsed() >= CDC_STATE_SAVE_INTERVAL
                     || events_since_save >= CDC_STATE_SAVE_EVENT_BURST;
                 if checkpoint_rotate || periodic_save {
+                    self.flush_all_mirror_tables();
                     self.save_state(&state)?;
                     events_since_save = 0;
                     last_state_save = std::time::Instant::now();
@@ -2200,7 +2218,7 @@ replaying missed events before declaring live (data added while Bittice was offl
         qkey: &str,
         disk_entity: &str,
         table_name: &str,
-        pk_field: &str,
+        _pk_field: &str,
         table: &mut Table,
     ) -> Result<usize> {
         debug!("CDC: Received Write event for table '{}'", qkey);
@@ -2209,27 +2227,21 @@ replaying missed events before declaring live (data added while Bittice was offl
             let Ok((before_opt, after_opt)) = row_pair else {
                 continue;
             };
-            // mysql_common `RowsEventRows`: WRITE_ROWS yields `(None, Some(row))` (after-image only);
-            // DELETE uses `(Some, None)`. Prefer after, then before.
             let Some(binlog_row) = after_opt.or(before_opt) else {
                 continue;
             };
             let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
             let data = self.parse_row(row, qkey)?;
-            let pk_val = data.get(pk_field).cloned().unwrap_or_default();
             table.insert(data.clone())?;
             applied += 1;
+        }
+        if applied > 0 {
             let _ = self.table_manager.events_tx.send(TableUpdateEvent {
                 entity: disk_entity.to_string(),
                 table_name: table_name.to_string(),
                 event_type: "INSERT".to_string(),
-                pk: pk_val,
-                row: table
-                    .manifest
-                    .original_fields
-                    .iter()
-                    .map(|f| data.get(f).cloned().unwrap_or_default())
-                    .collect(),
+                pk: String::new(),
+                row: vec![applied.to_string()],
             });
         }
         Ok(applied)
@@ -2379,20 +2391,16 @@ replaying missed events before declaring live (data added while Bittice was offl
             for (k, v) in delta {
                 merged.insert(k, v);
             }
-            table.update(&storage_pk, merged.clone())?;
+            table.update(&storage_pk, merged)?;
             applied += 1;
-            let display_row: Vec<String> = table
-                .manifest
-                .original_fields
-                .iter()
-                .map(|f| merged.get(f).cloned().unwrap_or_default())
-                .collect();
+        }
+        if applied > 0 {
             let _ = self.table_manager.events_tx.send(TableUpdateEvent {
                 entity: disk_entity.to_string(),
                 table_name: mirror_table.to_string(),
                 event_type: "UPDATE".to_string(),
-                pk: storage_pk.clone(),
-                row: display_row,
+                pk: String::new(),
+                row: vec![applied.to_string()],
             });
         }
         Ok(applied)
@@ -2413,18 +2421,19 @@ replaying missed events before declaring live (data added while Bittice was offl
                 let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                 let data = self.parse_row(row, qkey)?;
                 if let Some(pk_val) = data.get(pk_field) {
-                    let pk_copy = pk_val.clone();
                     table.delete(pk_val)?;
                     applied += 1;
-                    let _ = self.table_manager.events_tx.send(TableUpdateEvent {
-                        entity: disk_entity.to_string(),
-                        table_name: table_name.to_string(),
-                        event_type: "DELETE".to_string(),
-                        pk: pk_copy,
-                        row: vec![],
-                    });
                 }
             }
+        }
+        if applied > 0 {
+            let _ = self.table_manager.events_tx.send(TableUpdateEvent {
+                entity: disk_entity.to_string(),
+                table_name: table_name.to_string(),
+                event_type: "DELETE".to_string(),
+                pk: String::new(),
+                row: vec![applied.to_string()],
+            });
         }
         Ok(applied)
     }
@@ -2591,7 +2600,12 @@ replaying missed events before declaring live (data added while Bittice was offl
         };
 
         if applied > 0 {
+            self.table_manager.mark_dirty(&disk_entity, &mirror_table);
             let n_flush = crate::core::cdc_durability::mirror_flush_every_n_batches();
+            let max_rows_before_flush: usize = std::env::var("BITTICE_CDC_FLUSH_MAX_ROWS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(10_000);
             let do_flush = if n_flush <= 1 {
                 true
             } else {
@@ -2599,7 +2613,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                 let mut ticks = self.cdc_mirror_flush_ticks.write().unwrap();
                 let t = ticks.entry(k).or_insert(0);
                 *t = t.saturating_add(1);
-                if *t >= n_flush {
+                if *t >= n_flush || applied >= max_rows_before_flush {
                     *t = 0;
                     true
                 } else {
@@ -2609,8 +2623,6 @@ replaying missed events before declaring live (data added while Bittice was offl
             if do_flush {
                 table.flush_active_segment()?;
             } else {
-                // Even when the full segment rotation is batched, flush the BufWriters so that
-                // concurrent HTTP readers (who mmap the same files) see the new/updated data.
                 table.flush_active_segment_buffers()?;
             }
         }

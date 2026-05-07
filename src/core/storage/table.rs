@@ -26,6 +26,7 @@ pub struct Table {
     /// External ID -> (Segment ID, Local ID)
     pub primary_index: HashMap<String, (u64, u32)>,
     exact_index_cache: StdRwLock<HashMap<String, Arc<ExactIndex>>>,
+    flush_count_since_index_save: u32,
 }
 
 // Structures for the Heap
@@ -80,7 +81,31 @@ impl Ord for HeapItem {
     }
 }
 
+impl Drop for Table {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 impl Table {
+    pub fn close(&mut self) -> Result<()> {
+        if let Some(mut writer) = self.active_segment.take() {
+            let _ = writer.flush();
+        }
+        if !self.primary_index.is_empty() {
+            let _ = self.save_manifest();
+            let _ = self.save_primary_index();
+        }
+        let _ = self.wal.flush_writes();
+        for seg in &mut self.immutable_segments {
+            seg.mmap_cache.write().unwrap().clear();
+            seg.mmap_access_order.write().unwrap().clear();
+            seg.bitmap_cache.write().unwrap().clear();
+        }
+        self.exact_index_cache.write().unwrap().clear();
+        Ok(())
+    }
+
     pub fn open(base_path: &Path, name: &str) -> Result<Self> {
         let table_path = base_path.join(name);
         if !table_path.exists() { fs::create_dir_all(&table_path).context("Failed to create table directory")?; }
@@ -103,11 +128,96 @@ impl Table {
             wal,
             primary_index: HashMap::new(),
             exact_index_cache: StdRwLock::new(HashMap::new()),
+            flush_count_since_index_save: 0,
         };
         table.load_segments()?;
         table.ensure_active_segment()?;
         table.load_primary_index()?;
+        table.replay_wal()?;
         Ok(table)
+    }
+
+    fn replay_wal(&mut self) -> Result<()> {
+        if !self.primary_index.is_empty() {
+            self.wal.flush_writes()?;
+            self.wal.truncate()?;
+            return Ok(());
+        }
+        let ops = self.wal.replay()?;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        info!(
+            "Table '{}': replaying {} WAL operation(s) for crash recovery.",
+            self.name,
+            ops.len()
+        );
+        for op in ops {
+            match op {
+                WalOperation::Insert { id, data } => {
+                    let row_data: HashMap<String, String> = serde_json::from_slice(&data)
+                        .unwrap_or_default();
+                    let pk_field = if self.manifest.primary_key.is_empty() {
+                        "PK"
+                    } else {
+                        &self.manifest.primary_key
+                    };
+                    let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
+                    if let Some(writer) = &mut self.active_segment {
+                        let local_id = writer.segment.record_count as u32;
+                        writer.append_record(&row_data)?;
+                        self.primary_index.insert(pk_val, (writer.segment.id, local_id));
+                    }
+                }
+                WalOperation::Delete { id } => {
+                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id) {
+                        if let Some(writer) = &mut self.active_segment {
+                            if writer.segment.id == seg_id {
+                                writer.segment.mark_deleted(local_id)?;
+                            } else if let Some(seg) =
+                                self.immutable_segments.iter_mut().find(|s| s.id == seg_id)
+                            {
+                                seg.mark_deleted(local_id)?;
+                            }
+                        }
+                    }
+                }
+                WalOperation::Update { id, data } => {
+                    let row_data: HashMap<String, String> = serde_json::from_slice(&data)
+                        .unwrap_or_default();
+                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id) {
+                        if let Some(writer) = &mut self.active_segment {
+                            if writer.segment.id == seg_id {
+                                writer.segment.mark_deleted(local_id)?;
+                            } else if let Some(seg) =
+                                self.immutable_segments.iter_mut().find(|s| s.id == seg_id)
+                            {
+                                seg.mark_deleted(local_id)?;
+                            }
+                        }
+                    }
+                    let pk_field = if self.manifest.primary_key.is_empty() {
+                        "PK"
+                    } else {
+                        &self.manifest.primary_key
+                    };
+                    let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
+                    if let Some(writer) = &mut self.active_segment {
+                        let local_id = writer.segment.record_count as u32;
+                        writer.append_record(&row_data)?;
+                        self.primary_index.insert(pk_val, (writer.segment.id, local_id));
+                    }
+                }
+            }
+        }
+        self.save_primary_index()?;
+        self.wal.flush_writes()?;
+        self.wal.truncate()?;
+        info!(
+            "Table '{}': WAL replay complete; primary index saved.",
+            self.name
+        );
+        Ok(())
     }
 
     pub fn reload_if_needed(&mut self) -> Result<()> {
@@ -150,9 +260,13 @@ impl Table {
 
     fn save_primary_index(&self) -> Result<()> {
         let idx_path = self.base_path.join("primary.idx");
-        let file = fs::File::create(idx_path)?;
-        let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, &self.primary_index)?;
+        let tmp_path = self.base_path.join("primary.idx.tmp");
+        {
+            let file = fs::File::create(&tmp_path)?;
+            let writer = std::io::BufWriter::new(file);
+            bincode::serialize_into(writer, &self.primary_index)?;
+        }
+        fs::rename(&tmp_path, &idx_path)?;
         Ok(())
     }
 
@@ -272,23 +386,43 @@ impl Table {
 
     fn save_manifest(&self) -> Result<()> {
         let manifest_path = self.base_path.join("manifest.json");
-        let temp_path = self.base_path.join("manifest.tmp");
+        let tmp_path = self.base_path.join("manifest.tmp");
         {
-            let file = fs::File::create(&temp_path)?;
+            let file = fs::File::create(&tmp_path)?;
             serde_json::to_writer_pretty(&file, &self.manifest)?;
             file.sync_all()?;
         }
-        fs::rename(&temp_path, &manifest_path)?;
+        fs::rename(&tmp_path, &manifest_path)?;
+        self.sync_base_dir()?;
         Ok(())
     }
 
-    /// Flush the active segment's BufWriters to the OS page cache without rotating the segment.
+    /// Flush only the WAL to OS page cache. Used during fast exit to ensure WAL
+    /// entries survive a process crash without the expensive full segment flush.
+    pub fn flush_wal_only(&mut self) -> Result<()> {
+        self.wal.flush_writes()?;
+        Ok(())
+    }
+
+    /// Flush the active segment's BufWriters and WAL to the OS page cache without rotating the segment.
     /// Cheaper than `flush_active_segment` (no bitmap serialisation, no segment rotation).
     /// Call after any CDC write when the full flush is batched, so concurrent mmap readers see
-    /// the new row data immediately.
+    /// the new row data immediately and WAL entries survive a process crash.
     pub fn flush_active_segment_buffers(&mut self) -> Result<()> {
         if let Some(writer) = &mut self.active_segment {
             writer.flush_buffers()?;
+        }
+        self.wal.flush_writes()?;
+        self.flush_count_since_index_save += 1;
+        let index_save_interval: u32 = std::env::var("BITTICE_INDEX_SAVE_INTERVAL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10);
+        if self.flush_count_since_index_save >= index_save_interval {
+            self.save_primary_index()?;
+            self.wal.truncate()?;
+            self.sync_base_dir()?;
+            self.flush_count_since_index_save = 0;
         }
         Ok(())
     }
@@ -302,14 +436,39 @@ impl Table {
             self.manifest.active_segment_id += 1;
             self.manifest.last_sequence_number += 1; 
             self.save_manifest()?;
-            self.save_primary_index()?;
             self.wal.flush_writes()?;
-            self.wal.truncate()?;
+            self.flush_count_since_index_save += 1;
+            let index_save_interval: u32 = std::env::var("BITTICE_INDEX_SAVE_INTERVAL")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(10);
+            if self.flush_count_since_index_save >= index_save_interval {
+                self.save_primary_index()?;
+                self.wal.truncate()?;
+                self.sync_base_dir()?;
+                self.flush_count_since_index_save = 0;
+            }
             let mut immutable_seg = writer.segment;
             immutable_seg.is_immutable = true;
             self.immutable_segments.push(immutable_seg);
         }
+        self.persist_all_deleted_bitmaps()?;
         self.ensure_active_segment()?;
+        Ok(())
+    }
+
+    fn persist_all_deleted_bitmaps(&self) -> Result<()> {
+        for seg in &self.immutable_segments {
+            if seg.has_deletions() {
+                seg.persist_deleted_bitmap()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_base_dir(&self) -> Result<()> {
+        let dir_file = fs::File::open(&self.base_path)?;
+        dir_file.sync_all()?;
         Ok(())
     }
 
@@ -423,6 +582,7 @@ impl Table {
         let filter_start = std::time::Instant::now();
         let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
         let pk_filter = final_filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::Eq);
+        let pk_in_filter = final_filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::In);
         let segment_matches = if let Some(f) = pk_filter {
             let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
             if use_index {
@@ -437,10 +597,22 @@ impl Table {
                     }
                 } else { vec![] }
             } else { self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)? }
+        } else if let Some(f) = pk_in_filter {
+            let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
+            if use_index {
+                if let Some(matches) = self.exact_matches_for_in_filter(f)? {
+                    matches
+                } else {
+                    self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)?
+                }
+            } else {
+                self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)?
+            }
         } else if final_filters_op == LogicalOp::And {
             if let Some(exact_matches) = self.exact_matches_for_eq_filters(&final_filters, pk_field)? {
                 let remaining_filters: Vec<Filter> = final_filters.iter()
-                    .filter(|filter| !(filter.op == crate::core::types::ComparisonOp::Eq && filter.field != pk_field))
+                    .filter(|filter| !(filter.op == crate::core::types::ComparisonOp::Eq && filter.field != pk_field)
+                        && !(filter.op == crate::core::types::ComparisonOp::In))
                     .cloned()
                     .collect();
                 if remaining_filters.is_empty() {
@@ -701,15 +873,29 @@ impl Table {
         }
 
         let path = self.exact_index_path(field);
-        let index = if path.exists() {
+        let mut index: ExactIndex = if path.exists() {
             let file = fs::File::open(&path)?;
             let reader = BufReader::new(file);
             bincode::deserialize_from(reader)?
         } else {
-            let built = self.build_exact_index(field)?;
-            self.save_exact_index(field, &built)?;
-            built
+            self.build_exact_index(field)?
         };
+
+        if let Some(writer) = &self.active_segment {
+            if let Some(field_bitmaps) = writer.bitmaps.get(field) {
+                for (value, bitmap) in field_bitmaps {
+                    if !bitmap.is_empty() {
+                        let mut live_bitmap = bitmap.clone();
+                        if !writer.segment.deleted_bitmap.is_empty() {
+                            live_bitmap -= &writer.segment.deleted_bitmap;
+                        }
+                        if !live_bitmap.is_empty() {
+                            index.entry(value.clone()).or_insert_with(Vec::new).push((writer.segment.id, live_bitmap));
+                        }
+                    }
+                }
+            }
+        }
 
         let cached = Arc::new(index);
         let mut cache = self.exact_index_cache.write().unwrap();
@@ -730,6 +916,21 @@ impl Table {
             for (value, bitmap) in bitmaps {
                 if !bitmap.is_empty() {
                     index.entry(value).or_insert_with(Vec::new).push((segment.id, bitmap));
+                }
+            }
+        }
+        if let Some(writer) = &self.active_segment {
+            if let Some(field_bitmaps) = writer.bitmaps.get(field) {
+                for (value, bitmap) in field_bitmaps {
+                    if !bitmap.is_empty() {
+                        let mut live_bitmap = bitmap.clone();
+                        if !writer.segment.deleted_bitmap.is_empty() {
+                            live_bitmap -= &writer.segment.deleted_bitmap;
+                        }
+                        if !live_bitmap.is_empty() {
+                            index.entry(value.clone()).or_insert_with(Vec::new).push((writer.segment.id, live_bitmap));
+                        }
+                    }
                 }
             }
         }
@@ -783,8 +984,8 @@ impl Table {
     fn exact_matches_for_eq_filters(&self, filters: &[Filter], pk_field: &str) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
         let eq_filters: Vec<&Filter> = filters.iter()
             .filter(|filter| {
-                filter.op == crate::core::types::ComparisonOp::Eq
-                    && filter.field != pk_field
+                (filter.op == crate::core::types::ComparisonOp::Eq
+                 || filter.op == crate::core::types::ComparisonOp::In)
                     && filter.field != "?"
                     && filter.value != "?"
             })
@@ -797,7 +998,15 @@ impl Table {
         let mut exact_matches: Option<Vec<(u64, RoaringBitmap)>> = None;
 
         for filter in eq_filters {
-            let Some(current_matches) = self.exact_matches_for_field_value(filter)? else {
+            let current_matches = if filter.op == crate::core::types::ComparisonOp::In {
+                self.exact_matches_for_in_filter(filter)?
+            } else {
+                self.exact_matches_for_field_value(filter)?
+            };
+            let Some(current_matches) = current_matches else {
+                if filter.op == crate::core::types::ComparisonOp::In {
+                    break;
+                }
                 return Ok(None);
             };
 
@@ -812,6 +1021,41 @@ impl Table {
         }
 
         Ok(exact_matches)
+    }
+
+    fn exact_matches_for_in_filter(&self, filter: &Filter) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
+        let values = crate::core::types::list_values(&filter.value, &filter.value_options);
+        let mut found_any = false;
+        let mut combined: HashMap<u64, RoaringBitmap> = HashMap::new();
+
+        for value in &values {
+            let single = Filter {
+                field: filter.field.clone(),
+                op: crate::core::types::ComparisonOp::Eq,
+                value: value.clone(),
+                value_to: None,
+                value_options: vec![],
+                field_type: filter.field_type,
+            };
+            if let Some(matches) = self.exact_matches_for_field_value(&single)? {
+                found_any = true;
+                for (seg_id, bitmap) in matches {
+                    let entry = combined.entry(seg_id).or_insert_with(RoaringBitmap::new);
+                    *entry |= bitmap;
+                }
+            }
+        }
+
+        if found_any {
+            let result: Vec<(u64, RoaringBitmap)> = combined.into_iter().filter(|(_, bm)| !bm.is_empty()).collect();
+            if result.is_empty() {
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(Some(result))
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     fn exact_matches_for_field_value(&self, filter: &Filter) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {

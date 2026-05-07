@@ -33,13 +33,9 @@ impl Wal {
 
     pub fn append(&mut self, op: &WalOperation) -> Result<()> {
         let encoded: Vec<u8> = bincode::serialize(op)?;
-        // Write length prefix (u64) first for framing
         let len = encoded.len() as u64;
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&encoded)?;
-        if crate::core::cdc_durability::wal_sync_each_append() {
-            self.writer.flush()?;
-        }
         Ok(())
     }
 
@@ -77,12 +73,28 @@ impl Wal {
     }
 
     pub fn truncate(&mut self) -> Result<()> {
-        // Clear the file content (e.g., after successful flush to segment)
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(file);
+        self.writer.flush()?;
+        {
+            let file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?;
+            file.sync_all()?;
+        }
+        self.writer = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&self.path)?,
+        );
+        Ok(())
+    }
+
+    pub fn sync_directory(&self) -> Result<()> {
+        let dir_path = self.path.parent().context("WAL path has no parent directory")?;
+        let dir_file = File::open(dir_path).context("WAL directory fsync")?;
+        dir_file.sync_all().context("WAL directory fsync")?;
         Ok(())
     }
 }

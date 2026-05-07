@@ -140,8 +140,23 @@ pub(crate) fn register_cdc_background_handle(handle: JoinHandle<()>) {
 
 fn join_all_cdc_background_threads() {
     let handles: Vec<_> = std::mem::take(&mut *CDC_BACKGROUND_THREAD_HANDLES.lock().unwrap());
+    let join_timeout = std::time::Duration::from_secs(10);
     for h in handles {
-        let _ = h.join();
+        let start = std::time::Instant::now();
+        loop {
+            if h.is_finished() {
+                let _ = h.join();
+                break;
+            }
+            if start.elapsed() >= join_timeout {
+                warn!(
+                    "CDC: Thread join timed out after {}s — orphaned worker may still be running.",
+                    join_timeout.as_secs()
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -1515,8 +1530,11 @@ async fn execute_split_enrichment_read(
     for row in enrichment_rows {
         if let Some(key) = row.get(enrichment_key_field).and_then(value_to_id_token) {
             enrich_by_tx.insert(key, row);
+        } else {
+            tracing::warn!("[split_enrichment] enrichment row missing key_field '{}', row keys: {:?}", enrichment_key_field, row.as_object().map(|o| o.keys().collect::<Vec<_>>()));
         }
     }
+    tracing::info!("[split_enrichment] enrich_by_tx count={}", enrich_by_tx.len());
 
     for base_row in base_data.iter_mut() {
         if let Some(obj) = base_row.as_object_mut() {

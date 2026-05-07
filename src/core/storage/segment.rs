@@ -9,6 +9,8 @@ use crate::core::types::{compare_filter_value, compare_values, Filter, Compariso
 use memmap2::Mmap;
 use std::sync::{Arc, RwLock};
 
+const MMAP_CACHE_MAX_ENTRIES: usize = 64;
+
 pub struct Segment {
     pub id: u64,
     pub path: PathBuf,
@@ -20,6 +22,8 @@ pub struct Segment {
     pub mmap_cache: RwLock<HashMap<String, Arc<(Mmap, Mmap)>>>,
     /// Cache of immutable field bitmap indexes: Field -> value bitmap map
     pub bitmap_cache: RwLock<HashMap<String, Arc<HashMap<String, RoaringBitmap>>>>,
+    /// LRU access order for mmap eviction
+    pub mmap_access_order: RwLock<Vec<String>>,
 }
 
 impl std::fmt::Debug for Segment {
@@ -44,6 +48,7 @@ impl Segment {
             record_count: 0,
             mmap_cache: RwLock::new(HashMap::new()),
             bitmap_cache: RwLock::new(HashMap::new()),
+            mmap_access_order: RwLock::new(Vec::new()),
         }
     }
 
@@ -117,6 +122,7 @@ impl Segment {
             record_count,
             mmap_cache: RwLock::new(HashMap::new()),
             bitmap_cache: RwLock::new(HashMap::new()),
+            mmap_access_order: RwLock::new(Vec::new()),
         })
     }
 
@@ -142,9 +148,22 @@ impl Segment {
 
     pub fn mark_deleted(&mut self, local_id: u32) -> Result<()> {
         self.deleted_bitmap.insert(local_id);
+        Ok(())
+    }
+
+    pub fn has_deletions(&self) -> bool {
+        !self.deleted_bitmap.is_empty()
+    }
+
+    pub fn persist_deleted_bitmap(&self) -> Result<()> {
+        if self.deleted_bitmap.is_empty() {
+            return Ok(());
+        }
         let path = self.path.join("deleted.bitmap");
-        let file = OpenOptions::new().create(true).write(true).open(path)?;
+        let tmp_path = self.path.join("deleted.bitmap.tmp");
+        let file = File::create(&tmp_path)?;
         self.deleted_bitmap.serialize_into(file)?;
+        fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 
@@ -168,12 +187,18 @@ impl Segment {
     /// readers can hit **SIGBUS** (especially on macOS) when accessing grown files.
     pub fn invalidate_mmap_cache(&self) {
         self.mmap_cache.write().unwrap().clear();
+        self.mmap_access_order.write().unwrap().clear();
     }
 
     pub fn get_mmap_pair(&self, field: &str) -> Result<Arc<(Mmap, Mmap)>> {
-        let mut cache = self.mmap_cache.write().unwrap();
-        if let Some(p) = cache.get(field) {
-            return Ok(p.clone());
+        {
+            let cache = self.mmap_cache.read().unwrap();
+            if let Some(p) = cache.get(field) {
+                let mut order = self.mmap_access_order.write().unwrap();
+                order.retain(|k| k != field);
+                order.push(field.to_string());
+                return Ok(p.clone());
+            }
         }
         let dat_path = self.path.join(format!("{}.dat", field));
         let off_path = self.path.join(format!("{}.offsets", field));
@@ -190,10 +215,24 @@ impl Segment {
             unsafe { Mmap::map(&off_file)? },
         ));
 
+        let mut cache = self.mmap_cache.write().unwrap();
+        let mut order = self.mmap_access_order.write().unwrap();
         if let Some(p) = cache.get(field) {
+            order.retain(|k| k != field);
+            order.push(field.to_string());
             return Ok(p.clone());
         }
+
+        while cache.len() >= MMAP_CACHE_MAX_ENTRIES {
+            if let Some(evict_key) = order.first().cloned() {
+                cache.remove(&evict_key);
+                order.remove(0);
+            } else {
+                break;
+            }
+        }
         cache.insert(field.to_string(), pair.clone());
+        order.push(field.to_string());
         Ok(pair)
     }
 
@@ -470,11 +509,12 @@ pub struct SegmentWriter {
     writers: HashMap<String, (BufWriter<File>, BufWriter<File>, u64)>,
     pub bitmaps: HashMap<String, HashMap<String, RoaringBitmap>>,
     pub dirty: bool,
+    flush_count: u32,
 }
 
 impl SegmentWriter {
     pub fn new(segment: Segment) -> Self {
-        SegmentWriter { segment, writers: HashMap::new(), bitmaps: HashMap::new(), dirty: false }
+        SegmentWriter { segment, writers: HashMap::new(), bitmaps: HashMap::new(), dirty: false, flush_count: 0 }
     }
 
     pub fn append_record(&mut self, row: &HashMap<String, String>) -> Result<()> {
@@ -499,8 +539,6 @@ impl SegmentWriter {
         }
         self.segment.record_count += 1;
         self.dirty = true;
-        // Writer extended `.dat` / `.offsets`; cached maps would still end at the old file length.
-        self.segment.invalidate_mmap_cache();
         Ok(())
     }
 
@@ -512,7 +550,7 @@ impl SegmentWriter {
             dat.flush()?;
             off.flush()?;
         }
-        // Mmap must be recreated now that the files have grown.
+        self.segment.persist_deleted_bitmap()?;
         self.segment.invalidate_mmap_cache();
         Ok(())
     }
@@ -524,13 +562,20 @@ impl SegmentWriter {
             off.flush()?;
         }
         self.segment.save_metadata()?;
-        for (col, map) in &self.bitmaps {
-            let path = self.segment.path.join(format!("bitmaps_{}.dat", col));
-            let file = File::create(path)?;
-            bincode::serialize_into(file, map)?;
+        self.segment.persist_deleted_bitmap()?;
+        self.flush_count += 1;
+        let bitmap_rewrite_interval: u32 = std::env::var("BITTICE_BITMAP_REWRITE_INTERVAL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(5);
+        if self.flush_count % bitmap_rewrite_interval == 0 {
+            for (col, map) in &self.bitmaps {
+                let path = self.segment.path.join(format!("bitmaps_{}.dat", col));
+                let file = File::create(path)?;
+                bincode::serialize_into(file, map)?;
+            }
         }
         self.dirty = false;
-        // Files are now fully flushed on disk; drop maps so readers remap the final size.
         self.segment.invalidate_mmap_cache();
         Ok(())
     }

@@ -24,6 +24,9 @@ fn docker_engine_deploy_locked() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if !env_truthy("BITTICE_NO_RLIMIT") {
+        bittice::core::fd_limits::raise_fd_limits();
+    }
     let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
     let args_len = std::env::args().len();
     let is_docker_env = std::path::Path::new("/.dockerenv").exists();
