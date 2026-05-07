@@ -818,7 +818,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
                 let mut interval = tokio::time::interval(Duration::from_millis(90));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut frame: usize = 0;
-                loop {
+    loop {
                     tokio::select! {
                         res = &mut shutdown => {
                             res.map_err(|e| anyhow::anyhow!(e))?;
