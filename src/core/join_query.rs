@@ -1400,6 +1400,16 @@ fn resolve_param(raw: &str, params_map: &HashMap<String, String>) -> Result<Stri
                 continue;
             }
 
+            if transform.eq_ignore_ascii_case("lowercase") {
+                value = value.to_lowercase();
+                continue;
+            }
+
+            if transform.eq_ignore_ascii_case("uppercase") {
+                value = value.to_uppercase();
+                continue;
+            }
+
             if let Some(split_spec) = transform.strip_prefix("split:") {
                 let mut split_parts = split_spec.splitn(2, ':');
                 let delimiter = split_parts.next().unwrap_or_default();

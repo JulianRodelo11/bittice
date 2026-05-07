@@ -211,87 +211,6 @@ fn subscribe_resolve_event_alias(
     None
 }
 
-fn subscribe_entity_table_for_alias(
-    alias_map: &[(String, String, String)],
-    alias: &str,
-) -> Option<(String, String)> {
-    for (a, e, t) in alias_map {
-        if a.eq_ignore_ascii_case(alias) {
-            return Some((e.clone(), t.clone()));
-        }
-    }
-    None
-}
-
-/// Keeps filters that apply to CDC rows from `event_alias`' table (`ev.col` → `col`).
-/// Unqualified fields apply only when `event_alias` is the query base alias.
-fn subscribe_filters_for_physical_row(
-    filters: &[CoreFilter],
-    event_alias: &str,
-    base_alias: &str,
-) -> Vec<CoreFilter> {
-    let mut out = Vec::new();
-    for f in filters {
-        let col = match subscribe_normalize_filter_column(&f.field, event_alias, base_alias) {
-            Some(c) => c,
-            None => continue,
-        };
-        let mut nf = f.clone();
-        nf.field = col;
-        out.push(nf);
-    }
-    out
-}
-
-fn subscribe_normalize_filter_column(
-    field: &str,
-    event_alias: &str,
-    base_alias: &str,
-) -> Option<String> {
-    let field = field.trim();
-    if let Some(dot) = field.find('.') {
-        let pref = field[..dot].trim();
-        let col = field[dot + 1..].trim().to_string();
-        if pref.eq_ignore_ascii_case(event_alias) {
-            return Some(col);
-        }
-        return None;
-    }
-    if event_alias.eq_ignore_ascii_case(base_alias) {
-        return Some(field.to_string());
-    }
-    None
-}
-
-fn subscribe_eval_filters_against_row(
-    filters: &[CoreFilter],
-    row_data: &HashMap<&String, &String>,
-    filters_op: LogicalOp,
-) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-    let eval_one = |f: &CoreFilter| {
-        row_data
-            .get(&f.field)
-            .map(|actual_val| {
-                crate::core::types::compare_filter_value(
-                    actual_val.trim(),
-                    f.op,
-                    f.value.trim(),
-                    f.value_to.as_deref(),
-                    &f.value_options,
-                    f.field_type,
-                )
-            })
-            .unwrap_or(false)
-    };
-    match filters_op {
-        LogicalOp::And => filters.iter().all(eval_one),
-        LogicalOp::Or => filters.iter().any(eval_one),
-    }
-}
-
 const BATCH_SIZE: usize = 1000;
 
 pub struct MyDatabase {
@@ -1412,10 +1331,8 @@ impl Database for MyDatabase {
         &self,
         request: Request<bittice_proto::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeUpdatesStream>, Status> {
-        let metadata = request.metadata().clone();
         let req = request.into_inner();
         let query_name = req.query_name.trim().to_string();
-        let params = req.params.clone();
 
         if query_name.is_empty() {
             return Err(Status::invalid_argument("Query name required"));
@@ -1423,101 +1340,36 @@ impl Database for MyDatabase {
 
         let ops = self.get_operations().await;
 
-        let (alias_map, base_alias, filters, auth_cfg, filters_op_logical) =
-            if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
-                if let SavedOperation::Read(q) = op {
-                    if q.response_grouping.is_some() {
-                        return Err(Status::invalid_argument(
-                            "SubscribeUpdates does not support response_grouping (REST-only)",
-                        ));
-                    }
-                    if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
-                        return Err(Status::invalid_argument(
-                            "Collect aggregation is currently supported only by the REST API",
-                        ));
-                    }
-                    let base_alias = q
-                        .table_alias
-                        .clone()
-                        .unwrap_or_else(|| q.table.clone());
-                    let alias_map = subscribe_join_alias_map(q);
-                    let mut resolved_filters = Vec::new();
-                    for sf in &q.filters {
-                        let mut val = sf.value.clone();
-                        if val.starts_with('$') {
-                            if let Some(p_val) = params.get(&val[1..]) {
-                                val = p_val.clone();
-                            }
-                        }
-                        resolved_filters.push(CoreFilter {
-                            field: sf.field.clone(),
-                            op: ComparisonOp::from_str(&sf.op),
-                            value: val,
-                            value_to: sf.value_to.clone(),
-                            value_options: sf.values.clone(),
-                            field_type: sf.field_type,
-                        });
-                    }
-                    let filters_op_logical = match q.filters_op.as_str() {
-                        "Or" => LogicalOp::Or,
-                        _ => LogicalOp::And,
-                    };
-                    (
-                        alias_map,
-                        base_alias,
-                        resolved_filters,
-                        q.auth_config.clone(),
-                        filters_op_logical,
-                    )
-                } else {
-                    return Err(Status::not_found(
-                        "Query found but it is not a 'read' operation",
+        let alias_map = if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
+            if let SavedOperation::Read(q) = op {
+                if q.response_grouping.is_some() {
+                    return Err(Status::invalid_argument(
+                        "SubscribeUpdates does not support response_grouping (REST-only)",
                     ));
                 }
+                if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
+                    return Err(Status::invalid_argument(
+                        "Collect aggregation is currently supported only by the REST API",
+                    ));
+                }
+                subscribe_join_alias_map(q)
             } else {
-                return Err(Status::not_found(format!(
-                    "Query name '{}' not found in current configuration",
-                    query_name
-                )));
-            };
-
-        let auth_ctx = self.extract_auth_context(&metadata, auth_cfg.as_ref()).await;
+                return Err(Status::not_found(
+                    "Query found but it is not a 'read' operation",
+                ));
+            }
+        } else {
+            return Err(Status::not_found(format!(
+                "Query name '{}' not found in current configuration",
+                query_name
+            )));
+        };
 
         let table_manager = Arc::clone(&self.table_manager);
         let mut events_rx = table_manager.events_tx.subscribe();
         let (tx, rx) = mpsc::channel(100);
 
         tokio::spawn(async move {
-            let mut final_filters = filters;
-
-            if let Some(ctx) = auth_ctx {
-                let filter_col = ctx.filter_col.clone();
-                final_filters.push(CoreFilter {
-                    field: filter_col,
-                    op: ComparisonOp::Eq,
-                    value: ctx.user_id,
-                    value_to: None,
-                    value_options: vec![],
-                    field_type: None,
-                });
-            }
-
-            let filters_internal = final_filters;
-
-            let mut manifest_cols: HashMap<(String, String), Vec<String>> = HashMap::new();
-            for (_, ent, tbl) in &alias_map {
-                let key = (ent.trim().to_string(), tbl.trim().to_string());
-                if manifest_cols.contains_key(&key) {
-                    continue;
-                }
-                if let Ok(table_arc) = table_manager.get_table(&key.0, &key.1) {
-                    manifest_cols.insert(
-                        key.clone(),
-                        table_arc.read().unwrap().manifest.original_fields.clone(),
-                    );
-                }
-            }
-
             debug!(
                 "gRPC: Client subscribed to '{}' (joined_tables={:?})",
                 query_name,
@@ -1533,77 +1385,20 @@ impl Database for MyDatabase {
                         let e_raw = event.entity.trim();
                         let t_raw = event.table_name.trim();
 
-                        let Some(event_alias) =
-                            subscribe_resolve_event_alias(&alias_map, e_raw, t_raw)
-                        else {
+                        if subscribe_resolve_event_alias(&alias_map, e_raw, t_raw).is_none() {
                             continue;
+                        }
+
+                        let proto_event = bittice_proto::UpdateEvent {
+                            r#type: event.event_type.clone(),
+                            table: event.table_name.clone(),
+                            row: Some(bittice_proto::Row {
+                                values: event.row.clone(),
+                            }),
+                            pk: event.pk.clone(),
                         };
-
-                        let Some((phys_entity, phys_table)) =
-                            subscribe_entity_table_for_alias(&alias_map, &event_alias)
-                        else {
-                            continue;
-                        };
-
-                        let phys_key = (
-                            phys_entity.trim().to_string(),
-                            phys_table.trim().to_string(),
-                        );
-                        let cols_internal = manifest_cols
-                            .get(&phys_key)
-                            .cloned()
-                            .unwrap_or_default();
-
-                        let filters_for_row = subscribe_filters_for_physical_row(
-                            &filters_internal,
-                            &event_alias,
-                            &base_alias,
-                        );
-
-                        let pass = if filters_internal.is_empty() {
-                            true
-                        } else if filters_for_row.is_empty() {
-                            // Filters reference only other aliases — skip events from this table.
-                            continue;
-                        } else if event.row.is_empty() {
-                            // DELETE / minimal payloads cannot satisfy column filters (same as single-table path).
-                            continue;
-                        } else if cols_internal.is_empty() {
-                            continue;
-                        } else {
-                            let mut row_data: HashMap<&String, &String> = HashMap::new();
-                            for (i, col_name) in cols_internal.iter().enumerate() {
-                                if i < event.row.len() {
-                                    row_data.insert(col_name, &event.row[i]);
-                                }
-                            }
-                            subscribe_eval_filters_against_row(
-                                &filters_for_row,
-                                &row_data,
-                                filters_op_logical,
-                            )
-                        };
-
-                        if pass {
-                            debug!(
-                                "gRPC [{}]: Notification {} {} alias={} PK={}",
-                                query_name,
-                                event.event_type,
-                                event.table_name,
-                                event_alias,
-                                event.pk
-                            );
-                            let proto_event = bittice_proto::UpdateEvent {
-                                r#type: event.event_type.clone(),
-                                table: event.table_name.clone(),
-                                row: Some(bittice_proto::Row {
-                                    values: event.row.clone(),
-                                }),
-                                pk: event.pk.clone(),
-                            };
-                            if tx.send(Ok(proto_event)).await.is_err() {
-                                break;
-                            }
+                        if tx.send(Ok(proto_event)).await.is_err() {
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

@@ -981,7 +981,7 @@ impl Table {
         Ok(())
     }
 
-    fn exact_matches_for_eq_filters(&self, filters: &[Filter], pk_field: &str) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
+    fn exact_matches_for_eq_filters(&self, filters: &[Filter], _pk_field: &str) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
         let eq_filters: Vec<&Filter> = filters.iter()
             .filter(|filter| {
                 (filter.op == crate::core::types::ComparisonOp::Eq
