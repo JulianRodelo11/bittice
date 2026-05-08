@@ -22,6 +22,9 @@ WORKDIR /app
 COPY ${BINARY_PATH} /usr/local/bin/bittice
 RUN chmod +x /usr/local/bin/bittice
 
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 EXPOSE 3000 8080 50051
 
-ENTRYPOINT ["bittice"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
