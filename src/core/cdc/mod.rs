@@ -1337,19 +1337,43 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
                 return Err(e.into());
             }
         };
-        let opts: Opts = OptsBuilder::from_opts(raw_opts)
+        let health_host = raw_opts.ip_or_hostname().to_string();
+        let health_port = raw_opts.tcp_port();
+        let opts_with_keepalive: Opts = OptsBuilder::from_opts(raw_opts.clone())
             .tcp_keepalive(Some(30u32))
             .into();
-        let health_host = opts.ip_or_hostname().to_string();
-        let health_port = opts.tcp_port();
-        let pool = Pool::new(opts);
+        let opts_without_keepalive: Opts = OptsBuilder::from_opts(raw_opts).into();
+        let mut pool = Pool::new(opts_with_keepalive);
         self.log_info(format!("CDC: Connecting to MySQL at {}...", final_url.split('@').last().unwrap_or("unknown")));
-        
+
         let mut conn = match tokio::time::timeout(std::time::Duration::from_secs(30), pool.get_conn()).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
-                self.log_error(format!("CDC: Connection failed: {}", e));
-                return Err(e.into());
+                let msg = e.to_string();
+                if msg.contains("os error 22") || msg.contains("Invalid argument") {
+                    self.log_warn(
+                        "CDC: MySQL connect failed with TCP keepalive enabled (os error 22). Retrying without keepalive."
+                            .to_string(),
+                    );
+                    pool = Pool::new(opts_without_keepalive);
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), pool.get_conn()).await {
+                        Ok(Ok(c2)) => c2,
+                        Ok(Err(e2)) => {
+                            self.log_error(format!("CDC: Connection failed after keepalive fallback: {}", e2));
+                            return Err(e2.into());
+                        }
+                        Err(_) => {
+                            self.log_error(
+                                "CDC: Connection timed out after 30 seconds (after keepalive fallback). Check network/firewall."
+                                    .to_string(),
+                            );
+                            return Err(anyhow::anyhow!("Connection timeout"));
+                        }
+                    }
+                } else {
+                    self.log_error(format!("CDC: Connection failed: {}", e));
+                    return Err(e.into());
+                }
             }
             Err(_) => {
                 self.log_error("CDC: Connection timed out after 30 seconds. Check network/firewall.".to_string());
