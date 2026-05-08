@@ -388,6 +388,44 @@ impl CdcWorker {
         }
     }
 
+    fn configured_vpn_file_for_entity(&self) -> Option<String> {
+        let cfg_path = crate::core::data_paths::profile_dir(&self.entity).join("cdc_config.json");
+        let content = std::fs::read_to_string(cfg_path).ok()?;
+        let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+        let vpn_file = json.get("vpn_file")?.as_str()?.trim();
+        if vpn_file.is_empty() {
+            None
+        } else {
+            Some(vpn_file.to_string())
+        }
+    }
+
+    fn try_restart_openvpn_for_route_loss(&self, db_host: &str) -> bool {
+        let Some(vpn_file) = self.configured_vpn_file_for_entity() else {
+            return false;
+        };
+        self.log_warn(format!(
+            "CDC: attempting OpenVPN restart for profile '{}' after route loss.",
+            self.entity
+        ));
+        match crate::core::vpn::VpnManager::prepare_ovpn_file(&vpn_file, db_host) {
+            Ok(prepared) => match crate::core::vpn::VpnManager::start(&prepared) {
+                Ok(()) => {
+                    self.log_info("CDC: OpenVPN restarted; waiting for MySQL route recovery.".to_string());
+                    true
+                }
+                Err(e) => {
+                    self.log_warn(format!("CDC: OpenVPN restart failed: {}", e));
+                    false
+                }
+            },
+            Err(e) => {
+                self.log_warn(format!("CDC: OpenVPN config prepare failed: {}", e));
+                false
+            }
+        }
+    }
+
     fn empty_cdc_state() -> CdcState {
         CdcState {
             binlog_file: String::new(),
@@ -2018,6 +2056,19 @@ replaying missed events before declaring live (data added while Bittice was offl
             let mut repl_caught_up_streak: u32 = 0;
             let health_check_interval = cdc_health_check_interval();
             let mut last_health_check = std::time::Instant::now();
+            let max_health_check_failures = std::env::var("BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(3);
+            let infinite_health_retries = max_health_check_failures == 0;
+            let mut consecutive_health_failures: u32 = 0;
+            let vpn_restart_cooldown = std::time::Duration::from_secs(
+                std::env::var("BITTICE_CDC_VPN_RESTART_COOLDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(20),
+            );
+            let mut last_vpn_restart_attempt: Option<std::time::Instant> = None;
             loop {
                 if crate::server::engine_halt_requested() {
                     self.log_info(format!(
@@ -2089,15 +2140,50 @@ replaying missed events before declaring live (data added while Bittice was offl
                             )
                             .await
                             {
-                                Ok(Ok(_)) => {}
+                                Ok(Ok(_)) => {
+                                    if consecutive_health_failures > 0 {
+                                        self.log_info(format!(
+                                            "CDC: MySQL route recovered after {} transient health-check failure(s).",
+                                            consecutive_health_failures
+                                        ));
+                                        consecutive_health_failures = 0;
+                                    }
+                                }
                                 _ => {
-                                    let _ = self.save_state(&state);
-                                    return self
-                                        .enter_static_mode(format!(
-                                            "Lost network route to MySQL host {}:{}",
-                                            health_host, health_port,
-                                        ))
-                                        .await;
+                                    consecutive_health_failures =
+                                        consecutive_health_failures.saturating_add(1);
+                                    let can_restart_vpn = last_vpn_restart_attempt
+                                        .map(|t| t.elapsed() >= vpn_restart_cooldown)
+                                        .unwrap_or(true);
+                                    if can_restart_vpn
+                                        && self.try_restart_openvpn_for_route_loss(&health_host)
+                                    {
+                                        last_vpn_restart_attempt = Some(std::time::Instant::now());
+                                    }
+                                    if infinite_health_retries {
+                                        self.log_warn(format!(
+                                            "CDC: transient MySQL route failure #{} for {}:{}; retrying (infinite mode).",
+                                            consecutive_health_failures,
+                                            health_host,
+                                            health_port,
+                                        ));
+                                    } else if consecutive_health_failures < max_health_check_failures {
+                                        self.log_warn(format!(
+                                            "CDC: transient MySQL route failure {}/{} for {}:{}; retrying before shutdown.",
+                                            consecutive_health_failures,
+                                            max_health_check_failures,
+                                            health_host,
+                                            health_port,
+                                        ));
+                                    } else {
+                                        let _ = self.save_state(&state);
+                                        return self
+                                            .enter_static_mode(format!(
+                                                "Lost network route to MySQL host {}:{}",
+                                                health_host, health_port,
+                                            ))
+                                            .await;
+                                    }
                                 }
                             }
                         }
