@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use mysql_async::prelude::*;
-use mysql_async::{BinlogStream, Conn, Opts, Pool, BinlogStreamRequest};
+use mysql_async::{BinlogStream, Conn, Opts, OptsBuilder, Pool, BinlogStreamRequest};
 use mysql_common::packets::Sid;
 use mysql_common::binlog::events::{EventData, RowsEventData, RowsEventRows, TableMapEvent};
 use mysql_common::packets::Column;
@@ -39,6 +39,15 @@ const CDC_STATE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 const CDC_STATE_SAVE_EVENT_BURST: u32 = 1024;
 /// Wake `binlog` `stream.next()` waits periodically so [`crate::server::engine_halt_requested`] is honored even when the server is quiet.
 const CDC_ENGINE_HALT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn cdc_health_check_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    )
+}
 
 /// Guard for the one-line startup hint when `BITTICE_CDC_LOG_ROW_EVENTS` is enabled.
 static CDC_ROW_TRACE_BANNER_EMITTED: AtomicBool = AtomicBool::new(false);
@@ -1321,13 +1330,18 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             }
         }
 
-        let opts = match Opts::from_url(&final_url) {
+        let raw_opts = match Opts::from_url(&final_url) {
             Ok(o) => o,
             Err(e) => {
                 self.log_error(format!("Invalid URL: {}", e));
                 return Err(e.into());
             }
         };
+        let opts: Opts = OptsBuilder::from_opts(raw_opts)
+            .tcp_keepalive(Some(30u32))
+            .into();
+        let health_host = opts.ip_or_hostname().to_string();
+        let health_port = opts.tcp_port();
         let pool = Pool::new(opts);
         self.log_info(format!("CDC: Connecting to MySQL at {}...", final_url.split('@').last().unwrap_or("unknown")));
         
@@ -1978,6 +1992,8 @@ replaying missed events before declaring live (data added while Bittice was offl
             }
 
             let mut repl_caught_up_streak: u32 = 0;
+            let health_check_interval = cdc_health_check_interval();
+            let mut last_health_check = std::time::Instant::now();
             loop {
                 if crate::server::engine_halt_requested() {
                     self.log_info(format!(
@@ -2038,6 +2054,27 @@ replaying missed events before declaring live (data added while Bittice was offl
                                     }
                                 }
                                 _ => {}
+                            }
+                        }
+                        if last_health_check.elapsed() >= health_check_interval {
+                            last_health_check = std::time::Instant::now();
+                            let addr = (health_host.as_str(), health_port);
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                tokio::net::TcpStream::connect(addr),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                _ => {
+                                    let _ = self.save_state(&state);
+                                    return self
+                                        .enter_static_mode(format!(
+                                            "Lost network route to MySQL host {}:{}",
+                                            health_host, health_port,
+                                        ))
+                                        .await;
+                                }
                             }
                         }
                         continue;

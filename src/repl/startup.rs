@@ -766,28 +766,17 @@ pub async fn run_startup_cliclack() -> Result<()> {
         println!("\x1b[90m│\x1b[0m  \x1b[90mThe background engine has automatically loaded the new entity.\x1b[0m");
         println!("\x1b[90m│\x1b[0m");
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-    } else {
-        if let Err(e) =
-            tokio::task::spawn_blocking(|| crate::server::repl_stop_engine_and_join_cdc()).await
-        {
-            warn!("Pre-start engine shutdown task failed: {}", e);
+
+        tokio::signal::ctrl_c().await?;
+
+        if let Some(mut c) = tail_child.take() {
+            let _ = c.kill();
         }
-        tokio::spawn(async move {
-            let _ = crate::server::start_all_servers(None, false).await;
-        });
-    }
 
-    tokio::signal::ctrl_c().await?;
+        // One-line spinner; cleared when shutdown completes (no extra │ / ◆ banners).
+        println!();
+        const SPIN_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
-    if let Some(mut c) = tail_child.take() {
-        let _ = c.kill();
-    }
-
-    // One-line spinner; cleared when shutdown completes (no extra │ / ◆ banners).
-    println!();
-    const SPIN_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
-
-    if is_docker_only {
         let mut interval = tokio::time::interval(Duration::from_millis(90));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let start = Instant::now();
@@ -801,42 +790,79 @@ pub async fn run_startup_cliclack() -> Result<()> {
             let _ = io::stdout().flush();
         }
     } else {
-        match tokio::time::timeout(
-            Duration::from_secs(120),
-            async {
-                let mut shutdown = tokio::task::spawn_blocking(|| {
-                    crate::server::repl_stop_engine_and_join_cdc()
-                });
-                let mut interval = tokio::time::interval(Duration::from_millis(90));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut frame: usize = 0;
+        if let Err(e) =
+            tokio::task::spawn_blocking(|| crate::server::repl_stop_engine_and_join_cdc()).await
+        {
+            warn!("Pre-start engine shutdown task failed: {}", e);
+        }
+        let engine_handle = tokio::spawn(async move {
+            crate::server::start_all_servers(None, false).await
+        });
+
+        let cdc_triggered = tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                res?;
+                false
+            }
+            engine_result = engine_handle => {
+                match engine_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("Engine stopped: {}", e),
+                    Err(e) => warn!("Engine task failed: {}", e),
+                }
+                true
+            }
+        };
+
+        if let Some(mut c) = tail_child.take() {
+            let _ = c.kill();
+        }
+
+        if cdc_triggered {
+            println!();
+            println!("\x1b[33m▲\x1b[0m  Connection to MySQL host lost \u{2014} returning to main menu.");
+        } else {
+            // One-line spinner; cleared when shutdown completes (no extra │ / ◆ banners).
+            println!();
+            const SPIN_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+            match tokio::time::timeout(
+                Duration::from_secs(120),
+                async {
+                    let mut shutdown = tokio::task::spawn_blocking(|| {
+                        crate::server::repl_stop_engine_and_join_cdc()
+                    });
+                    let mut interval = tokio::time::interval(Duration::from_millis(90));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut frame: usize = 0;
     loop {
-                    tokio::select! {
-                        res = &mut shutdown => {
-                            res.map_err(|e| anyhow::anyhow!(e))?;
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                        _ = interval.tick() => {
-                            print!(
-                                "\r\x1b[2K\x1b[35m{}\x1b[0m  Leaving Live Monitor…",
-                                SPIN_FRAMES[frame % 4]
-                            );
-                            let _ = io::stdout().flush();
-                            frame += 1;
+                        tokio::select! {
+                            res = &mut shutdown => {
+                                res.map_err(|e| anyhow::anyhow!(e))?;
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                            _ = interval.tick() => {
+                                print!(
+                                    "\r\x1b[2K\x1b[35m{}\x1b[0m  Leaving Live Monitor…",
+                                    SPIN_FRAMES[frame % 4]
+                                );
+                                let _ = io::stdout().flush();
+                                frame += 1;
+                            }
                         }
                     }
-                }
-            },
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Engine shutdown: {}", e),
-            Err(_) => {
-                warn!(
-                    "Engine shutdown still running after 120s (CDC may be finishing a long query). \
+                },
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Engine shutdown: {}", e),
+                Err(_) => {
+                    warn!(
+                        "Engine shutdown still running after 120s (CDC may be finishing a long query). \
 Returning to menu; stop orphaned workers with: kill bittice or restart the terminal session."
-                );
+                    );
+                }
             }
         }
     }
