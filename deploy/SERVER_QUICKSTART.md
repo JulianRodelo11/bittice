@@ -36,6 +36,7 @@ This package is built on each GitHub **release** along with the Docker image pub
 5. Start:
 
    ```bash
+   docker compose -f docker-compose.yaml --env-file .env pull
    docker compose -f docker-compose.yaml --env-file .env up -d
    ```
 

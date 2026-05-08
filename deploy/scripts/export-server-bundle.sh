@@ -106,6 +106,7 @@ Bittice — bundle exported from your local machine
      echo TOKEN | docker login ghcr.io -u GITHUB_USER --password-stdin
 3. Edit .env if needed (especially BITTICE_IMAGE).
 4. From this directory:
+     docker compose --env-file .env pull
      docker compose --env-file .env up -d
    Optional — automatic pulls when BITTICE_IMAGE points at GHCR (see deploy/actualizacion-automatica-ec2.md):
      docker compose -f docker-compose.yaml -f docker-compose.watchtower.yaml --env-file .env up -d
@@ -149,4 +150,4 @@ sys.exit(0 if ok else 1)
 PY
 
 echo "Done: $OUT_ABS"
-echo "Next: upload that folder to the server and run: docker compose --env-file .env up -d"
+echo "Next: upload that folder to the server and run: docker compose --env-file .env pull && docker compose --env-file .env up -d"

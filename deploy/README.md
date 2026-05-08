@@ -39,6 +39,7 @@ On the instance: install Docker (and *Compose v2*). Copy the `deploy/` directory
 cd deploy
 cp .env.example .env
 # edit .env: BITTICE_IMAGE, ports, BITTICE_HOST, etc.
+docker compose -f docker-compose.production.yaml --env-file .env pull
 docker compose -f docker-compose.production.yaml --env-file .env up -d
 ```
 
@@ -78,6 +79,7 @@ If you already connected and synced on your machine (UI or CLI) and you do not w
 3. On the server, if the image is private: `docker login` to the registry, then:
    ```bash
    cd my-server-bundle
+   docker compose --env-file .env pull
    docker compose --env-file .env up -d
    ```
 
@@ -91,7 +93,7 @@ With the interactive app (`bittice` with no extra args), open **Deploy → Build
 2. Run `deploy/scripts/export-server-bundle.sh` into a staging directory (your `data/`, `vpn/`, compose, `.env` with the same image tag).
 3. `docker save | ssh … docker load` so the instance has the image without a public registry.
 4. Stream the bundle with `tar` over SSH (preserves `.env` and other dotfiles).
-5. `ssh` into the server and run `docker compose up -d` in `~/<folder>`.
+5. `ssh` into the server and run `docker compose pull && docker compose up -d` in `~/<folder>`.
 
 You need Docker running locally, `ssh` with key-based auth to the server, and on the server: Docker with Compose v2 and `docker` usable by your SSH user. No separate shell steps are required unless something fails (check the error message).
 

@@ -503,6 +503,7 @@ EOF
         # Stop everything first to ensure a clean state
         if command -v docker-compose &> /dev/null; then
                         docker-compose -f "$COMPOSE_FILE" down &> /dev/null || true
+                        docker-compose -f "$COMPOSE_FILE" pull || true
                         if ! docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans; then
         installer_error "Failed to start Bittice Engine with docker-compose."
         installer_info "Please check if ports 3000, 8080, or 50051 are already in use."
@@ -510,6 +511,7 @@ EOF
             fi
         else
                         docker compose -f "$COMPOSE_FILE" down &> /dev/null || true
+                        docker compose -f "$COMPOSE_FILE" pull || true
                         if ! docker compose -f "$COMPOSE_FILE" up -d --remove-orphans; then
         installer_error "Failed to start Bittice Engine with docker compose."
         installer_info "Please check if ports 3000, 8080, or 50051 are already in use."
