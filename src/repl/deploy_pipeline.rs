@@ -146,6 +146,8 @@ pub fn run_local_docker_container(project_root: &Path, use_vpn: bool) -> Result<
             "--privileged".into(),
             "--cap-add".into(), "NET_ADMIN".into(),
             "--device".into(), "/dev/net/tun".into(),
+            "--dns".into(), "8.8.8.8".into(),
+            "--dns".into(), "8.8.4.4".into(),
             "-v".into(), vpn_vol,
             "--entrypoint".into(), "/bin/sh".into(),
         ]);
