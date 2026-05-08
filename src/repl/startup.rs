@@ -239,21 +239,24 @@ async fn run_interactive_local_docker_run() -> Result<()> {
     if vpn_needed {
         let data_root = crate::core::data_paths::resolved_data_root();
         let data_vpn = data_root.join("vpn");
-        let has_ovpn = data_vpn.is_dir()
-            && std::fs::read_dir(&data_vpn)
-                .ok()
-                .map(|entries| {
-                    entries.filter_map(|e| e.ok()).any(|e| {
+        let ovpn_files: Vec<String> = std::fs::read_dir(&data_vpn)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
                         e.path()
                             .extension()
                             .and_then(|ext| ext.to_str())
                             .map(|s| s.eq_ignore_ascii_case("ovpn"))
                             .unwrap_or(false)
                     })
-                })
-                .unwrap_or(false);
+                    .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        if !has_ovpn {
+        if ovpn_files.is_empty() {
             println!("\x1b[90m│\x1b[0m");
             println!("\x1b[33m▲\x1b[0m  \x1b[1mNo OpenVPN profiles found\x1b[0m");
             println!(
@@ -261,6 +264,52 @@ async fn run_interactive_local_docker_run() -> Result<()> {
             );
             return Ok(());
         }
+
+        let ovpn_name = if ovpn_files.len() == 1 {
+            ovpn_files[0].clone()
+        } else {
+            let items: Vec<(usize, String, &str)> = ovpn_files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.clone(), ""))
+                .collect();
+            let idx: usize = match select("Select the OpenVPN profile to use")
+                .items(&items)
+                .interact()
+            {
+                Ok(i) => i,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            ovpn_files[idx].clone()
+        };
+
+        let container_vpn_path = format!("/app/vpn/{}", ovpn_name);
+
+        let mut updated = 0u32;
+        for entity in &entities {
+            let config_path = crate::core::data_paths::profile_dir(entity).join("cdc_config.json");
+            let Ok(content) = std::fs::read_to_string(&config_path) else {
+                continue;
+            };
+            let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            let vpn_val = config.get("vpn_file").and_then(|v| v.as_str()).unwrap_or("");
+            if vpn_val.trim().is_empty() {
+                config["vpn_file"] = serde_json::Value::String(container_vpn_path.clone());
+                if let Ok(json) = serde_json::to_string_pretty(&config) {
+                    let _ = std::fs::write(&config_path, json);
+                    updated += 1;
+                }
+            }
+        }
+
+        if updated > 0 {
+            println!("\x1b[32m◆\x1b[0m  Set \x1b[1mvpn_file\x1b[0m → \x1b[1m{}\x1b[0m in {} profile(s).", container_vpn_path, updated);
+        }
+
+        
     }
 
     let res = tokio::task::spawn_blocking(move || {
