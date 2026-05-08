@@ -250,12 +250,13 @@ impl VpnManager {
         let mut content = fs::read_to_string(&path)?;
         let split_tunnel = std::env::var("BITTICE_VPN_SPLIT_TUNNEL")
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or_else(|_| is_docker());
+            .unwrap_or(false);
 
         let baseline_options = [
             "client",
             "dev tun",
             "data-ciphers AES-256-GCM:AES-128-GCM",
+            "mssfix 1400",
         ];
 
         for opt in &baseline_options {
