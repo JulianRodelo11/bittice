@@ -250,7 +250,6 @@ jobs:
           REPO_LOWER="${GITHUB_REPOSITORY,,}"
           mkdir -p server-bundle
           cp deploy/docker-compose.production.yaml server-bundle/docker-compose.yaml
-          cp deploy/docker-compose.vpn.yaml server-bundle/
           cp deploy/docker-compose.watchtower.yaml server-bundle/
           cp deploy/SERVER_QUICKSTART.md server-bundle/README.md
           {
@@ -261,6 +260,8 @@ jobs:
             echo "BITTICE_REST_ADMIN_PORT=8080"
             echo "BITTICE_GRPC_PORT=50051"
             echo "BITTICE_ENGINE_ONLY=1"
+            echo "BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0"
+            echo "BITTICE_CDC_VPN_RESTART_COOLDOWN_SECS=20"
           } > server-bundle/.env
           zip -r "bittice-server-${REF_NAME}.zip" server-bundle
           rm -rf server-bundle

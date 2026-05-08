@@ -460,22 +460,28 @@ fn spawn_cdc_worker_thread(
     active_workers: Arc<StdRwLock<HashSet<String>>>,
     startup_report_tx: Option<mpsc::Sender<crate::core::cdc::CdcStartupReport>>,
 ) {
-    if let Some(ref vpn_path) = spec.vpn_file {
-        info!(
-            "CDC: Auto-starting VPN from saved config for entity '{}'...",
-            spec.entity
-        );
-        match crate::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &spec.vpn_host) {
-            Ok(prepared) => {
-                if let Err(e) = crate::core::vpn::VpnManager::start(&prepared) {
-                    warn!("CDC: Failed to start VPN for entity '{}': {}", spec.entity, e);
+    let docker_env = std::path::Path::new("/.dockerenv").exists()
+        || std::env::var("BITTICE_ENGINE_ONLY")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+    if !docker_env {
+        if let Some(ref vpn_path) = spec.vpn_file {
+            info!(
+                "CDC: Auto-starting VPN from saved config for entity '{}'...",
+                spec.entity
+            );
+            match crate::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &spec.vpn_host) {
+                Ok(prepared) => {
+                    if let Err(e) = crate::core::vpn::VpnManager::start(&prepared) {
+                        warn!("CDC: Failed to start VPN for entity '{}': {}", spec.entity, e);
+                    }
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "CDC: Failed to prepare VPN file for entity '{}': {}",
-                    spec.entity, e
-                );
+                Err(e) => {
+                    warn!(
+                        "CDC: Failed to prepare VPN file for entity '{}': {}",
+                        spec.entity, e
+                    );
+                }
             }
         }
     }

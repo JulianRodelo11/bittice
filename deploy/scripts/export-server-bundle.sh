@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds a folder you can upload to the server: your local data/, .ovpn profiles, compose + .env
-# with OpenVPN and bind mounts. After "docker compose up" on the instance, the engine starts with
+# Builds a folder you can upload to the server: your local data/, compose + .env.
+# After "docker compose up" on the instance, the engine starts with
 # the same entity, CDC, and VPN you configured locally.
 #
 # From the project root (where the data/ directory exists):
@@ -38,11 +38,6 @@ if [[ ! -d data ]]; then
   exit 1
 fi
 
-if ! command -v python3 &>/dev/null; then
-  echo "python3 is required on PATH (for cdc_config.json validation)." >&2
-  exit 1
-fi
-
 mkdir -p "$OUT_ABS"
 OUT_ABS="$(cd "$OUT_ABS" && pwd)"
 
@@ -54,27 +49,9 @@ if [[ -n "$SKIP_DATA_COPY" ]]; then
   echo "Skipping embedded data/ copy (BITTICE_EXPORT_BUNDLE_SKIP_DATA). Validation uses \$WORK_ROOT/data." >&2
   export BITTICE_BUNDLE_VALIDATE_DATA="$WORK_ROOT/data"
 else
-  # Data tree: includes data/<entity>/cdc_config.json, tables, data/vpn/, etc.
+  # Data tree: includes data/<entity>/cdc_config.json and tables.
   tar -C "$WORK_ROOT" -cf - data | tar -C "$OUT_ABS" -xf -
   export BITTICE_BUNDLE_VALIDATE_DATA="$OUT_ABS/data"
-fi
-
-mkdir -p "$OUT_ABS/vpn"
-
-# Profiles: canonical local data/vpn + optional repo-root mount (dev docker-compose)
-if [[ -d data/vpn ]]; then
-  shopt -s nullglob
-  for f in data/vpn/*.ovpn; do
-    cp -f "$f" "$OUT_ABS/vpn/"
-  done
-  shopt -u nullglob
-fi
-if [[ -d vpn ]]; then
-  shopt -s nullglob
-  for f in vpn/*.ovpn; do
-    cp -f "$f" "$OUT_ABS/vpn/"
-  done
-  shopt -u nullglob
 fi
 
 # Compose template from this repo; the bundle only needs docker-compose.yaml at its root
@@ -93,9 +70,9 @@ fi
   echo "BITTICE_REST_PORT=$BITTICE_REST_PORT"
   echo "BITTICE_REST_ADMIN_PORT=$BITTICE_REST_ADMIN_PORT"
   echo "BITTICE_GRPC_PORT=$BITTICE_GRPC_PORT"
-  echo "BITTICE_VPN_DIR=/app/vpn"
-  echo "BITTICE_VPN_SPLIT_TUNNEL=true"
   echo "BITTICE_ENGINE_ONLY=1"
+  echo "BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0"
+  echo "BITTICE_CDC_VPN_RESTART_COOLDOWN_SECS=20"
 } > "$OUT_ABS/.env"
 
 cat > "$OUT_ABS/README-DEPLOY.txt" <<'EOF'
@@ -112,42 +89,8 @@ Bittice — bundle exported from your local machine
      docker compose -f docker-compose.yaml -f docker-compose.watchtower.yaml --env-file .env up -d
 5. Verify: docker ps && docker logs bittice
 
-Contains ./data (CDC, tables, cdc_config.json) and ./vpn (.ovpn profiles). Do not share this bundle publicly; it includes credentials.
+Contains ./data (CDC, tables, cdc_config.json). Do not share this bundle publicly; it includes credentials.
 EOF
-
-# Ensure each cdc_config vpn_file has a matching .ovpn in the bundle (by file name)
-python3 <<PY
-import json, os, sys
-from pathlib import Path
-
-out = Path(r"""$OUT_ABS""")
-vpn_in_pack = (out / "vpn")
-data_in_pack = Path(os.environ["BITTICE_BUNDLE_VALIDATE_DATA"])
-
-ok = True
-def has_ovpn(basename: str) -> bool:
-    if not basename.endswith(".ovpn"):
-        return False
-    a = vpn_in_pack / basename
-    b = data_in_pack / "vpn" / basename
-    return a.is_file() or b.is_file()
-
-for cfg in sorted(data_in_pack.rglob("cdc_config.json"), key=lambda p: str(p)):
-    try:
-        j = json.loads(cfg.read_text())
-    except Exception as e:
-        print(f"Warning: could not read {cfg}: {e}", file=sys.stderr)
-        continue
-    v = j.get("vpn_file")
-    if not v:
-        continue
-    name = os.path.basename(v)
-    if not has_ovpn(name):
-        print(f"Error: {cfg} references VPN '{v}' but {name} was not found in vpn/ or data/vpn/ in the bundle.", file=sys.stderr)
-        ok = False
-
-sys.exit(0 if ok else 1)
-PY
 
 echo "Done: $OUT_ABS"
 echo "Next: upload that folder to the server and run: docker compose --env-file .env pull && docker compose --env-file .env up -d"

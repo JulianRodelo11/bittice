@@ -88,8 +88,8 @@ fn detect_ghcr_repo(project_root: &Path) -> Result<String> {
 }
 
 /// Run the Bittice container locally using the published GHCR image for the latest tag.
-/// Mounts local `data/` and optionally `vpn/` from the project root.
-pub fn run_local_docker_container(project_root: &Path, use_vpn: bool) -> Result<()> {
+/// Mounts local `data/` from the project root.
+pub fn run_local_docker_container(project_root: &Path) -> Result<()> {
     check_docker_prerequisites()?;
 
     let tag = get_latest_git_tag(project_root)?;
@@ -139,24 +139,7 @@ pub fn run_local_docker_container(project_root: &Path, use_vpn: bool) -> Result<
         "-v".into(), data_vol,
     ];
 
-    if use_vpn {
-        let vpn_vol = format!("{}:/app/vpn", data_root.join("vpn").display());
-        let setup_cmd = "mkdir -p /dev/net && (test -c /dev/net/tun || mknod /dev/net/tun c 10 200) && chmod 600 /dev/net/tun && exec bittice";
-        args.extend_from_slice(&[
-            "--privileged".into(),
-            "--cap-add".into(), "NET_ADMIN".into(),
-            "--device".into(), "/dev/net/tun".into(),
-            "--dns".into(), "8.8.8.8".into(),
-            "--dns".into(), "8.8.4.4".into(),
-            "-v".into(), vpn_vol,
-            "--entrypoint".into(), "/bin/sh".into(),
-        ]);
-        args.push(image.clone());
-        args.push("-c".into());
-        args.push(setup_cmd.into());
-    } else {
-        args.push(image.clone());
-    }
+    args.push(image.clone());
 
     println!("\n\x1b[34m→\x1b[0m  Starting container…\n");
     let run = std::process::Command::new("docker")

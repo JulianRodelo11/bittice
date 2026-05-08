@@ -7,7 +7,6 @@ This package is built on each GitHub **release** along with the Docker image pub
 ## What’s in the package
 
 - `docker-compose.yaml` — production start (ports, data volume).
-- `docker-compose.vpn.yaml` — optional, if you use OpenVPN in the container.
 - `docker-compose.watchtower.yaml` — optional, [Watchtower](https://containrrr.dev/watchtower/) polls GHCR and recreates the labeled `bittice` service when the image digest changes (see `deploy/actualizacion-automatica-ec2.md` in the repo).
 - `.env` — `BITTICE_IMAGE` already points at **this** release’s image.
 
@@ -79,7 +78,7 @@ Data lives in the `bittice-data` volume.
 
 ## MySQL / CDC
 
-You do not need the repo to connect Bittice to your database: configuration is in the container’s **data volume**. Ensure the instance has **network** access to MySQL (and a VPN or tunnel if your environment requires it). For the VPN overlay, also use `docker-compose.vpn.yaml` as in `deploy/README.md` in the development repository.
+You do not need the repo to connect Bittice to your database: configuration is in the container’s **data volume**. Ensure the instance has **network** access to MySQL (and a VPN or tunnel if your environment requires it). Run VPN on the host/network layer; Docker deploy no longer bundles OpenVPN.
 
 ## From a machine where Bittice is already set up (recommended with VPN)
 

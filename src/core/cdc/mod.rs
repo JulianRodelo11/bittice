@@ -401,6 +401,9 @@ impl CdcWorker {
     }
 
     fn try_restart_openvpn_for_route_loss(&self, db_host: &str) -> bool {
+        if std::path::Path::new("/.dockerenv").exists() {
+            return false;
+        }
         let Some(vpn_file) = self.configured_vpn_file_for_entity() else {
             return false;
         };

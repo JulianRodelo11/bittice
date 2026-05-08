@@ -9,7 +9,6 @@ This directory holds the image definition, compose files, and scripts to run Bit
 | `Dockerfile` | Minimal Debian image that copies a pre-built **Linux** binary (same as the `docker` CI job). |
 | `Dockerfile.from-source` | Builds the engine with `cargo` inside the image; useful for local tests without cross-compilation. |
 | `docker-compose.production.yaml` | Service with restart policy, ports **3000** (saved queries), **8080** (admin), **50051** (gRPC), named volume for `/app/data`. |
-| `docker-compose.vpn.yaml` | Optional OpenVPN overlay (`/dev/net/tun`, `.ovpn` volume). |
 | `docker-compose.bundled.yaml` | Same stack as `production` + VPN with bind mounts for `./data` and `./vpn` (see *Deploy with pre-configured local profile* below). |
 | `docker-compose.watchtower.yaml` | Optional overlay: [Watchtower](https://containrrr.dev/watchtower/) polls the registry and recreates labeled containers (use with `BITTICE_IMAGE` from GHCR or another registry). |
 | `actualizacion-automatica-ec2.md` | Spanish guide: Watchtower vs log-only release checks; when `docker load` over SSH is not enough for automatic updates. |
@@ -29,7 +28,7 @@ Set your tag and owner in `BITTICE_IMAGE` inside `deploy/.env`.
 
 ## Deploy without cloning the repo (GitHub Actions / release)
 
-Each release attaches **`bittice-server-<tag>.zip`**: it includes `docker-compose.yaml`, `docker-compose.vpn.yaml`, `docker-compose.watchtower.yaml`, a `.env` with `BITTICE_IMAGE` pointing to that tag’s image, and **`SERVER_QUICKSTART.md`** (as `README.md` inside the zip). Download the asset from the release page, upload it to the server, and follow the zip’s README. You do not need the source on the instance.
+Each release attaches **`bittice-server-<tag>.zip`**: it includes `docker-compose.yaml`, `docker-compose.watchtower.yaml`, a `.env` with `BITTICE_IMAGE` pointing to that tag’s image, and **`SERVER_QUICKSTART.md`** (as `README.md` inside the zip). Download the asset from the release page, upload it to the server, and follow the zip’s README. You do not need the source on the instance.
 
 ## Run on a server (Compose)
 
@@ -54,14 +53,7 @@ cd deploy
 docker compose -f docker-compose.production.yaml -f docker-compose.watchtower.yaml --env-file .env up -d
 ```
 
-**VPN:** for the same OpenVPN-in-container pattern as the cloud installer:
-
-```bash
-cd deploy
-docker compose -f docker-compose.production.yaml -f docker-compose.vpn.yaml up -d
-```
-
-On the host, create the `deploy/vpn` directory (or set `BITTICE_VPN_HOST_DIR`) and place your `.ovpn` files there.
+**VPN:** run your VPN client on the host (or network layer) before starting the container. Bittice Docker images no longer embed OpenVPN/tun management.
 
 ## Deploy with a pre-configured local profile (VPN + CDC)
 

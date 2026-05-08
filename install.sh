@@ -431,19 +431,12 @@ EOF
 
                 # 2. Create or Update cloud docker-compose.yml (Permanent Service)
                 APP_DIR="${BITTICE_APP_DIR:-$DEFAULT_CLOUD_APP_DIR}"
-                VPN_MODE_RAW="${BITTICE_VPN_MODE:-container}"
-                VPN_MODE=$(echo "$VPN_MODE_RAW" | tr '[:upper:]' '[:lower:]')
-                if [ "$VPN_MODE" != "container" ]; then
-                        VPN_MODE="host"
-                fi
 
                 ensure_dir "$APP_DIR"
                 ensure_dir "$APP_DIR/data"
-                ensure_dir "$APP_DIR/vpn"
                 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
-                if [ "$VPN_MODE" = "container" ]; then
-                        COMPOSE_CONTENT=$(cat <<EOF
+                COMPOSE_CONTENT=$(cat <<EOF
 services:
     bittice:
         image: $IMAGE_NAME
@@ -454,49 +447,17 @@ services:
         environment:
             - BITTICE_HOST=0.0.0.0
             - BITTICE_ENGINE_ONLY=1
-            - BITTICE_VPN_DIR=/app/vpn
-            - BITTICE_VPN_SPLIT_TUNNEL=true
         ports:
             - "3000:3000"
             - "8080:8080"
             - "50051:50051"
         volumes:
             - $APP_DIR/data:/app/data
-            - $APP_DIR/vpn:/app/vpn
-        privileged: true
-        cap_add:
-            - NET_ADMIN
-        devices:
-            - "/dev/net/tun:/dev/net/tun"
 EOF
 )
-                else
-                        COMPOSE_CONTENT=$(cat <<EOF
-services:
-    bittice:
-        image: $IMAGE_NAME
-        container_name: bittice
-        restart: always
-        labels:
-            - com.centurylinklabs.watchtower.enable=true
-        environment:
-            - BITTICE_HOST=0.0.0.0
-            - BITTICE_ENGINE_ONLY=1
-            - BITTICE_VPN_DIR=/app/vpn
-            - BITTICE_VPN_SPLIT_TUNNEL=true
-        ports:
-            - "3000:3000"
-            - "8080:8080"
-            - "50051:50051"
-        volumes:
-            - $APP_DIR/data:/app/data
-            - $APP_DIR/vpn:/app/vpn
-EOF
-)
-                fi
 
                 write_text_file "$COMPOSE_FILE" "$COMPOSE_CONTENT"
-        installer_ok "Cloud compose ready at $COMPOSE_FILE (vpn_mode=$VPN_MODE)."
+        installer_ok "Cloud compose ready at $COMPOSE_FILE."
 
         # 3. Start/Restart Bittice Service immediately
     installer_info "Starting Bittice Engine..."
@@ -540,7 +501,6 @@ EOF
         installer_info "Configure and sync databases from your workstation, then redeploy."
         installer_info "Compose file: $COMPOSE_FILE"
         installer_info "Data dir: $APP_DIR/data"
-        installer_info "VPN dir: $APP_DIR/vpn"
         else
                 installer_warn "Skipping Docker background setup on cloud instance."
     fi

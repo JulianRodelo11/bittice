@@ -10,9 +10,6 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libc6 \
-    openvpn \
-    iproute2 \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 ARG BINARY_PATH
