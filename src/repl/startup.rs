@@ -698,17 +698,9 @@ pub async fn run_startup_cliclack() -> Result<()> {
                     WizardOutcome::Cancelled => continue 'main,
                     WizardOutcome::Done(cdc_info) => {
                         run_cdc_initial_sync(&cdc_info).await?;
-                        break 'main (
-                            0u8,
-                            if cdc_info.sync_all_databases {
-                                format!(
-                                    "connection profile '{}' (all schemas on host)",
-                                    cdc_info.entity
-                                )
-                            } else {
-                                format!("all synchronized entities (new: {})", cdc_info.entity)
-                            },
-                        );
+                        println!("\n\x1b[32m◆\x1b[0m  Initial sync complete. Returning to main menu.");
+                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                        continue 'main;
                     }
                 }
             }
