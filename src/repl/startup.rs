@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::deploy_pipeline::{self, BuildPlatform, FullDeployConfig};
+use super::deploy_pipeline;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CdcInfo {
@@ -193,20 +193,10 @@ async fn add_ovpn_profile_to_storage_for_deploy() -> Result<()> {
     Ok(())
 }
 
-fn print_deploy_instructions() {
-    println!("\x1b[90m│\x1b[0m");
-    println!("\x1b[32m◆\x1b[0m  \x1b[1mDeploy\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mBittice is published as a Docker image on every v* release.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m1. GitHub → Releases: download bittice-server-<version>.zip\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m2. On the server: Docker + docker compose (the .env already points at the GHCR image).\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m3. Manual bundle: deploy/scripts/export-server-bundle.sh (see deploy/README.md)\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m4. Or: Deploy menu → full SSH deploy or “Update engine image on SSH only”.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m5. Docs: deploy/README.md and deploy/SERVER_QUICKSTART.md\x1b[0m");
-    println!("\x1b[90m│\x1b[0m");
-}
+async fn run_interactive_local_docker_run() -> Result<()> {
+    println!("\x1b[90m│\x1b[0m  \x1b[90mRuns the published GHCR image with your local data/ and vpn/ mounted.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mUses the latest git tag to pull the correct image version.\x1b[0m");
 
-/// Shared prompts for SSH-based deploy flows (full or image refresh).
-async fn prompt_ssh_deploy_config() -> Result<Option<FullDeployConfig>> {
     let default_root = deploy_pipeline::find_bittice_project_root()
         .or_else(|| std::env::current_dir().ok())
         .map(|p| p.to_string_lossy().to_string())
@@ -216,118 +206,77 @@ async fn prompt_ssh_deploy_config() -> Result<Option<FullDeployConfig>> {
         .interact()
     {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let project_root = PathBuf::from(root_s.trim());
-    if !project_root.join("deploy/Dockerfile.from-source").is_file() {
+    if !project_root.join("deploy/Dockerfile").is_file() {
         return Err(anyhow::anyhow!(
-            "Not the Bittice repo root: missing deploy/Dockerfile.from-source in {}",
+            "Not the Bittice repo root: missing deploy/Dockerfile in {}",
             project_root.display()
         ));
     }
-    let local_image: String = match input("Docker image name:tag (same on your machine and the server)")
-        .default_input("bittice:local-run")
-        .interact()
-    {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if local_image.is_empty() {
-        return Err(anyhow::anyhow!("Image name is required."));
-    }
-    let ssh_target: String = match input("SSH target (e.g. ubuntu@ec2-…amazonaws.com)")
-        .interact()
-    {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if ssh_target.is_empty() {
-        return Err(anyhow::anyhow!("SSH target is required (user@host)."));
-    }
-    let remote_subdir: String = match input("Remote folder (under the server home) for compose and data")
-        .default_input("bittice-run")
-        .interact()
-    {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if remote_subdir.is_empty() {
-        return Err(anyhow::anyhow!("Remote folder name is required."));
-    }
-    let pl: u8 = match select("Target server CPU (image must match)")
-        .item(0u8, "linux/amd64 (typical x86 cloud VMs)", "")
-        .item(1u8, "linux/arm64 (e.g. AWS Graviton)", "")
-        .item(2u8, "Native (this computer — no buildx)", "")
-        .interact()
-    {
-        Ok(x) => x,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let platform = match pl {
-        0 => BuildPlatform::LinuxAmd64,
-        1 => BuildPlatform::LinuxArm64,
-        _ => BuildPlatform::HostNative,
-    };
-    Ok(Some(FullDeployConfig {
-        project_root,
-        local_image,
-        ssh_target,
-        remote_subdir,
-        platform,
-    }))
-}
 
-async fn run_interactive_full_ssh_deploy() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90mVPN is optional: only profiles with `vpn_file` need .ovpn files in data/vpn/ before deploy (OpenVPN only).\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mBuilds the image in Docker, pushes it over SSH, uploads compose + vpn/, rsyncs data/ twice for large mirrors, then compose up. Requires: Docker, rsync, ssh, keys, python3.\x1b[0m");
-    let Some(cfg) = prompt_ssh_deploy_config().await? else {
+    let entities = list_synced_entities();
+    if entities.is_empty() {
+        println!("\x1b[90m│\x1b[0m");
+        println!("\x1b[33m▲\x1b[0m  \x1b[1mNo synchronized entities found\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[90mConnect and sync at least one database before deploying.\x1b[0m");
         return Ok(());
-    };
-    let res = tokio::task::spawn_blocking(move || deploy_pipeline::run_full_deploy(&cfg))
-        .await
-        .map_err(|e| anyhow::anyhow!("join error: {e}"))?;
-    res?;
-    Ok(())
-}
+    }
 
-async fn run_interactive_ssh_image_refresh() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90mFor fixes/features after the first deploy: rebuild image, docker load on EC2, recreate container — keeps server data.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mSingle-node caveat: ~seconds offline during recreate; large uploads happen while the old container still runs.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mNeeds docker + ssh only unless you rsync data (then rsync on remote too).\x1b[0m");
-    let Some(cfg) = prompt_ssh_deploy_config().await? else {
-        return Ok(());
-    };
-    let sync_data: u8 = match select("Merge local data/ onto the server before recreate?")
-        .item(0u8, "No — ship new binary/engine only", "")
-        .item(1u8, "Yes — queries, vpn, or mirrors changed on this laptop", "")
+    let use_vpn: u8 = match select("Will the database require OpenVPN?")
+        .item(0u8, "Yes — OpenVPN profile required", "")
+        .item(1u8, "No — direct database access", "")
         .interact()
     {
         Ok(x) => x,
         Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let sync_flag = sync_data == 1u8;
-    let res =
-        tokio::task::spawn_blocking(move || deploy_pipeline::run_ssh_engine_image_refresh(&cfg, sync_flag))
-            .await
-            .map_err(|e| anyhow::anyhow!("join error: {e}"))?;
-    res?;
-    Ok(())
+    let vpn_needed = use_vpn == 0u8;
+
+    if vpn_needed {
+        let data_root = crate::core::data_paths::resolved_data_root();
+        let data_vpn = data_root.join("vpn");
+        let has_ovpn = data_vpn.is_dir()
+            && std::fs::read_dir(&data_vpn)
+                .ok()
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok()).any(|e| {
+                        e.path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|s| s.eq_ignore_ascii_case("ovpn"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+
+        if !has_ovpn {
+            println!("\x1b[90m│\x1b[0m");
+            println!("\x1b[33m▲\x1b[0m  \x1b[1mNo OpenVPN profiles found\x1b[0m");
+            println!(
+                "\x1b[90m│\x1b[0m  \x1b[90mAdd an OpenVPN profile first (Deploy → Add OpenVPN profile).\x1b[0m"
+            );
+            return Ok(());
+        }
+    }
+
+    let res = tokio::task::spawn_blocking(move || {
+        deploy_pipeline::run_local_docker_container(&project_root, vpn_needed)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("join error: {e}"))?;
+    res
 }
 
 async fn run_deploy_flow() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90mDirect DB access: no VPN setup required. OpenVPN `.ovpn` only when `vpn_file` is set on a profile.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90m(1) Optional OpenVPN; (2) Full SSH deploy; (3) Quick image refresh on EC2 (keep data); (4) Instructions.\x1b[0m");
-    let first: u8 = match select("Deploy to a server (Docker)")
-        .item(0u8, "Add OpenVPN profile (only if sync uses VPN — OpenVPN → data/vpn/)", "")
-        .item(1u8, "Build image + bundle + deploy over SSH (full)", "")
-        .item(2u8, "Update engine image on SSH only (reuse server data; optional rsync)", "")
-        .item(3u8, "Show deployment instructions only", "")
+    println!("\x1b[90m│\x1b[0m  \x1b[90mDeploy using the published GHCR Docker image with your local data.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mNo build required — pulls the image matching the latest git tag.\x1b[0m");
+    let first: u8 = match select("Deploy (Docker)")
+        .item(0u8, "Run Bittice in Docker locally", "")
+        .item(1u8, "Add OpenVPN profile (stores under data/vpn/)", "")
         .item(SEL_BACK_MAIN, "« Back to main menu", "")
         .interact()
     {
@@ -339,13 +288,9 @@ async fn run_deploy_flow() -> Result<()> {
         return Ok(());
     }
     if first == 0u8 {
-        add_ovpn_profile_to_storage_for_deploy().await?;
+        run_interactive_local_docker_run().await?;
     } else if first == 1u8 {
-        run_interactive_full_ssh_deploy().await?;
-    } else if first == 2u8 {
-        run_interactive_ssh_image_refresh().await?;
-    } else if first == 3u8 {
-        print_deploy_instructions();
+        add_ovpn_profile_to_storage_for_deploy().await?;
     }
     let _ = match select("Deploy")
         .item((), "« Back to main menu", "")

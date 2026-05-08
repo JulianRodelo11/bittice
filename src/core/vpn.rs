@@ -12,7 +12,11 @@ use tracing::warn;
 pub struct VpnManager;
 
 fn is_docker() -> bool {
-    std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok()
+    std::path::Path::new("/.dockerenv").exists()
+        || std::env::var("BITTICE_HOST").is_ok()
+        || std::env::var("BITTICE_ENGINE_ONLY")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
 }
 
 /// PID written by OpenVPN (`--writepid`). Root-owned daemon: plain `kill -0` from a user often fails (EPERM).
