@@ -404,6 +404,14 @@ impl Table {
         Ok(())
     }
 
+    /// Number of rows written to the active (in-memory) segment so far.
+    pub fn active_segment_row_count(&self) -> u64 {
+        self.active_segment
+            .as_ref()
+            .map(|w| w.segment.record_count)
+            .unwrap_or(0)
+    }
+
     /// Flush the active segment's BufWriters and WAL to the OS page cache without rotating the segment.
     /// Cheaper than `flush_active_segment` (no bitmap serialisation, no segment rotation).
     /// Call after any CDC write when the full flush is batched, so concurrent mmap readers see

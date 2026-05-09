@@ -2863,29 +2863,37 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
 
         if applied > 0 {
             self.table_manager.mark_dirty(&disk_entity, &mirror_table);
-            let n_flush = crate::core::cdc_durability::mirror_flush_every_n_batches();
-            let max_rows_before_flush: usize = std::env::var("BITTICE_CDC_FLUSH_MAX_ROWS")
+            self.table_manager.mark_cdc_active(&disk_entity, &mirror_table);
+
+            // Rotate the segment (expensive: rebuilds all bitmaps) only when it is full.
+            // This decouples durability flushes from bitmap serialisation, so a 1-row CDC
+            // event never triggers a full segment rebuild mid-stream.
+            let cdc_seg_max: u64 = std::env::var("BITTICE_CDC_SEGMENT_MAX_ROWS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(10_000);
-            let do_flush = if n_flush <= 1 {
-                true
-            } else {
-                let k = format!("{}/{}", disk_entity, mirror_table);
-                let mut ticks = self.cdc_mirror_flush_ticks.write().unwrap();
-                let t = ticks.entry(k).or_insert(0);
-                *t = t.saturating_add(1);
-                if *t >= n_flush || applied >= max_rows_before_flush {
-                    *t = 0;
-                    true
-                } else {
-                    false
-                }
-            };
-            if do_flush {
+                .unwrap_or(50_000);
+            if table.active_segment_row_count() >= cdc_seg_max {
                 table.flush_active_segment()?;
             } else {
-                table.flush_active_segment_buffers()?;
+                // Periodic lightweight buffer flush for durability (no bitmap rebuild).
+                let n_flush = crate::core::cdc_durability::mirror_flush_every_n_batches();
+                let do_buffer_flush = if n_flush <= 1 {
+                    true
+                } else {
+                    let k = format!("{}/{}", disk_entity, mirror_table);
+                    let mut ticks = self.cdc_mirror_flush_ticks.write().unwrap();
+                    let t = ticks.entry(k).or_insert(0);
+                    *t = t.saturating_add(1);
+                    if *t >= n_flush || applied >= 10_000 {
+                        *t = 0;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if do_buffer_flush {
+                    table.flush_active_segment_buffers()?;
+                }
             }
         }
         self.maybe_log_mysql_row_batch(

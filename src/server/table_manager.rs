@@ -25,6 +25,8 @@ pub struct TableManager {
     pub dirty_tables: RwLock<HashSet<String>>,
     /// When set, `evict_lru` closes tables **not** in this set first (from `.bittice_ops.json`).
     query_priority_keys: Arc<RwLock<Option<Arc<HashSet<String>>>>>,
+    /// Tables that received a CDC write event recently; evicted last to avoid expensive reopen.
+    cdc_active_tables: RwLock<HashSet<String>>,
 }
 
 fn ops_table_cache_priority_enabled() -> bool {
@@ -51,7 +53,15 @@ impl TableManager {
             open_count: AtomicUsize::new(0),
             dirty_tables: RwLock::new(HashSet::new()),
             query_priority_keys: Arc::new(RwLock::new(None)),
+            cdc_active_tables: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Mark a table as having received a recent CDC event.
+    /// These tables are placed last in the eviction order to avoid the expensive `Table::open()`.
+    pub fn mark_cdc_active(&self, entity: &str, table_name: &str) {
+        let key = format!("{}/{}", entity, table_name);
+        self.cdc_active_tables.write().unwrap().insert(key);
     }
 
     pub fn set_query_priority_keys(&self, keys: Option<Arc<HashSet<String>>>) {
@@ -161,11 +171,18 @@ impl TableManager {
         }
 
         let mut keys: Vec<String> = cache.keys().cloned().collect();
-        if let Some(hot) = self.query_priority_keys.read().unwrap().as_ref() {
-            let (mut cold, warm): (Vec<String>, Vec<String>) = keys
-                .into_iter()
-                .partition(|k| !hot.contains(k.as_str()));
+        {
+            let query_hot = self.query_priority_keys.read().unwrap();
+            let cdc_hot = self.cdc_active_tables.read().unwrap();
+            // Eviction order: cold → query-priority → CDC-active (most expensive to reopen)
+            let (mut cold, rest): (Vec<String>, Vec<String>) = keys.into_iter().partition(|k| {
+                let in_query = query_hot.as_ref().map_or(false, |h| h.contains(k.as_str()));
+                !in_query && !cdc_hot.contains(k.as_str())
+            });
+            let (warm, hot): (Vec<String>, Vec<String>) =
+                rest.into_iter().partition(|k| !cdc_hot.contains(k.as_str()));
             cold.extend(warm);
+            cold.extend(hot);
             keys = cold;
         }
         let evict_count = to_evict.min(keys.len());
