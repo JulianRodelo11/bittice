@@ -82,6 +82,11 @@ impl TableManager {
             .map_or(false, |hot| hot.contains(key.as_str()))
     }
 
+    /// Returns the current set of query-priority table keys (cloned Arc), or None if not set.
+    pub fn get_query_priority_keys(&self) -> Option<Arc<HashSet<String>>> {
+        self.query_priority_keys.read().unwrap().clone()
+    }
+
     pub fn set_query_priority_keys(&self, keys: Option<Arc<HashSet<String>>>) {
         // When ops are configured, shrink the open-table limit to ops_count + buffer so
         // non-ops tables can only occupy a small number of cache slots.

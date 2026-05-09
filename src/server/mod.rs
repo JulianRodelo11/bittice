@@ -272,6 +272,12 @@ pub async fn start_all_servers(
         info!("CDC autostart disabled. Running with static local data only.");
     }
 
+    // Compact over-segmented ops tables before opening HTTP — runs once, blocking, then exits.
+    {
+        let tm = table_manager.clone();
+        let _ = tokio::task::spawn_blocking(move || compact_startup_ops_tables(&tm)).await;
+    }
+
     crate::server::auto_update_hint::spawn_if_configured();
 
     let http_tm = table_manager.clone();
@@ -528,6 +534,46 @@ fn spawn_cdc_worker_thread(
         }
     });
     register_cdc_background_handle(h);
+}
+
+/// Compact any ops tables that have accumulated excessive micro-segments.
+/// Called once at startup (blocking), after CDC workers reach Phase 4, before HTTP opens.
+fn compact_startup_ops_tables(table_manager: &TableManager) {
+    let keys = match table_manager.get_query_priority_keys() {
+        Some(k) if !k.is_empty() => k,
+        _ => return,
+    };
+    info!("Startup compact: checking {} ops table(s) for segment fragmentation…", keys.len());
+    let mut compacted = 0usize;
+    for key in keys.iter() {
+        let mut parts = key.splitn(2, '/');
+        let (entity, table_name) = match (parts.next(), parts.next()) {
+            (Some(e), Some(t)) => (e, t),
+            _ => continue,
+        };
+        let table_arc = match table_manager.get_table(entity, table_name) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Startup compact: cannot open {}: {:#}", key, e);
+                continue;
+            }
+        };
+        let result = table_arc.write().map(|mut t| t.compact());
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(reduced)) => {
+                info!("Startup compact: {} — reduced by {} segment(s)", key, reduced);
+                compacted += 1;
+            }
+            Ok(Err(e)) => warn!("Startup compact: {} error: {:#}", key, e),
+            Err(e) => warn!("Startup compact: {} lock error: {}", key, e),
+        }
+    }
+    if compacted > 0 {
+        info!("Startup compact: finished — {} table(s) compacted.", compacted);
+    } else {
+        info!("Startup compact: all ops tables are already well-segmented.");
+    }
 }
 
 fn run_cdc_staged_sequential(
