@@ -20,7 +20,9 @@ const DEFAULT_MAX_OPEN_TABLES: usize = 50;
 pub struct TableManager {
     pub tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
     pub events_tx: broadcast::Sender<TableUpdateEvent>,
-    max_open: usize,
+    /// Hard upper bound set by env; actual limit shrinks to ops_count + buffer when ops load.
+    max_open_hard: usize,
+    max_open: AtomicUsize,
     open_count: AtomicUsize,
     pub dirty_tables: RwLock<HashSet<String>>,
     /// When set, `evict_lru` closes tables **not** in this set first (from `.bittice_ops.json`).
@@ -42,14 +44,15 @@ fn ops_table_cache_priority_enabled() -> bool {
 impl TableManager {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel::<TableUpdateEvent>(100);
-        let max_open = std::env::var("BITTICE_MAX_OPEN_TABLES")
+        let max_open_hard = std::env::var("BITTICE_MAX_OPEN_TABLES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_OPEN_TABLES);
         Self {
             tables: RwLock::new(HashMap::new()),
             events_tx: tx,
-            max_open,
+            max_open_hard,
+            max_open: AtomicUsize::new(max_open_hard),
             open_count: AtomicUsize::new(0),
             dirty_tables: RwLock::new(HashSet::new()),
             query_priority_keys: Arc::new(RwLock::new(None)),
@@ -80,6 +83,29 @@ impl TableManager {
     }
 
     pub fn set_query_priority_keys(&self, keys: Option<Arc<HashSet<String>>>) {
+        // When ops are configured, shrink the open-table limit to ops_count + buffer so
+        // non-ops tables can only occupy a small number of cache slots.
+        // The buffer (env BITTICE_OPS_CACHE_BUFFER, default 10) keeps room for a few
+        // non-ops tables that may be hot in CDC without accumulating hundreds.
+        let buffer: usize = std::env::var("BITTICE_OPS_CACHE_BUFFER")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10);
+        let new_limit = match &keys {
+            Some(k) if !k.is_empty() => {
+                let ops_limit = k.len().saturating_add(buffer);
+                ops_limit.min(self.max_open_hard)
+            }
+            _ => self.max_open_hard,
+        };
+        self.max_open.store(new_limit, Ordering::Relaxed);
+        debug!(
+            "TableManager: max_open set to {} (ops={} buffer={} hard={})",
+            new_limit,
+            keys.as_ref().map(|k| k.len()).unwrap_or(0),
+            buffer,
+            self.max_open_hard
+        );
         *self.query_priority_keys.write().unwrap() = keys;
     }
 
@@ -117,7 +143,7 @@ impl TableManager {
             }
         }
 
-        if self.open_count.load(Ordering::Relaxed) >= self.max_open {
+        if self.open_count.load(Ordering::Relaxed) >= self.max_open.load(Ordering::Relaxed) {
             self.evict_lru();
         }
 
@@ -167,10 +193,11 @@ impl TableManager {
     }
 
     fn evict_lru(&self) {
-        let target = if self.max_open > 50 {
-            self.max_open / 2
+        let max_open = self.max_open.load(Ordering::Relaxed);
+        let target = if max_open > 50 {
+            max_open / 2
         } else {
-            self.max_open.saturating_sub(1)
+            max_open.saturating_sub(1)
         };
         let to_evict = self
             .open_count
@@ -217,7 +244,7 @@ impl TableManager {
             "TableManager: evicting {} of {} cached tables (open_limit={})",
             evict_count,
             keys.len(),
-            self.max_open
+            max_open
         );
 
         let mut evicted = 0usize;

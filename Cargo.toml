@@ -1,6 +1,6 @@
 [package]
 name = "bittice"
-version = "0.1.88"
+version = "0.1.89"
 edition = "2021"
 license = "Elastic-2.0"
 
