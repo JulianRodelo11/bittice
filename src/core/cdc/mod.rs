@@ -1183,7 +1183,8 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         // Return freed heap pages to the OS so the glibc allocator doesn't hoard them.
         // Each table bootstrap allocates then frees large HashMaps; malloc_trim causes
         // glibc to return those free pages to the kernel, reducing container RSS.
-        #[cfg(target_os = "linux")]
+        // malloc_trim is a glibc extension; not available in musl.
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
         {
             extern "C" { fn malloc_trim(pad: usize) -> i32; }
             unsafe { malloc_trim(0); }

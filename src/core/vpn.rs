@@ -95,11 +95,6 @@ impl VpnManager {
         Some(PathBuf::from(t))
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn which_openvpn_macos() -> Option<PathBuf> {
-        None
-    }
-
     fn openvpn_version_ok(bin: &Path) -> bool {
         let mut cmd = Command::new(bin);
         cmd.arg("--version")
