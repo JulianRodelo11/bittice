@@ -2439,7 +2439,16 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                                 }
                             }
                         }
-                        self.handle_rows_event(&pool, rows_data, &mut state, &stream).await?;
+                        match self.handle_rows_event(&pool, rows_data, &mut state, &stream).await {
+                            Ok(()) => {}
+                            Err(e) if format!("{:#}", e).contains("Missing TableMapEvent") => {
+                                // Cursor resumed mid-file before the TableMapEvent for this table
+                                // was seen. Safe to skip — MySQL will re-emit the map on the next
+                                // write to this table, and the row event cannot be applied anyway.
+                                warn!("CDC: Skipping row event — TableMapEvent not yet seen (mid-file resume): {}", e);
+                            }
+                            Err(e) => return Err(e),
+                        }
                         Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     Some(EventData::RotateEvent(rotate_data)) => {

@@ -1266,6 +1266,301 @@ impl Table {
             .unwrap_or("unknown");
         Self::get_indexed_fields_static(entity, &self.name)
     }
+
+    /// Compact all immutable segments into larger segments.
+    ///
+    /// Merges the existing immutable segments into fewer, larger segments whose
+    /// target row-count is controlled by the `BITTICE_COMPACT_SEGMENT_ROWS`
+    /// environment variable (default 50,000).
+    ///
+    /// Returns the number of segments removed (old_count - new_count).
+    ///
+    /// Safety: must be called when no concurrent writes are happening.
+    pub fn compact(&mut self) -> Result<usize> {
+        // 1. Flush active segment so every row is in an immutable segment.
+        self.flush_active_segment()?;
+
+        let old_count = self.immutable_segments.len();
+
+        // 2. Skip-early check.
+        let target_rows: u64 = std::env::var("BITTICE_COMPACT_SEGMENT_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(50_000);
+
+        if old_count < 4 {
+            info!("Table '{}': compact() skipped — only {} immutable segment(s).", self.name, old_count);
+            return Ok(0);
+        }
+
+        let total_rows: u64 = self.immutable_segments.iter()
+            .map(|s| s.record_count.saturating_sub(s.deleted_bitmap.len()))
+            .sum();
+
+        let ideal_segments = total_rows.div_ceil(target_rows).max(1);
+        // Skip if already compact enough (fits in 2x the ideal count).
+        if old_count as u64 <= ideal_segments * 2 {
+            info!(
+                "Table '{}': compact() skipped — {} segments already close to ideal {} for {} rows.",
+                self.name, old_count, ideal_segments, total_rows
+            );
+            return Ok(0);
+        }
+
+        info!(
+            "Table '{}': compacting {} segments ({} live rows) into ~{} segment(s) of {} rows each.",
+            self.name, old_count, total_rows, ideal_segments, target_rows
+        );
+
+        // 3. Collect field names from the first segment's directory listing.
+        let fields: Vec<String> = if let Some(first_seg) = self.immutable_segments.first() {
+            let mut found: Vec<String> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&first_seg.path) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.ends_with(".dat") && !name.starts_with("bitmaps_") {
+                            found.push(name.trim_end_matches(".dat").to_string());
+                        }
+                    }
+                }
+            }
+            found.sort();
+            found
+        } else {
+            return Ok(0);
+        };
+
+        if fields.is_empty() {
+            return Ok(0);
+        }
+
+        // 4. Write compacted segments into a temporary directory, then rename into place.
+        let segments_dir = self.base_path.join("segments");
+        let tmp_dir = self.base_path.join("segments_compact_tmp");
+        if tmp_dir.exists() {
+            fs::remove_dir_all(&tmp_dir)?;
+        }
+        fs::create_dir_all(&tmp_dir)?;
+
+        // Choose starting ID well past all existing segment IDs to avoid collisions.
+        let max_existing_id = self.immutable_segments.iter().map(|s| s.id).max().unwrap_or(0);
+        let mut next_new_id = max_existing_id + 1_000_000;
+
+        let pk_field = if self.manifest.primary_key.is_empty() {
+            "PK".to_string()
+        } else {
+            self.manifest.primary_key.clone()
+        };
+
+        // pk_val -> (new_seg_id, new_local_id)
+        let mut new_primary_index: HashMap<String, (u64, u32)> = HashMap::new();
+
+        // Collect new segments as (SegmentWriter, bitmaps) so we can finalize them.
+        let mut finished_writers: Vec<SegmentWriter> = Vec::new();
+
+        // Current writer being filled.
+        let mut current_writer: Option<SegmentWriter> = None;
+        let mut current_row_count: u64 = 0;
+
+        // Build a reverse map: (old_seg_id, old_local_id) -> pk_val for re-indexing.
+        // We need this to update primary_index after compaction.
+        let reverse_pk: HashMap<(u64, u32), String> = self.primary_index
+            .iter()
+            .map(|(pk_val, &(seg_id, local_id))| ((seg_id, local_id), pk_val.clone()))
+            .collect();
+
+        // Iterate over all immutable segments in order.
+        for seg in &self.immutable_segments {
+            // Ensure mmap files are mapped.
+            let _ = seg.ensure_mmaps_batch(&fields);
+
+            for local_id in 0u32..seg.record_count as u32 {
+                // Skip deleted rows.
+                if seg.deleted_bitmap.contains(local_id) {
+                    continue;
+                }
+
+                // Start a new compact segment when needed.
+                if current_writer.is_none() || current_row_count >= target_rows {
+                    // Finish the current writer.
+                    if let Some(writer) = current_writer.take() {
+                        finished_writers.push(writer);
+                    }
+
+                    let new_seg = Segment::new(next_new_id, &tmp_dir);
+                    new_seg.create_dirs()?;
+                    current_writer = Some(SegmentWriter::new(new_seg));
+                    current_row_count = 0;
+                    next_new_id += 1;
+                }
+
+                // Read all field values for this row.
+                let row_values = seg.get_row_values(local_id, &fields)?;
+                let mut row_map: HashMap<String, String> = HashMap::with_capacity(fields.len());
+                for (i, field) in fields.iter().enumerate() {
+                    row_map.insert(field.clone(), row_values.get(i).cloned().unwrap_or_default());
+                }
+
+                let writer = current_writer.as_mut().unwrap();
+                let new_local_id = writer.segment.record_count as u32;
+                let new_seg_id = writer.segment.id;
+
+                writer.append_record(&row_map)?;
+                current_row_count += 1;
+
+                // Update reverse primary index mapping.
+                if let Some(pk_val) = reverse_pk.get(&(seg.id, local_id)) {
+                    new_primary_index.insert(pk_val.clone(), (new_seg_id, new_local_id));
+                } else {
+                    // Fallback: try to get pk value from the row itself.
+                    if let Some(pk_val) = row_map.get(&pk_field) {
+                        new_primary_index.insert(pk_val.clone(), (new_seg_id, new_local_id));
+                    }
+                }
+            }
+        }
+
+        // Finish the last writer.
+        if let Some(writer) = current_writer.take() {
+            finished_writers.push(writer);
+        }
+
+        if finished_writers.is_empty() {
+            // All rows were deleted — still clean up old segments.
+            info!("Table '{}': compact() found no live rows; removing all old segments.", self.name);
+        }
+
+        // 5. Flush all new writers and collect bitmaps.
+        for writer in &mut finished_writers {
+            writer.flush()?;
+            // Persist final bitmaps unconditionally (flush() only writes periodically).
+            for (col, map) in &writer.bitmaps {
+                let path = writer.segment.path.join(format!("bitmaps_{}.dat", col));
+                let file = fs::File::create(path)?;
+                bincode::serialize_into(file, map)?;
+            }
+        }
+
+        // 6. Move new segments from tmp dir into the real segments dir.
+        //    Use final IDs starting right after the old highest segment ID so they
+        //    sort after everything that exists, avoiding any ID collision.
+        let old_ids: Vec<u64> = self.immutable_segments.iter().map(|s| s.id).collect();
+        let base_final_id = self.manifest.active_segment_id + 1;
+        // We'll remap the temporary IDs to final sequential IDs.
+        // Collect temp-id -> final-id mapping.
+        let mut temp_to_final: HashMap<u64, u64> = HashMap::new();
+        let mut final_id_cursor = base_final_id;
+        for writer in &finished_writers {
+            temp_to_final.insert(writer.segment.id, final_id_cursor);
+            final_id_cursor += 1;
+        }
+
+        // Rename temp segment dirs to final names.
+        for writer in &finished_writers {
+            let temp_seg_path = &writer.segment.path; // tmp_dir/seg_XXXXXX
+            let final_id = temp_to_final[&writer.segment.id];
+            let final_seg_path = segments_dir.join(format!("seg_{:04}", final_id));
+            // A previous interrupted compact may have left data at this path; clear it first
+            // so that rename() doesn't fail with ENOTEMPTY on macOS / Linux.
+            if final_seg_path.exists() {
+                fs::remove_dir_all(&final_seg_path)?;
+            }
+            fs::rename(temp_seg_path, &final_seg_path)?;
+        }
+        // Remove the tmp directory (should be empty now).
+        let _ = fs::remove_dir(&tmp_dir);
+
+        // 7. Update primary_index IDs from temp to final.
+        for (_, (seg_id, _)) in new_primary_index.iter_mut() {
+            if let Some(&final_id) = temp_to_final.get(seg_id) {
+                *seg_id = final_id;
+            }
+        }
+
+        // 8. Load new segments as immutable Segment structs.
+        let mut new_immutable_segments: Vec<Segment> = Vec::with_capacity(finished_writers.len());
+        for writer in &finished_writers {
+            let final_id = temp_to_final[&writer.segment.id];
+            let final_seg_path = segments_dir.join(format!("seg_{:04}", final_id));
+            // Build a SegmentMeta from the writer's in-memory state.
+            let meta = crate::core::storage::manifest::SegmentMeta {
+                id: final_id,
+                min_max: writer.segment.min_max.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                record_count: writer.segment.record_count,
+                deleted_count: 0,
+                path: format!("seg_{:04}", final_id),
+            };
+            let mut seg = Segment::load(&final_seg_path, Some(&meta))?;
+            seg.is_immutable = true;
+            new_immutable_segments.push(seg);
+        }
+
+        // 9. Build exact indexes for each new segment.
+        for (idx, writer) in finished_writers.iter().enumerate() {
+            let final_id = temp_to_final[&writer.segment.id];
+            // Build a bitmaps map with final IDs for merge_exact_indexes_for_segment.
+            self.merge_exact_indexes_for_segment(final_id, &writer.bitmaps)?;
+            // Also update the segment's ID reference in our new list.
+            new_immutable_segments[idx].id = final_id;
+        }
+
+        // 10. Delete old segment directories from disk.
+        for old_id in &old_ids {
+            let old_seg_path = segments_dir.join(format!("seg_{:04}", old_id));
+            if old_seg_path.exists() {
+                fs::remove_dir_all(&old_seg_path)?;
+            }
+        }
+
+        // 11. Update manifest: remove old segments, add new ones, bump active_segment_id.
+        for old_id in &old_ids {
+            self.manifest.remove_segment(*old_id);
+        }
+        for seg in &new_immutable_segments {
+            let meta = seg.to_meta();
+            self.manifest.add_segment(meta);
+        }
+        // Advance active_segment_id past all new compact segments.
+        self.manifest.active_segment_id = final_id_cursor;
+        self.manifest.last_sequence_number += 1;
+
+        // 12. Replace in-memory immutable segments.
+        // Drop old mmaps first to free file handles.
+        for seg in &mut self.immutable_segments {
+            seg.mmap_cache.write().unwrap().clear();
+            seg.mmap_access_order.write().unwrap().clear();
+            seg.bitmap_cache.write().unwrap().clear();
+        }
+        self.immutable_segments = new_immutable_segments;
+
+        // 13. Replace primary index and clear exact index cache.
+        self.primary_index = new_primary_index;
+        self.exact_index_cache.write().unwrap().clear();
+
+        // 14. Save manifest and primary index; truncate WAL.
+        self.save_manifest()?;
+        self.save_primary_index()?;
+        self.wal.flush_writes()?;
+        self.wal.truncate()?;
+
+        // 15. Re-create active segment for subsequent writes.
+        self.active_segment = None;
+        self.ensure_active_segment()?;
+
+        let new_count = self.immutable_segments.len();
+        let reduced = old_count.saturating_sub(new_count);
+
+        info!(
+            "Table '{}': compaction complete. {} -> {} segments ({} reduced).",
+            self.name, old_count, new_count, reduced
+        );
+
+        Ok(reduced)
+    }
 }
 
 fn intersect_segment_matches(
