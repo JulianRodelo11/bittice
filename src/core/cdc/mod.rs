@@ -2752,7 +2752,19 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         };
 
         let mirror_table = Self::resolve_mirror_table_dir(&disk_entity, &table_name);
-        let table_lock = self.table_manager.get_table(&disk_entity, &mirror_table)?;
+        let table_lock = match self.table_manager.get_table(&disk_entity, &mirror_table) {
+            Ok(t) => t,
+            Err(e) => {
+                // Table::open failed — log the full chain and skip this event.
+                // Killing the CDC worker here causes an engine restart loop; skipping
+                // is safer and lets the table recover on the next restart or compaction.
+                warn!(
+                    "CDC: Cannot open table '{}/{}' — skipping row event: {:#}",
+                    disk_entity, mirror_table, e
+                );
+                return Ok(());
+            }
+        };
         let mut table = table_lock.write().unwrap();
 
         let pk_field = state
