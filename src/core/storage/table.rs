@@ -7,6 +7,9 @@ use memmap2::Mmap;
 use anyhow::{Result, Context};
 use roaring::RoaringBitmap;
 use crate::core::storage::manifest::Manifest;
+use crate::core::storage::primary_index::{
+    migrate_legacy_index, SegmentedPrimaryIndex,
+};
 use crate::core::storage::segment::{Segment, SegmentWriter};
 use crate::core::storage::wal::{Wal, WalOperation};
 use crate::core::types::{compare_filter_value, Filter, LogicalOp, OrderBy, QueryResult, SortDirection};
@@ -23,8 +26,8 @@ pub struct Table {
     active_segment: Option<SegmentWriter>,
     immutable_segments: Vec<Segment>,
     wal: Wal,
-    /// External ID -> (Segment ID, Local ID)
-    pub primary_index: HashMap<String, (u64, u32)>,
+    /// External ID -> (Segment ID, Local ID); on-disk segments under `primary/`.
+    pub primary_index: SegmentedPrimaryIndex,
     exact_index_cache: StdRwLock<HashMap<String, Arc<ExactIndex>>>,
     flush_count_since_index_save: u32,
 }
@@ -88,13 +91,24 @@ impl Drop for Table {
 }
 
 impl Table {
+    fn max_segments_in_ram() -> usize {
+        std::env::var("BITTICE_PRIMARY_INDEX_MAX_RAM_SEGMENTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .max(4)
+    }
+
     pub fn close(&mut self) -> Result<()> {
         if let Some(mut writer) = self.active_segment.take() {
             let _ = writer.flush();
         }
-        if !self.primary_index.is_empty() {
+        let _ = self.primary_index.flush_all();
+        if SegmentedPrimaryIndex::primary_dir_from_table(&self.base_path)
+            .join("manifest.json")
+            .is_file()
+        {
             let _ = self.save_manifest();
-            let _ = self.save_primary_index();
         }
         let _ = self.wal.flush_writes();
         for seg in &mut self.immutable_segments {
@@ -119,6 +133,9 @@ impl Table {
         } else { Manifest::new() };
         let wal_path = table_path.join("wal.log");
         let wal = Wal::open(&wal_path)?;
+        let num_segments = SegmentedPrimaryIndex::configured_num_segments();
+        migrate_legacy_index(&table_path, num_segments)?;
+        let primary_index = SegmentedPrimaryIndex::open(&table_path, Self::max_segments_in_ram())?;
         let mut table = Table {
             name: name.to_string(),
             base_path: table_path,
@@ -126,19 +143,18 @@ impl Table {
             active_segment: None,
             immutable_segments: Vec::new(),
             wal,
-            primary_index: HashMap::new(),
+            primary_index,
             exact_index_cache: StdRwLock::new(HashMap::new()),
             flush_count_since_index_save: 0,
         };
         table.load_segments()?;
         table.ensure_active_segment()?;
-        table.load_primary_index()?;
         table.replay_wal()?;
         Ok(table)
     }
 
     fn replay_wal(&mut self) -> Result<()> {
-        if !self.primary_index.is_empty() {
+        if SegmentedPrimaryIndex::disk_contains_any_entries(&self.base_path)? {
             self.wal.flush_writes()?;
             self.wal.truncate()?;
             return Ok(());
@@ -166,11 +182,11 @@ impl Table {
                     if let Some(writer) = &mut self.active_segment {
                         let local_id = writer.segment.record_count as u32;
                         writer.append_record(&row_data)?;
-                        self.primary_index.insert(pk_val, (writer.segment.id, local_id));
+                        self.primary_index.insert(pk_val, (writer.segment.id, local_id))?;
                     }
                 }
                 WalOperation::Delete { id } => {
-                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id) {
+                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id)? {
                         if let Some(writer) = &mut self.active_segment {
                             if writer.segment.id == seg_id {
                                 writer.segment.mark_deleted(local_id)?;
@@ -185,7 +201,7 @@ impl Table {
                 WalOperation::Update { id, data } => {
                     let row_data: HashMap<String, String> = serde_json::from_slice(&data)
                         .unwrap_or_default();
-                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id) {
+                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id)? {
                         if let Some(writer) = &mut self.active_segment {
                             if writer.segment.id == seg_id {
                                 writer.segment.mark_deleted(local_id)?;
@@ -205,12 +221,12 @@ impl Table {
                     if let Some(writer) = &mut self.active_segment {
                         let local_id = writer.segment.record_count as u32;
                         writer.append_record(&row_data)?;
-                        self.primary_index.insert(pk_val, (writer.segment.id, local_id));
+                        self.primary_index.insert(pk_val, (writer.segment.id, local_id))?;
                     }
                 }
             }
         }
-        self.save_primary_index()?;
+        self.primary_index.flush_dirty()?;
         self.wal.flush_writes()?;
         self.wal.truncate()?;
         info!(
@@ -238,35 +254,16 @@ impl Table {
             
             self.manifest = new_manifest;
             self.load_segments()?;
-            self.load_primary_index()?;
+            let ns = SegmentedPrimaryIndex::configured_num_segments();
+            migrate_legacy_index(&self.base_path, ns)?;
+            self.primary_index =
+                SegmentedPrimaryIndex::open(&self.base_path, Self::max_segments_in_ram())?;
             
             // Clean the active segment so that it is re-created if necessary
             self.active_segment = None;
             self.ensure_active_segment()?;
         }
 
-        Ok(())
-    }
-
-    fn load_primary_index(&mut self) -> Result<()> {
-        let idx_path = self.base_path.join("primary.idx");
-        if idx_path.exists() {
-            let file = fs::File::open(idx_path)?;
-            let reader = std::io::BufReader::new(file);
-            self.primary_index = bincode::deserialize_from(reader).unwrap_or_default();
-        }
-        Ok(())
-    }
-
-    fn save_primary_index(&self) -> Result<()> {
-        let idx_path = self.base_path.join("primary.idx");
-        let tmp_path = self.base_path.join("primary.idx.tmp");
-        {
-            let file = fs::File::create(&tmp_path)?;
-            let writer = std::io::BufWriter::new(file);
-            bincode::serialize_into(writer, &self.primary_index)?;
-        }
-        fs::rename(&tmp_path, &idx_path)?;
         Ok(())
     }
 
@@ -306,7 +303,12 @@ impl Table {
 
     /// Removes every mirrored row (WAL tombstones + segment deletes). Used rarely after CDC checkpoint loss.
     pub fn delete_all_rows(&mut self) -> Result<()> {
-        let ids: Vec<String> = self.primary_index.keys().cloned().collect();
+        let mut ids = Vec::new();
+        self.primary_index
+            .iter_all_segments(|pk, _| {
+                ids.push(pk.to_string());
+                Ok(())
+            })?;
         for id in ids {
             self.delete(&id)?;
         }
@@ -322,7 +324,7 @@ impl Table {
         if let Some(writer) = &mut self.active_segment {
              let local_id = writer.segment.record_count as u32;
              writer.append_record(&row_data)?; 
-             self.primary_index.insert(id, (writer.segment.id, local_id));
+             self.primary_index.insert(id, (writer.segment.id, local_id))?;
         }
         Ok(())
     }
@@ -334,7 +336,7 @@ impl Table {
     /// shorter (stale) version of the file and every field reads back as an empty string,
     /// which then gets written verbatim by the UPDATE merge — losing all existing field values.
     pub fn get_row_as_map(&mut self, pk_val: &str) -> Result<Option<HashMap<String, String>>> {
-        let Some((seg_id, local_id)) = self.primary_index.get(pk_val).copied() else {
+        let Some((seg_id, local_id)) = self.primary_index.get(pk_val)? else {
             return Ok(None);
         };
         let fields = &self.manifest.original_fields;
@@ -362,7 +364,7 @@ impl Table {
     }
 
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        if let Some((seg_id, local_id)) = self.primary_index.remove(id) {
+        if let Some((seg_id, local_id)) = self.primary_index.remove(id)? {
             let op = WalOperation::Delete { id: id.to_string() };
             self.wal.append(&op)?;
             if let Some(writer) = &mut self.active_segment {
@@ -419,7 +421,7 @@ impl Table {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(10);
         if self.flush_count_since_index_save >= index_save_interval {
-            self.save_primary_index()?;
+            self.primary_index.flush_dirty()?;
             self.wal.truncate()?;
             self.sync_base_dir()?;
             self.flush_count_since_index_save = 0;
@@ -443,7 +445,7 @@ impl Table {
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(10);
             if self.flush_count_since_index_save >= index_save_interval {
-                self.save_primary_index()?;
+                self.primary_index.flush_dirty()?;
                 self.wal.truncate()?;
                 self.sync_base_dir()?;
                 self.flush_count_since_index_save = 0;
@@ -586,12 +588,12 @@ impl Table {
         let segment_matches = if let Some(f) = pk_filter {
             let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
             if use_index {
-                if let Some((seg_id, local_id)) = self.primary_index.get(&f.value) {
-                    let candidate = (*seg_id, *local_id);
+                if let Some((seg_id, local_id)) = self.primary_index.get(&f.value)? {
+                    let candidate = (seg_id, local_id);
                     if self.candidate_matches_filters(candidate, &final_filters, &final_filters_op)? {
                         let mut bm = RoaringBitmap::new();
-                        bm.insert(*local_id);
-                        vec![(*seg_id, bm)]
+                        bm.insert(local_id);
+                        vec![(seg_id, bm)]
                     } else {
                         vec![]
                     }

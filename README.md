@@ -88,6 +88,15 @@ $env:BITTICE_VERSION = "v0.1.64"; irm https://raw.githubusercontent.com/JulianRo
 ### Docker and production servers
 See [`deploy/README.md`](deploy/README.md) for building the runtime image, `docker compose` and publishing to GitHub Container Registry (automated on version tags `v*`).
 
+### Environment variables (storage / cache)
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `BITTICE_PRIMARY_INDEX_SEGMENTS` | `256` | Number of on-disk shards for the primary PK index (`primary/segment_XX.idx`). Parsed as `u32`, rounded **up** to the next power of two, capped between 1 and 4096. |
+| `BITTICE_PRIMARY_INDEX_MAX_RAM_SEGMENTS` | `32` | LRU cap: how many index shards of **one** open table may be resident in RAM at once (minimum 4). |
+| `BITTICE_MAX_OPEN_TABLES` | *dynamic* | When unset, computed as `max(10, ceil(total_mirror_tables × (1 + margin/100)))` using on-disk mirrors; when set, overrides that calculation entirely. |
+| `BITTICE_MAX_OPEN_TABLES_MARGIN_PCT` | `20` | Margin (integer percent, 0–200) applied to `total_mirror_tables` for the dynamic `BITTICE_MAX_OPEN_TABLES` calculation. |
+
 ---
 
 ## 📜 Documentation & License

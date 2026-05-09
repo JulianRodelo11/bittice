@@ -1,5 +1,6 @@
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
@@ -15,7 +16,53 @@ pub struct TableUpdateEvent {
     pub row: Vec<String>,
 }
 
-const DEFAULT_MAX_OPEN_TABLES: usize = 200;
+/// A mirror table directory is counted if it contains `manifest.json` or at least one `*.dat`
+/// under `segments/*/`.
+fn is_valid_mirror_table_dir(dir: &std::path::Path) -> bool {
+    if dir.join("manifest.json").is_file() {
+        return true;
+    }
+    let seg_root = dir.join("segments");
+    let Ok(rd) = fs::read_dir(&seg_root) else {
+        return false;
+    };
+    for seg in rd.flatten() {
+        let p = seg.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let Ok(rd2) = fs::read_dir(&p) else {
+            continue;
+        };
+        for f in rd2.flatten() {
+            if f
+                .path()
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("dat"))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn count_mirror_tables_on_disk() -> usize {
+    let mut n = 0usize;
+    for entity_path in crate::core::data_paths::iter_mirror_entity_paths() {
+        let Ok(rd) = fs::read_dir(&entity_path) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && is_valid_mirror_table_dir(&p) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
 
 pub struct TableManager {
     pub tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
@@ -38,12 +85,37 @@ fn ops_table_cache_priority_enabled() -> bool {
 }
 
 impl TableManager {
+    /// Maximum number of mirrored `Table` handles kept open in memory.
+    ///
+    /// If `BITTICE_MAX_OPEN_TABLES` is set, that value wins. Otherwise the limit is
+    /// `max(10, ceil(total × (1 + MARGIN/100)))` where `total` is the number of valid table
+    /// directories under all mirror entity roots, and MARGIN is `BITTICE_MAX_OPEN_TABLES_MARGIN_PCT`
+    /// (default 20, clamped 0–200).
+    ///
+    /// This is computed once at startup (`TableManager::new`); there is no periodic refresh loop
+    /// in this module—restart the process or set `BITTICE_MAX_OPEN_TABLES` to change the cap later.
+    fn compute_dynamic_max_open() -> usize {
+        if let Ok(v) = std::env::var("BITTICE_MAX_OPEN_TABLES") {
+            let t = v.trim();
+            if let Ok(n) = t.parse::<usize>() {
+                return n.max(1);
+            }
+        }
+        let total = count_mirror_tables_on_disk();
+        let margin_pct: u32 = std::env::var("BITTICE_MAX_OPEN_TABLES_MARGIN_PCT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(20)
+            .min(200);
+        let num = total as u128;
+        let pct = margin_pct as u128;
+        let scaled = num.saturating_mul(100 + pct).div_ceil(100);
+        scaled.max(10).min(usize::MAX as u128) as usize
+    }
+
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel::<TableUpdateEvent>(100);
-        let max_open = std::env::var("BITTICE_MAX_OPEN_TABLES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MAX_OPEN_TABLES);
+        let max_open = Self::compute_dynamic_max_open();
         Self {
             tables: RwLock::new(HashMap::new()),
             events_tx: tx,
