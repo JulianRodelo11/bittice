@@ -1050,82 +1050,92 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             d_maps.insert(qkey.clone(), dates.clone());
         }
 
-        let table_lock = self.table_manager.get_table(&disk_entity, table_name)?;
-        let mut table = table_lock.write().unwrap();
+        // Scoped block: drop the write guard before close_table so there's no deadlock.
+        {
+            let table_lock = self.table_manager.get_table(&disk_entity, table_name)?;
+            let mut table = table_lock.write().unwrap();
 
-        // Save the original fields in the manifest
-        let _ = table.set_original_fields(cols.clone());
+            // Save the original fields in the manifest
+            let _ = table.set_original_fields(cols.clone());
 
-        let pk_query = format!(
-            "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
-             WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
-             AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX LIMIT 1",
-            Self::mysql_string_literal(&schema_mysql),
-            Self::mysql_string_literal(table_name)
-        );
-        let pk_col: Option<String> = conn.query_first(pk_query).await?;
-
-        if let Some(col) = pk_col {
-            table.manifest.primary_key = col.clone();
-            state.pk_map.insert(qkey.clone(), col);
-            debug!(
-                "CDC: Detected PK='{}' for table '{}'",
-                table.manifest.primary_key, qkey
+            let pk_query = format!(
+                "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
+                 WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
+                 AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX LIMIT 1",
+                Self::mysql_string_literal(&schema_mysql),
+                Self::mysql_string_literal(table_name)
             );
-        } else if let Some(pk_cand) = cols.iter().find(|c| c.ends_with("_id") || *c == "id") {
-            table.manifest.primary_key = pk_cand.clone();
-            state.pk_map.insert(qkey.clone(), pk_cand.clone());
-        }
+            let pk_col: Option<String> = conn.query_first(pk_query).await?;
 
-        let mut count = 0usize;
-        if mode == BootstrapMode::FullSnapshot {
-            let fq = Self::qualified_schema_table(&schema_mysql, table_name);
-            let mut result_set = conn.query_iter(format!("SELECT * FROM {}", fq)).await?;
+            if let Some(col) = pk_col {
+                table.manifest.primary_key = col.clone();
+                state.pk_map.insert(qkey.clone(), col);
+                debug!(
+                    "CDC: Detected PK='{}' for table '{}'",
+                    table.manifest.primary_key, qkey
+                );
+            } else if let Some(pk_cand) = cols.iter().find(|c| c.ends_with("_id") || *c == "id") {
+                table.manifest.primary_key = pk_cand.clone();
+                state.pk_map.insert(qkey.clone(), pk_cand.clone());
+            }
 
-            while let Some(row) = result_set.next().await? {
-                let mut data = HashMap::new();
-                for (i, col_name) in cols.iter().enumerate() {
-                    let val: mysql_common::Value = row.get(i).unwrap_or(mysql_common::Value::NULL);
-                    let mut val_str = match val {
-                        mysql_common::Value::NULL => "".to_string(),
-                        mysql_common::Value::Bytes(ref b) => String::from_utf8_lossy(b).to_string(),
-                        mysql_common::Value::Date(y, m, d, h, min, s, ms) => format!("{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", y, m, d, h, min, s, ms),
-                        _ => format!("{:?}", val),
-                    };
-                    if val_str.starts_with("Int(") || val_str.starts_with("UInt(") {
-                        if let Some(start) = val_str.find('(') {
-                            if let Some(end) = val_str.find(')') {
-                                val_str = val_str[start+1..end].to_string();
+            let mut count = 0usize;
+            if mode == BootstrapMode::FullSnapshot {
+                let fq = Self::qualified_schema_table(&schema_mysql, table_name);
+                let mut result_set = conn.query_iter(format!("SELECT * FROM {}", fq)).await?;
+
+                while let Some(row) = result_set.next().await? {
+                    let mut data = HashMap::new();
+                    for (i, col_name) in cols.iter().enumerate() {
+                        let val: mysql_common::Value = row.get(i).unwrap_or(mysql_common::Value::NULL);
+                        let mut val_str = match val {
+                            mysql_common::Value::NULL => "".to_string(),
+                            mysql_common::Value::Bytes(ref b) => String::from_utf8_lossy(b).to_string(),
+                            mysql_common::Value::Date(y, m, d, h, min, s, ms) => format!("{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", y, m, d, h, min, s, ms),
+                            _ => format!("{:?}", val),
+                        };
+                        if val_str.starts_with("Int(") || val_str.starts_with("UInt(") {
+                            if let Some(start) = val_str.find('(') {
+                                if let Some(end) = val_str.find(')') {
+                                    val_str = val_str[start+1..end].to_string();
+                                }
                             }
                         }
-                    }
 
-                    // Date expansion if applicable
-                    if dates.contains(col_name) && is_date_format(&val_str) {
-                        if let Some(d) = extract_day(&val_str) { data.insert(format!("{}_day", col_name), d); }
-                        if let Some(m) = extract_month(&val_str) { data.insert(format!("{}_month", col_name), m); }
-                        if has_time_component(&val_str) {
-                            if let Some(h) = extract_hour_bucket(&val_str) { data.insert(format!("{}_hour_bucket", col_name), h); }
+                        // Date expansion if applicable
+                        if dates.contains(col_name) && is_date_format(&val_str) {
+                            if let Some(d) = extract_day(&val_str) { data.insert(format!("{}_day", col_name), d); }
+                            if let Some(m) = extract_month(&val_str) { data.insert(format!("{}_month", col_name), m); }
+                            if has_time_component(&val_str) {
+                                if let Some(h) = extract_hour_bucket(&val_str) { data.insert(format!("{}_hour_bucket", col_name), h); }
+                            }
                         }
+
+                        data.insert(col_name.clone(), val_str);
                     }
-
-                    data.insert(col_name.clone(), val_str);
+                    table.insert(data)?;
+                    count += 1;
                 }
-                table.insert(data)?;
-                count += 1;
+                self.log_info(format!(
+                    "CDC: Table '{}' synchronized ({} rows).",
+                    qkey, count
+                ));
+            } else {
+                self.log_info(format!(
+                    "CDC: Table '{}' registered without bulk snapshot — row data comes from binlog replay only.",
+                    qkey
+                ));
             }
-            self.log_info(format!(
-                "CDC: Table '{}' synchronized ({} rows).",
-                qkey, count
-            ));
-        } else {
-            self.log_info(format!(
-                "CDC: Table '{}' registered without bulk snapshot — row data comes from binlog replay only.",
-                qkey
-            ));
-        }
 
-        table.flush_active_segment()?;
+            table.flush_active_segment()?;
+        } // write guard and Arc ref dropped here
+
+        // Release the bootstrapped table from the in-memory cache so its primary index
+        // and segment bitmaps are freed immediately.  Tables are reopened on demand when
+        // CDC events or queries arrive, spreading the memory cost across time instead of
+        // holding every bootstrapped table simultaneously.
+        self.table_manager.close_table(&disk_entity, table_name);
+
         Ok(())
     }
 

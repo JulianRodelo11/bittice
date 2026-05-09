@@ -899,6 +899,17 @@ impl Table {
 
         let cached = Arc::new(index);
         let mut cache = self.exact_index_cache.write().unwrap();
+        // Evict one arbitrary entry when the cache is at capacity to bound RAM usage.
+        // Evicted entries are rebuilt from disk on the next access.
+        let max_fields: usize = std::env::var("BITTICE_EXACT_INDEX_CACHE_FIELDS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(8);
+        if cache.len() >= max_fields && !cache.contains_key(field) {
+            if let Some(evict_key) = cache.keys().next().cloned() {
+                cache.remove(&evict_key);
+            }
+        }
         let entry = cache.entry(field.to_string()).or_insert_with(|| cached.clone());
         Ok(entry.clone())
     }

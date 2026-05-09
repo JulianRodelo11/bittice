@@ -15,7 +15,7 @@ pub struct TableUpdateEvent {
     pub row: Vec<String>,
 }
 
-const DEFAULT_MAX_OPEN_TABLES: usize = 200;
+const DEFAULT_MAX_OPEN_TABLES: usize = 50;
 
 pub struct TableManager {
     pub tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
