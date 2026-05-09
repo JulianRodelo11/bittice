@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use libc;
 use mysql_async::prelude::*;
 use mysql_async::{BinlogStream, Conn, Opts, OptsBuilder, Pool, BinlogStreamRequest};
 use mysql_common::packets::Sid;
@@ -967,6 +969,40 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         }
     }
 
+    /// Load column metadata for ALL tables in a schema with a single
+    /// `information_schema.COLUMNS` query instead of one `DESCRIBE` per table.
+    /// Returns `HashMap<table_name_lower, (ordered_col_names, date_col_names)>`.
+    /// Falls back to an empty map on error (callers fall back to per-table DESCRIBE).
+    async fn fetch_schema_columns_bulk(
+        conn: &mut Conn,
+        schema: &str,
+    ) -> HashMap<String, (Vec<String>, Vec<String>)> {
+        let sql = format!(
+            "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = {} \
+             ORDER BY TABLE_NAME, ORDINAL_POSITION",
+            Self::mysql_string_literal(schema)
+        );
+        let rows: Vec<(String, String, String, String)> = match conn.query(sql).await {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+        let mut result: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+        for (table, col_name, data_type, col_type) in rows {
+            let entry = result.entry(table).or_insert_with(|| (Vec::new(), Vec::new()));
+            let dt_lower = data_type.to_lowercase();
+            if dt_lower.contains("date") || dt_lower.contains("timestamp") || dt_lower.contains("time") {
+                entry.1.push(col_name.clone());
+            }
+            entry.0.push(col_name);
+            // Enum detection: COLUMN_TYPE looks like "enum('a','b')"
+            let ct_lower = col_type.to_lowercase();
+            let _ = (ct_lower, col_type); // available for enum parsing if needed
+        }
+        result
+    }
+
     async fn fetch_column_info(
         &self,
         conn: &mut Conn,
@@ -1081,6 +1117,15 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
 
             let mut count = 0usize;
             if mode == BootstrapMode::FullSnapshot {
+                // Rotate the active segment every N rows so SegmentWriter bitmaps (the
+                // in-memory inverted index) are written to disk and freed periodically.
+                // Without this, the bitmaps for the whole table accumulate in RAM until
+                // the single flush at the end, which can be hundreds of MB for large tables.
+                let segment_max_rows: usize = std::env::var("BITTICE_BOOTSTRAP_SEGMENT_MAX_ROWS")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(50_000);
+
                 let fq = Self::qualified_schema_table(&schema_mysql, table_name);
                 let mut result_set = conn.query_iter(format!("SELECT * FROM {}", fq)).await?;
 
@@ -1115,6 +1160,10 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
                     }
                     table.insert(data)?;
                     count += 1;
+                    // Rotate segment at boundary: flushes bitmaps to disk and resets RAM.
+                    if count % segment_max_rows == 0 {
+                        table.flush_active_segment()?;
+                    }
                 }
                 self.log_info(format!(
                     "CDC: Table '{}' synchronized ({} rows).",
@@ -1135,6 +1184,12 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         // CDC events or queries arrive, spreading the memory cost across time instead of
         // holding every bootstrapped table simultaneously.
         self.table_manager.close_table(&disk_entity, table_name);
+
+        // Return freed heap pages to the OS so the allocator doesn't hoard them.
+        // Each table bootstrap allocates then frees large HashMaps; without this the
+        // glibc allocator keeps those pages mapped, inflating the container RSS.
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
 
         Ok(())
     }
@@ -1614,6 +1669,13 @@ so the account can read coordinates."
                         continue;
                     }
                 };
+                // Bulk-load column metadata for the entire schema in one query so we
+                // don't need a separate DESCRIBE per already-bootstrapped table.
+                let bulk_cols = Self::fetch_schema_columns_bulk(&mut conn, &schema).await;
+                let has_new_tables = tables.iter().any(|t| {
+                    let qk = Self::qualified_table_key(true, &schema, t);
+                    !state.bootstrapped_tables.contains(&qk)
+                });
                 self.log_info(format!(
                     "CDC: Schema '{}' — {} base table(s) to process.",
                     schema,
@@ -1646,19 +1708,28 @@ so the account can read coordinates."
                         state.bootstrapped_tables.push(qkey.clone());
                         self.save_state(&state)?;
                     } else {
-                        let (cols, dates) = match self
-                            .fetch_column_info(&mut conn, &schema, &qkey, table_name)
-                            .await
+                        // Use bulk-loaded column info; fall back to per-table DESCRIBE only
+                        // if the bulk query didn't include this table (e.g. it was created
+                        // after the bulk fetch ran or the query failed).
+                        let (cols, dates) = if let Some((c, d)) = bulk_cols.get(table_name.as_str())
+                            .or_else(|| bulk_cols.get(table_name.to_lowercase().as_str()))
                         {
-                            Ok(info) => info,
-                            Err(e) => {
-                                Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
-                                return self
-                                    .enter_static_mode(format!(
-                                        "Failed to refresh schema for '{}': {}.",
-                                        qkey, e
-                                    ))
-                                    .await;
+                            (c.clone(), d.clone())
+                        } else {
+                            match self
+                                .fetch_column_info(&mut conn, &schema, &qkey, table_name)
+                                .await
+                            {
+                                Ok(info) => info,
+                                Err(e) => {
+                                    Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
+                                    return self
+                                        .enter_static_mode(format!(
+                                            "Failed to refresh schema for '{}': {}.",
+                                            qkey, e
+                                        ))
+                                        .await;
+                                }
                             }
                         };
                         {
@@ -1669,6 +1740,7 @@ so the account can read coordinates."
                         }
                     }
                 }
+                let _ = has_new_tables; // used for potential future logging
             }
         } else {
             let tables = match self.fetch_all_tables(&mut conn).await {
@@ -1679,6 +1751,8 @@ so the account can read coordinates."
                     return Err(e.into());
                 }
             };
+            // Bulk-load column metadata for all tables in the database at once.
+            let bulk_cols = Self::fetch_schema_columns_bulk(&mut conn, self.database.as_str()).await;
             self.log_info(format!(
                 "CDC: Database '{}' — {} base table(s) to process.",
                 self.database,
@@ -1712,24 +1786,30 @@ so the account can read coordinates."
                     state.bootstrapped_tables.push(qkey.clone());
                     self.save_state(&state)?;
                 } else {
-                    let (cols, dates) = match self
-                        .fetch_column_info(
-                            &mut conn,
-                            self.database.as_str(),
-                            &qkey,
-                            table_name,
-                        )
-                        .await
+                    let (cols, dates) = if let Some((c, d)) = bulk_cols.get(table_name.as_str())
+                        .or_else(|| bulk_cols.get(table_name.to_lowercase().as_str()))
                     {
-                        Ok(info) => info,
-                        Err(e) => {
-                            Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
-                            return self
-                                .enter_static_mode(format!(
-                                    "Failed to refresh schema for '{}': {}.",
-                                    table_name, e
-                                ))
-                                .await;
+                        (c.clone(), d.clone())
+                    } else {
+                        match self
+                            .fetch_column_info(
+                                &mut conn,
+                                self.database.as_str(),
+                                &qkey,
+                                table_name,
+                            )
+                            .await
+                        {
+                            Ok(info) => info,
+                            Err(e) => {
+                                Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
+                                return self
+                                    .enter_static_mode(format!(
+                                        "Failed to refresh schema for '{}': {}.",
+                                        table_name, e
+                                    ))
+                                    .await;
+                            }
                         }
                     };
                     {
@@ -1750,6 +1830,22 @@ so the account can read coordinates."
                 ));
                 return Err(e.into());
             }
+        }
+
+        // If Phase 2 did NOT open a new MVCC snapshot (i.e. this is a restart / resume, not a
+        // fresh bootstrap), clear any stale `mvcc_snapshot_catchup_pending` flag that was left
+        // over from a previous run.  The flag's purpose is to ensure events that arrived DURING
+        // a bulk SELECT* snapshot are applied before HTTP serves data.  On a simple restart those
+        // events were already applied in the previous session; holding the flag blocks the HTTP
+        // server unnecessarily (sometimes indefinitely on very-active databases).
+        if !rr_snapshot_active && state.mvcc_snapshot_catchup_pending {
+            state.mvcc_snapshot_catchup_pending = false;
+            let _ = self.save_state(&state);
+            self.log_info(
+                "CDC: Cleared stale mvcc_snapshot_catchup_pending — no new snapshot taken this \
+run; HTTP server will open immediately while the binlog gap is applied in the background."
+                    .to_string(),
+            );
         }
 
         self.log_phase(3, "Replication checkpoint (binlog position and safety checks)");
@@ -1870,12 +1966,14 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
 
         // Resume-with-gap detection: when we have a saved binlog position from a previous session
         // and that position is behind the current master tip, events that occurred while Bittice was
-        // offline (e.g. the user went to the main menu to connect a new RDS) must be replayed before
-        // the engine is considered "live".  Setting mvcc_snapshot_catchup_pending here re-uses the
-        // existing backlog-drain mechanism so that:
-        //   • run_cdc_staged_sequential waits for the catchup to finish before opening HTTP,
-        //   • tables are flushed durably once the gap is closed.
-        // We only do this check when NOT already pending (fresh bootstrap sets it independently).
+        // offline must be replayed.
+        //
+        // By default the gap is applied in the background — HTTP opens immediately and serves the
+        // data that was already mirrored (typically seconds to a few minutes stale), while the
+        // binlog backlog drains.  Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to restore the
+        // old blocking behaviour where ports stay closed until the gap is fully closed.
+        //
+        // We only run this check when NOT already pending (fresh bootstrap sets it independently).
         if !state.mvcc_snapshot_catchup_pending
             && had_checkpoint_at_start
             && !requires_lossless_mvcc_bootstrap
@@ -1883,15 +1981,26 @@ Queries may show stale data vs MySQL. Set BITTICE_CDC_REQUIRE_ROW=1 to refuse st
             match self.query_master_coordinates_pool(&pool).await {
                 Ok(Some((tip_file, tip_pos))) if !tip_file.is_empty() => {
                     if !Self::cdc_replication_caught_up_to_tip(&state, &tip_file, tip_pos) {
-                        state.mvcc_snapshot_catchup_pending = true;
-                        self.log_info(format!(
-                            "CDC: [{}] Resume gap detected — saved {}:{} is behind master {}:{}; \
-replaying missed events before declaring live (data added while Bittice was offline will be recovered).",
-                            self.entity,
-                            state.binlog_file, state.binlog_pos,
-                            tip_file, tip_pos,
-                        ));
-                        let _ = self.save_state(&state);
+                        if Self::env_truthy("BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP") {
+                            state.mvcc_snapshot_catchup_pending = true;
+                            self.log_info(format!(
+                                "CDC: [{}] Resume gap detected — saved {}:{} is behind master {}:{}; \
+waiting for full catchup before opening HTTP (BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1).",
+                                self.entity,
+                                state.binlog_file, state.binlog_pos,
+                                tip_file, tip_pos,
+                            ));
+                            let _ = self.save_state(&state);
+                        } else {
+                            self.log_info(format!(
+                                "CDC: [{}] Resume gap detected — saved {}:{} is behind master {}:{}; \
+applying missed events in the background (HTTP opens immediately). \
+Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
+                                self.entity,
+                                state.binlog_file, state.binlog_pos,
+                                tip_file, tip_pos,
+                            ));
+                        }
                     }
                 }
                 _ => {}

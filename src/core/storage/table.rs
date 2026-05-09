@@ -451,6 +451,10 @@ impl Table {
             let mut immutable_seg = writer.segment;
             immutable_seg.is_immutable = true;
             self.immutable_segments.push(immutable_seg);
+            // Drop cached exact indexes after each segment rotation: the compiled
+            // bitmaps are already persisted to disk by merge_exact_indexes_for_segment.
+            // Clearing here bounds RAM usage; entries rebuild lazily on the next query.
+            self.exact_index_cache.write().unwrap().clear();
         }
         self.persist_all_deleted_bitmaps()?;
         self.ensure_active_segment()?;
