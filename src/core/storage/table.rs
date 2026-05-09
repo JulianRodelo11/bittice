@@ -12,7 +12,7 @@ use crate::core::storage::wal::{Wal, WalOperation};
 use crate::core::types::{compare_filter_value, Filter, LogicalOp, OrderBy, QueryResult, SortDirection};
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 type ExactIndex = HashMap<String, Vec<(u64, RoaringBitmap)>>;
 
@@ -296,10 +296,22 @@ impl Table {
         let active_id = self.manifest.active_segment_id;
         let seg_path = segments_dir.join(format!("seg_{:04}", active_id));
         let segment = if seg_path.exists() {
-             let meta = self.manifest.segments.iter().find(|s| s.id == active_id);
-             let mut s = Segment::load(&seg_path, meta)?;
-             s.is_immutable = false;
-             s
+            let meta = self.manifest.segments.iter().find(|s| s.id == active_id);
+            match Segment::load(&seg_path, meta) {
+                Ok(mut s) => { s.is_immutable = false; s }
+                Err(e) => {
+                    // Active segment is corrupt (e.g. leftover from an interrupted compact).
+                    // Recover by starting a fresh empty segment at the same ID so that WAL
+                    // replay on this open can still reconstruct any unflushed rows.
+                    warn!(
+                        "Table '{}': active segment {} failed to load ({}); creating fresh segment.",
+                        self.name, active_id, e
+                    );
+                    let s = Segment::new(active_id, &segments_dir);
+                    s.create_dirs()?;
+                    s
+                }
+            }
         } else {
             let s = Segment::new(active_id, &segments_dir);
             s.create_dirs()?;

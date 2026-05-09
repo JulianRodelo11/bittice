@@ -239,13 +239,20 @@ pub async fn start_all_servers(
     let entity_filter = entity_filter.map(|e| e.trim().to_lowercase());
 
     table_manager.refresh_query_priority_keys_from_ops(entity_filter.clone());
-    
+
     if let Some(ref f) = entity_filter {
         debug!("Filtering by entity: '{}'", f);
     } else {
         debug!("No entity filter applied (loading all)");
     }
-    
+
+    // Compact over-segmented ops tables BEFORE CDC starts — no write-lock contention.
+    // Tables are in a stable on-disk state here (no live streaming yet).
+    {
+        let tm = table_manager.clone();
+        let _ = tokio::task::spawn_blocking(move || compact_startup_ops_tables(&tm)).await;
+    }
+
     // --- AUTO-START CDC WORKERS (sequential: HTTP only after each profile signals Phase 4) ---
     if cdc_autostart_enabled() {
         let specs = collect_cdc_spawn_specs(&entity_filter, &active_workers);
@@ -270,12 +277,6 @@ pub async fn start_all_servers(
         }
     } else {
         info!("CDC autostart disabled. Running with static local data only.");
-    }
-
-    // Compact over-segmented ops tables before opening HTTP — runs once, blocking, then exits.
-    {
-        let tm = table_manager.clone();
-        let _ = tokio::task::spawn_blocking(move || compact_startup_ops_tables(&tm)).await;
     }
 
     crate::server::auto_update_hint::spawn_if_configured();
