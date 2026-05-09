@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cliclack::{intro, outro_cancel, select, input, password, spinner};
+use cliclack::{confirm, intro, multiselect, note, outro_cancel, select, input, password, spinner};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::thread;
@@ -28,6 +28,10 @@ struct CdcInfo {
     /// When true: sync every non-system database; data paths use real MySQL schema names.
     #[serde(default)]
     sync_all_databases: bool,
+    /// When non-empty: only these tables are mirrored. Keys match CDC `qualified_table_key`: `schema.table`
+    /// (lowercased schema) in sync-all mode, or bare `table` name for a single database.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sync_tables: Vec<String>,
     entity: String,
     vpn_file: Option<String>,
 }
@@ -241,6 +245,7 @@ async fn run_deploy_flow() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mNo build required — pulls the image matching the latest git tag.\x1b[0m");
     let first: u8 = match select("Deploy (Docker)")
         .item(0u8, "Run Bittice in Docker locally", "")
+        .item(1u8, "Add OpenVPN profile to VPN storage", "")
         .item(SEL_BACK_MAIN, "« Back to main menu", "")
         .interact()
     {
@@ -253,6 +258,9 @@ async fn run_deploy_flow() -> Result<()> {
     }
     if first == 0u8 {
         run_interactive_local_docker_run().await?;
+    }
+    if first == 1u8 {
+        add_ovpn_profile_to_storage_for_deploy().await?;
     }
     let _ = match select("Deploy")
         .item((), "« Back to main menu", "")
@@ -479,6 +487,110 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         vpn_file = Some(final_vpn_path);
     }
 
+    let probe_url = if sync_all_databases {
+        format!("mysql://{}:{}@{}:{}/", user, pass, host, port)
+    } else {
+        format!(
+            "mysql://{}:{}@{}:{}/{}",
+            user, pass, host, port, database
+        )
+    };
+    let single_db_catalog = (!sync_all_databases).then_some(database.as_str());
+
+    let mut sync_tables: Vec<String> = Vec::new();
+    let limit_tables: bool = match confirm(
+        "Limit synchronization to selected tables only? (Otherwise every table in scope is synced)",
+    )
+    .initial_value(false)
+    .interact()
+    {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+            return Ok(WizardOutcome::Cancelled);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    if limit_tables {
+        match note(
+            "Table picker",
+            "Space toggles each row; Enter confirms your selection. Type to filter the list.",
+        ) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                return Ok(WizardOutcome::Cancelled);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let catalog = {
+            let s = spinner();
+            s.start("Listing schemas and tables from MySQL...");
+            match CdcWorker::discover_mysql_catalog(&probe_url, single_db_catalog).await {
+                Ok(c) => {
+                    s.stop("✓ Catalog loaded.");
+                    c
+                }
+                Err(e) => {
+                    s.stop("✗ Failed to inspect MySQL catalog.");
+                    let _ = cliclack::log::error(
+                        "Could not list databases/tables. Check host, credentials, and network.",
+                    );
+                    return Err(e.context(
+                        "Could not list databases/tables. Check host, credentials, and network.",
+                    ));
+                }
+            }
+        };
+        let n_tables: usize = catalog.iter().map(|(_, t)| t.len()).sum();
+        if n_tables == 0 {
+            let _ = cliclack::log::warning(
+                "No user tables were found. Choose “all tables” or verify grants / database name.",
+            );
+            return Err(anyhow::anyhow!(
+                "No user tables were found. Use “all tables” or verify grants / database name."
+            ));
+        }
+        let _ = cliclack::log::info(format!(
+            "{n_tables} table(s) found — select which ones to mirror."
+        ));
+
+        let mut picker = multiselect("Select tables to synchronize")
+            .filter_mode()
+            .max_rows(18)
+            .required(true);
+        if sync_all_databases {
+            for (sch, tables) in &catalog {
+                for t in tables {
+                    let key = format!("{}.{}", sch.to_lowercase(), t);
+                    let label = format!("{}.{}", sch, t);
+                    picker = picker.item(key, label, "");
+                }
+            }
+        } else {
+            for (_, tables) in &catalog {
+                for t in tables {
+                    let label = format!("{}.{}", database, t);
+                    picker = picker.item(t.clone(), label, "");
+                }
+            }
+        }
+
+        sync_tables = match picker.interact() {
+            Ok(v) => {
+                let mut v = v;
+                v.sort();
+                v.dedup();
+                let _ =
+                    cliclack::log::success(format!("{} table(s) will be mirrored.", v.len()));
+                v
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                return Ok(WizardOutcome::Cancelled);
+            }
+            Err(e) => return Err(e.into()),
+        };
+    }
+
     let cdc_info = CdcInfo {
         host,
         port,
@@ -486,6 +598,7 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         pass,
         database,
         sync_all_databases,
+        sync_tables,
         entity,
         vpn_file,
     };

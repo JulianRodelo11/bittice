@@ -1,3 +1,5 @@
+# Publishes binaries, GHCR Docker image (multi-arch manifest), and server bundle zip.
+# Trigger from your machine after bumping Cargo.toml: ./deploy/scripts/push-release-tag.sh
 name: Release
 
 on:

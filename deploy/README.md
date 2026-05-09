@@ -15,16 +15,31 @@ This directory holds the image definition, compose files, and scripts to run Bit
 | `scripts/build-image-from-source.sh` | `docker build` using `Dockerfile.from-source`. |
 | `scripts/build-image-from-binary.sh` | `docker build` like a release, from a Linux `bittice` binary. |
 | `scripts/export-server-bundle.sh` | Packs a local project’s `data/` and `.ovpn` files into a folder ready for `docker compose` on the server. |
+| `scripts/push-release-tag.sh` | Creates and pushes `v<Cargo.toml version>` so GitHub Actions publishes the GHCR image. |
 | `ec2/user-data.example.sh` | Example instance bootstrap (Docker + `docker run`). |
 | `.env.example` | Compose variables (copy to `deploy/.env`). |
 
 ## Image on GitHub Container Registry
 
-When you push a `v*` tag, the *Release* workflow builds `linux/amd64` and `linux/arm64` images and publishes a multi-arch manifest at:
+When you push a `v*` (or `beta-v*`) tag, the *Release* workflow builds `linux/amd64` and `linux/arm64` images and publishes a multi-arch manifest at:
 
-`ghcr.io/<owner>/bittice:<tag>`
+`ghcr.io/<owner>/<repository>:<tag>` (same path as on GitHub → *Packages*)
 
 Set your tag and owner in `BITTICE_IMAGE` inside `deploy/.env`.
+
+### Publish a tag (same image Actions uses)
+
+1. Commit your changes (including **`sync_tables` support** if you rely on filtered CDC).
+2. Set `version = "…"` in the root **`Cargo.toml`** to match the release you want.
+3. From the repo root:
+
+   ```bash
+   ./deploy/scripts/push-release-tag.sh
+   ```
+
+   That creates and pushes annotated tag **`v` + Cargo version** (e.g. `0.1.66` → `v0.1.66`), which triggers the workflow. Wait for Actions to finish, then `docker pull ghcr.io/<owner>/<repository>:v0.1.66` (copy the URL from GitHub → *Packages*).
+
+Docker **does not** embed MySQL URLs or table lists from the Git build — at runtime it only reads whatever you mount under **`/app/data`** (`profiles/*/cdc_config.json`, including `sync_tables`). The image only supplies the **`bittice`** binary.
 
 ## Deploy without cloning the repo (GitHub Actions / release)
 
@@ -61,7 +76,7 @@ If you already connected and synced on your machine (UI or CLI) and you do not w
 
 1. From the **project root** (where `data/` lives), set the image you will use in production (e.g. a GHCR tag):
    ```bash
-   export BITTICE_IMAGE=ghcr.io/<owner>/bittice:<tag>
+   export BITTICE_IMAGE=ghcr.io/<owner>/<repository>:<tag>
    ./deploy/scripts/export-server-bundle.sh my-server-bundle
    ```
 2. Upload the `my-server-bundle` folder (or a zip of it) to the Linux host. The bundle includes:

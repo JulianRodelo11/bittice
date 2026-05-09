@@ -6,7 +6,7 @@ use mysql_common::binlog::events::{EventData, RowsEventData, RowsEventRows, Tabl
 use mysql_common::packets::Column;
 use mysql_common::row::Row;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,6 +108,8 @@ pub struct CdcWorker {
     startup_report_sent: AtomicBool,
     /// Per-mirror-table key `entity/table_dir`: row batches applied since last `flush_active_segment`.
     cdc_mirror_flush_ticks: Arc<RwLock<HashMap<String, u32>>>,
+    /// When set (from `sync_tables` in `cdc_config.json`), only these tables participate in snapshot + binlog mirror.
+    sync_table_allowlist: Arc<RwLock<Option<HashSet<String>>>>,
 }
 
 impl CdcWorker {
@@ -176,6 +178,129 @@ impl CdcWorker {
             startup_report_tx,
             startup_report_sent: AtomicBool::new(false),
             cdc_mirror_flush_ticks: Arc::new(RwLock::new(HashMap::new())),
+            sync_table_allowlist: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Inspect user schemas and base tables (connect wizard). `single_database == None` scans every user DB.
+    pub async fn discover_mysql_catalog(
+        url: &str,
+        single_database: Option<&str>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let raw_opts = Opts::from_url(url).context("invalid MySQL URL for catalog discovery")?;
+        let opts_with_keepalive: Opts = OptsBuilder::from_opts(raw_opts.clone())
+            .tcp_keepalive(Some(30u32))
+            .into();
+        let opts_without_keepalive: Opts = OptsBuilder::from_opts(raw_opts).into();
+        let mut pool = Pool::new(opts_with_keepalive);
+        let mut conn = match pool.get_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("os error 22") || msg.contains("Invalid argument") {
+                    pool = Pool::new(opts_without_keepalive);
+                    pool.get_conn()
+                        .await
+                        .context("MySQL catalog discovery: connect after keepalive fallback")?
+                } else {
+                    return Err(anyhow::Error::new(e)
+                        .context("MySQL catalog discovery: connect"));
+                }
+            }
+        };
+        match single_database {
+            Some(db) => {
+                conn.query_drop(format!("USE {}", Self::mysql_ident(db)))
+                    .await
+                    .with_context(|| format!("USE '{}' for catalog discovery", db))?;
+                let tables =
+                    Self::fetch_all_tables_in_schema(&mut conn, db).await?;
+                Ok(vec![(db.to_string(), tables)])
+            }
+            None => {
+                conn.query_drop("USE information_schema")
+                    .await
+                    .context("USE information_schema for catalog discovery")?;
+                let schemas = Self::list_user_schemas(&mut conn).await?;
+                let mut out = Vec::with_capacity(schemas.len());
+                for sch in schemas {
+                    let tables =
+                        Self::fetch_all_tables_in_schema(&mut conn, &sch).await?;
+                    out.push((sch, tables));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn load_sync_table_allowlist_from_config(entity: &str) -> Option<HashSet<String>> {
+        let path = crate::core::data_paths::profile_dir(entity).join("cdc_config.json");
+        let content = std::fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let arr = value.get("sync_tables").and_then(|x| x.as_array())?;
+        let mut set = HashSet::<String>::new();
+        for item in arr {
+            let s = item.as_str()?.trim();
+            if s.is_empty() {
+                continue;
+            }
+            set.insert(s.to_owned());
+        }
+        if set.is_empty() {
+            None
+        } else {
+            Some(set)
+        }
+    }
+
+    /// Keys in `sync_tables` follow [`Self::qualified_table_key`]: lowercased schema + original table when `sync_all`;
+    /// otherwise the table name alone.
+    fn matches_sync_table_allowlist(
+        sync_all: bool,
+        schema: &str,
+        table: &str,
+        allow: &HashSet<String>,
+    ) -> bool {
+        if sync_all {
+            let k1 = format!("{}.{}", schema.to_lowercase(), table);
+            if allow.contains(&k1) {
+                return true;
+            }
+            let k2 = format!("{}.{}", schema.to_lowercase(), table.to_lowercase());
+            if allow.contains(&k2) {
+                return true;
+            }
+            for entry in allow {
+                let Some((es, et)) = entry.split_once('.') else {
+                    continue;
+                };
+                if schema.eq_ignore_ascii_case(es) && et.eq_ignore_ascii_case(table) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            if allow.contains(table) {
+                return true;
+            }
+            if allow.contains(&table.to_lowercase()) {
+                return true;
+            }
+            allow.iter().any(|e| e.eq_ignore_ascii_case(table))
+        }
+    }
+
+    fn is_table_in_sync_allowlist(&self, schema: &str, table: &str) -> bool {
+        let guard = self.sync_table_allowlist.read().unwrap();
+        match &*guard {
+            None => true,
+            Some(set) if set.is_empty() => true,
+            Some(set) => Self::matches_sync_table_allowlist(
+                self.sync_all_databases,
+                schema,
+                table,
+                set,
+            ),
         }
     }
 
@@ -1307,6 +1432,10 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             return Ok(());
         };
 
+        if !self.is_table_in_sync_allowlist(&sch, &tbl) {
+            return Ok(());
+        }
+
         let qkey = Self::qualified_table_key(self.sync_all_databases, &sch, &tbl);
         if self.column_maps.read().unwrap().contains_key(&qkey) {
             return Ok(());
@@ -1339,6 +1468,22 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
     }
 
     async fn run_impl(&self) -> Result<()> {
+        {
+            let loaded = Self::load_sync_table_allowlist_from_config(&self.entity);
+            if let Some(ref s) = loaded {
+                self.log_info(format!(
+                    "CDC: `sync_tables` filter active — {} table(s).",
+                    s.len()
+                ));
+            } else {
+                self.log_info(
+                    "CDC: no `sync_tables` allowlist — mirroring every table in scope \
+(if you expected a filter: use a binary that supports `sync_tables` and ensure cdc_config.json is mounted)."
+                        .to_string(),
+                );
+            }
+            *self.sync_table_allowlist.write().unwrap() = loaded;
+        }
         let data_root = crate::core::data_paths::resolved_data_root();
         let root_disp = std::fs::canonicalize(&data_root).unwrap_or_else(|_| data_root.clone());
         let state_pb = Path::new(&self.state_path);
@@ -1619,6 +1764,9 @@ so the account can read coordinates."
                         let _ = self.save_state(&state);
                         return Ok(());
                     }
+                    if !self.is_table_in_sync_allowlist(&schema, table_name) {
+                        continue;
+                    }
                     let qkey = Self::qualified_table_key(true, &schema, table_name);
                     if !state.bootstrapped_tables.contains(&qkey) {
                         if let Err(e) = self
@@ -1684,6 +1832,9 @@ so the account can read coordinates."
                     self.fast_exit_flush();
                     let _ = self.save_state(&state);
                     return Ok(());
+                }
+                if !self.is_table_in_sync_allowlist(self.database.as_str(), table_name) {
+                    continue;
                 }
                 let qkey = Self::qualified_table_key(false, &self.database, table_name);
                 if !state.bootstrapped_tables.contains(&qkey) {
@@ -2286,6 +2437,7 @@ replaying missed events before declaring live (data added while Bittice was offl
                             let tbl = tm_probe.table_name().to_string();
                             if !(self.sync_all_databases && Self::is_system_schema(&schema))
                                 && !self.is_out_of_scope_binlog_schema(&schema)
+                                && self.is_table_in_sync_allowlist(&schema, &tbl)
                             {
                                 let known = {
                                     let maps = self.column_maps.read().unwrap();
@@ -2604,6 +2756,10 @@ replaying missed events before declaring live (data added while Bittice was offl
         }
 
         if self.is_out_of_scope_binlog_schema(&schema) {
+            return Ok(());
+        }
+
+        if !self.is_table_in_sync_allowlist(&schema, &table_name) {
             return Ok(());
         }
 
