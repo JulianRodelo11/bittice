@@ -2883,10 +2883,8 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(50_000);
-            let mut did_flush = false;
             if table.active_segment_row_count() >= cdc_seg_max {
                 table.flush_active_segment()?;
-                did_flush = true;
             } else {
                 // Periodic lightweight buffer flush for durability (no bitmap rebuild).
                 let n_flush = crate::core::cdc_durability::mirror_flush_every_n_batches();
@@ -2906,15 +2904,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 };
                 if do_buffer_flush {
                     table.flush_active_segment_buffers()?;
-                    did_flush = true;
                 }
-            }
-
-            // Non-ops tables: release the write guard and evict from cache immediately
-            // after flushing so their primary_index does not accumulate in RAM.
-            if !is_ops_table && did_flush {
-                drop(table);
-                self.table_manager.close_table(&disk_entity, &mirror_table);
             }
         }
         self.maybe_log_mysql_row_batch(

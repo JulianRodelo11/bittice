@@ -189,13 +189,25 @@ impl TableManager {
         {
             let query_hot = self.query_priority_keys.read().unwrap();
             let cdc_hot = self.cdc_active_tables.read().unwrap();
-            // Eviction order: cold → query-priority → CDC-active (most expensive to reopen)
+            let has_ops = query_hot.is_some();
+            // Eviction order (front = evicted first):
+            //   1. cold: not in ops, not CDC-active
+            //   2. cdc-non-ops: receiving CDC events but not queried (no value in RAM)
+            //   3. warm: in ops, not CDC-active
+            //   4. hot: in ops AND CDC-active (most valuable — keep last)
             let (mut cold, rest): (Vec<String>, Vec<String>) = keys.into_iter().partition(|k| {
                 let in_query = query_hot.as_ref().map_or(false, |h| h.contains(k.as_str()));
                 !in_query && !cdc_hot.contains(k.as_str())
             });
+            // rest = in_query OR cdc_active
+            let (cdc_non_ops, rest2): (Vec<String>, Vec<String>) = rest.into_iter().partition(|k| {
+                let in_query = query_hot.as_ref().map_or(false, |h| h.contains(k.as_str()));
+                // CDC-active but not in ops: only meaningful to separate when ops are configured
+                has_ops && !in_query && cdc_hot.contains(k.as_str())
+            });
             let (warm, hot): (Vec<String>, Vec<String>) =
-                rest.into_iter().partition(|k| !cdc_hot.contains(k.as_str()));
+                rest2.into_iter().partition(|k| !cdc_hot.contains(k.as_str()));
+            cold.extend(cdc_non_ops);
             cold.extend(warm);
             cold.extend(hot);
             keys = cold;
@@ -223,6 +235,15 @@ impl TableManager {
                     }
                 }
             }
+        }
+
+        // After dropping large primary_index HashMaps, tell the allocator to return
+        // freed pages to the OS. Without this, glibc keeps the heap at its peak size
+        // even after eviction, making RSS grow monotonically under rotation pressure.
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+        if evicted > 0 {
+            extern "C" { fn malloc_trim(pad: usize) -> i32; }
+            unsafe { malloc_trim(0); }
         }
     }
 
