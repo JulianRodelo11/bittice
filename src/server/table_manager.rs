@@ -64,6 +64,21 @@ impl TableManager {
         self.cdc_active_tables.write().unwrap().insert(key);
     }
 
+    /// Returns true when `.bittice_ops.json` has been loaded and contains at least one table key.
+    pub fn has_query_priority_ops(&self) -> bool {
+        self.query_priority_keys.read().unwrap().is_some()
+    }
+
+    /// Returns true when `entity/table_name` is referenced by a saved operation.
+    pub fn is_query_priority_table(&self, entity: &str, table_name: &str) -> bool {
+        let key = format!("{}/{}", entity, table_name);
+        self.query_priority_keys
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(false, |hot| hot.contains(key.as_str()))
+    }
+
     pub fn set_query_priority_keys(&self, keys: Option<Arc<HashSet<String>>>) {
         *self.query_priority_keys.write().unwrap() = keys;
     }

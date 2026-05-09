@@ -2864,7 +2864,17 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
 
         if applied > 0 {
             self.table_manager.mark_dirty(&disk_entity, &mirror_table);
-            self.table_manager.mark_cdc_active(&disk_entity, &mirror_table);
+
+            // A table is "ops-relevant" when .bittice_ops.json either doesn't exist yet
+            // (no ops configured) or it explicitly references this table in a query.
+            // Non-ops tables are written to disk and immediately evicted from the cache:
+            // their primary_index has zero query value in RAM.
+            let is_ops_table = !self.table_manager.has_query_priority_ops()
+                || self.table_manager.is_query_priority_table(&disk_entity, &mirror_table);
+
+            if is_ops_table {
+                self.table_manager.mark_cdc_active(&disk_entity, &mirror_table);
+            }
 
             // Rotate the segment (expensive: rebuilds all bitmaps) only when it is full.
             // This decouples durability flushes from bitmap serialisation, so a 1-row CDC
@@ -2873,8 +2883,10 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(50_000);
+            let mut did_flush = false;
             if table.active_segment_row_count() >= cdc_seg_max {
                 table.flush_active_segment()?;
+                did_flush = true;
             } else {
                 // Periodic lightweight buffer flush for durability (no bitmap rebuild).
                 let n_flush = crate::core::cdc_durability::mirror_flush_every_n_batches();
@@ -2894,7 +2906,15 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 };
                 if do_buffer_flush {
                     table.flush_active_segment_buffers()?;
+                    did_flush = true;
                 }
+            }
+
+            // Non-ops tables: release the write guard and evict from cache immediately
+            // after flushing so their primary_index does not accumulate in RAM.
+            if !is_ops_table && did_flush {
+                drop(table);
+                self.table_manager.close_table(&disk_entity, &mirror_table);
             }
         }
         self.maybe_log_mysql_row_batch(
