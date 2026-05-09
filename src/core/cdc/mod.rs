@@ -1,6 +1,4 @@
 use anyhow::{Context, Result};
-#[cfg(target_os = "linux")]
-use libc;
 use mysql_async::prelude::*;
 use mysql_async::{BinlogStream, Conn, Opts, OptsBuilder, Pool, BinlogStreamRequest};
 use mysql_common::packets::Sid;
@@ -989,16 +987,13 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             Err(_) => return HashMap::new(),
         };
         let mut result: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
-        for (table, col_name, data_type, col_type) in rows {
+        for (table, col_name, data_type, _col_type) in rows {
             let entry = result.entry(table).or_insert_with(|| (Vec::new(), Vec::new()));
             let dt_lower = data_type.to_lowercase();
             if dt_lower.contains("date") || dt_lower.contains("timestamp") || dt_lower.contains("time") {
                 entry.1.push(col_name.clone());
             }
             entry.0.push(col_name);
-            // Enum detection: COLUMN_TYPE looks like "enum('a','b')"
-            let ct_lower = col_type.to_lowercase();
-            let _ = (ct_lower, col_type); // available for enum parsing if needed
         }
         result
     }
@@ -1185,11 +1180,14 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         // holding every bootstrapped table simultaneously.
         self.table_manager.close_table(&disk_entity, table_name);
 
-        // Return freed heap pages to the OS so the allocator doesn't hoard them.
-        // Each table bootstrap allocates then frees large HashMaps; without this the
-        // glibc allocator keeps those pages mapped, inflating the container RSS.
+        // Return freed heap pages to the OS so the glibc allocator doesn't hoard them.
+        // Each table bootstrap allocates then frees large HashMaps; malloc_trim causes
+        // glibc to return those free pages to the kernel, reducing container RSS.
         #[cfg(target_os = "linux")]
-        unsafe { libc::malloc_trim(0); }
+        {
+            extern "C" { fn malloc_trim(pad: usize) -> i32; }
+            unsafe { malloc_trim(0); }
+        }
 
         Ok(())
     }
@@ -1672,10 +1670,6 @@ so the account can read coordinates."
                 // Bulk-load column metadata for the entire schema in one query so we
                 // don't need a separate DESCRIBE per already-bootstrapped table.
                 let bulk_cols = Self::fetch_schema_columns_bulk(&mut conn, &schema).await;
-                let has_new_tables = tables.iter().any(|t| {
-                    let qk = Self::qualified_table_key(true, &schema, t);
-                    !state.bootstrapped_tables.contains(&qk)
-                });
                 self.log_info(format!(
                     "CDC: Schema '{}' — {} base table(s) to process.",
                     schema,
@@ -1740,7 +1734,6 @@ so the account can read coordinates."
                         }
                     }
                 }
-                let _ = has_new_tables; // used for potential future logging
             }
         } else {
             let tables = match self.fetch_all_tables(&mut conn).await {

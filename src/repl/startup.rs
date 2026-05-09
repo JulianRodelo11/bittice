@@ -178,6 +178,7 @@ async fn read_ovpn_source_interactive() -> io::Result<String> {
 }
 
 /// Add an .ovpn for later Docker / export-server-bundle; does not start OpenVPN.
+#[allow(dead_code)]
 async fn add_ovpn_profile_to_storage_for_deploy() -> Result<()> {
     let vpn_storage = VpnManager::storage_dir();
     std::fs::create_dir_all(&vpn_storage)?;
