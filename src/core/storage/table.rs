@@ -92,11 +92,16 @@ impl Table {
         if let Some(mut writer) = self.active_segment.take() {
             let _ = writer.flush();
         }
+        let _ = self.wal.flush_writes();
         if !self.primary_index.is_empty() {
             let _ = self.save_manifest();
             let _ = self.save_primary_index();
+            // Truncate WAL now that primary_index is persisted and the active segment
+            // is flushed. Without this, large WAL files (100MB–300MB) accumulate for
+            // high-write tables and are fully replayed on every restart, inflating both
+            // startup time and peak RAM. The WAL is redundant once primary_index is saved.
+            let _ = self.wal.truncate();
         }
-        let _ = self.wal.flush_writes();
         for seg in &mut self.immutable_segments {
             seg.mmap_cache.write().unwrap().clear();
             seg.mmap_access_order.write().unwrap().clear();
