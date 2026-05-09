@@ -237,6 +237,8 @@ pub async fn start_all_servers(
     
     // Convert entity_filter to lowercase and trim it
     let entity_filter = entity_filter.map(|e| e.trim().to_lowercase());
+
+    table_manager.refresh_query_priority_keys_from_ops(entity_filter.clone());
     
     if let Some(ref f) = entity_filter {
         debug!("Filtering by entity: '{}'", f);
@@ -842,6 +844,9 @@ async fn handle_request(
 
     if path == "/_config/reload" {
         info!("Hot-reloading configuration from disk...");
+        state
+            .table_manager
+            .refresh_query_priority_keys_from_ops(state.entity_filter.clone());
         if cdc_autostart_enabled() {
             scan_and_start_cdc(state.table_manager.clone(), state.entity_filter.clone(), state.active_workers.clone());
         } else {
@@ -865,6 +870,9 @@ async fn handle_request(
                                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to save configuration", "details": e.to_string() }))).into_response();
                             }
                             { let mut cache = state.ops_cache.write().await; *cache = None; }
+                            state.table_manager.refresh_query_priority_keys_from_ops(
+                                state.entity_filter.clone(),
+                            );
                             (StatusCode::CREATED, Json(serde_json::json!({ "status": "created", "name": name }))).into_response()
                         }
                     },
@@ -882,6 +890,9 @@ async fn handle_request(
                                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to save configuration", "details": e.to_string() }))).into_response();
                             }
                             { let mut cache = state.ops_cache.write().await; *cache = None; }
+                            state.table_manager.refresh_query_priority_keys_from_ops(
+                                state.entity_filter.clone(),
+                            );
                             (StatusCode::OK, Json(serde_json::json!({ "status": "updated", "name": name }))).into_response()
                         } else {
                             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("Operation '{}' not found. Use POST to create.", name) }))).into_response()
@@ -911,6 +922,9 @@ async fn handle_request(
                             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to save configuration", "details": e.to_string() }))).into_response();
                         }
                         { let mut cache = state.ops_cache.write().await; *cache = None; }
+                        state.table_manager.refresh_query_priority_keys_from_ops(
+                            state.entity_filter.clone(),
+                        );
                         (StatusCode::OK, Json(serde_json::json!({ "status": "deleted", "name": name_to_del }))).into_response()
                     } else {
                         (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Operation not found" }))).into_response()

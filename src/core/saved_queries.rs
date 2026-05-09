@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use crate::core::types::{OrderBy, Filter, FieldType};
@@ -374,6 +375,72 @@ pub fn save_operations(ops: &[SavedOperation]) -> anyhow::Result<()> {
 
 pub fn load_operations() -> anyhow::Result<Vec<SavedOperation>> {
     load_operations_with_filter(None)
+}
+
+/// Keys `entity/table` matching [`crate::server::table_manager::TableManager`] for every table
+/// referenced by saved HTTP operations (reads, writes, batch expansion, joins, auth tables,
+/// split enrichment queries). Used to prefer keeping these mirror tables in RAM under pressure.
+pub fn collect_ops_query_table_keys(ops: &[SavedOperation]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let by_name: HashMap<String, &SavedOperation> =
+        ops.iter().map(|o| (o.name().to_string(), o)).collect();
+    let mut batch_visited: HashSet<String> = HashSet::new();
+    for op in ops {
+        collect_op_tables(op, &by_name, &mut batch_visited, &mut out);
+    }
+    out
+}
+
+fn ops_table_key(entity: &str, table: &str) -> String {
+    format!("{}/{}", entity, table)
+}
+
+fn collect_op_tables(
+    op: &SavedOperation,
+    by_name: &HashMap<String, &SavedOperation>,
+    batch_visited: &mut HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match op {
+        SavedOperation::Read(q) => collect_read_query_tables(q, out),
+        SavedOperation::Insert(i) => {
+            out.insert(ops_table_key(&i.entity, &i.table));
+        }
+        SavedOperation::Update(u) => {
+            out.insert(ops_table_key(&u.entity, &u.table));
+        }
+        SavedOperation::Delete(d) => {
+            out.insert(ops_table_key(&d.entity, &d.table));
+        }
+        SavedOperation::Batch(b) => {
+            if !batch_visited.insert(b.name.clone()) {
+                return;
+            }
+            for name in &b.operations {
+                if let Some(next) = by_name.get(name) {
+                    collect_op_tables(next, by_name, batch_visited, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_read_query_tables(q: &SavedQuery, out: &mut HashSet<String>) {
+    out.insert(ops_table_key(&q.entity, &q.table));
+    for j in &q.joins {
+        let ent = j.entity.as_deref().unwrap_or(q.entity.as_str());
+        out.insert(ops_table_key(ent, &j.table));
+    }
+    if let Some(auth) = &q.auth_config {
+        if auth.enabled {
+            out.insert(ops_table_key(&q.entity, &auth.table));
+        }
+    }
+    if let Some(profile) = &q.execution_profile {
+        if let SavedExecutionProfile::Split(s) = profile {
+            collect_read_query_tables(&s.enrichment_query, out);
+        }
+    }
 }
 
 pub fn load_operations_with_filter(entity_filter: Option<String>) -> anyhow::Result<Vec<SavedOperation>> {

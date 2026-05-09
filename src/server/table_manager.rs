@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use crate::core::storage::table::Table;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct TableUpdateEvent {
@@ -23,6 +23,18 @@ pub struct TableManager {
     max_open: usize,
     open_count: AtomicUsize,
     pub dirty_tables: RwLock<HashSet<String>>,
+    /// When set, `evict_lru` closes tables **not** in this set first (from `.bittice_ops.json`).
+    query_priority_keys: Arc<RwLock<Option<Arc<HashSet<String>>>>>,
+}
+
+fn ops_table_cache_priority_enabled() -> bool {
+    match std::env::var("BITTICE_OPS_TABLE_CACHE_PRIORITY") {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !matches!(t.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
 }
 
 impl TableManager {
@@ -38,6 +50,36 @@ impl TableManager {
             max_open,
             open_count: AtomicUsize::new(0),
             dirty_tables: RwLock::new(HashSet::new()),
+            query_priority_keys: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub fn set_query_priority_keys(&self, keys: Option<Arc<HashSet<String>>>) {
+        *self.query_priority_keys.write().unwrap() = keys;
+    }
+
+    /// Reload `.bittice_ops.json` and refresh priority keys (same filter as HTTP when applicable).
+    pub fn refresh_query_priority_keys_from_ops(&self, entity_filter: Option<String>) {
+        if !ops_table_cache_priority_enabled() {
+            self.set_query_priority_keys(None);
+            return;
+        }
+        match crate::core::saved_queries::load_operations_with_filter(entity_filter) {
+            Ok(ops) => {
+                let keys = crate::core::saved_queries::collect_ops_query_table_keys(&ops);
+                if keys.is_empty() {
+                    self.set_query_priority_keys(None);
+                } else {
+                    debug!(
+                        "TableManager: {} query-priority table key(s) from saved operations",
+                        keys.len()
+                    );
+                    self.set_query_priority_keys(Some(Arc::new(keys)));
+                }
+            }
+            Err(e) => {
+                warn!("refresh_query_priority_keys_from_ops: {}", e);
+            }
         }
     }
 
@@ -118,7 +160,14 @@ impl TableManager {
             return;
         }
 
-        let keys: Vec<String> = cache.keys().cloned().collect();
+        let mut keys: Vec<String> = cache.keys().cloned().collect();
+        if let Some(hot) = self.query_priority_keys.read().unwrap().as_ref() {
+            let (mut cold, warm): (Vec<String>, Vec<String>) = keys
+                .into_iter()
+                .partition(|k| !hot.contains(k.as_str()));
+            cold.extend(warm);
+            keys = cold;
+        }
         let evict_count = to_evict.min(keys.len());
         debug!(
             "TableManager: evicting {} of {} cached tables (open_limit={})",
