@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader;
 use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use memmap2::Mmap;
 use anyhow::{Result, Context};
 use roaring::RoaringBitmap;
@@ -27,6 +28,9 @@ pub struct Table {
     pub primary_index: HashMap<String, (u64, u32)>,
     exact_index_cache: StdRwLock<HashMap<String, Arc<ExactIndex>>>,
     flush_count_since_index_save: u32,
+    /// Set by TableManager when this Table lost a cache-dedup race and is about to be dropped.
+    /// Prevents Drop::close from calling save_manifest and racing with the winning Table instance.
+    discarded: bool,
 }
 
 // Structures for the Heap
@@ -88,7 +92,19 @@ impl Drop for Table {
 }
 
 impl Table {
+    /// Mark this Table as discarded — it lost a TableManager cache-dedup race and will be dropped
+    /// without having been used.  Prevents Drop::close from calling save_manifest and racing with
+    /// the winning Table instance's concurrent manifest writes.
+    pub fn discard(&mut self) {
+        self.discarded = true;
+    }
+
     pub fn close(&mut self) -> Result<()> {
+        // If this instance was discarded (lost a concurrent open race in TableManager), skip all
+        // disk writes — the winning instance owns the on-disk state.
+        if self.discarded {
+            return Ok(());
+        }
         if let Some(mut writer) = self.active_segment.take() {
             let _ = writer.flush();
         }
@@ -96,6 +112,11 @@ impl Table {
         if !self.primary_index.is_empty() {
             let _ = self.save_manifest();
             let _ = self.save_primary_index();
+            // Persist the in-memory exact_index — `merge_exact_indexes_for_segment` skips
+            // disk I/O on the CDC hot path to avoid holding the write lock for seconds, so
+            // close() is the safety net that ensures the on-disk index reflects the latest
+            // rotated segments before the table leaves RAM.
+            let _ = self.persist_all_exact_indexes();
             // Truncate WAL now that primary_index is persisted and the active segment
             // is flushed. Without this, large WAL files (100MB–300MB) accumulate for
             // high-write tables and are fully replayed on every restart, inflating both
@@ -134,6 +155,7 @@ impl Table {
             primary_index: HashMap::new(),
             exact_index_cache: StdRwLock::new(HashMap::new()),
             flush_count_since_index_save: 0,
+            discarded: false,
         };
         table.load_segments()?;
         table.ensure_active_segment()?;
@@ -402,14 +424,22 @@ impl Table {
     }
 
     fn save_manifest(&self) -> Result<()> {
+        // Each call uses a unique temp filename so that two concurrent callers (e.g. a discard
+        // race that somehow slipped past the TableManager per-key lock) never share the same
+        // manifest.tmp inode and interleave bytes.  The rename is always same-device (same dir)
+        // so it is atomic on POSIX.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let tmp_name = format!("manifest.tmp.{}.{}", std::process::id(), seq);
         let manifest_path = self.base_path.join("manifest.json");
-        let tmp_path = self.base_path.join("manifest.tmp");
+        let tmp_path = self.base_path.join(&tmp_name);
         {
             let file = fs::File::create(&tmp_path)?;
             serde_json::to_writer_pretty(&file, &self.manifest)?;
             file.sync_all()?;
         }
-        fs::rename(&tmp_path, &manifest_path)?;
+        fs::rename(&tmp_path, &manifest_path)
+            .with_context(|| format!("rename {} → manifest.json", tmp_name))?;
         self.sync_base_dir()?;
         Ok(())
     }
@@ -476,10 +506,9 @@ impl Table {
             let mut immutable_seg = writer.segment;
             immutable_seg.is_immutable = true;
             self.immutable_segments.push(immutable_seg);
-            // Drop cached exact indexes after each segment rotation: the compiled
-            // bitmaps are already persisted to disk by merge_exact_indexes_for_segment.
-            // Clearing here bounds RAM usage; entries rebuild lazily on the next query.
-            self.exact_index_cache.write().unwrap().clear();
+            // No cache clear here: load_exact_index only caches the immutable view, and
+            // merge_exact_indexes_for_segment above already updated each touched field's cache
+            // entry to include the freshly-rotated segment.  Untouched fields stay valid.
         }
         self.persist_all_deleted_bitmaps()?;
         self.ensure_active_segment()?;
@@ -896,34 +925,32 @@ impl Table {
         self.exact_index_dir().join(format!("exact_{}.idx", field))
     }
 
+    /// Load the exact index for `field`, covering only **immutable** segments.
+    ///
+    /// The active segment is intentionally NOT merged here so the cached value is stable across
+    /// CDC writes and only changes when a segment rotates (via `merge_exact_indexes_for_segment`).
+    /// Callers that need the active-segment view (e.g. `exact_matches_for_field_value`) merge
+    /// `writer.bitmaps[field]` themselves, which is cheap (a single HashMap lookup, no disk I/O).
     fn load_exact_index(&self, field: &str) -> Result<Arc<ExactIndex>> {
         if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
             return Ok(cached.clone());
         }
 
+        let t = std::time::Instant::now();
         let path = self.exact_index_path(field);
-        let mut index: ExactIndex = if path.exists() {
+        let index: ExactIndex = if path.exists() {
             let file = fs::File::open(&path)?;
             let reader = BufReader::new(file);
             bincode::deserialize_from(reader)?
         } else {
             self.build_exact_index(field)?
         };
-
-        if let Some(writer) = &self.active_segment {
-            if let Some(field_bitmaps) = writer.bitmaps.get(field) {
-                for (value, bitmap) in field_bitmaps {
-                    if !bitmap.is_empty() {
-                        let mut live_bitmap = bitmap.clone();
-                        if !writer.segment.deleted_bitmap.is_empty() {
-                            live_bitmap -= &writer.segment.deleted_bitmap;
-                        }
-                        if !live_bitmap.is_empty() {
-                            index.entry(value.clone()).or_insert_with(Vec::new).push((writer.segment.id, live_bitmap));
-                        }
-                    }
-                }
-            }
+        let load_ms = t.elapsed().as_secs_f64() * 1000.0;
+        if load_ms > 50.0 {
+            warn!(
+                "load_exact_index SLOW table='{}' field='{}' took {:.1}ms entries={}",
+                self.name, field, load_ms, index.len()
+            );
         }
 
         let cached = Arc::new(index);
@@ -933,7 +960,7 @@ impl Table {
         let max_fields: usize = std::env::var("BITTICE_EXACT_INDEX_CACHE_FIELDS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(8);
+            .unwrap_or(32);
         if cache.len() >= max_fields && !cache.contains_key(field) {
             if let Some(evict_key) = cache.keys().next().cloned() {
                 cache.remove(&evict_key);
@@ -991,21 +1018,96 @@ impl Table {
         Ok(())
     }
 
+    /// Rewrite every on-disk exact index file removing entries that reference any of the
+    /// `removed_segment_ids`.  Called after `compact()` deletes old segments — without this,
+    /// the merged index keeps growing forever and queries pay extra work for stale entries
+    /// that resolve to deleted segments.
+    fn purge_exact_indexes_for_removed_segments(&self, removed_segment_ids: &[u64]) -> Result<()> {
+        if removed_segment_ids.is_empty() {
+            return Ok(());
+        }
+        let removed: std::collections::HashSet<u64> = removed_segment_ids.iter().copied().collect();
+        let dir = self.exact_index_dir();
+        if !dir.exists() {
+            return Ok(());
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = match file_name.to_str() {
+                Some(n) => n,
+                None => continue,
+            };
+            if !name.starts_with("exact_") || !name.ends_with(".idx") {
+                continue;
+            }
+            let field = name.trim_start_matches("exact_").trim_end_matches(".idx").to_string();
+            let path = entry.path();
+            let mut index: ExactIndex = match fs::File::open(&path) {
+                Ok(file) => {
+                    let reader = BufReader::new(file);
+                    match bincode::deserialize_from(reader) {
+                        Ok(i) => i,
+                        Err(_) => continue,
+                    }
+                }
+                Err(_) => continue,
+            };
+            let mut changed = false;
+            index.retain(|_value, segment_entries| {
+                let before = segment_entries.len();
+                segment_entries.retain(|(seg_id, _)| !removed.contains(seg_id));
+                if segment_entries.len() != before {
+                    changed = true;
+                }
+                !segment_entries.is_empty()
+            });
+            if changed {
+                self.save_exact_index(&field, &index)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge a freshly-rotated segment's bitmaps into the in-memory exact_index cache only.
+    ///
+    /// Disk persistence is intentionally skipped here because this runs on the CDC hot path
+    /// while the Table write lock is held — rewriting hundreds of MB per high-cardinality
+    /// field per rotation freezes every concurrent reader for seconds.  The per-segment
+    /// `bitmaps_<field>.dat` files are still persisted (by `SegmentWriter::flush`), so the
+    /// index can be rebuilt from disk on next `Table::open` if the in-memory cache is cold.
+    ///
+    /// Compaction (`compact()` and `purge_exact_indexes_for_removed_segments`) and explicit
+    /// `persist_all_exact_indexes` calls flush the cache to disk.
+    /// Merge a freshly-rotated segment's bitmaps into the in-memory exact_index cache only.
+    ///
+    /// Disk persistence is intentionally skipped here because this runs on the CDC hot path
+    /// while the Table write lock is held — rewriting hundreds of MB per high-cardinality
+    /// field per rotation freezes every concurrent reader for seconds.  The per-segment
+    /// `bitmaps_<field>.dat` files are still persisted (by `SegmentWriter::flush`), and
+    /// `close()`/`compact()` flush the cache to the on-disk merged index.
     fn merge_exact_indexes_for_segment(
         &self,
         segment_id: u64,
         segment_bitmaps: &HashMap<String, HashMap<String, RoaringBitmap>>,
     ) -> Result<()> {
         for (field, values) in segment_bitmaps {
-            let path = self.exact_index_path(field);
-            let mut index = if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
+            let mut index: ExactIndex = if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
                 (**cached).clone()
-            } else if path.exists() {
-                let file = fs::File::open(&path)?;
-                let reader = BufReader::new(file);
-                bincode::deserialize_from(reader)?
             } else {
-                HashMap::new()
+                // Cache miss: load from disk (read is cheap) so the merged result also covers
+                // segments persisted by previous sessions.  We still avoid writing back here.
+                let path = self.exact_index_path(field);
+                if path.exists() {
+                    let file = fs::File::open(&path)?;
+                    let reader = BufReader::new(file);
+                    bincode::deserialize_from(reader).unwrap_or_default()
+                } else {
+                    HashMap::new()
+                }
             };
 
             for (value, bitmap) in values {
@@ -1014,10 +1116,23 @@ impl Table {
                 }
             }
 
-            self.save_exact_index(field, &index)?;
             self.exact_index_cache.write().unwrap().insert(field.clone(), Arc::new(index));
         }
 
+        Ok(())
+    }
+
+    /// Write every in-memory exact_index entry to disk.  Called by `compact()` and `close()`
+    /// so that crash recovery sees an up-to-date index without paying disk I/O on every CDC
+    /// segment rotation.
+    fn persist_all_exact_indexes(&self) -> Result<()> {
+        let snapshot: Vec<(String, Arc<ExactIndex>)> = {
+            let cache = self.exact_index_cache.read().unwrap();
+            cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        for (field, index) in snapshot {
+            self.save_exact_index(&field, &index)?;
+        }
         Ok(())
     }
 
@@ -1155,7 +1270,12 @@ impl Table {
             return live;
         }
 
-        bitmap.clone()
+        // Segment no longer exists (compact removed it but the on-disk exact_index still has
+        // entries pointing to its old id). Returning the original bitmap inflates total_found
+        // and produces phantom matches that resolve to empty rows during get_rows_batch, which
+        // forces the join executor to page through non-existent data — turning sub-100ms
+        // queries into multi-second ones. Drop the stale entry instead.
+        RoaringBitmap::new()
     }
 
     fn scan_segments_parallel(
@@ -1549,8 +1669,13 @@ impl Table {
         }
         self.immutable_segments = new_immutable_segments;
 
-        // 13. Replace primary index and clear exact index cache.
+        // 13. Replace primary index, persist cache (with new compact segments), purge stale
+        //     entries, and clear cache.
         self.primary_index = new_primary_index;
+        // Flush cache to disk first so the on-disk index reflects the new compact segments
+        // (merge_exact_indexes_for_segment skipped disk writes on the CDC hot path).
+        self.persist_all_exact_indexes()?;
+        self.purge_exact_indexes_for_removed_segments(&old_ids)?;
         self.exact_index_cache.write().unwrap().clear();
 
         // 14. Save manifest and primary index; truncate WAL.

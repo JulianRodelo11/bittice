@@ -153,6 +153,7 @@ pub fn execute_join_query(
     let base_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &base_alias);
 
     let base_fields = sorted_fields(needed_fields.get(&base_alias), &base_alias)?;
+    let t_base_start = Instant::now();
     let mut current_rows = fetch_table_rows(
         &query.entity,
         &query.table,
@@ -162,10 +163,14 @@ pub fn execute_join_query(
         table_manager.clone(),
         auth_context,
     )?;
+    let t_base_ms = t_base_start.elapsed().as_secs_f64() * 1000.0;
+    let base_row_count = current_rows.len();
+    let mut join_timings: Vec<(String, f64, f64, f64, usize)> = Vec::new();
 
     for (idx, join) in joins.iter().enumerate() {
         let join_fields = sorted_join_fetch_fields(needed_fields.get(&join.alias), join)?;
         let join_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &join.alias);
+        let t_fetch = Instant::now();
         let join_rows = fetch_join_rows(
             join,
             &join_fields,
@@ -173,8 +178,15 @@ pub fn execute_join_query(
             &join_pushdown_filters,
             table_manager.clone(),
         )?;
+        let fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
+        let fetched_count = join_rows.len();
+        let t_idx = Instant::now();
         let join_index = build_join_index(&join_rows, &join.conditions);
+        let index_ms = t_idx.elapsed().as_secs_f64() * 1000.0;
+        let t_apply = Instant::now();
         current_rows = apply_join(current_rows, join, &join_index)?;
+        let apply_ms = t_apply.elapsed().as_secs_f64() * 1000.0;
+        join_timings.push((join.alias.clone(), fetch_ms, index_ms, apply_ms, fetched_count));
         available_aliases.insert(join.alias.clone());
 
         // If all filter/order aliases are already available and only LEFT joins remain,
@@ -246,12 +258,20 @@ pub fn execute_join_query(
         })
         .collect::<Vec<_>>();
 
-    let debug = format!(
-        "JoinExec: {} join(s), BaseRows: {}, ResultRows: {}",
+    let mut debug = format!(
+        "JoinExec: {} join(s), BaseRows: {}, ResultRows: {}, Base: {:.1}ms (rows={})",
         joins.len(),
         current_rows.len(),
-        total_found
+        total_found,
+        t_base_ms,
+        base_row_count,
     );
+    for (alias, fetch_ms, index_ms, apply_ms, fetched) in &join_timings {
+        debug.push_str(&format!(
+            " | join '{}' fetch={:.1}ms (rows={}) idx={:.1}ms apply={:.1}ms",
+            alias, fetch_ms, fetched, index_ms, apply_ms
+        ));
+    }
 
     Ok(QueryResult {
         headers,
@@ -758,13 +778,25 @@ fn fetch_join_rows(
     let lookup_filters = build_join_lookup_filters(current_rows, join, pushdown_filters);
 
     if let Some(filter_sets) = lookup_filters {
+        let t_get = Instant::now();
         let table_lock = table_manager.get_table(&join.entity, &join.table)?;
-        let mut table = table_lock.write().unwrap();
-        let _ = table.reload_if_needed();
+        let get_ms = t_get.elapsed().as_secs_f64() * 1000.0;
+        let t_lock = Instant::now();
+        // Read lock: search/get_rows_batch only need &Table; using a write lock here forced
+        // every join lookup to wait behind CDC writes on hot tables (e.g. BpBono), turning
+        // sub-100ms queries into multi-second ones under streaming load.
+        let table = table_lock.read().unwrap();
+        let lock_ms = t_lock.elapsed().as_secs_f64() * 1000.0;
+        if get_ms > 5.0 || lock_ms > 5.0 {
+            tracing::warn!(
+                "join: get_table {}/{} get={:.1}ms lock={:.1}ms",
+                join.entity, join.table, get_ms, lock_ms
+            );
+        }
 
         let mut rows = Vec::new();
         for filters in filter_sets {
-            let mut batch = fetch_rows_from_table(&mut table, &join.alias, fields, &filters, None)?;
+            let mut batch = fetch_rows_from_table(&table, &join.alias, fields, &filters, None)?;
             rows.append(&mut batch);
         }
         Ok(rows)
@@ -832,13 +864,12 @@ fn fetch_table_rows(
     auth_context: Option<&AuthContext>,
 ) -> Result<Vec<FlatRow>> {
     let table_lock = table_manager.get_table(entity, table_name)?;
-    let mut table = table_lock.write().unwrap();
-    let _ = table.reload_if_needed();
-    fetch_rows_from_table(&mut table, alias, fields, filters, auth_context)
+    let table = table_lock.read().unwrap();
+    fetch_rows_from_table(&table, alias, fields, filters, auth_context)
 }
 
 fn fetch_rows_from_table(
-    table: &mut crate::core::storage::table::Table,
+    table: &crate::core::storage::table::Table,
     alias: &str,
     fields: &[String],
     filters: &[Filter],
@@ -847,9 +878,17 @@ fn fetch_rows_from_table(
 
     let mut rows = Vec::new();
     let mut offset = 0;
+    let mut iter = 0;
+    let mut total_search_ms = 0.0;
+    let mut total_fetch_ms = 0.0;
 
     loop {
+        iter += 1;
+        let t_s = Instant::now();
         let result = table.search(fields, filters, &LogicalOp::And, &[], &[], FETCH_PAGE_SIZE, offset, auth_context)?;
+        let s_ms = t_s.elapsed().as_secs_f64() * 1000.0;
+        total_search_ms += s_ms;
+        let t_f = Instant::now();
         let batch_rows = if result.rows.is_empty() {
             if let Some(row_ids) = &result.row_ids {
                 table.get_rows_batch(fields, row_ids)?
@@ -859,6 +898,8 @@ fn fetch_rows_from_table(
         } else {
             result.rows
         };
+        let f_ms = t_f.elapsed().as_secs_f64() * 1000.0;
+        total_fetch_ms += f_ms;
 
         if batch_rows.is_empty() {
             break;
@@ -876,6 +917,15 @@ fn fetch_rows_from_table(
         if offset >= result.total_found {
             break;
         }
+    }
+
+    if total_search_ms + total_fetch_ms > 50.0 {
+        tracing::warn!(
+            "fetch_rows_from_table '{}' iters={} search={:.1}ms fetch={:.1}ms total_rows={} filter0_field={:?} filter0_value={:?}",
+            alias, iter, total_search_ms, total_fetch_ms, rows.len(),
+            filters.first().map(|f| f.field.clone()),
+            filters.first().map(|f| f.value.clone())
+        );
     }
 
     Ok(rows)

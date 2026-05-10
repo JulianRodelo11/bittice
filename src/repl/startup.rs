@@ -698,6 +698,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
             let _ = io::stdout().flush();
         }
     } else {
+        println!("\x1b[90m│\x1b[0m  \x1b[90mStarting engine — connecting to databases…\x1b[0m");
         if let Err(e) =
             tokio::task::spawn_blocking(|| crate::server::repl_stop_engine_and_join_cdc()).await
         {

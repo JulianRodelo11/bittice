@@ -1,7 +1,7 @@
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
 use crate::core::storage::table::Table;
 use tracing::{debug, warn};
@@ -29,6 +29,10 @@ pub struct TableManager {
     query_priority_keys: Arc<RwLock<Option<Arc<HashSet<String>>>>>,
     /// Tables that received a CDC write event recently; evicted last to avoid expensive reopen.
     cdc_active_tables: RwLock<HashSet<String>>,
+    /// Per-key locks that prevent two threads from calling Table::open for the same path
+    /// concurrently, which would produce two Table instances whose Drop/close paths race on
+    /// manifest.tmp and corrupt the manifest.
+    opening_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 fn ops_table_cache_priority_enabled() -> bool {
@@ -57,6 +61,7 @@ impl TableManager {
             dirty_tables: RwLock::new(HashSet::new()),
             query_priority_keys: Arc::new(RwLock::new(None)),
             cdc_active_tables: RwLock::new(HashSet::new()),
+            opening_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -141,11 +146,26 @@ impl TableManager {
 
     pub fn get_table(&self, entity: &str, table_name: &str) -> anyhow::Result<Arc<RwLock<Table>>> {
         let key = format!("{}/{}", entity, table_name);
-        {
-            let cache = self.tables.read().unwrap();
-            if let Some(table) = cache.get(&key) {
-                return Ok(Arc::clone(table));
-            }
+
+        // Fast path: table is already in the cache.
+        if let Some(table) = self.tables.read().unwrap().get(&key) {
+            return Ok(Arc::clone(table));
+        }
+
+        // Acquire a per-key mutex before calling Table::open.  This prevents two threads from
+        // opening the same on-disk table simultaneously — the lost racer would otherwise drop its
+        // Table instance and its Drop::close → save_manifest would race with the winner's writes
+        // on the shared manifest.tmp file, producing a corrupt manifest.json.
+        let key_lock = {
+            let mut locks = self.opening_locks.lock().unwrap();
+            Arc::clone(locks.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
+        };
+        let _open_guard = key_lock.lock().unwrap();
+
+        // Re-check after acquiring the per-key lock: another thread may have already opened and
+        // cached this table while we were waiting.
+        if let Some(table) = self.tables.read().unwrap().get(&key) {
+            return Ok(Arc::clone(table));
         }
 
         if self.open_count.load(Ordering::Relaxed) >= self.max_open.load(Ordering::Relaxed) {
@@ -153,22 +173,31 @@ impl TableManager {
         }
 
         let entity_path = crate::core::data_paths::mirror_entity_dir(entity);
-        let table = Arc::new(RwLock::new(
-            Table::open(&entity_path, table_name).with_context(|| {
-                format!(
-                    "mirror Table::open entity_dir={:?} table_dir={}",
-                    entity_path.display(),
-                    table_name
-                )
-            })?,
-        ));
+        let t_open = std::time::Instant::now();
+        let mut new_table = Table::open(&entity_path, table_name).with_context(|| {
+            format!(
+                "mirror Table::open entity_dir={:?} table_dir={}",
+                entity_path.display(),
+                table_name
+            )
+        })?;
+        let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+        if open_ms > 50.0 {
+            warn!(
+                "Table::open SLOW {}/{} took {:.1}ms — table was evicted from cache",
+                entity, table_name, open_ms
+            );
+        }
         self.open_count.fetch_add(1, Ordering::Relaxed);
 
         let mut cache = self.tables.write().unwrap();
         if let Some(existing) = cache.get(&key) {
+            // Should not happen under the per-key lock, but guard defensively.
             self.open_count.fetch_sub(1, Ordering::Relaxed);
+            new_table.discard(); // skip save_manifest in Drop
             return Ok(Arc::clone(existing));
         }
+        let table = Arc::new(RwLock::new(new_table));
         cache.insert(key, Arc::clone(&table));
         Ok(table)
     }

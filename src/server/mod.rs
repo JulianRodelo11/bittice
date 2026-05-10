@@ -544,6 +544,10 @@ fn compact_startup_ops_tables(table_manager: &TableManager) {
         Some(k) if !k.is_empty() => k,
         _ => return,
     };
+    println!(
+        "\x1b[90m│\x1b[0m  \x1b[34m→\x1b[0m  Checking {} op table(s) for compaction…",
+        keys.len()
+    );
     info!("Startup compact: checking {} ops table(s) for segment fragmentation…", keys.len());
     let mut compacted = 0usize;
     for key in keys.iter() {
@@ -603,6 +607,12 @@ fn run_cdc_staged_sequential(
             root_disp.display(),
             state_disp.display()
         );
+        println!(
+            "\x1b[90m│\x1b[0m  \x1b[34m→\x1b[0m  [{}/{}] '{}': connecting and syncing…",
+            idx + 1,
+            total,
+            spec.entity
+        );
         let (tx, rx) = mpsc::channel();
         spawn_cdc_worker_thread(spec, table_manager.clone(), active_workers.clone(), Some(tx));
         match rx.recv() {
@@ -610,6 +620,10 @@ fn run_cdc_staged_sequential(
                 CdcStartupOutcome::LiveReplication => {
                     info!(
                         "CDC: Profile '{}' finished Phase 4 — live replication running.",
+                        report.entity
+                    );
+                    println!(
+                        "\x1b[90m│\x1b[0m  \x1b[32m✓\x1b[0m  '{}': live replication active.",
                         report.entity
                     );
                 }
@@ -1829,8 +1843,6 @@ async fn run_query_page(
         let t1 = std::time::Instant::now();
         match table_res {
             Ok(table_lock) => {
-                let mut table = table_lock.write().unwrap();
-                let _ = table.reload_if_needed();
                 let mut f_search = if !param_fields.is_empty() { param_fields }
                                    else if sel_fields.is_empty() && aggs_query.is_empty() {
                                        let all = Table::get_indexed_fields_static(&query_entity, &query_table);
@@ -1838,12 +1850,23 @@ async fn run_query_page(
                                    } else { sel_fields };
 
                 if f_search.iter().any(|f| f == "*") {
-                    let mut all_cols = table.manifest.original_fields.clone();
-                    if all_cols.is_empty() {
-                        all_cols = Table::get_indexed_fields_static(&query_entity, &query_table);
-                        all_cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
-                        if !all_cols.is_empty() { let _ = table.set_original_fields(all_cols.clone()); }
-                    }
+                    let needs_persist = {
+                        let table_ro = table_lock.read().unwrap();
+                        table_ro.manifest.original_fields.is_empty()
+                    };
+                    let all_cols = if needs_persist {
+                        let mut cols = Table::get_indexed_fields_static(&query_entity, &query_table);
+                        cols.retain(|f| !f.ends_with("_day") && !f.ends_with("_month") && !f.ends_with("_hour_bucket"));
+                        if !cols.is_empty() {
+                            let mut table_w = table_lock.write().unwrap();
+                            if table_w.manifest.original_fields.is_empty() {
+                                let _ = table_w.set_original_fields(cols.clone());
+                            }
+                        }
+                        cols
+                    } else {
+                        table_lock.read().unwrap().manifest.original_fields.clone()
+                    };
                     let mut new_f = Vec::new();
                     let mut seen = std::collections::HashSet::new();
                     for f in f_search {
@@ -1858,6 +1881,9 @@ async fn run_query_page(
                     f_search = new_f;
                 }
 
+                // Read lock: search/get_rows_batch only need &Table; using a write lock here
+                // forced every read to wait behind CDC writes on hot tables.
+                let table = table_lock.read().unwrap();
                 let t2 = std::time::Instant::now();
                 let mut res = table.search(&f_search, &filters, &filters_op, &aggs_query, &order_by, limit, offset, auth_ctx_clone.as_ref())?;
                 let open_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
