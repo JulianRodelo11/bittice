@@ -108,6 +108,11 @@ pub struct CdcWorker {
     startup_report_sent: AtomicBool,
     /// Per-mirror-table key `entity/table_dir`: row batches applied since last `flush_active_segment`.
     cdc_mirror_flush_ticks: Arc<RwLock<HashMap<String, u32>>>,
+    /// White-list of `schema.table` (lowercase) to mirror.  When `Some`, every other binlog
+    /// table is skipped during bootstrap and live replication.  Built from `.bittice_ops.json`
+    /// when `BITTICE_CDC_SYNC_ONLY_OPS=1` — drastically reduces disk and CPU when the user only
+    /// queries a small subset of the source DBs.
+    ops_table_filter: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 impl CdcWorker {
@@ -160,6 +165,7 @@ impl CdcWorker {
             .join("cdc_state.json")
             .to_string_lossy()
             .into_owned();
+        let ops_table_filter = Self::build_ops_table_filter();
         Self {
             url,
             entity,
@@ -176,7 +182,45 @@ impl CdcWorker {
             startup_report_tx,
             startup_report_sent: AtomicBool::new(false),
             cdc_mirror_flush_ticks: Arc::new(RwLock::new(HashMap::new())),
+            ops_table_filter,
         }
+    }
+
+    /// Read `BITTICE_CDC_SYNC_ONLY_OPS` and build a `schema.table` (lowercase) white-list from
+    /// `.bittice_ops.json`.  Returns `None` when the flag is unset or the ops file is empty —
+    /// callers treat `None` as "sync everything" (the historical behaviour).
+    fn build_ops_table_filter() -> Option<Arc<std::collections::HashSet<String>>> {
+        if !Self::env_truthy("BITTICE_CDC_SYNC_ONLY_OPS") {
+            return None;
+        }
+        let ops = match crate::core::saved_queries::load_operations() {
+            Ok(ops) => ops,
+            Err(_) => return None,
+        };
+        let raw_keys = crate::core::saved_queries::collect_ops_query_table_keys(&ops);
+        if raw_keys.is_empty() {
+            return None;
+        }
+        // Saved-ops keys are `entity/table`.  In sync-all mode the entity matches the MySQL
+        // schema name verbatim; in single-DB mode it is the user's profile name (which we
+        // also match against `self.database`).  Store as `schema.table` lowercased so binlog
+        // events and bootstrap loops can both query with a single normalised lookup.
+        let normalized: std::collections::HashSet<String> = raw_keys
+            .iter()
+            .map(|k| k.replace('/', ".").to_lowercase())
+            .collect();
+        Some(Arc::new(normalized))
+    }
+
+    /// True when this `(schema, table)` should be mirrored.  Returns `true` when no filter is
+    /// active (legacy behaviour) and only filters out tables when the caller has explicitly
+    /// opted into ops-only sync via `BITTICE_CDC_SYNC_ONLY_OPS=1`.
+    fn is_table_in_scope_filter(&self, schema: &str, table: &str) -> bool {
+        let Some(filter) = self.ops_table_filter.as_ref() else {
+            return true;
+        };
+        let key = format!("{}.{}", schema.to_lowercase(), table.to_lowercase());
+        filter.contains(&key)
     }
 
     fn mysql_ident(ident: &str) -> String {
@@ -1497,6 +1541,13 @@ set BITTICE_CDC_DURABILITY=strict|balanced|throughput",
         ));
         self.log_phase(1, "Connection, scope, and binlog policy");
 
+        if let Some(filter) = self.ops_table_filter.as_ref() {
+            self.log_info(format!(
+                "CDC: BITTICE_CDC_SYNC_ONLY_OPS=1 — only mirroring {} table(s) referenced by saved operations.",
+                filter.len()
+            ));
+        }
+
         if self.sync_all_databases {
             if let Err(e) = conn.query_drop("USE information_schema").await {
                 self.log_error(format!("CDC: USE information_schema failed: {}", e));
@@ -1671,11 +1722,26 @@ so the account can read coordinates."
                 // Bulk-load column metadata for the entire schema in one query so we
                 // don't need a separate DESCRIBE per already-bootstrapped table.
                 let bulk_cols = Self::fetch_schema_columns_bulk(&mut conn, &schema).await;
-                self.log_info(format!(
-                    "CDC: Schema '{}' — {} base table(s) to process.",
-                    schema,
-                    tables.len()
-                ));
+                let total_tables = tables.len();
+                let tables: Vec<String> = if self.ops_table_filter.is_some() {
+                    tables
+                        .into_iter()
+                        .filter(|t| self.is_table_in_scope_filter(&schema, t))
+                        .collect()
+                } else {
+                    tables
+                };
+                if self.ops_table_filter.is_some() {
+                    self.log_info(format!(
+                        "CDC: Schema '{}' — {} of {} base table(s) selected by BITTICE_CDC_SYNC_ONLY_OPS.",
+                        schema, tables.len(), total_tables
+                    ));
+                } else {
+                    self.log_info(format!(
+                        "CDC: Schema '{}' — {} base table(s) to process.",
+                        schema, total_tables
+                    ));
+                }
                 for table_name in &tables {
                     if crate::server::engine_halt_requested() {
                         self.log_info(format!(
@@ -1747,11 +1813,32 @@ so the account can read coordinates."
             };
             // Bulk-load column metadata for all tables in the database at once.
             let bulk_cols = Self::fetch_schema_columns_bulk(&mut conn, self.database.as_str()).await;
-            self.log_info(format!(
-                "CDC: Database '{}' — {} base table(s) to process.",
-                self.database,
-                tables.len()
-            ));
+            let total_tables = tables.len();
+            // For single-DB mode, ops keys use either the entity name OR the schema name as
+            // their first segment; check both so the white-list works regardless of how the
+            // user named the saved query.
+            let tables: Vec<String> = if self.ops_table_filter.is_some() {
+                tables
+                    .into_iter()
+                    .filter(|t| {
+                        self.is_table_in_scope_filter(&self.database, t)
+                            || self.is_table_in_scope_filter(&self.entity, t)
+                    })
+                    .collect()
+            } else {
+                tables
+            };
+            if self.ops_table_filter.is_some() {
+                self.log_info(format!(
+                    "CDC: Database '{}' — {} of {} base table(s) selected by BITTICE_CDC_SYNC_ONLY_OPS.",
+                    self.database, tables.len(), total_tables
+                ));
+            } else {
+                self.log_info(format!(
+                    "CDC: Database '{}' — {} base table(s) to process.",
+                    self.database, total_tables
+                ));
+            }
 
             for table_name in &tables {
                 if crate::server::engine_halt_requested() {
@@ -2394,10 +2481,20 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                         Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     Some(EventData::RowsEvent(rows_data)) => {
+                        let mut filtered_out = false;
                         if let Ok(tm_probe) = self.resolve_rows_table_map(&rows_data, &stream) {
                             let schema = tm_probe.database_name().to_string();
                             let tbl = tm_probe.table_name().to_string();
-                            if !(self.sync_all_databases && Self::is_system_schema(&schema))
+                            // Skip events for tables outside the BITTICE_CDC_SYNC_ONLY_OPS
+                            // white-list — applying them would force a bootstrap of an
+                            // unwanted table on the very first row event.
+                            if self.ops_table_filter.is_some()
+                                && !self.is_table_in_scope_filter(&schema, &tbl)
+                            {
+                                filtered_out = true;
+                            }
+                            if !filtered_out
+                                && !(self.sync_all_databases && Self::is_system_schema(&schema))
                                 && !self.is_out_of_scope_binlog_schema(&schema)
                             {
                                 let known = {
@@ -2439,15 +2536,17 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                                 }
                             }
                         }
-                        match self.handle_rows_event(&pool, rows_data, &mut state, &stream).await {
-                            Ok(()) => {}
-                            Err(e) if format!("{:#}", e).contains("Missing TableMapEvent") => {
-                                // Cursor resumed mid-file before the TableMapEvent for this table
-                                // was seen. Safe to skip — MySQL will re-emit the map on the next
-                                // write to this table, and the row event cannot be applied anyway.
-                                warn!("CDC: Skipping row event — TableMapEvent not yet seen (mid-file resume): {}", e);
+                        if !filtered_out {
+                            match self.handle_rows_event(&pool, rows_data, &mut state, &stream).await {
+                                Ok(()) => {}
+                                Err(e) if format!("{:#}", e).contains("Missing TableMapEvent") => {
+                                    // Cursor resumed mid-file before the TableMapEvent for this table
+                                    // was seen. Safe to skip — MySQL will re-emit the map on the next
+                                    // write to this table, and the row event cannot be applied anyway.
+                                    warn!("CDC: Skipping row event — TableMapEvent not yet seen (mid-file resume): {}", e);
+                                }
+                                Err(e) => return Err(e),
                             }
-                            Err(e) => return Err(e),
                         }
                         Self::apply_binlog_file_pos(&mut state, next_pos);
                     }

@@ -26,7 +26,11 @@ pub struct Table {
     wal: Wal,
     /// External ID -> (Segment ID, Local ID)
     pub primary_index: HashMap<String, (u64, u32)>,
-    exact_index_cache: StdRwLock<HashMap<String, Arc<ExactIndex>>>,
+    /// Field name → mutable per-field index.  The inner `RwLock` lets `merge_exact_indexes_for_segment`
+    /// add a freshly-rotated segment in place (O(values touched)) instead of cloning the entire
+    /// `ExactIndex` (millions of allocations on high-cardinality fields).  Readers take the inner
+    /// read lock briefly and scope it to a single value lookup.
+    exact_index_cache: StdRwLock<HashMap<String, Arc<StdRwLock<ExactIndex>>>>,
     flush_count_since_index_save: u32,
     /// Set by TableManager when this Table lost a cache-dedup race and is about to be dropped.
     /// Prevents Drop::close from calling save_manifest and racing with the winning Table instance.
@@ -161,6 +165,15 @@ impl Table {
         table.ensure_active_segment()?;
         table.load_primary_index()?;
         table.replay_wal()?;
+        // One-time cleanup: remove `exact_<PK>.idx` left over from sessions before the PK
+        // skip was added.  The file is hundreds of MB on tables with many distinct keys and
+        // has no benefit (PK Eq/IN now go through `primary_index`).
+        if !table.manifest.primary_key.is_empty() {
+            let stale = table.exact_index_path(&table.manifest.primary_key);
+            if stale.exists() {
+                let _ = fs::remove_file(&stale);
+            }
+        }
         Ok(table)
     }
 
@@ -658,11 +671,32 @@ impl Table {
         } else if let Some(f) = pk_in_filter {
             let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
             if use_index {
-                if let Some(matches) = self.exact_matches_for_in_filter(f)? {
-                    matches
-                } else {
-                    self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)?
+                // PK IN: resolve directly through `primary_index` instead of the exact_index.
+                // Since the PK exact_index is intentionally not built (see should_skip_exact_index),
+                // every PK IN lookup would otherwise fall back to a full segment scan.  Doing
+                // N hash lookups against `primary_index` is O(N) and avoids touching segments.
+                let values = crate::core::types::list_values(&f.value, &f.value_options);
+                let mut by_seg: HashMap<u64, RoaringBitmap> = HashMap::new();
+                for value in &values {
+                    if let Some((seg_id, local_id)) = self.primary_index.get(value) {
+                        by_seg.entry(*seg_id).or_default().insert(*local_id);
+                    }
                 }
+                let mut matches: Vec<(u64, RoaringBitmap)> =
+                    by_seg.into_iter().filter(|(_, bm)| !bm.is_empty()).collect();
+                if final_filters.len() > 1 {
+                    // Other filters present: re-validate each candidate against them.
+                    matches.retain(|(seg_id, bm)| {
+                        bm.iter().any(|local_id| {
+                            self.candidate_matches_filters(
+                                (*seg_id, local_id),
+                                &final_filters,
+                                &final_filters_op,
+                            ).unwrap_or(false)
+                        })
+                    });
+                }
+                matches
             } else {
                 self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)?
             }
@@ -925,15 +959,44 @@ impl Table {
         self.exact_index_dir().join(format!("exact_{}.idx", field))
     }
 
+    /// Returns true when this column's merged exact_index should NOT be built or persisted.
+    ///
+    /// The PK is always skipped because `primary_index` already serves PK Eq lookups in O(1)
+    /// — the merged `exact_<PK>.idx` would just be a much heavier duplicate (333 MB on
+    /// BpBono).  Operators can list extra fields (e.g. `FechaCreacion`, `FechaActualizacion`)
+    /// in `BITTICE_SKIP_EXACT_INDEX_FIELDS` (comma-separated) when those fields are only
+    /// queried as ranges, not Eq.
+    fn should_skip_exact_index(&self, field: &str) -> bool {
+        if !self.manifest.primary_key.is_empty() && field == self.manifest.primary_key {
+            return true;
+        }
+        if let Ok(list) = std::env::var("BITTICE_SKIP_EXACT_INDEX_FIELDS") {
+            for entry in list.split(',') {
+                if entry.trim() == field {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Load the exact index for `field`, covering only **immutable** segments.
     ///
     /// The active segment is intentionally NOT merged here so the cached value is stable across
     /// CDC writes and only changes when a segment rotates (via `merge_exact_indexes_for_segment`).
     /// Callers that need the active-segment view (e.g. `exact_matches_for_field_value`) merge
     /// `writer.bitmaps[field]` themselves, which is cheap (a single HashMap lookup, no disk I/O).
-    fn load_exact_index(&self, field: &str) -> Result<Arc<ExactIndex>> {
+    fn load_exact_index(&self, field: &str) -> Result<Arc<StdRwLock<ExactIndex>>> {
         if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
             return Ok(cached.clone());
+        }
+
+        // Short-circuit for skipped fields (PK + operator-listed columns) — return an
+        // empty index without touching disk.  Callers (e.g. exact_matches_for_field_value)
+        // treat empty as "no exact-index match" and fall back to the proper code path
+        // (primary_index for PK Eq/IN, scan_segments_parallel for everything else).
+        if self.should_skip_exact_index(field) {
+            return Ok(Arc::new(StdRwLock::new(HashMap::new())));
         }
 
         let t = std::time::Instant::now();
@@ -953,7 +1016,7 @@ impl Table {
             );
         }
 
-        let cached = Arc::new(index);
+        let cached = Arc::new(StdRwLock::new(index));
         let mut cache = self.exact_index_cache.write().unwrap();
         // Evict one arbitrary entry when the cache is at capacity to bound RAM usage.
         // Evicted entries are rebuilt from disk on the next access.
@@ -1095,28 +1158,37 @@ impl Table {
         segment_bitmaps: &HashMap<String, HashMap<String, RoaringBitmap>>,
     ) -> Result<()> {
         for (field, values) in segment_bitmaps {
-            let mut index: ExactIndex = if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
-                (**cached).clone()
+            if self.should_skip_exact_index(field) {
+                continue;
+            }
+
+            let existing = self.exact_index_cache.read().unwrap().get(field).cloned();
+            let arc = if let Some(arc) = existing {
+                arc
             } else {
                 // Cache miss: load from disk (read is cheap) so the merged result also covers
                 // segments persisted by previous sessions.  We still avoid writing back here.
                 let path = self.exact_index_path(field);
-                if path.exists() {
+                let initial: ExactIndex = if path.exists() {
                     let file = fs::File::open(&path)?;
                     let reader = BufReader::new(file);
                     bincode::deserialize_from(reader).unwrap_or_default()
                 } else {
                     HashMap::new()
-                }
+                };
+                let new_arc = Arc::new(StdRwLock::new(initial));
+                let mut cache = self.exact_index_cache.write().unwrap();
+                cache.entry(field.clone()).or_insert_with(|| new_arc.clone()).clone()
             };
 
+            // Append in place — O(values touched), not O(index size).  Concurrent readers
+            // briefly block on the per-field write lock instead of the whole-cache lock.
+            let mut guard = arc.write().unwrap();
             for (value, bitmap) in values {
                 if !bitmap.is_empty() {
-                    index.entry(value.clone()).or_insert_with(Vec::new).push((segment_id, bitmap.clone()));
+                    guard.entry(value.clone()).or_insert_with(Vec::new).push((segment_id, bitmap.clone()));
                 }
             }
-
-            self.exact_index_cache.write().unwrap().insert(field.clone(), Arc::new(index));
         }
 
         Ok(())
@@ -1126,12 +1198,13 @@ impl Table {
     /// so that crash recovery sees an up-to-date index without paying disk I/O on every CDC
     /// segment rotation.
     fn persist_all_exact_indexes(&self) -> Result<()> {
-        let snapshot: Vec<(String, Arc<ExactIndex>)> = {
+        let snapshot: Vec<(String, Arc<StdRwLock<ExactIndex>>)> = {
             let cache = self.exact_index_cache.read().unwrap();
             cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
-        for (field, index) in snapshot {
-            self.save_exact_index(&field, &index)?;
+        for (field, arc) in snapshot {
+            let guard = arc.read().unwrap();
+            self.save_exact_index(&field, &*guard)?;
         }
         Ok(())
     }
@@ -1218,12 +1291,15 @@ impl Table {
         let mut matches = Vec::new();
         let mut found_exact_key = false;
 
-        if let Some(entries) = immutable_index.get(&filter.value) {
-            found_exact_key = true;
-            for (segment_id, bitmap) in entries {
-                let live_bitmap = self.live_bitmap_for_segment(*segment_id, bitmap);
-                if !live_bitmap.is_empty() {
-                    matches.push((*segment_id, live_bitmap));
+        {
+            let guard = immutable_index.read().unwrap();
+            if let Some(entries) = guard.get(&filter.value) {
+                found_exact_key = true;
+                for (segment_id, bitmap) in entries {
+                    let live_bitmap = self.live_bitmap_for_segment(*segment_id, bitmap);
+                    if !live_bitmap.is_empty() {
+                        matches.push((*segment_id, live_bitmap));
+                    }
                 }
             }
         }
