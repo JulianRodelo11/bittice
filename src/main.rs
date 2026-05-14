@@ -117,6 +117,40 @@ async fn main() -> Result<()> {
             Commands::Uninstall => {
                 bittice::core::uninstall::perform_uninstall().await?;
             }
+            Commands::MigratePrimaryIndex { entity, table, all, dry_run, keep_backup, force } => {
+                if all {
+                    let data_root = bittice::core::data_paths::resolved_data_root();
+                    let results = bittice::core::migrate_primary_index::migrate_all(
+                        &data_root, dry_run, keep_backup, force,
+                    );
+                    let has_errors = results.iter().any(|r| r.error.is_some());
+                    if has_errors {
+                        std::process::exit(1);
+                    }
+                } else {
+                    match (entity, table) {
+                        (Some(ent), Some(tbl)) => {
+                            let table_dir = bittice::core::data_paths::mirror_entity_dir(&ent).join(&tbl);
+                            if !table_dir.exists() {
+                                anyhow::bail!("Directorio de tabla no encontrado: {}", table_dir.display());
+                            }
+                            let result = bittice::core::migrate_primary_index::migrate_table(
+                                &ent, &tbl, &table_dir, dry_run, keep_backup, force,
+                            );
+                            result.print_report();
+                            if result.error.is_some() {
+                                std::process::exit(1);
+                            }
+                        }
+                        _ => {
+                            anyhow::bail!(
+                                "Especificar <ENTITY> <TABLE> o usar --all. \
+                                 Ejemplo: bittice migrate-primary-index mi_entity mi_tabla"
+                            );
+                        }
+                    }
+                }
+            }
         }
     } else {
         // Local workstation: interactive wizard when launched with no args.

@@ -8,12 +8,16 @@ use memmap2::Mmap;
 use anyhow::{Result, Context};
 use roaring::RoaringBitmap;
 use crate::core::storage::manifest::Manifest;
+use crate::core::storage::pk::canonical_bytes;
+use crate::core::storage::primary_index::PrimaryIndex;
+use crate::core::storage::primary_index_io;
 use crate::core::storage::segment::{Segment, SegmentWriter};
 use crate::core::storage::wal::{Wal, WalOperation};
 use crate::core::types::{compare_filter_value, Filter, LogicalOp, OrderBy, QueryResult, SortDirection};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use tracing::{info, debug, warn};
+use unicode_normalization::UnicodeNormalization;
 
 type ExactIndex = HashMap<String, Vec<(u64, RoaringBitmap)>>;
 
@@ -25,7 +29,7 @@ pub struct Table {
     immutable_segments: Vec<Segment>,
     wal: Wal,
     /// External ID -> (Segment ID, Local ID)
-    pub primary_index: HashMap<String, (u64, u32)>,
+    pub primary_index: PrimaryIndex,
     /// Field name → mutable per-field index.  The inner `RwLock` lets `merge_exact_indexes_for_segment`
     /// add a freshly-rotated segment in place (O(values touched)) instead of cloning the entire
     /// `ExactIndex` (millions of allocations on high-cardinality fields).  Readers take the inner
@@ -103,6 +107,10 @@ impl Table {
         self.discarded = true;
     }
 
+    pub fn immutable_segment_count(&self) -> usize {
+        self.immutable_segments.len()
+    }
+
     pub fn close(&mut self) -> Result<()> {
         // If this instance was discarded (lost a concurrent open race in TableManager), skip all
         // disk writes — the winning instance owns the on-disk state.
@@ -156,7 +164,7 @@ impl Table {
             active_segment: None,
             immutable_segments: Vec::new(),
             wal,
-            primary_index: HashMap::new(),
+            primary_index: PrimaryIndex::new(),
             exact_index_cache: StdRwLock::new(HashMap::new()),
             flush_count_since_index_save: 0,
             discarded: false,
@@ -195,22 +203,32 @@ impl Table {
         for op in ops {
             match op {
                 WalOperation::Insert { id, data } => {
-                    let row_data: HashMap<String, String> = serde_json::from_slice(&data)
+                    let mut row_data: HashMap<String, String> = serde_json::from_slice(&data)
                         .unwrap_or_default();
                     let pk_field = if self.manifest.primary_key.is_empty() {
                         "PK"
                     } else {
                         &self.manifest.primary_key
                     };
+                    // Normalize PK to NFC for consistency with hash-based index.
+                    if let Some(pk_raw) = row_data.get(pk_field).cloned() {
+                        let normalized: String = pk_raw.nfc().collect();
+                        if normalized != pk_raw {
+                            row_data.insert(pk_field.to_string(), normalized);
+                        }
+                    }
                     let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
                     if let Some(writer) = &mut self.active_segment {
                         let local_id = writer.segment.record_count as u32;
                         writer.append_record(&row_data)?;
-                        self.primary_index.insert(pk_val, (writer.segment.id, local_id));
+                        self.primary_index.insert(&pk_val, (writer.segment.id, local_id));
                     }
                 }
                 WalOperation::Delete { id } => {
-                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id) {
+                    // Normalize PK to NFC for consistency with hash-based index.
+                    // Defensive: WAL entries from pre-1c code may have non-normalized PKs.
+                    let normalized_id: String = id.nfc().collect();
+                    if let Some((seg_id, local_id)) = self.primary_index.remove(&normalized_id) {
                         if let Some(writer) = &mut self.active_segment {
                             if writer.segment.id == seg_id {
                                 writer.segment.mark_deleted(local_id)?;
@@ -223,7 +241,7 @@ impl Table {
                     }
                 }
                 WalOperation::Update { id, data } => {
-                    let row_data: HashMap<String, String> = serde_json::from_slice(&data)
+                    let mut row_data: HashMap<String, String> = serde_json::from_slice(&data)
                         .unwrap_or_default();
                     if let Some((seg_id, local_id)) = self.primary_index.remove(&id) {
                         if let Some(writer) = &mut self.active_segment {
@@ -241,11 +259,18 @@ impl Table {
                     } else {
                         &self.manifest.primary_key
                     };
+                    // Normalize PK to NFC for consistency.
+                    if let Some(pk_raw) = row_data.get(pk_field).cloned() {
+                        let normalized: String = pk_raw.nfc().collect();
+                        if normalized != pk_raw {
+                            row_data.insert(pk_field.to_string(), normalized);
+                        }
+                    }
                     let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
                     if let Some(writer) = &mut self.active_segment {
                         let local_id = writer.segment.record_count as u32;
                         writer.append_record(&row_data)?;
-                        self.primary_index.insert(pk_val, (writer.segment.id, local_id));
+                        self.primary_index.insert(&pk_val, (writer.segment.id, local_id));
                     }
                 }
             }
@@ -291,23 +316,14 @@ impl Table {
     fn load_primary_index(&mut self) -> Result<()> {
         let idx_path = self.base_path.join("primary.idx");
         if idx_path.exists() {
-            let file = fs::File::open(idx_path)?;
-            let reader = std::io::BufReader::new(file);
-            self.primary_index = bincode::deserialize_from(reader).unwrap_or_default();
+            self.primary_index = primary_index_io::load_primary_index(&idx_path)?;
         }
         Ok(())
     }
 
     fn save_primary_index(&self) -> Result<()> {
         let idx_path = self.base_path.join("primary.idx");
-        let tmp_path = self.base_path.join("primary.idx.tmp");
-        {
-            let file = fs::File::create(&tmp_path)?;
-            let writer = std::io::BufWriter::new(file);
-            bincode::serialize_into(writer, &self.primary_index)?;
-        }
-        fs::rename(&tmp_path, &idx_path)?;
-        Ok(())
+        primary_index_io::save_primary_index(&idx_path, &self.primary_index)
     }
 
     fn load_segments(&mut self) -> Result<()> {
@@ -357,24 +373,72 @@ impl Table {
     }
 
     /// Removes every mirrored row (WAL tombstones + segment deletes). Used rarely after CDC checkpoint loss.
+    ///
+    /// Reads PK values from segments directly rather than from primary_index,
+    /// so this works even after the index representation changes (e.g. hashed keys).
     pub fn delete_all_rows(&mut self) -> Result<()> {
-        let ids: Vec<String> = self.primary_index.keys().cloned().collect();
-        for id in ids {
-            self.delete(&id)?;
+        let pk_field = if self.manifest.primary_key.is_empty() {
+            "PK".to_string()
+        } else {
+            self.manifest.primary_key.clone()
+        };
+        let pk_fields = vec![pk_field.clone()];
+
+        // Collect PKs from all immutable segments.
+        let mut all_pks: Vec<String> = Vec::new();
+        for seg in &self.immutable_segments {
+            let _ = seg.ensure_mmaps_batch(&pk_fields);
+            for local_id in 0u32..seg.record_count as u32 {
+                if seg.deleted_bitmap.contains(local_id) {
+                    continue;
+                }
+                let vals = seg.get_row_values(local_id, &pk_fields)?;
+                if let Some(pk) = vals.into_iter().next() {
+                    all_pks.push(pk);
+                }
+            }
+        }
+
+        // Collect PKs from the active segment.
+        if let Some(writer) = &self.active_segment {
+            let seg = &writer.segment;
+            let _ = seg.ensure_mmaps_batch(&pk_fields);
+            for local_id in 0u32..seg.record_count as u32 {
+                if seg.deleted_bitmap.contains(local_id) {
+                    continue;
+                }
+                let vals = seg.get_row_values(local_id, &pk_fields)?;
+                if let Some(pk) = vals.into_iter().next() {
+                    all_pks.push(pk);
+                }
+            }
+        }
+
+        for pk in all_pks {
+            self.delete(&pk)?;
         }
         self.flush_active_segment()
     }
 
     pub fn insert(&mut self, row_data: HashMap<String, String>) -> Result<()> {
-        let row_bytes = serde_json::to_vec(&row_data)?;
         let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
+        // Normalize PK value to NFC before storing, so canonically equivalent
+        // strings (e.g. NFC vs NFD) are stored identically and hash consistently.
+        let mut row_data = row_data;
+        if let Some(pk_val) = row_data.get(pk_field).cloned() {
+            let normalized: String = pk_val.nfc().collect();
+            if normalized != pk_val {
+                row_data.insert(pk_field.to_string(), normalized);
+            }
+        }
+        let row_bytes = serde_json::to_vec(&row_data)?;
         let id = row_data.get(pk_field).cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let op = WalOperation::Insert { id: id.clone(), data: row_bytes };
         self.wal.append(&op)?;
         if let Some(writer) = &mut self.active_segment {
              let local_id = writer.segment.record_count as u32;
-             writer.append_record(&row_data)?; 
-             self.primary_index.insert(id, (writer.segment.id, local_id));
+             writer.append_record(&row_data)?;
+             self.primary_index.insert(&id, (writer.segment.id, local_id));
         }
         Ok(())
     }
@@ -386,7 +450,7 @@ impl Table {
     /// shorter (stale) version of the file and every field reads back as an empty string,
     /// which then gets written verbatim by the UPDATE merge — losing all existing field values.
     pub fn get_row_as_map(&mut self, pk_val: &str) -> Result<Option<HashMap<String, String>>> {
-        let Some((seg_id, local_id)) = self.primary_index.get(pk_val).copied() else {
+        let Some((seg_id, local_id)) = self.primary_index.get(pk_val) else {
             return Ok(None);
         };
         let fields = &self.manifest.original_fields;
@@ -410,6 +474,26 @@ impl Table {
         for (i, f) in fields.iter().enumerate() {
             map.insert(f.clone(), vals.get(i).cloned().unwrap_or_default());
         }
+
+        // Collision verification: after reading the row, confirm the PK stored
+        // in the row matches the requested PK (under canonical_bytes). A mismatch
+        // means two distinct PKs hashed to the same u128 bucket — astronomically
+        // unlikely with xxh3_128 but checked for correctness.
+        let pk_field = if self.manifest.primary_key.is_empty() {
+            "PK"
+        } else {
+            &self.manifest.primary_key
+        };
+        if let Some(actual_pk) = map.get(pk_field) {
+            if canonical_bytes(actual_pk) != canonical_bytes(pk_val) {
+                warn!(
+                    "Hash collision detected in get_row_as_map: requested={:?}, actual={:?}",
+                    pk_val, actual_pk
+                );
+                return Ok(None);
+            }
+        }
+
         Ok(Some(map))
     }
 
@@ -652,17 +736,34 @@ impl Table {
         if let Some(writer) = &self.active_segment { segment_tasks.push(&writer.segment); }
         let filter_start = std::time::Instant::now();
         let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
+
+        // Normalize PK filter values to NFC so that canonically equivalent
+        // strings (e.g. "café" NFC vs NFD) match correctly. Without this,
+        // a query with NFD form would fail candidate_matches_filters even
+        // though the row was stored with NFC form (same canonical_bytes hash).
+        for filter in final_filters.iter_mut() {
+            if filter.field == pk_field {
+                filter.value = filter.value.nfc().collect();
+                if let Some(ref mut v) = filter.value_to {
+                    *v = v.nfc().collect();
+                }
+                for opt in filter.value_options.iter_mut() {
+                    *opt = opt.nfc().collect();
+                }
+            }
+        }
+
         let pk_filter = final_filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::Eq);
         let pk_in_filter = final_filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::In);
         let segment_matches = if let Some(f) = pk_filter {
             let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
             if use_index {
                 if let Some((seg_id, local_id)) = self.primary_index.get(&f.value) {
-                    let candidate = (*seg_id, *local_id);
+                    let candidate = (seg_id, local_id);
                     if self.candidate_matches_filters(candidate, &final_filters, &final_filters_op)? {
                         let mut bm = RoaringBitmap::new();
-                        bm.insert(*local_id);
-                        vec![(*seg_id, bm)]
+                        bm.insert(local_id);
+                        vec![(seg_id, bm)]
                     } else {
                         vec![]
                     }
@@ -679,7 +780,7 @@ impl Table {
                 let mut by_seg: HashMap<u64, RoaringBitmap> = HashMap::new();
                 for value in &values {
                     if let Some((seg_id, local_id)) = self.primary_index.get(value) {
-                        by_seg.entry(*seg_id).or_default().insert(*local_id);
+                        by_seg.entry(seg_id).or_default().insert(local_id);
                     }
                 }
                 let mut matches: Vec<(u64, RoaringBitmap)> =
@@ -963,7 +1064,7 @@ impl Table {
     ///
     /// The PK is always skipped because `primary_index` already serves PK Eq lookups in O(1)
     /// — the merged `exact_<PK>.idx` would just be a much heavier duplicate (333 MB on
-    /// BpBono).  Operators can list extra fields (e.g. `FechaCreacion`, `FechaActualizacion`)
+    /// large PKs).  Operators can list extra fields (e.g. `FechaCreacion`, `FechaActualizacion`)
     /// in `BITTICE_SKIP_EXACT_INDEX_FIELDS` (comma-separated) when those fields are only
     /// queried as ranges, not Eq.
     fn should_skip_exact_index(&self, field: &str) -> bool {
@@ -1561,7 +1662,7 @@ impl Table {
         };
 
         // pk_val -> (new_seg_id, new_local_id)
-        let mut new_primary_index: HashMap<String, (u64, u32)> = HashMap::new();
+        let mut new_primary_index = PrimaryIndex::new();
 
         // Collect new segments as (SegmentWriter, bitmaps) so we can finalize them.
         let mut finished_writers: Vec<SegmentWriter> = Vec::new();
@@ -1570,12 +1671,12 @@ impl Table {
         let mut current_writer: Option<SegmentWriter> = None;
         let mut current_row_count: u64 = 0;
 
-        // Build a reverse map: (old_seg_id, old_local_id) -> pk_val for re-indexing.
-        // We need this to update primary_index after compaction.
-        let reverse_pk: HashMap<(u64, u32), String> = self.primary_index
-            .iter()
-            .map(|(pk_val, &(seg_id, local_id))| ((seg_id, local_id), pk_val.clone()))
-            .collect();
+        // Build a set of alive (seg_id, local_id) from primary_index.
+        // This is necessary because deleted_bitmap for immutable segments
+        // may not be persisted to disk when deletions happen in a later session
+        // (the bitmap is only in-memory). The primary_index always reflects
+        // the true set of live rows.
+        let alive_positions: std::collections::HashSet<(u64, u32)> = self.primary_index.inner().values().copied().collect();
 
         // Iterate over all immutable segments in order.
         for seg in &self.immutable_segments {
@@ -1583,8 +1684,9 @@ impl Table {
             let _ = seg.ensure_mmaps_batch(&fields);
 
             for local_id in 0u32..seg.record_count as u32 {
-                // Skip deleted rows.
-                if seg.deleted_bitmap.contains(local_id) {
+                // Skip deleted rows: check both the segment's in-memory bitmap
+                // and the primary_index-derived alive set (for robustness after reopen).
+                if seg.deleted_bitmap.contains(local_id) || !alive_positions.contains(&(seg.id, local_id)) {
                     continue;
                 }
 
@@ -1616,14 +1718,11 @@ impl Table {
                 writer.append_record(&row_map)?;
                 current_row_count += 1;
 
-                // Update reverse primary index mapping.
-                if let Some(pk_val) = reverse_pk.get(&(seg.id, local_id)) {
-                    new_primary_index.insert(pk_val.clone(), (new_seg_id, new_local_id));
-                } else {
-                    // Fallback: try to get pk value from the row itself.
-                    if let Some(pk_val) = row_map.get(&pk_field) {
-                        new_primary_index.insert(pk_val.clone(), (new_seg_id, new_local_id));
-                    }
+                // Get PK value directly from the row data.
+                // pk_field is always in fields (derived from segment directory),
+                // so row_map always contains it.
+                if let Some(pk_val) = row_map.get(&pk_field) {
+                    new_primary_index.insert(pk_val, (new_seg_id, new_local_id));
                 }
             }
         }

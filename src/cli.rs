@@ -34,4 +34,25 @@ pub enum Commands {
     Uninstall,
     /// Run the interactive configuration wizard
     Setup,
+    /// Migrate primary.idx from legacy/v1 format to v2 (hash-based)
+    MigratePrimaryIndex {
+        /// Entity (schema) name. Mutually exclusive with --all.
+        #[arg()]
+        entity: Option<String>,
+        /// Table name. Mutually exclusive with --all.
+        #[arg()]
+        table: Option<String>,
+        /// Migrate all tables in the data directory
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Report statistics without writing anything
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Keep the .v1.bak backup after migration (default: true)
+        #[arg(long, default_value_t = true)]
+        keep_backup: bool,
+        /// Force re-migration even if already v2
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }

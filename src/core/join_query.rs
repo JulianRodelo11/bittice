@@ -783,7 +783,7 @@ fn fetch_join_rows(
         let get_ms = t_get.elapsed().as_secs_f64() * 1000.0;
         let t_lock = Instant::now();
         // Read lock: search/get_rows_batch only need &Table; using a write lock here forced
-        // every join lookup to wait behind CDC writes on hot tables (e.g. BpBono), turning
+        // every join lookup to wait behind CDC writes on hot tables, turning
         // sub-100ms queries into multi-second ones under streaming load.
         let table = table_lock.read().unwrap();
         let lock_ms = t_lock.elapsed().as_secs_f64() * 1000.0;
