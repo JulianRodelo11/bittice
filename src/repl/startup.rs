@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cliclack::{intro, outro_cancel, select, input, password, spinner};
+use cliclack::{intro, outro_cancel, select, input, password, spinner, multiselect};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::thread;
@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -28,6 +29,12 @@ struct CdcInfo {
     /// When true: sync every non-system database; data paths use real MySQL schema names.
     #[serde(default)]
     sync_all_databases: bool,
+    /// When set (single-database mode): only these base tables are mirrored.
+    #[serde(default)]
+    tables: Option<Vec<String>>,
+    /// Multi-database scoped sync: schema name → base tables to mirror (`sync_all_databases` must be true).
+    #[serde(default)]
+    scoped_sync: Option<HashMap<String, Vec<String>>>,
     entity: String,
     vpn_file: Option<String>,
 }
@@ -39,6 +46,155 @@ enum WizardOutcome {
 
 /// Reserved `select` value: explicit return to the main menu (works when Esc does not).
 const SEL_BACK_MAIN: u8 = 240;
+const SEL_SCOPED_ADD_DB: u8 = 0;
+const SEL_SCOPED_CONTINUE: u8 = 1;
+
+/// One database at a time: pick DB → pick tables → add another or continue.
+async fn wizard_pick_scoped_sync(
+    user: &str,
+    pass: &str,
+    host: &str,
+    port: &str,
+    available_dbs: Vec<String>,
+) -> Result<Option<HashMap<String, Vec<String>>>> {
+    println!(
+        "\x1b[90m│\x1b[0m  \x1b[90mConfigure one database at a time (type to filter tables, Space to toggle).\x1b[0m"
+    );
+
+    let mut configured: HashMap<String, Vec<String>> = HashMap::new();
+
+    loop {
+        let pending: Vec<&String> = available_dbs
+            .iter()
+            .filter(|db| !configured.contains_key(db.as_str()))
+            .collect();
+
+        if pending.is_empty() {
+            break;
+        }
+
+        let back_idx = pending.len();
+        let mut db_picker = select("Select a database to configure")
+            .max_rows(16)
+            .filter_mode();
+        for (i, db) in pending.iter().enumerate() {
+            db_picker = db_picker.item(i, db.as_str(), "");
+        }
+        db_picker = db_picker.item(back_idx, "« Back to main menu", "");
+
+        let db_idx = match db_picker.interact() {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if db_idx == back_idx {
+            return Ok(None);
+        }
+        let db_choice = pending[db_idx].clone();
+
+        let db_url = format!(
+            "mysql://{}:{}@{}:{}/{}",
+            user, pass, host, port, db_choice
+        );
+        let s = spinner();
+        s.start(format!("Listing tables in '{}'...", db_choice));
+        let available_tables =
+            match CdcWorker::list_base_tables_in_schema(&db_url, &db_choice).await {
+            Ok(t) => t,
+            Err(e) => {
+                s.stop(format!("Could not list tables in '{}': {}", db_choice, e));
+                return Err(e);
+            }
+        };
+        s.stop(format!(
+            "Found {} base table(s) in '{}'.",
+            available_tables.len(),
+            db_choice
+        ));
+        if available_tables.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Database '{}' has no base tables to synchronize.",
+                db_choice
+            ));
+        }
+
+        let prompt = format!("Select tables in '{}'", db_choice);
+        let mut table_picker = multiselect(&prompt)
+            .required(true)
+            .filter_mode()
+            .max_rows(18);
+        for name in &available_tables {
+            table_picker = table_picker.item(name.clone(), name, "");
+        }
+        let mut picked: Vec<String> = match table_picker.interact() {
+            Ok(p) => p,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if picked.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Select at least one table in database '{}'.",
+                db_choice
+            ));
+        }
+        picked.sort();
+        println!(
+            "\x1b[90m│\x1b[0m  \x1b[90m'{}': {} table(s) selected.\x1b[0m",
+            db_choice,
+            picked.len()
+        );
+        configured.insert(db_choice, picked);
+
+        let still_pending = available_dbs
+            .iter()
+            .any(|db| !configured.contains_key(db.as_str()));
+        if !still_pending {
+            println!(
+                "\x1b[90m│\x1b[0m  \x1b[90mAll listed databases are configured.\x1b[0m"
+            );
+            break;
+        }
+
+        let mut next_picker = select("What next?");
+        next_picker = next_picker.item(
+            SEL_SCOPED_ADD_DB,
+            "Add another database",
+            "",
+        );
+        next_picker = next_picker.item(
+            SEL_SCOPED_CONTINUE,
+            "Continue with this selection",
+            "",
+        );
+        next_picker = next_picker.item(SEL_BACK_MAIN, "« Back to main menu", "");
+
+        let next = match next_picker.interact() {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if next == SEL_BACK_MAIN {
+            return Ok(None);
+        }
+        if next == SEL_SCOPED_CONTINUE {
+            break;
+        }
+    }
+
+    if configured.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Select at least one database and table to synchronize."
+        ));
+    }
+
+    let total_tables: usize = configured.values().map(|v| v.len()).sum();
+    println!(
+        "\x1b[90m│\x1b[0m  \x1b[90m{} database(s), {} table(s) selected for sync.\x1b[0m",
+        configured.len(),
+        total_tables
+    );
+    Ok(Some(configured))
+}
 
 fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
     let path = crate::core::data_paths::profile_dir(&info.entity).join("cdc_config.json");
@@ -348,7 +504,9 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         println!("\x1b[90m│\x1b[0m  \x1b[90m“All databases”: one CDC; each stored schema\x1b[0m");
         select("What should be synchronized?")
             .item(0u8, "All user databases on this host", "")
-            .item(1u8, "A single database only", "")
+            .item(1u8, "A single database — all tables", "")
+            .item(2u8, "A single database — selected tables only", "")
+            .item(3u8, "Selected databases — pick tables per database", "")
             .item(SEL_BACK_MAIN, "« Back to main menu", "")
             .interact()
     });
@@ -356,14 +514,45 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         return Ok(WizardOutcome::Cancelled);
     }
 
-    let (database, sync_all_databases, entity) = if sync_mode == 0 {
+    let (database, sync_all_databases, entity, tables, scoped_sync) = if sync_mode == 0 {
         let profile: String = interact_or_cancel!({
             let mut p = input("Connection profile name (folder under data/profiles/)")
                 .default_input("_bittice_host");
             p.interact()
         });
         println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. _bittice_host).\x1b[0m");
-        (String::new(), true, profile)
+        (String::new(), true, profile, None, None)
+    } else if sync_mode == 3 {
+        let profile: String = interact_or_cancel!({
+            let mut p = input("Connection profile name (folder under data/profiles/)")
+                .default_input("_bittice_host");
+            p.interact()
+        });
+        println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. _bittice_host).\x1b[0m");
+
+        let base_url = format!("mysql://{}:{}@{}:{}/", user, pass, host, port);
+        let s = spinner();
+        s.start("Listing databases from MySQL...");
+        let available_dbs = match CdcWorker::list_user_schemas_at_url(&base_url).await {
+            Ok(d) => d,
+            Err(e) => {
+                s.stop(format!("Could not list databases: {}", e));
+                return Err(e);
+            }
+        };
+        s.stop(format!("Found {} user database(s).", available_dbs.len()));
+        if available_dbs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No user databases found on this host to synchronize."
+            ));
+        }
+
+        let scoped = match wizard_pick_scoped_sync(&user, &pass, &host, &port, available_dbs).await?
+        {
+            Some(m) => m,
+            None => return Ok(WizardOutcome::Cancelled),
+        };
+        (String::new(), true, profile, None, Some(scoped))
     } else {
         let database: String = interact_or_cancel!({
             let mut p = input("Database to synchronize").placeholder("name");
@@ -373,7 +562,48 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
             let mut p = input("Entity name in Bittice").default_input(&database);
             p.interact()
         });
-        (database, false, entity)
+        let tables = if sync_mode == 2 {
+            let url = format!(
+                "mysql://{}:{}@{}:{}/{}",
+                user, pass, host, port, database
+            );
+            let s = spinner();
+            s.start("Listing tables from MySQL...");
+            let available = match CdcWorker::list_base_tables_in_schema(&url, &database).await {
+                Ok(t) => t,
+                Err(e) => {
+                    s.stop(format!("Could not list tables: {}", e));
+                    return Err(e);
+                }
+            };
+            s.stop(format!("Found {} base table(s).", available.len()));
+            if available.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Database '{}' has no base tables to synchronize.",
+                    database
+                ));
+            }
+            let mut picker = multiselect("Select tables to synchronize")
+                .required(true)
+                .filter_mode()
+                .max_rows(18);
+            for name in &available {
+                picker = picker.item(name.clone(), name, "");
+            }
+            let mut selected: Vec<String> = interact_or_cancel!({ picker.interact() });
+            if selected.is_empty() {
+                return Err(anyhow::anyhow!("Select at least one table to synchronize."));
+            }
+            selected.sort();
+            println!(
+                "\x1b[90m│\x1b[0m  \x1b[90m{} table(s) selected for sync.\x1b[0m",
+                selected.len()
+            );
+            Some(selected)
+        } else {
+            None
+        };
+        (database, false, entity, tables, None)
     };
 
     let is_docker_container = std::path::Path::new("/.dockerenv").exists();
@@ -487,6 +717,8 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         pass,
         database,
         sync_all_databases,
+        tables,
+        scoped_sync,
         entity,
         vpn_file,
     };

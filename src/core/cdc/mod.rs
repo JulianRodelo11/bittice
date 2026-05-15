@@ -6,7 +6,7 @@ use mysql_common::binlog::events::{EventData, RowsEventData, RowsEventRows, Tabl
 use mysql_common::packets::Column;
 use mysql_common::row::Row;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,10 +109,13 @@ pub struct CdcWorker {
     /// Per-mirror-table key `entity/table_dir`: row batches applied since last `flush_active_segment`.
     cdc_mirror_flush_ticks: Arc<RwLock<HashMap<String, u32>>>,
     /// White-list of `schema.table` (lowercase) to mirror.  When `Some`, every other binlog
-    /// table is skipped during bootstrap and live replication.  Built from `.bittice_ops.json`
-    /// when `BITTICE_CDC_SYNC_ONLY_OPS=1` — drastically reduces disk and CPU when the user only
-    /// queries a small subset of the source DBs.
-    ops_table_filter: Option<Arc<std::collections::HashSet<String>>>,
+    /// table is skipped during bootstrap and live replication.  Built from `cdc_config.json`
+    /// (`tables`, `scoped_sync`) or, if unset, from `.bittice_ops.json` when `BITTICE_CDC_SYNC_ONLY_OPS=1`.
+    table_allowlist: Option<Arc<HashSet<String>>>,
+    /// When set with `sync_all_databases`: only these schemas are bootstrapped and receive binlog events.
+    schema_allowlist: Option<Arc<HashSet<String>>>,
+    /// Human-readable source for startup logs (`profile config` vs env ops).
+    table_allowlist_source: Option<&'static str>,
 }
 
 impl CdcWorker {
@@ -165,7 +168,8 @@ impl CdcWorker {
             .join("cdc_state.json")
             .to_string_lossy()
             .into_owned();
-        let ops_table_filter = Self::build_ops_table_filter();
+        let (table_allowlist, schema_allowlist, table_allowlist_source) =
+            Self::build_sync_allowlists(&entity, &database);
         Self {
             url,
             entity,
@@ -182,14 +186,151 @@ impl CdcWorker {
             startup_report_tx,
             startup_report_sent: AtomicBool::new(false),
             cdc_mirror_flush_ticks: Arc::new(RwLock::new(HashMap::new())),
-            ops_table_filter,
+            table_allowlist,
+            schema_allowlist,
+            table_allowlist_source,
         }
+    }
+
+    /// List base tables in a MySQL schema (for setup wizard table selection).
+    pub async fn list_base_tables_in_schema(url: &str, schema: &str) -> Result<Vec<String>> {
+        let opts = Opts::from_url(url)?;
+        let pool = Pool::new(opts);
+        let mut conn = pool.get_conn().await.context("connect to MySQL")?;
+        let tables = Self::fetch_all_tables_in_schema(&mut conn, schema).await?;
+        drop(conn);
+        pool.disconnect().await.ok();
+        Ok(tables)
+    }
+
+    /// List non-system databases on the server (setup wizard).
+    pub async fn list_user_schemas_at_url(url: &str) -> Result<Vec<String>> {
+        let opts = Opts::from_url(url)?;
+        let pool = Pool::new(opts);
+        let mut conn = pool.get_conn().await.context("connect to MySQL")?;
+        let schemas = Self::list_user_schemas(&mut conn).await?;
+        drop(conn);
+        pool.disconnect().await.ok();
+        Ok(schemas)
+    }
+
+    /// Profile `scoped_sync` / `tables` in `cdc_config.json` take precedence over the ops env whitelist.
+    fn build_sync_allowlists(
+        entity: &str,
+        database: &str,
+    ) -> (
+        Option<Arc<HashSet<String>>>,
+        Option<Arc<HashSet<String>>>,
+        Option<&'static str>,
+    ) {
+        if let Some(scoped) = Self::load_config_scoped_sync(entity) {
+            if !scoped.is_empty() {
+                let mut tables = HashSet::new();
+                let mut schemas = HashSet::new();
+                for (schema, table_names) in &scoped {
+                    let schema_l = schema.to_lowercase();
+                    schemas.insert(schema_l.clone());
+                    for t in table_names {
+                        tables.insert(format!("{}.{}", schema_l, t.to_lowercase()));
+                    }
+                }
+                return (
+                    Some(Arc::new(tables)),
+                    Some(Arc::new(schemas)),
+                    Some("profile config (scoped_sync)"),
+                );
+            }
+        }
+        if let Some(names) = Self::load_config_table_names(entity) {
+            if !names.is_empty() {
+                let schema = database.to_lowercase();
+                let entity_key = entity.to_lowercase();
+                let mut set = HashSet::new();
+                for t in &names {
+                    if let Some((s, tbl)) = t.split_once('.') {
+                        set.insert(format!("{}.{}", s.to_lowercase(), tbl.to_lowercase()));
+                        continue;
+                    }
+                    let table = t.to_lowercase();
+                    set.insert(format!("{}.{}", schema, table));
+                    if entity_key != schema {
+                        set.insert(format!("{}.{}", entity_key, table));
+                    }
+                }
+                return (Some(Arc::new(set)), None, Some("profile config"));
+            }
+        }
+        let ops = Self::build_ops_table_allowlist();
+        let source = if ops.is_some() {
+            Some("BITTICE_CDC_SYNC_ONLY_OPS")
+        } else {
+            None
+        };
+        (ops, None, source)
+    }
+
+    fn allowlist_log_label(&self) -> &'static str {
+        self.table_allowlist_source
+            .unwrap_or("table allowlist")
+    }
+
+    fn load_config_table_names(entity: &str) -> Option<Vec<String>> {
+        let path = crate::core::data_paths::profile_dir(entity).join("cdc_config.json");
+        let content = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let arr = json.get("tables")?.as_array()?;
+        let names: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::trim))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if names.is_empty() {
+            None
+        } else {
+            Some(names)
+        }
+    }
+
+    fn load_config_scoped_sync(entity: &str) -> Option<HashMap<String, Vec<String>>> {
+        let path = crate::core::data_paths::profile_dir(entity).join("cdc_config.json");
+        let content = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let obj = json.get("scoped_sync")?.as_object()?;
+        let mut out = HashMap::new();
+        for (schema, tables_val) in obj {
+            let schema = schema.trim();
+            if schema.is_empty() {
+                continue;
+            }
+            let Some(arr) = tables_val.as_array() else {
+                continue;
+            };
+            let tables: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::trim))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if !tables.is_empty() {
+                out.insert(schema.to_string(), tables);
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn has_table_allowlist(&self) -> bool {
+        self.table_allowlist.is_some()
     }
 
     /// Read `BITTICE_CDC_SYNC_ONLY_OPS` and build a `schema.table` (lowercase) white-list from
     /// `.bittice_ops.json`.  Returns `None` when the flag is unset or the ops file is empty —
     /// callers treat `None` as "sync everything" (the historical behaviour).
-    fn build_ops_table_filter() -> Option<Arc<std::collections::HashSet<String>>> {
+    fn build_ops_table_allowlist() -> Option<Arc<std::collections::HashSet<String>>> {
         if !Self::env_truthy("BITTICE_CDC_SYNC_ONLY_OPS") {
             return None;
         }
@@ -212,11 +353,10 @@ impl CdcWorker {
         Some(Arc::new(normalized))
     }
 
-    /// True when this `(schema, table)` should be mirrored.  Returns `true` when no filter is
-    /// active (legacy behaviour) and only filters out tables when the caller has explicitly
-    /// opted into ops-only sync via `BITTICE_CDC_SYNC_ONLY_OPS=1`.
+    /// True when this `(schema, table)` should be mirrored.  Returns `true` when no allowlist is
+    /// active; otherwise only keys present in the profile or ops allowlist pass.
     fn is_table_in_scope_filter(&self, schema: &str, table: &str) -> bool {
-        let Some(filter) = self.ops_table_filter.as_ref() else {
+        let Some(filter) = self.table_allowlist.as_ref() else {
             return true;
         };
         let key = format!("{}.{}", schema.to_lowercase(), table.to_lowercase());
@@ -254,9 +394,16 @@ impl CdcWorker {
 
     /// With `sync_all_databases = false`, MySQL still ships **one server-wide binlog**; events include
     /// writes to every schema on the instance. We only mirror `self.database` — everything else is skipped.
+    /// With `schema_allowlist`, only selected schemas are mirrored (scoped multi-database sync).
     #[inline]
     fn is_out_of_scope_binlog_schema(&self, schema: &str) -> bool {
-        !self.sync_all_databases && !schema.eq_ignore_ascii_case(&self.database)
+        if !self.sync_all_databases {
+            return !schema.eq_ignore_ascii_case(&self.database);
+        }
+        if let Some(allowed) = self.schema_allowlist.as_ref() {
+            return !allowed.contains(&schema.to_lowercase());
+        }
+        false
     }
 
     /// Row map key: `schema.table` in sync-all mode (schema lowercased for stable binlog match),
@@ -1541,9 +1688,10 @@ set BITTICE_CDC_DURABILITY=strict|balanced|throughput",
         ));
         self.log_phase(1, "Connection, scope, and binlog policy");
 
-        if let Some(filter) = self.ops_table_filter.as_ref() {
+        if let Some(filter) = self.table_allowlist.as_ref() {
             self.log_info(format!(
-                "CDC: BITTICE_CDC_SYNC_ONLY_OPS=1 — only mirroring {} table(s) referenced by saved operations.",
+                "CDC: Table allowlist ({}) — mirroring {} table(s) only.",
+                self.allowlist_log_label(),
                 filter.len()
             ));
         }
@@ -1687,7 +1835,7 @@ so the account can read coordinates."
         }
 
         if self.sync_all_databases {
-            let schemas = match Self::list_user_schemas(&mut conn).await {
+            let mut schemas = match Self::list_user_schemas(&mut conn).await {
                 Ok(s) => s,
                 Err(e) => {
                     Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
@@ -1695,10 +1843,20 @@ so the account can read coordinates."
                     return Err(e.into());
                 }
             };
-            self.log_info(format!(
-                "CDC: Discovered {} user database(s) to sync.",
-                schemas.len()
-            ));
+            if let Some(allowed) = self.schema_allowlist.as_ref() {
+                let before = schemas.len();
+                schemas.retain(|s| allowed.contains(&s.to_lowercase()));
+                self.log_info(format!(
+                    "CDC: Scoped sync — {} of {} user database(s) selected in profile.",
+                    schemas.len(),
+                    before
+                ));
+            } else {
+                self.log_info(format!(
+                    "CDC: Discovered {} user database(s) to sync.",
+                    schemas.len()
+                ));
+            }
             for schema in schemas {
                 if crate::server::engine_halt_requested() {
                     self.log_info(format!(
@@ -1723,7 +1881,7 @@ so the account can read coordinates."
                 // don't need a separate DESCRIBE per already-bootstrapped table.
                 let bulk_cols = Self::fetch_schema_columns_bulk(&mut conn, &schema).await;
                 let total_tables = tables.len();
-                let tables: Vec<String> = if self.ops_table_filter.is_some() {
+                let tables: Vec<String> = if self.table_allowlist.is_some() {
                     tables
                         .into_iter()
                         .filter(|t| self.is_table_in_scope_filter(&schema, t))
@@ -1731,10 +1889,13 @@ so the account can read coordinates."
                 } else {
                     tables
                 };
-                if self.ops_table_filter.is_some() {
+                if self.has_table_allowlist() {
                     self.log_info(format!(
-                        "CDC: Schema '{}' — {} of {} base table(s) selected by BITTICE_CDC_SYNC_ONLY_OPS.",
-                        schema, tables.len(), total_tables
+                        "CDC: Schema '{}' — {} of {} base table(s) selected by {}.",
+                        schema,
+                        tables.len(),
+                        total_tables,
+                        self.allowlist_log_label()
                     ));
                 } else {
                     self.log_info(format!(
@@ -1817,7 +1978,7 @@ so the account can read coordinates."
             // For single-DB mode, ops keys use either the entity name OR the schema name as
             // their first segment; check both so the white-list works regardless of how the
             // user named the saved query.
-            let tables: Vec<String> = if self.ops_table_filter.is_some() {
+            let tables: Vec<String> = if self.table_allowlist.is_some() {
                 tables
                     .into_iter()
                     .filter(|t| {
@@ -1828,10 +1989,13 @@ so the account can read coordinates."
             } else {
                 tables
             };
-            if self.ops_table_filter.is_some() {
+            if self.has_table_allowlist() {
                 self.log_info(format!(
-                    "CDC: Database '{}' — {} of {} base table(s) selected by BITTICE_CDC_SYNC_ONLY_OPS.",
-                    self.database, tables.len(), total_tables
+                    "CDC: Database '{}' — {} of {} base table(s) selected by {}.",
+                    self.database,
+                    tables.len(),
+                    total_tables,
+                    self.allowlist_log_label()
                 ));
             } else {
                 self.log_info(format!(
@@ -2485,10 +2649,9 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                         if let Ok(tm_probe) = self.resolve_rows_table_map(&rows_data, &stream) {
                             let schema = tm_probe.database_name().to_string();
                             let tbl = tm_probe.table_name().to_string();
-                            // Skip events for tables outside the BITTICE_CDC_SYNC_ONLY_OPS
-                            // white-list — applying them would force a bootstrap of an
-                            // unwanted table on the very first row event.
-                            if self.ops_table_filter.is_some()
+                            // Skip events for tables outside the allowlist — applying them
+                            // would force a bootstrap of an unwanted table on the first row event.
+                            if self.table_allowlist.is_some()
                                 && !self.is_table_in_scope_filter(&schema, &tbl)
                             {
                                 filtered_out = true;
