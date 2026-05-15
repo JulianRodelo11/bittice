@@ -1,6 +1,6 @@
 [package]
 name = "bittice"
-version = "0.1.91"
+version = "0.1.92"
 edition = "2021"
 license = "Elastic-2.0"
 
@@ -19,6 +19,7 @@ console = "0.15"
 indicatif = "0.17"
 anyhow = "1.0"
 memmap2 = "0.9"
+lru = "0.12"
 tokio = { version = "1.36", features = ["full"] }
 axum = { version = "0.7.5", features = ["macros"] }
 tower-http = { version = "0.5.2", features = ["trace", "cors", "catch-panic"] }
@@ -38,6 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 evalexpr = "8.1"
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -63,4 +65,12 @@ harness = false
 
 [[bench]]
 name = "ram_usage"
+harness = false
+
+[[bench]]
+name = "exact_index_ops"
+harness = false
+
+[[bench]]
+name = "exact_index_ram"
 harness = false

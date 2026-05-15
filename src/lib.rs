@@ -14,6 +14,7 @@ pub mod core {
     pub mod cdc;
     pub mod cdc_durability;
     pub mod migrate_primary_index;
+    pub mod migrate_exact_index;
     pub mod update;
     pub mod uninstall;
     pub mod vpn;

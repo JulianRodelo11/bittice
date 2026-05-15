@@ -1,30 +1,27 @@
 use std::borrow::Cow;
 use unicode_normalization::{is_nfc, UnicodeNormalization};
 
-/// Returns the canonical byte representation of a primary key string.
+/// Returns the canonical byte representation of a string value.
 ///
 /// Applies Unicode NFC normalization so that strings which are
 /// canonically equivalent (precomposed vs decomposed forms of accented
 /// characters, Hangul syllables, etc.) produce identical byte sequences.
 ///
-/// CONTRACT: This function defines primary key identity in the storage
-/// layer. Any change to its output for the same input requires a full
-/// migration of every primary index on disk. Treat it as a stable wire
-/// format.
+/// Used for both primary key identity (primary_index) and indexed field
+/// values (exact_index). Any change to its output for the same input
+/// requires a full migration of every index on disk. Treat it as a stable
+/// wire format.
 ///
 /// - `Cow::Borrowed` for strings already in NFC avoids allocation in the
 ///   common case (ASCII and most real-world UTF-8).
 /// - NFC, not NFKC: semantic differences are preserved (`①` ≠ `1`,
 ///   `ﬁ` ≠ `fi`). If compatible equivalence is needed later, that is a
 ///   separate function.
-///
-/// This function is not called from anywhere yet. It is the foundation
-/// for the hash-based primary index refactor (Fase 1b+).
-pub fn canonical_bytes(pk: &str) -> Cow<'_, [u8]> {
-    if is_nfc(pk) {
-        Cow::Borrowed(pk.as_bytes())
+pub fn canonical_bytes(s: &str) -> Cow<'_, [u8]> {
+    if is_nfc(s) {
+        Cow::Borrowed(s.as_bytes())
     } else {
-        Cow::Owned(pk.nfc().collect::<String>().into_bytes())
+        Cow::Owned(s.nfc().collect::<String>().into_bytes())
     }
 }
 
@@ -216,5 +213,80 @@ mod tests {
                 "idempotency must hold for long strings"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // (h) Patrones de valores de exact_index (emails, nombres, fechas, números)
+    //
+    // Verifica que los tipos de valores que aparecen en campos indexados de
+    // producción (Email, Apellidos, FechaIngresoPrograma, Cedula) sean
+    // correctamente canónicos. Complementa ascii_no_allocation que no cubre '@'.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exact_index_value_patterns() {
+        // Emails estándar (ASCII puro) → Borrowed, sin alocación.
+        let emails_ascii = [
+            "usuario@ejemplo.com",
+            "user.name+tag@sub.domain.io",
+            "noreply@company.org",
+            "test@test.test",
+        ];
+        for email in &emails_ascii {
+            let result = canonical_bytes(email);
+            assert!(
+                matches!(result, Cow::Borrowed(_)),
+                "ASCII email '{}' must return Borrowed (no alloc)",
+                email
+            );
+        }
+
+        // Fechas ISO y strings numéricos (ASCII) → Borrowed.
+        let ascii_passthrough = ["2025-03-15", "1990-01-01", "12345.67", "0", "9999999999"];
+        for s in &ascii_passthrough {
+            let result = canonical_bytes(s);
+            assert!(
+                matches!(result, Cow::Borrowed(_)),
+                "ASCII-only value '{}' must return Borrowed",
+                s
+            );
+        }
+
+        // Nombres con caracteres latinos compuestos (NFC) → ya NFC → Borrowed.
+        let names_nfc = ["José", "Núñez", "Müller", "García", "Søren"];
+        for name in &names_nfc {
+            let result = canonical_bytes(name);
+            assert!(
+                matches!(result, Cow::Borrowed(_)),
+                "NFC name '{}' must return Borrowed",
+                name
+            );
+        }
+
+        // Los mismos nombres en NFD → deben producir los mismos bytes que NFC.
+        use unicode_normalization::UnicodeNormalization;
+        let names_nfd: Vec<String> = names_nfc.iter().map(|s| s.nfd().collect()).collect();
+        for (nfc, nfd) in names_nfc.iter().zip(names_nfd.iter()) {
+            assert_eq!(
+                canonical_bytes(nfc),
+                canonical_bytes(nfd.as_str()),
+                "NFC and NFD forms of '{}' must canonicalize identically",
+                nfc
+            );
+        }
+
+        // Email con tilde en local-part (NFC) → Borrowed.
+        // Email con tilde en NFD → mismos bytes que NFC.
+        let email_nfc = "caf\u{00e9}@dominio.com";   // café@ (NFC é)
+        let email_nfd = "cafe\u{0301}@dominio.com";   // café@ (NFD é)
+        assert!(
+            matches!(canonical_bytes(email_nfc), Cow::Borrowed(_)),
+            "NFC email must return Borrowed"
+        );
+        assert_eq!(
+            canonical_bytes(email_nfc),
+            canonical_bytes(email_nfd),
+            "NFC and NFD email must canonicalize identically"
+        );
     }
 }

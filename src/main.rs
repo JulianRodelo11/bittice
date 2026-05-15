@@ -117,6 +117,60 @@ async fn main() -> Result<()> {
             Commands::Uninstall => {
                 bittice::core::uninstall::perform_uninstall().await?;
             }
+            Commands::MigrateExactIndex {
+                entity,
+                table,
+                field,
+                all,
+                dry_run,
+                keep_backup,
+                force,
+            } => {
+                if all {
+                    let data_root = bittice::core::data_paths::resolved_data_root();
+                    let results = bittice::core::migrate_exact_index::migrate_all(
+                        &data_root,
+                        dry_run,
+                        keep_backup,
+                        force,
+                    );
+                    if results.iter().any(|r| r.error.is_some()) {
+                        std::process::exit(1);
+                    }
+                } else {
+                    match (entity, table) {
+                        (Some(ent), Some(tbl)) => {
+                            let table_dir =
+                                bittice::core::data_paths::mirror_entity_dir(&ent).join(&tbl);
+                            if !table_dir.exists() {
+                                anyhow::bail!(
+                                    "Directorio de tabla no encontrado: {}",
+                                    table_dir.display()
+                                );
+                            }
+                            let results = bittice::core::migrate_exact_index::migrate_table(
+                                &ent,
+                                &tbl,
+                                &table_dir,
+                                field.as_deref(),
+                                dry_run,
+                                keep_backup,
+                                force,
+                            );
+                            bittice::core::migrate_exact_index::print_table_results(&results);
+                            if results.iter().any(|r| r.error.is_some()) {
+                                std::process::exit(1);
+                            }
+                        }
+                        _ => {
+                            anyhow::bail!(
+                                "Especificar <ENTITY> <TABLE> o usar --all. \
+                                 Ejemplo: bittice migrate-exact-index mi_entity mi_tabla [campo]"
+                            );
+                        }
+                    }
+                }
+            }
             Commands::MigratePrimaryIndex { entity, table, all, dry_run, keep_backup, force } => {
                 if all {
                     let data_root = bittice::core::data_paths::resolved_data_root();

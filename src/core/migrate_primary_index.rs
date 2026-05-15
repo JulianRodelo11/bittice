@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::core::storage::pk::canonical_bytes;
+use crate::core::storage::canonical::canonical_bytes;
 use crate::core::storage::primary_index::PrimaryIndex;
 use crate::core::storage::primary_index_io;
 use xxhash_rust::xxh3::xxh3_128;

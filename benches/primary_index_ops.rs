@@ -1,7 +1,7 @@
 mod common;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use bittice::core::storage::pk::canonical_bytes;
+use bittice::core::storage::canonical::canonical_bytes;
 use bittice::core::storage::primary_index::PrimaryIndex;
 use xxhash_rust::xxh3::xxh3_128;
 

@@ -216,7 +216,7 @@ fn collision_detection_get_row_as_map() {
 #[test]
 fn hash_stability_hardcoded() {
     use xxhash_rust::xxh3::xxh3_128;
-    use bittice::core::storage::pk::canonical_bytes;
+    use bittice::core::storage::canonical::canonical_bytes;
 
     let test_cases: &[(&str, Option<u128>)] = &[
         ("simple_pk", None),   // fill with actual value after first run
@@ -253,7 +253,7 @@ fn hash_stability_hardcoded() {
 #[test]
 fn hash_determinism_across_pk_types() {
     use xxhash_rust::xxh3::xxh3_128;
-    use bittice::core::storage::pk::canonical_bytes;
+    use bittice::core::storage::canonical::canonical_bytes;
 
     let long_pk = "A".repeat(500);
     let pks = vec![

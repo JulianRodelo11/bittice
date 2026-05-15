@@ -95,3 +95,17 @@ pub fn table_sizes_with_large() -> Vec<(&'static str, usize)> {
     }
     sizes
 }
+
+/// Distinct-value counts for exact-index benchmarks.
+pub fn exact_index_sizes() -> Vec<(&'static str, usize)> {
+    let mut sizes = vec![("10k", 10_000), ("100k", 100_000)];
+    if std::env::var("BITTICE_BENCH_LARGE").is_ok() {
+        sizes.push(("1m", 1_000_000));
+    }
+    sizes
+}
+
+/// Build `n` distinct field values for exact-index benchmarks.
+pub fn exact_values(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("status_{:08}", i)).collect()
+}
