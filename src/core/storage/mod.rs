@@ -1,3 +1,7 @@
+pub mod canonical;
+pub mod exact_index;
+pub mod exact_index_io;
+pub mod exact_index_v3;
 pub mod manifest;
 pub mod pk;
 pub mod primary_index;

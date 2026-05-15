@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use super::pk::canonical_bytes;
+use super::canonical::canonical_bytes;
 use super::primary_index::PrimaryIndex;
 use xxhash_rust::xxh3::xxh3_128;
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::pk::canonical_bytes;
+use super::canonical::canonical_bytes;
 use xxhash_rust::xxh3::xxh3_128;
 
 /// Encapsulates the table's primary key index.

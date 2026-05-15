@@ -7,8 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use memmap2::Mmap;
 use anyhow::{Result, Context};
 use roaring::RoaringBitmap;
+use crate::core::storage::canonical::canonical_bytes;
+use crate::core::storage::exact_index::ExactIndex;
+use crate::core::storage::exact_index_io::{
+    load_exact_index as load_exact_index_from_path,
+    save_exact_index as save_exact_index_to_path,
+};
 use crate::core::storage::manifest::Manifest;
-use crate::core::storage::pk::canonical_bytes;
 use crate::core::storage::primary_index::PrimaryIndex;
 use crate::core::storage::primary_index_io;
 use crate::core::storage::segment::{Segment, SegmentWriter};
@@ -18,8 +23,6 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use tracing::{info, debug, warn};
 use unicode_normalization::UnicodeNormalization;
-
-type ExactIndex = HashMap<String, Vec<(u64, RoaringBitmap)>>;
 
 pub struct Table {
     pub name: String,
@@ -1097,15 +1100,13 @@ impl Table {
         // treat empty as "no exact-index match" and fall back to the proper code path
         // (primary_index for PK Eq/IN, scan_segments_parallel for everything else).
         if self.should_skip_exact_index(field) {
-            return Ok(Arc::new(StdRwLock::new(HashMap::new())));
+            return Ok(Arc::new(StdRwLock::new(ExactIndex::new())));
         }
 
         let t = std::time::Instant::now();
         let path = self.exact_index_path(field);
         let index: ExactIndex = if path.exists() {
-            let file = fs::File::open(&path)?;
-            let reader = BufReader::new(file);
-            bincode::deserialize_from(reader)?
+            load_exact_index_from_path(&path)?
         } else {
             self.build_exact_index(field)?
         };
@@ -1135,7 +1136,7 @@ impl Table {
     }
 
     fn build_exact_index(&self, field: &str) -> Result<ExactIndex> {
-        let mut index = HashMap::new();
+        let mut index = ExactIndex::new();
         for segment in &self.immutable_segments {
             let bitmap_path = segment.path.join(format!("bitmaps_{}.dat", field));
             if !bitmap_path.exists() {
@@ -1144,14 +1145,15 @@ impl Table {
             let file = fs::File::open(bitmap_path)?;
             let reader = BufReader::new(file);
             let bitmaps: HashMap<String, RoaringBitmap> = bincode::deserialize_from(reader)?;
-            for (value, bitmap) in bitmaps {
-                if !bitmap.is_empty() {
-                    index.entry(value).or_insert_with(Vec::new).push((segment.id, bitmap));
-                }
-            }
+            let non_empty: HashMap<String, RoaringBitmap> = bitmaps
+                .into_iter()
+                .filter(|(_, b)| !b.is_empty())
+                .collect();
+            index.merge_segment(segment.id, non_empty);
         }
         if let Some(writer) = &self.active_segment {
             if let Some(field_bitmaps) = writer.bitmaps.get(field) {
+                let mut live_bitmaps: HashMap<String, RoaringBitmap> = HashMap::new();
                 for (value, bitmap) in field_bitmaps {
                     if !bitmap.is_empty() {
                         let mut live_bitmap = bitmap.clone();
@@ -1159,27 +1161,19 @@ impl Table {
                             live_bitmap -= &writer.segment.deleted_bitmap;
                         }
                         if !live_bitmap.is_empty() {
-                            index.entry(value.clone()).or_insert_with(Vec::new).push((writer.segment.id, live_bitmap));
+                            live_bitmaps.insert(value.clone(), live_bitmap);
                         }
                     }
                 }
+                index.merge_segment(writer.segment.id, live_bitmaps);
             }
         }
         Ok(index)
     }
 
     fn save_exact_index(&self, field: &str, index: &ExactIndex) -> Result<()> {
-        let dir = self.exact_index_dir();
-        if !dir.exists() {
-            fs::create_dir_all(&dir)?;
-        }
         let path = self.exact_index_path(field);
-        let tmp_path = dir.join(format!("exact_{}.tmp", field));
-        let file = fs::File::create(&tmp_path)?;
-        let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, index)?;
-        fs::rename(tmp_path, path)?;
-        Ok(())
+        save_exact_index_to_path(&path, index)
     }
 
     /// Rewrite every on-disk exact index file removing entries that reference any of the
@@ -1210,14 +1204,8 @@ impl Table {
             }
             let field = name.trim_start_matches("exact_").trim_end_matches(".idx").to_string();
             let path = entry.path();
-            let mut index: ExactIndex = match fs::File::open(&path) {
-                Ok(file) => {
-                    let reader = BufReader::new(file);
-                    match bincode::deserialize_from(reader) {
-                        Ok(i) => i,
-                        Err(_) => continue,
-                    }
-                }
+            let mut index: ExactIndex = match load_exact_index_from_path(&path) {
+                Ok(i) => i,
                 Err(_) => continue,
             };
             let mut changed = false;
@@ -1271,11 +1259,9 @@ impl Table {
                 // segments persisted by previous sessions.  We still avoid writing back here.
                 let path = self.exact_index_path(field);
                 let initial: ExactIndex = if path.exists() {
-                    let file = fs::File::open(&path)?;
-                    let reader = BufReader::new(file);
-                    bincode::deserialize_from(reader).unwrap_or_default()
+                    load_exact_index_from_path(&path).unwrap_or_default()
                 } else {
-                    HashMap::new()
+                    ExactIndex::new()
                 };
                 let new_arc = Arc::new(StdRwLock::new(initial));
                 let mut cache = self.exact_index_cache.write().unwrap();
@@ -1285,11 +1271,12 @@ impl Table {
             // Append in place — O(values touched), not O(index size).  Concurrent readers
             // briefly block on the per-field write lock instead of the whole-cache lock.
             let mut guard = arc.write().unwrap();
-            for (value, bitmap) in values {
-                if !bitmap.is_empty() {
-                    guard.entry(value.clone()).or_insert_with(Vec::new).push((segment_id, bitmap.clone()));
-                }
-            }
+            let non_empty: HashMap<String, RoaringBitmap> = values
+                .iter()
+                .filter(|(_, b)| !b.is_empty())
+                .map(|(v, b)| (v.clone(), b.clone()))
+                .collect();
+            guard.merge_segment(segment_id, non_empty);
         }
 
         Ok(())
