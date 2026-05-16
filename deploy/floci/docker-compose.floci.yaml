@@ -1,0 +1,34 @@
+services:
+  floci:
+    image: floci/floci:latest
+    container_name: floci
+    restart: unless-stopped
+    user: root
+    ports:
+      - "4566:4566"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - floci-data:/app/data
+    environment:
+      FLOCI_DEFAULT_REGION: us-east-1
+
+  bittice:
+    image: ghcr.io/julianrodelo11/bittice:v0.1.93
+    container_name: bittice
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      BITTICE_HOST: 0.0.0.0
+      BITTICE_ENGINE_ONLY: 1
+      BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES: 0
+      BITTICE_CDC_VPN_RESTART_COOLDOWN_SECS: 20
+    volumes:
+      - ../../data:/app/data
+    depends_on:
+      - floci
+
+volumes:
+  floci-data:

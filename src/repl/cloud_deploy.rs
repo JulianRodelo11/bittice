@@ -230,12 +230,20 @@ r#"services:
       - "0.0.0.0:8080:8080"
       - "0.0.0.0:50051:50051"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ip", "link", "show", "tun0"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   bittice:
     image: "{image}"
     container_name: bittice
     network_mode: "service:vpn"
-    depends_on: [vpn]
+    depends_on:
+      vpn:
+        condition: service_healthy
     volumes: ["/opt/bittice/data:/app/data"]
     environment:
       - BITTICE_HOST=0.0.0.0
@@ -243,6 +251,8 @@ r#"services:
       - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=120
       - BITTICE_CDC_VPN_RESTART_COOLDOWN_SECS=20
+      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
+      - BITTICE_SKIP_STARTUP_COMPACT=1
     restart: unless-stopped
 "#
         )

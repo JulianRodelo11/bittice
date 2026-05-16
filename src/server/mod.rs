@@ -248,9 +248,15 @@ pub async fn start_all_servers(
 
     // Compact over-segmented ops tables BEFORE CDC starts — no write-lock contention.
     // Tables are in a stable on-disk state here (no live streaming yet).
-    {
+    // Skip entirely if BITTICE_SKIP_STARTUP_COMPACT=1 (useful on memory-constrained hosts).
+    let skip_compact = std::env::var("BITTICE_SKIP_STARTUP_COMPACT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !skip_compact {
         let tm = table_manager.clone();
         let _ = tokio::task::spawn_blocking(move || compact_startup_ops_tables(&tm)).await;
+    } else {
+        info!("Startup compact: skipped (BITTICE_SKIP_STARTUP_COMPACT=1).");
     }
 
     // --- AUTO-START CDC WORKERS (sequential: HTTP only after each profile signals Phase 4) ---
