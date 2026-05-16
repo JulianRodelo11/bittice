@@ -396,8 +396,9 @@ async fn run_interactive_local_docker_run() -> Result<()> {
 async fn run_deploy_flow() -> Result<()> {
     println!("\x1b[90m│\x1b[0m  \x1b[90mDeploy using the published GHCR Docker image with your local data.\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90mNo build required — pulls the image matching the latest git tag.\x1b[0m");
-    let first: u8 = match select("Deploy (Docker)")
+    let first: u8 = match select("Deploy")
         .item(0u8, "Run Bittice in Docker locally", "")
+        .item(1u8, "Deploy to cloud VM  (AWS / Azure / GCP via Terraform)", "")
         .item(SEL_BACK_MAIN, "« Back to main menu", "")
         .interact()
     {
@@ -410,6 +411,11 @@ async fn run_deploy_flow() -> Result<()> {
     }
     if first == 0u8 {
         run_interactive_local_docker_run().await?;
+    } else if first == 1u8 {
+        if let Err(e) = super::cloud_deploy::run_cloud_deploy_wizard().await {
+            println!("\x1b[90m│\x1b[0m");
+            println!("\x1b[31m✗\x1b[0m  Cloud deploy failed: {e}");
+        }
     }
     let _ = match select("Deploy")
         .item((), "« Back to main menu", "")

@@ -2436,6 +2436,16 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                     .unwrap_or(20),
             );
             let mut last_vpn_restart_attempt: Option<std::time::Instant> = None;
+            // Maximum silence from MySQL before treating the stream as dead (no heartbeats → hung).
+            // MySQL sends Heartbeat_log_event every slave_net_timeout/2 (default 15s). 90s gives
+            // 3 missed heartbeats before declaring the connection stale and restarting Phase 1.
+            let stream_silence_timeout = std::time::Duration::from_secs(
+                std::env::var("BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(90),
+            );
+            let mut last_stream_event = std::time::Instant::now();
             loop {
                 if crate::server::engine_halt_requested() {
                     self.log_info(format!(
@@ -2448,8 +2458,19 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 }
                 let next_item = tokio::select! {
                     biased;
-                    opt = stream.next() => opt,
+                    opt = stream.next() => {
+                        last_stream_event = std::time::Instant::now();
+                        opt
+                    },
                     _ = tokio::time::sleep(CDC_ENGINE_HALT_POLL) => {
+                        if last_stream_event.elapsed() >= stream_silence_timeout {
+                            self.log_warn(format!(
+                                "CDC: Binlog stream silent for {}s (no heartbeats or events) — \
+                                 restarting stream to recover possible dead TCP connection.",
+                                stream_silence_timeout.as_secs()
+                            ));
+                            break; // exit inner loop → 'binlog_retry restarts Phase 1
+                        }
                         if self.exit_after_cdc_ready || state.mvcc_snapshot_catchup_pending {
                             match self.query_master_coordinates_pool(&pool).await {
                                 Ok(Some((mf, mp))) if !mf.is_empty() => {

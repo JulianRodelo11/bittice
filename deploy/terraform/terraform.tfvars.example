@@ -1,0 +1,7 @@
+# Copiar a terraform.tfvars y completar con tus valores
+# cp terraform.tfvars.example terraform.tfvars
+
+aws_region       = "us-east-1"
+instance_type    = "t3.micro"
+ssh_public_key   = "ssh-rsa AAAA..."  # cat ~/.ssh/id_rsa.pub
+allowed_ssh_cidr = "0.0.0.0/0"        # Restringir a tu IP en producción: "1.2.3.4/32"
