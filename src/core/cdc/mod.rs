@@ -2257,6 +2257,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         let mut events_since_save: u32 = 0;
         let mut live_startup_reported = false;
 
+        let mut binlog_retry_count: u32 = 0;
         'binlog_retry: loop {
             if crate::server::engine_halt_requested() {
                 self.log_info(format!(
@@ -2267,6 +2268,11 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 let _ = self.save_state(&state);
                 return Ok(());
             }
+            if binlog_retry_count > 0 {
+                let delay = std::time::Duration::from_secs(3.min(binlog_retry_count) as u64);
+                tokio::time::sleep(delay).await;
+            }
+            binlog_retry_count = binlog_retry_count.saturating_add(1);
             if Self::env_truthy("BITTICE_CDC_LOG_ROW_EVENTS")
                 && !CDC_ROW_TRACE_BANNER_EMITTED.swap(true, Ordering::SeqCst)
             {
@@ -2301,12 +2307,16 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 state.binlog_file, state.binlog_pos
             ));
 
-            let server_id = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                % 100_000) as u32
-                + 1000;
+            // Stable server_id derived from entity name so two profiles on the same MySQL
+            // server never collide. MySQL allows only one replica per server_id; a timestamp-
+            // based id causes the two profiles to kick each other out in a loop.
+            let server_id = {
+                let mut h: u32 = 0x811c9dc5;
+                for b in self.entity.bytes() {
+                    h = h.wrapping_mul(0x01000193) ^ (b as u32);
+                }
+                (h % 90_000) + 10_000 // range [10000, 99999]
+            };
 
             let filename_b = state.binlog_file.as_bytes();
             let pos_u64 = state.binlog_pos as u64;
@@ -2420,6 +2430,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 self.emit_startup_report(CdcStartupOutcome::LiveReplication);
             }
 
+            binlog_retry_count = 0; // stream connected successfully, reset backoff
             let mut repl_caught_up_streak: u32 = 0;
             let health_check_interval = cdc_health_check_interval();
             let mut last_health_check = std::time::Instant::now();
