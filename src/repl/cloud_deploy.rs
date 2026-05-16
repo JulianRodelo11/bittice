@@ -308,8 +308,9 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
     // Install docker-compose if not already present.
     ssh_run(ip, ssh_key,
         "docker compose version 2>/dev/null || \
-         (curl -sSL https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64 \
-          -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose)"
+         docker-compose version 2>/dev/null || \
+         (sudo curl -sSL https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64 \
+          -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose)"
     )?;
 
     // Write docker-compose.yml
