@@ -2758,12 +2758,13 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
             }
 
             self.save_state(&state)?;
-            return self
-                .enter_static_mode(format!(
-                    "CDC: Binlog stream ended unexpectedly for entity '{}'.",
-                    self.entity
-                ))
-                .await;
+            // Stream returned None — TCP connection dropped (e.g. VPN renegotiation).
+            // Restart Phase 1 instead of stopping the engine so CDC recovers automatically.
+            self.log_warn(format!(
+                "CDC: Binlog stream ended unexpectedly for entity '{}' — restarting stream.",
+                self.entity
+            ));
+            continue 'binlog_retry;
         }
     }
 
