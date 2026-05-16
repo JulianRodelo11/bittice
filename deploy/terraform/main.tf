@@ -1,25 +1,6 @@
-resource "aws_iam_role" "bittice" {
-  name = "${var.app_name}-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-    }]
-  })
-  tags = { Name = var.app_name }
-}
-
-resource "aws_iam_role_policy_attachment" "cloudwatch" {
-  role       = aws_iam_role.bittice.name
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-}
-
-resource "aws_iam_instance_profile" "bittice" {
-  name = "${var.app_name}-profile"
-  role = aws_iam_role.bittice.name
-}
+# Use the pre-existing IAM instance profile (created manually — requires iam:CreateRole
+# which is not available to the deploying user). The profile must have
+# CloudWatchAgentServerPolicy attached so the CloudWatch agent can publish metrics.
 
 data "aws_ami" "ubuntu" {
   most_recent = true
@@ -94,7 +75,6 @@ resource "aws_instance" "bittice" {
   instance_type          = var.instance_type
   key_name               = aws_key_pair.bittice.key_name
   vpc_security_group_ids = [aws_security_group.bittice.id]
-  iam_instance_profile   = aws_iam_instance_profile.bittice.name
 
   user_data = <<-EOF
     #!/bin/bash

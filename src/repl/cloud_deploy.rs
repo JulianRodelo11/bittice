@@ -273,19 +273,17 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
         ssh_run(ip, ssh_key, &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"))?;
     }
 
-    // Stop and remove old deployment (systemd VPN + standalone container).
+    // Ensure /opt/bittice is writable by ubuntu and clean up old deployment.
     ssh_run(ip, ssh_key,
-        "sudo systemctl stop 'openvpn@*' 2>/dev/null || true; \
+        "sudo chown -R ubuntu:ubuntu /opt/bittice; \
+         sudo systemctl stop 'openvpn@*' 2>/dev/null || true; \
          sudo systemctl disable 'openvpn@bittice' 2>/dev/null || true; \
          docker rm -f bittice bittice-vpn 2>/dev/null || true; \
-         cd /opt/bittice && docker compose down 2>/dev/null || true"
+         cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true"
     )?;
 
     if vpn_configured {
-        // vpn/ dir already populated by rsync (vpn.conf from .ovpn + up.sh written below).
-        ssh_run(ip, ssh_key,
-            "sudo mkdir -p /opt/bittice/vpn && sudo chown ubuntu:ubuntu /opt/bittice/vpn"
-        )?;
+        ssh_run(ip, ssh_key, "mkdir -p /opt/bittice/vpn")?;
         // Place .ovpn at the path dperson expects: /vpn/vpn.conf
         ssh_run(ip, ssh_key, &format!(
             "cp /opt/bittice/data/vpn/{EC2_OVPN_NAME} /opt/bittice/vpn/vpn.conf"
@@ -297,6 +295,13 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
         ))?;
     }
 
+    // Install docker-compose if not already present.
+    ssh_run(ip, ssh_key,
+        "docker compose version 2>/dev/null || \
+         (curl -sSL https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64 \
+          -o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose)"
+    )?;
+
     // Write docker-compose.yml
     let compose = generate_compose(image, vpn_configured);
     ssh_run(ip, ssh_key, &format!(
@@ -305,7 +310,9 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
 
     // Pull image and start stack.
     ssh_run(ip, ssh_key, &format!("docker pull '{image}'"))?;
-    ssh_run(ip, ssh_key, "cd /opt/bittice && docker compose up -d")?;
+    ssh_run(ip, ssh_key,
+        "cd /opt/bittice && (docker compose up -d 2>/dev/null || docker-compose up -d)"
+    )?;
 
     if vpn_configured {
         // Wait for VPN tunnel inside the sidecar container.
@@ -730,7 +737,9 @@ fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_co
     wait_for_ssh(ip, ssh_priv)?;
 
     let _ = log::step("Syncing data/…");
-    ssh_run(ip, ssh_priv, "sudo mkdir -p /opt/bittice/data && sudo chown ubuntu:ubuntu /opt/bittice/data")?;
+    ssh_run(ip, ssh_priv,
+        "sudo mkdir -p /opt/bittice/data && sudo chown -R ubuntu:ubuntu /opt/bittice"
+    )?;
     rsync_data(data_root, ip, ssh_priv)?;
 
     let _ = log::step(format!("Deploying {image}…"));
