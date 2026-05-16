@@ -2,9 +2,12 @@
 //! Provisions an EC2 instance, syncs data/, and starts the Bittice engine container.
 //!
 //! Terraform is downloaded automatically on first use (~70 MB, cached in ~/.bittice/bin/).
-//! When VPN is needed, OpenVPN runs as a Docker sidecar container that shares its network
-//! namespace with the Bittice container. This mirrors the local experience exactly:
-//! Bittice sees tun0 directly, TCP keepalive works, and VPN reconnects transparently.
+//! When VPN is needed, OpenVPN runs on the EC2 host as a systemd service
+//! (openvpn-client@bittice) with split-tunnel routing: only the configured CIDR (the
+//! network where MySQL lives) flows through tun0; everything else (SSH, REST/gRPC
+//! inbound, image pulls) stays on eth0. Bittice runs in a normal Docker bridge
+//! container with port mappings — VPN reconnects do not move the container's
+//! network around, so inbound traffic is never interrupted.
 
 use anyhow::{bail, Context, Result};
 use cliclack::{input, log, note, select, spinner};
@@ -192,117 +195,105 @@ fn wait_for_ssh(ip: &str, ssh_key: &str) -> Result<()> {
     );
 }
 
-// ── VPN sidecar via docker-compose ────────────────────────────────────────────
+// ── compose generation ────────────────────────────────────────────────────────
 
-/// up.sh injected into the VPN container at /vpn/up.sh.
-/// Runs after every OpenVPN connect/reconnect and sets up conntrack-based
-/// policy routing so incoming gRPC/REST connections reply via eth0, not tun0.
-fn vpn_up_sh() -> &'static str {
-    r#"#!/bin/sh
-IFACE="eth0"
-REAL_GW=$(ip route | awk '/^default/ && /eth0/{print $3; exit}')
-[ -z "$REAL_GW" ] && REAL_GW=$(ip route | awk '/^default/{print $3; exit}')
-
-ip rule add fwmark 1 table 200 pref 100 2>/dev/null || true
-ip route replace default via "$REAL_GW" dev "$IFACE" table 200 2>/dev/null || true
-
-iptables -t mangle -F PREROUTING
-iptables -t mangle -A PREROUTING -i "$IFACE" -m conntrack --ctstate NEW -j CONNMARK --set-mark 1
-iptables -t mangle -A PREROUTING -i "$IFACE" -j CONNMARK --restore-mark
-iptables -t mangle -A OUTPUT -m connmark --mark 1 -j MARK --set-mark 1 2>/dev/null || true
-
-ip route add 169.254.169.254/32 dev "$IFACE" 2>/dev/null || true
-"#
-}
-
-fn generate_compose(image: &str, vpn: bool) -> String {
-    if vpn {
-        format!(
+/// Bittice runs in a normal Docker bridge container regardless of VPN. When VPN is
+/// configured, OpenVPN runs on the host (systemd) with split-tunnel routing, so the
+/// container's outbound traffic to the configured CIDR follows the host's kernel
+/// routing table through tun0 — no namespace sharing, no policy routing dance.
+fn generate_compose(image: &str) -> String {
+    format!(
 r#"services:
-  vpn:
-    image: dperson/openvpn-client:latest
-    container_name: bittice-vpn
-    cap_add: [NET_ADMIN, NET_RAW]
-    devices: ["/dev/net/tun"]
-    volumes: ["/opt/bittice/vpn:/vpn"]
+  bittice:
+    image: "{image}"
+    container_name: bittice
     ports:
       - "0.0.0.0:3000:3000"
       - "0.0.0.0:8080:8080"
       - "0.0.0.0:50051:50051"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "ip", "link", "show", "tun0"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 5s
-
-  bittice:
-    image: "{image}"
-    container_name: bittice
-    network_mode: "service:vpn"
-    depends_on:
-      vpn:
-        condition: service_healthy
     volumes: ["/opt/bittice/data:/app/data"]
     environment:
       - BITTICE_HOST=0.0.0.0
       - BITTICE_ENGINE_ONLY=1
       - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
-      - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=120
-      - BITTICE_CDC_VPN_RESTART_COOLDOWN_SECS=20
-      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
+      - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
+      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=300
       - BITTICE_SKIP_STARTUP_COMPACT=1
     restart: unless-stopped
 "#
-        )
-    } else {
-        format!(
-r#"services:
-  bittice:
-    image: "{image}"
-    container_name: bittice
-    ports:
-      - "0.0.0.0:3000:3000"
-      - "0.0.0.0:8080:8080"
-      - "0.0.0.0:50051:50051"
-    volumes: ["/opt/bittice/data:/app/data"]
-    environment:
-      - BITTICE_HOST=0.0.0.0
-      - BITTICE_ENGINE_ONLY=1
-      - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
-      - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=120
-    restart: unless-stopped
-"#
-        )
-    }
+    )
 }
+
+/// systemd drop-in to force `Restart=always` (the shipped unit defaults to on-failure).
+const SYSTEMD_RESTART_DROPIN: &str = "[Service]\nRestart=always\nRestartSec=5\n";
 
 fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) -> Result<()> {
     if let (Ok(token), Ok(user)) = (std::env::var("GHCR_TOKEN"), std::env::var("GHCR_USER")) {
         ssh_run(ip, ssh_key, &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"))?;
     }
 
-    // Ensure /opt/bittice is writable by ubuntu and clean up old deployment.
+    // Ensure /opt/bittice is writable by ubuntu and clean up old deployment (sidecar
+    // and previous host systemd VPN — both are torn down before re-deploying).
     ssh_run(ip, ssh_key,
         "sudo chown -R ubuntu:ubuntu /opt/bittice; \
-         sudo systemctl stop 'openvpn@*' 2>/dev/null || true; \
-         sudo systemctl disable 'openvpn@bittice' 2>/dev/null || true; \
+         sudo systemctl stop 'openvpn@*' 'openvpn-client@*' 2>/dev/null || true; \
+         sudo systemctl disable 'openvpn@bittice' 'openvpn-client@bittice' 2>/dev/null || true; \
          docker rm -f bittice bittice-vpn 2>/dev/null || true; \
-         cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true"
+         cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true; \
+         sudo rm -rf /opt/bittice/vpn 2>/dev/null || true"
     )?;
 
     if vpn_configured {
-        ssh_run(ip, ssh_key, "mkdir -p /opt/bittice/vpn")?;
-        // Place .ovpn at the path dperson expects: /vpn/vpn.conf
+        // Install OpenVPN host package + place the prepared profile where the
+        // openvpn-client@.service unit expects it.
+        ssh_run(ip, ssh_key,
+            "command -v openvpn >/dev/null 2>&1 || \
+             (sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openvpn)"
+        )?;
         ssh_run(ip, ssh_key, &format!(
-            "cp /opt/bittice/data/vpn/{EC2_OVPN_NAME} /opt/bittice/vpn/vpn.conf"
+            "sudo install -m 0600 /opt/bittice/data/vpn/{EC2_OVPN_NAME} /etc/openvpn/client/bittice.conf"
         ))?;
-        // Write the up.sh with conntrack rules and make it executable.
-        let up_sh = vpn_up_sh();
+        // Drop-in unit override: Restart=always + 5s backoff.
+        let dropin = SYSTEMD_RESTART_DROPIN;
         ssh_run(ip, ssh_key, &format!(
-            "cat > /opt/bittice/vpn/up.sh << 'UPEOF'\n{up_sh}UPEOF\nchmod +x /opt/bittice/vpn/up.sh"
+            "sudo mkdir -p /etc/systemd/system/openvpn-client@bittice.service.d && \
+             sudo tee /etc/systemd/system/openvpn-client@bittice.service.d/override.conf >/dev/null << 'DROPEOF'\n{dropin}DROPEOF\n\
+             sudo systemctl daemon-reload && \
+             sudo systemctl enable --now openvpn-client@bittice.service"
         ))?;
+
+        // Wait for tun0 on the host. systemd starts OpenVPN immediately, but
+        // the tunnel handshake takes a few seconds.
+        const MAX_VPN: u32 = 24;
+        let ws = spinner();
+        ws.start(format!("Waiting for VPN tunnel (tun0 on host)… (1/{MAX_VPN})"));
+        let mut vpn_up = false;
+        for attempt in 1..=MAX_VPN {
+            ws.set_message(format!("Waiting for VPN tunnel (tun0 on host)… ({attempt}/{MAX_VPN})"));
+            let ok = Command::new("ssh")
+                .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                       "-i", ssh_key, &format!("ubuntu@{ip}"),
+                       "ip link show tun0 2>/dev/null"])
+                .stdout(Stdio::null()).stderr(Stdio::null())
+                .status().map(|s| s.success()).unwrap_or(false);
+            if ok { vpn_up = true; break; }
+            if attempt < MAX_VPN {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+        if vpn_up {
+            ws.stop("VPN tunnel established (tun0 up on host).");
+        } else {
+            ws.stop("VPN tunnel not detected after 2 minutes.");
+            let logs = ssh_capture(ip, ssh_key,
+                "sudo journalctl -u openvpn-client@bittice --no-pager -n 30 2>&1");
+            let _ = log::warning(format!(
+                "openvpn-client@bittice logs:\n{logs}\n\n\
+                 To debug: ssh -i {ssh_key} ubuntu@{ip} \
+                 'sudo journalctl -u openvpn-client@bittice -f'"
+            ));
+        }
     }
 
     // Install docker-compose if not already present.
@@ -314,7 +305,7 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
     )?;
 
     // Write docker-compose.yml
-    let compose = generate_compose(image, vpn_configured);
+    let compose = generate_compose(image);
     ssh_run(ip, ssh_key, &format!(
         "cat > /opt/bittice/docker-compose.yml << 'COMPEOF'\n{compose}COMPEOF"
     ))?;
@@ -325,36 +316,6 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
         "cd /opt/bittice && (docker compose up -d 2>/dev/null || docker-compose up -d)"
     )?;
 
-    if vpn_configured {
-        // Wait for VPN tunnel inside the sidecar container.
-        const MAX_VPN: u32 = 24;
-        let ws = spinner();
-        ws.start(format!("Waiting for VPN tunnel (tun0 in sidecar)… (1/{MAX_VPN})"));
-        let mut vpn_up = false;
-        for attempt in 1..=MAX_VPN {
-            ws.set_message(format!("Waiting for VPN tunnel (tun0 in sidecar)… ({attempt}/{MAX_VPN})"));
-            let ok = Command::new("ssh")
-                .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                       "-i", ssh_key, &format!("ubuntu@{ip}"),
-                       "docker exec bittice-vpn ip link show tun0 2>/dev/null"])
-                .stdout(Stdio::null()).stderr(Stdio::null())
-                .status().map(|s| s.success()).unwrap_or(false);
-            if ok { vpn_up = true; break; }
-            if attempt < MAX_VPN {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-            }
-        }
-        if vpn_up {
-            ws.stop("VPN sidecar tunnel established.");
-        } else {
-            ws.stop("VPN tunnel not detected after 2 minutes.");
-            let logs = ssh_capture(ip, ssh_key, "docker logs bittice-vpn --tail 20 2>&1");
-            let _ = log::warning(format!(
-                "VPN sidecar logs:\n{logs}\n\n\
-                 To debug: ssh -i {ssh_key} ubuntu@{ip} 'docker logs bittice-vpn'"
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -382,62 +343,73 @@ fn derive_public_key(private_key_path: &str) -> Result<String> {
 
 // ── VPN setup on EC2 ──────────────────────────────────────────────────────────
 
-fn prepare_ovpn_content(raw: &str) -> String {
-    let mut content = raw.to_string();
+/// Converts "10.0.0.0/8" to ("10.0.0.0", "255.0.0.0") for OpenVPN's classic
+/// `route <network> <netmask>` directive.
+fn cidr_to_route(cidr: &str) -> Result<(String, String)> {
+    let (ip, prefix) = cidr.split_once('/')
+        .with_context(|| format!("CIDR must be in form ip/prefix (got '{cidr}')"))?;
+    let prefix: u32 = prefix.trim().parse()
+        .with_context(|| format!("Invalid CIDR prefix in '{cidr}'"))?;
+    if prefix > 32 { bail!("CIDR prefix must be 0-32 (got /{prefix})"); }
+    let mask: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix) };
+    let netmask = format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff, mask & 0xff,
+    );
+    Ok((ip.trim().to_string(), netmask))
+}
 
-    // Baseline compatibility for cloud instances.
-    // Note: data-ciphers is OpenVPN 2.5+ only; dperson/openvpn-client uses 2.4.x.
-    // Strip it so the sidecar image doesn't reject the config.
-    let lines: Vec<&str> = content.lines()
-        .filter(|l| !l.starts_with("data-ciphers "))
-        .collect();
-    content = lines.join("\n");
+/// Rewrites a raw .ovpn for host-OpenVPN with split-tunnel routing:
+/// only `cidr` flows through tun0 — default route stays on eth0, so Bittice's
+/// inbound REST/gRPC and outbound to the public internet are unaffected.
+fn prepare_ovpn_content(raw: &str, cidr: &str) -> Result<String> {
+    let (route_net, route_mask) = cidr_to_route(cidr)?;
+    let route_line = format!("route {route_net} {route_mask}");
+
+    // Drop any prior route/up directives baked in from a previous prepare or the
+    // raw upstream profile — we'll rewrite them.
+    let mut content: String = raw
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("route ")
+                || t.starts_with("route-nopull")
+                || t == "redirect-gateway def1"
+                || t.starts_with("redirect-gateway ")
+                || t.starts_with("up ")
+                || t.starts_with("up-restart"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     if !content.ends_with('\n') { content.push('\n'); }
 
+    // Baseline compatibility.
     for opt in ["client", "dev tun", "mssfix 1400"] {
         if !content.contains(opt) {
-            if !content.ends_with('\n') { content.push('\n'); }
             content.push_str(opt);
             content.push('\n');
         }
     }
 
-    // keepalive: ping every 10s, reconnect after 60s without response.
-    if !content.contains("keepalive") {
-        if !content.ends_with('\n') { content.push('\n'); }
+    // Stability: keep TCP healthy, never let the server force a tunnel restart.
+    if !content.contains("keepalive ") {
         content.push_str("keepalive 10 60\n");
     }
-
-    // Ignore the server's ping-restart push so the client never does an inactivity restart.
-    // Without this, "ping-restart 120" from the server restarts the tunnel every ~2 minutes
-    // of low traffic, which breaks MySQL TCP connections.
     if !content.contains("pull-filter ignore \"ping-restart\"") {
-        if !content.ends_with('\n') { content.push('\n'); }
         content.push_str("pull-filter ignore \"ping-restart\"\n");
     }
-    // Disable data-channel renegotiation (default every 3600s) which also interrupts traffic.
-    if !content.contains("reneg-sec") {
-        if !content.ends_with('\n') { content.push('\n'); }
+    if !content.contains("reneg-sec ") {
         content.push_str("reneg-sec 0\n");
     }
 
-    // Run the conntrack routing script inside the VPN sidecar container.
-    if !content.contains("up /vpn/up.sh") {
-        if !content.ends_with('\n') { content.push('\n'); }
-        content.push_str("up /vpn/up.sh\n");
-    }
-    // Re-run the up script on every VPN reconnect (required for conntrack rules).
-    if !content.contains("up-restart") {
-        if !content.ends_with('\n') { content.push('\n'); }
-        content.push_str("up-restart\n");
-    }
+    // Split-tunnel: ignore the server's pushed default route; install only the
+    // explicit route to the MySQL CIDR.
+    content.push_str("route-nopull\n");
+    content.push_str(&format!("{route_line}\n"));
 
-    content
+    Ok(content)
 }
 
-/// Installs OpenVPN as a systemd service with Restart=always.
-/// The service is independent of the Bittice container: VPN drop → systemd restarts it,
-/// the EC2 instance stays up, the container keeps running.
 fn ssh_capture(ip: &str, ssh_key: &str, cmd: &str) -> String {
     Command::new("ssh")
         .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
@@ -450,8 +422,8 @@ fn ssh_capture(ip: &str, ssh_key: &str, cmd: &str) -> String {
 // ── .ovpn collection ──────────────────────────────────────────────────────────
 
 async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
-    let _ = log::info("The .ovpn profile runs in a Docker sidecar container that shares its network with Bittice.");
-    let _ = log::info("Bittice sees tun0 directly — identical to local mode. VPN reconnects transparently.");
+    let _ = log::info("OpenVPN will run on the EC2 host (systemd) with split-tunnel routing.");
+    let _ = log::info("Only the configured CIDR (where MySQL lives) goes through tun0; everything else stays on eth0.");
 
     let source: u8 = match select("How do you want to provide the .ovpn file?")
         .item(0u8, "File path on this machine", "")
@@ -500,11 +472,34 @@ async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
     if !raw.contains("client") || !raw.contains("dev") {
         bail!("The content does not look like a valid .ovpn file (missing 'client' or 'dev').");
     }
+
+    // CIDR to route through the tunnel (everything else stays on eth0).
+    let cidr: String = loop {
+        let entered: String = match input("CIDR to route through VPN (network where MySQL lives)")
+            .default_input("10.0.0.0/8")
+            .interact()
+        {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        match cidr_to_route(entered.trim()) {
+            Ok(_) => break entered.trim().to_string(),
+            Err(e) => {
+                let _ = log::warning(format!("Invalid CIDR: {e}. Try again (e.g. 10.0.0.0/8)."));
+            }
+        }
+    };
+
     let vpn_dir = data_root.join("vpn");
     std::fs::create_dir_all(&vpn_dir).context("create data/vpn")?;
     let dest = vpn_dir.join(EC2_OVPN_NAME);
-    std::fs::write(&dest, prepare_ovpn_content(&raw)).context("write .ovpn")?;
-    let _ = log::success(format!("Saved {} (will be rsynced to EC2)", dest.display()));
+    let prepared = prepare_ovpn_content(&raw, &cidr).context("prepare .ovpn content")?;
+    std::fs::write(&dest, prepared).context("write .ovpn")?;
+    let _ = log::success(format!(
+        "Saved {} with split-tunnel route {cidr} (will be rsynced to EC2)",
+        dest.display()
+    ));
     Ok(true)
 }
 
@@ -784,7 +779,9 @@ fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_co
     let _ = log::info(format!("Admin  http://{ip}:8080"));
     let _ = log::info(format!("gRPC   {ip}:50051"));
     if vpn_configured {
-        let _ = log::info(format!("VPN    ssh ubuntu@{ip} 'docker logs -f bittice-vpn'"));
+        let _ = log::info(format!(
+            "VPN    ssh -i {ssh_priv} ubuntu@{ip} 'sudo journalctl -u openvpn-client@bittice -f'"
+        ));
     }
     let _ = log::info(format!("Logs   ssh -i {ssh_priv} ubuntu@{ip} 'docker logs -f bittice'"));
     Ok(())
