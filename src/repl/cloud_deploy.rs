@@ -408,6 +408,19 @@ fn prepare_ovpn_content(raw: &str) -> String {
         content.push_str("keepalive 10 60\n");
     }
 
+    // Ignore the server's ping-restart push so the client never does an inactivity restart.
+    // Without this, "ping-restart 120" from the server restarts the tunnel every ~2 minutes
+    // of low traffic, which breaks MySQL TCP connections.
+    if !content.contains("pull-filter ignore \"ping-restart\"") {
+        if !content.ends_with('\n') { content.push('\n'); }
+        content.push_str("pull-filter ignore \"ping-restart\"\n");
+    }
+    // Disable data-channel renegotiation (default every 3600s) which also interrupts traffic.
+    if !content.contains("reneg-sec") {
+        if !content.ends_with('\n') { content.push('\n'); }
+        content.push_str("reneg-sec 0\n");
+    }
+
     // Run the conntrack routing script inside the VPN sidecar container.
     if !content.contains("up /vpn/up.sh") {
         if !content.ends_with('\n') { content.push('\n'); }
