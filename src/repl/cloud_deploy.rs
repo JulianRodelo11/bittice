@@ -395,11 +395,21 @@ fn generate_compose(image: &str, ident: Option<&EngineIdentity>) -> String {
         ),
         None => String::new(),
     };
+    // Image is always `ghcr.io/.../bittice:stable`. Watchtower polls every 5 min;
+    // when a new release is promoted to :stable by release.yml, it auto-pulls and
+    // restarts the bittice container (env, volumes preserved → CDC resumes from
+    // its saved binlog position, heartbeats reconnect with the same instance token).
+    //
+    // `--label-enable` means Watchtower only touches containers explicitly labeled.
+    // We label `bittice` so it gets updated; we DON'T label `watchtower` itself so
+    // it never tries to update its own process while restarting (would deadlock).
     format!(
 r#"services:
   bittice:
     image: "{image}"
     container_name: bittice
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     ports:
       - "0.0.0.0:3000:3000"
       - "0.0.0.0:8080:8080"
@@ -414,6 +424,18 @@ r#"services:
       - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
       - BITTICE_SKIP_STARTUP_COMPACT=1
 {identity_block}    restart: unless-stopped
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - --interval
+      - "300"
+      - --label-enable
+      - --cleanup
 "#
     )
 }
@@ -954,6 +976,10 @@ fn ensure_ssh_keypair_auto() -> Result<AutoKeypair> {
 
 // ── image detection ───────────────────────────────────────────────────────────
 
+/// Returns the GHCR image reference for the deploy. Always uses the `:stable`
+/// floating tag so customer EC2s with Watchtower auto-pull future releases.
+/// The git tag is still required (sanity-check that the repo has at least one
+/// release published — otherwise `:stable` wouldn't resolve).
 fn detect_image() -> Result<String> {
     let root = super::deploy_pipeline::find_bittice_project_root()
         .ok_or_else(|| anyhow::anyhow!(
@@ -968,10 +994,9 @@ fn detect_image() -> Result<String> {
     if !tag_out.status.success() {
         bail!(
             "No git tags found. Push a release tag first (e.g. git tag v0.1.93 && git push --tags)\n\
-             GitHub Actions will build and publish the Docker image."
+             GitHub Actions will build and publish the Docker image as :stable."
         );
     }
-    let tag = String::from_utf8_lossy(&tag_out.stdout).trim().to_string();
 
     let remote_out = Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -987,7 +1012,7 @@ fn detect_image() -> Result<String> {
         .map(|s| s.trim_end_matches(".git").to_lowercase())
         .ok_or_else(|| anyhow::anyhow!("Unsupported git remote format: {url}"))?;
 
-    Ok(format!("ghcr.io/{repo}:{tag}"))
+    Ok(format!("ghcr.io/{repo}:stable"))
 }
 
 // ── wizard ────────────────────────────────────────────────────────────────────

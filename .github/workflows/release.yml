@@ -232,9 +232,22 @@ jobs:
             BINARY_PATH=bittice-linux-arm64
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-arm64
-      - name: Create Multi-Arch Manifest
+      - name: Create Multi-Arch Manifest (+ promote to :stable for non-beta tags)
         run: |
-          docker buildx imagetools create -t ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }} \
+          # Always publish the immutable version tag (vX.Y.Z, beta-vX.Y.Z, …).
+          # Additionally, for non-beta tags, also point :stable at this build —
+          # that's the moving tag Watchtower-enabled fleet machines poll, so a
+          # successful release auto-rolls out to every customer EC2 within 5 min.
+          EXTRA_TAGS=""
+          if [[ ! "${{ github.ref_name }}" =~ ^(beta-v|alpha-v) ]]; then
+            EXTRA_TAGS="-t ghcr.io/${{ steps.repo.outputs.name }}:stable"
+            echo "→ promoting ${{ github.ref_name }} to :stable"
+          else
+            echo "→ pre-release tag '${{ github.ref_name }}', skipping :stable promotion"
+          fi
+          docker buildx imagetools create \
+            -t ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }} \
+            $EXTRA_TAGS \
             ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-amd64 \
             ghcr.io/${{ steps.repo.outputs.name }}:${{ github.ref_name }}-arm64
 
