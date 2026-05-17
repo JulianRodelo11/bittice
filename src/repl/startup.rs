@@ -12,10 +12,7 @@ use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-use super::deploy_pipeline;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CdcInfo {
@@ -204,72 +201,11 @@ fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_interactive_local_docker_run() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90mRuns the published GHCR image with your local data/ and vpn/ mounted.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mUses the latest git tag to pull the correct image version.\x1b[0m");
-
-    let default_root = deploy_pipeline::find_bittice_project_root()
-        .or_else(|| std::env::current_dir().ok())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
-    let root_s: String = match input("Bittice project root (repo with deploy/)")
-        .default_input(&default_root)
-        .interact()
-    {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let project_root = PathBuf::from(root_s.trim());
-    if !project_root.join("deploy/Dockerfile").is_file() {
-        return Err(anyhow::anyhow!(
-            "Not the Bittice repo root: missing deploy/Dockerfile in {}",
-            project_root.display()
-        ));
-    }
-
-    let entities = list_synced_entities();
-    if entities.is_empty() {
-        println!("\x1b[90m│\x1b[0m");
-        println!("\x1b[33m▲\x1b[0m  \x1b[1mNo synchronized entities found\x1b[0m");
-        println!("\x1b[90m│\x1b[0m  \x1b[90mConnect and sync at least one database before deploying.\x1b[0m");
-        return Ok(());
-    }
-
-    println!("\x1b[90m│\x1b[0m  \x1b[90mIf your sync profile uses VPN, deploy starts an OpenVPN sidecar automatically.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mKeep your host OpenVPN app/session active while Bittice runs in Docker.\x1b[0m");
-
-    let res = tokio::task::spawn_blocking(move || {
-        deploy_pipeline::run_local_docker_container(&project_root)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("join error: {e}"))?;
-    res
-}
-
 async fn run_deploy_flow() -> Result<()> {
-    println!("\x1b[90m│\x1b[0m  \x1b[90mDeploy using the published GHCR Docker image with your local data.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mNo build required — pulls the image matching the latest git tag.\x1b[0m");
-    let first: u8 = match select("Deploy")
-        .item(0u8, "Run Bittice in Docker locally", "")
-        .item(1u8, "Deploy to cloud VM  (AWS / Azure / GCP via Terraform)", "")
-        .item(SEL_BACK_MAIN, "« Back to main menu", "")
-        .interact()
-    {
-        Ok(x) => x,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    if first == SEL_BACK_MAIN {
-        return Ok(());
-    }
-    if first == 0u8 {
-        run_interactive_local_docker_run().await?;
-    } else if first == 1u8 {
-        if let Err(e) = super::cloud_deploy::run_cloud_deploy_wizard().await {
-            println!("\x1b[90m│\x1b[0m");
-            println!("\x1b[31m✗\x1b[0m  Cloud deploy failed: {e}");
-        }
+    println!("\x1b[90m│\x1b[0m  \x1b[90mDeploy to a cloud VM (AWS / Azure / GCP via Terraform).\x1b[0m");
+    if let Err(e) = super::cloud_deploy::run_cloud_deploy_wizard().await {
+        println!("\x1b[90m│\x1b[0m");
+        println!("\x1b[31m✗\x1b[0m  Cloud deploy failed: {e}");
     }
     let _ = match select("Deploy")
         .item((), "« Back to main menu", "")
@@ -377,18 +313,18 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
     let (database, sync_all_databases, entity, tables, scoped_sync) = if sync_mode == 0 {
         let profile: String = interact_or_cancel!({
             let mut p = input("Connection profile name (folder under data/profiles/)")
-                .default_input("_bittice_host");
+                .default_input("bittice_host");
             p.interact()
         });
-        println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. _bittice_host).\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. bittice_host).\x1b[0m");
         (String::new(), true, profile, None, None)
     } else if sync_mode == 3 {
         let profile: String = interact_or_cancel!({
             let mut p = input("Connection profile name (folder under data/profiles/)")
-                .default_input("_bittice_host");
+                .default_input("bittice_host");
             p.interact()
         });
-        println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. _bittice_host).\x1b[0m");
+        println!("\x1b[90m│\x1b[0m  \x1b[90mUse a name that does not match a real MySQL database (e.g. bittice_host).\x1b[0m");
 
         let base_url = format!("mysql://{}:{}@{}:{}/", user, pass, host, port);
         let s = spinner();
@@ -571,7 +507,7 @@ pub async fn run_startup_cliclack() -> Result<()> {
         if synced_ok {
             main_sel = main_sel
                 .item(1u8, "Use Bittice with synced databases", "")
-                .item(2u8, "Deploy (Docker / server bundle)", "");
+                .item(2u8, "Deploy to cloud VM", "");
         }
 
         let exit_id: u8 = if synced_ok { 3 } else { 1 };
