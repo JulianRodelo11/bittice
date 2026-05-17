@@ -74,16 +74,16 @@ resource "aws_security_group" "bittice" {
   }
 }
 
-# When the wizard discovers an RDS in the same account, it passes the RDS's SG
-# here and we open MySQL (3306 by default) from the Bittice EC2's SG. This is
-# how Bittice replaces a VPN tunnel with native AWS networking.
+# For each target RDS the wizard discovered, open inbound MySQL from the
+# Bittice EC2's SG. One rule per target — Bittice replaces VPN with native
+# intra-VPC SG-to-SG networking.
 resource "aws_security_group_rule" "rds_ingress_from_bittice" {
-  count                    = var.target_rds_security_group_id != "" ? 1 : 0
+  count                    = length(var.target_rds_security_group_ids)
   type                     = "ingress"
   from_port                = var.rds_port
   to_port                  = var.rds_port
   protocol                 = "tcp"
-  security_group_id        = var.target_rds_security_group_id
+  security_group_id        = var.target_rds_security_group_ids[count.index]
   source_security_group_id = aws_security_group.bittice.id
   description              = "Bittice CDC binlog stream (managed by ${var.app_name} Terraform)"
 }

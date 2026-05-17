@@ -52,10 +52,10 @@ variable "target_subnet_id" {
   default     = ""
 }
 
-variable "target_rds_security_group_id" {
-  description = "Security group of the target RDS. When set, an inbound rule on 3306 from the Bittice SG is added so CDC can reach MySQL."
-  type        = string
-  default     = ""
+variable "target_rds_security_group_ids" {
+  description = "Security groups of target RDSes (one entry per RDS Bittice mirrors). For each ID, an inbound rule on 3306 from the Bittice SG is added so CDC can reach MySQL."
+  type        = list(string)
+  default     = []
 }
 
 variable "rds_port" {

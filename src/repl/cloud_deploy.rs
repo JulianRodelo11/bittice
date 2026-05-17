@@ -357,14 +357,22 @@ fn ssh_capture(ip: &str, ssh_key: &str, cmd: &str) -> String {
 // VPN, zero tunnel restart problems.
 
 #[derive(Debug, Clone)]
+struct RdsTarget {
+    identifier: String,
+    security_group_id: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone)]
 struct RdsPlacement {
-    rds_identifier: String,
     region: String,
     vpc_id: String,
     subnet_id: String,
-    rds_security_group_id: String,
-    rds_port: u16,
     vpc_cidr: String,
+    /// One entry per RDS the EC2 needs to reach. All must live in `vpc_id` —
+    /// if profiles point at RDSes in different VPCs, the wizard bails because
+    /// Bittice's single SG can only open ingress on SGs in the same VPC.
+    targets: Vec<RdsTarget>,
 }
 
 fn aws_cli_available() -> bool {
@@ -389,10 +397,12 @@ fn aws_json(args: &[&str]) -> Result<serde_json::Value> {
     ))
 }
 
-/// Scans data/profiles/*/cdc_config.json for the first MySQL host matching the
-/// AWS RDS endpoint pattern `<id>.<random>.<region>.rds.amazonaws.com`.
-/// Returns `(db_instance_identifier, region)` so the wizard can pre-fill them.
-fn extract_rds_hint_from_cdc_profiles(data_root: &Path) -> Option<(String, String)> {
+/// Scans every `cdc_config.json` for MySQL hosts matching the AWS RDS endpoint
+/// pattern `<id>.<random>.<region>.rds.amazonaws.com` and returns the unique
+/// `(db_instance_identifier, region)` pairs in profile-scan order. Duplicate
+/// identifiers (e.g. two profiles sharing one RDS) collapse to one entry.
+fn extract_rds_hints_from_cdc_profiles(data_root: &Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     for cfg in crate::core::data_paths::scan_all_cdc_config_paths_in_data_root(data_root) {
         let Ok(txt) = std::fs::read_to_string(&cfg) else { continue };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
@@ -401,9 +411,10 @@ fn extract_rds_hint_from_cdc_profiles(data_root: &Path) -> Option<(String, Strin
         if !host.ends_with(".rds.amazonaws.com") { continue; }
         let parts: Vec<&str> = host.split('.').collect();
         if parts.len() < 6 { continue; }
-        return Some((parts[0].to_string(), parts[2].to_string()));
+        let pair = (parts[0].to_string(), parts[2].to_string());
+        if !out.contains(&pair) { out.push(pair); }
     }
-    None
+    out
 }
 
 /// Returns `(vpc_id, port, primary_sg_id)` for the RDS instance.
@@ -467,18 +478,18 @@ fn get_vpc_cidr(vpc_id: &str, region: &str) -> Result<String> {
         .with_context(|| format!("CidrBlock not found for VPC {vpc_id}"))
 }
 
-/// Full discovery: from a guessed identifier/region, returns everything Terraform
-/// needs to place the EC2 in the RDS's VPC. Prompts the user to pick a public
-/// subnet when the VPC has more than one.
-async fn discover_rds_placement(
-    rds_identifier_hint: Option<String>,
-    region_hint: Option<String>,
-) -> Result<RdsPlacement> {
-    if !aws_cli_available() {
-        bail!("aws CLI not installed — install from https://aws.amazon.com/cli/ and run `aws configure`");
-    }
-    let raw_id: String = match input("RDS instance identifier (not the endpoint hostname)")
-        .default_input(rds_identifier_hint.as_deref().unwrap_or(""))
+/// Prompt for one RDS identifier (with a hint as default) and query AWS for it.
+/// Returns the target plus the VPC and region it lives in.
+async fn prompt_and_describe_one_rds(
+    hint: Option<&(String, String)>,
+    forced_region: Option<&str>,
+    nth_label: &str,
+) -> Result<(RdsTarget, String, String)> {
+    let id_hint = hint.map(|(i, _)| i.as_str()).unwrap_or("");
+    let raw_id: String = match input(format!(
+            "RDS instance identifier {nth_label} (not the endpoint hostname)"
+        ))
+        .default_input(id_hint)
         .interact()
     {
         Ok(s) => s,
@@ -488,23 +499,79 @@ async fn discover_rds_placement(
     let identifier = raw_id.trim().to_string();
     if identifier.is_empty() { bail!("RDS identifier is required"); }
 
-    let raw_region: String = match input("AWS region of that RDS")
-        .default_input(region_hint.as_deref().unwrap_or("us-east-1"))
-        .interact()
-    {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => bail!("cancelled"),
-        Err(e) => return Err(e.into()),
+    let region = if let Some(r) = forced_region {
+        r.to_string()
+    } else {
+        let raw: String = match input("AWS region of that RDS")
+            .default_input(hint.map(|(_, r)| r.as_str()).unwrap_or("us-east-1"))
+            .interact()
+        {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => bail!("cancelled"),
+            Err(e) => return Err(e.into()),
+        };
+        raw.trim().to_string()
     };
-    let region = raw_region.trim().to_string();
 
     let s = spinner();
     s.start(format!("Querying RDS '{identifier}' in {region}…"));
-    let (vpc_id, rds_port, rds_sg_id) = match describe_rds(&identifier, &region) {
-        Ok(v) => { s.stop(format!("RDS found in VPC {}.", v.0)); v }
+    let (vpc_id, port, sg_id) = match describe_rds(&identifier, &region) {
+        Ok(v) => { s.stop(format!("RDS '{identifier}' in VPC {} (port {}).", v.0, v.1)); v }
         Err(e) => { s.stop("RDS lookup failed."); return Err(e); }
     };
 
+    Ok((RdsTarget { identifier, security_group_id: sg_id, port }, vpc_id, region))
+}
+
+/// Full discovery: iterates all RDS hints from CDC profiles, prompts for each,
+/// validates they all live in the same VPC, then picks one public subnet for
+/// the Bittice EC2. The Terraform plan ends up opening MySQL ingress from
+/// Bittice's SG to every RDS SG returned here.
+async fn discover_rds_placement(hints: Vec<(String, String)>) -> Result<RdsPlacement> {
+    if !aws_cli_available() {
+        bail!("aws CLI not installed — install from https://aws.amazon.com/cli/ and run `aws configure`");
+    }
+
+    // No hints = wizard runs blind, ask the user for at least one identifier.
+    let effective: Vec<Option<(String, String)>> = if hints.is_empty() {
+        vec![None]
+    } else {
+        let _ = log::info(format!(
+            "Detected {} RDS target(s) in your sync profiles — confirm each below (Enter to accept).",
+            hints.len()
+        ));
+        hints.into_iter().map(Some).collect()
+    };
+    let total = effective.len();
+
+    // First RDS decides the region + VPC; every subsequent one must match.
+    let mut targets: Vec<RdsTarget> = Vec::with_capacity(total);
+    let mut region: String = String::new();
+    let mut vpc_id: String = String::new();
+
+    for (i, hint) in effective.iter().enumerate() {
+        let label = if total > 1 { format!("({}/{})", i + 1, total) } else { String::new() };
+        let forced_region = if i == 0 { None } else { Some(region.as_str()) };
+        let (tgt, this_vpc, this_region) =
+            prompt_and_describe_one_rds(hint.as_ref(), forced_region, &label).await?;
+
+        if i == 0 {
+            region = this_region;
+            vpc_id = this_vpc;
+        } else if this_vpc != vpc_id {
+            bail!(
+                "RDS '{}' lives in {this_vpc}, but the first RDS is in {vpc_id}.\n\
+                 A single Bittice EC2 can only reach RDSes in one VPC. To cover both:\n\
+                 • Set up VPC peering between {vpc_id} and {this_vpc}, OR\n\
+                 • Run a separate Bittice deployment per VPC (one entity per deploy).",
+                tgt.identifier
+            );
+        }
+
+        targets.push(tgt);
+    }
+
+    // Pick a public subnet in the shared VPC.
     let s = spinner();
     s.start(format!("Listing public subnets in {vpc_id}…"));
     let publics = match find_public_subnets(&vpc_id, &region) {
@@ -552,15 +619,7 @@ async fn discover_rds_placement(
         Err(e) => { s.stop("VPC CIDR lookup failed."); return Err(e); }
     };
 
-    Ok(RdsPlacement {
-        rds_identifier: identifier,
-        region,
-        vpc_id,
-        subnet_id,
-        rds_security_group_id: rds_sg_id,
-        rds_port,
-        vpc_cidr,
-    })
+    Ok(RdsPlacement { region, vpc_id, subnet_id, vpc_cidr, targets })
 }
 
 // ── SSH key auto-generation (no .pem required in AWS-managed mode) ──────────
@@ -672,13 +731,22 @@ fn build_tfvars(
          app_name       = \"{app_name}\"\n"
     );
     if let Some(p) = placement {
+        // RDS ingress rules: one per target SG. Terraform iterates the list with
+        // count, so each target gets its own aws_security_group_rule resource.
+        let sg_list = p.targets.iter()
+            .map(|t| format!("\"{}\"", t.security_group_id))
+            .collect::<Vec<_>>().join(", ");
+        // Different targets can technically have different MySQL ports; in
+        // practice they don't, so we use the first target's port for the
+        // single `rds_port` Terraform var. (Common pattern: all RDS on 3306.)
+        let rds_port = p.targets.first().map(|t| t.port).unwrap_or(3306);
         s.push_str(&format!(
-            "target_vpc_id                = \"{}\"\n\
-             target_subnet_id             = \"{}\"\n\
-             target_rds_security_group_id = \"{}\"\n\
-             rds_port                     = {}\n\
-             allowed_admin_cidr           = \"{}\"\n",
-            p.vpc_id, p.subnet_id, p.rds_security_group_id, p.rds_port, p.vpc_cidr,
+            "target_vpc_id                  = \"{}\"\n\
+             target_subnet_id               = \"{}\"\n\
+             target_rds_security_group_ids  = [{}]\n\
+             rds_port                       = {}\n\
+             allowed_admin_cidr             = \"{}\"\n",
+            p.vpc_id, p.subnet_id, sg_list, rds_port, p.vpc_cidr,
         ));
     }
     s
@@ -748,22 +816,11 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
 
     let tf_dir = crate::core::data_paths::resolved_data_root().join("terraform");
     let data_root = crate::core::data_paths::resolved_data_root();
-    let has_state = tf_dir.join("terraform.tfstate").is_file();
-
-    if has_state {
-        let _ = log::info("Found existing Terraform state.");
-        let action: u8 = match select("What do you want to do?")
-            .item(0u8, "Deploy latest image to existing VM", "skip terraform apply")
-            .item(1u8, "Re-provision infrastructure + deploy", "runs terraform apply again")
-            .item(255u8, "« Back", "")
-            .interact()
-        {
-            Ok(x) => x,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        if action == 255 { return Ok(()); }
-        if action == 0 { return deploy_to_existing(&tf_bin, &tf_dir, &data_root, &image).await; }
+    if tf_dir.join("terraform.tfstate").is_file() {
+        let _ = log::info(
+            "Found existing Terraform state — `terraform apply` will reconcile it (idempotent: \
+             unchanged resources stay; only diffs apply)."
+        );
     }
 
     // ── RDS discovery (mandatory) ─────────────────────────────────────────────
@@ -779,9 +836,8 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
              VPC and place Bittice in the same network."
         );
     }
-    let (hint_id, hint_region) = extract_rds_hint_from_cdc_profiles(&data_root)
-        .map(|(i, r)| (Some(i), Some(r))).unwrap_or((None, None));
-    let placement: RdsPlacement = discover_rds_placement(hint_id, hint_region).await?;
+    let hints = extract_rds_hints_from_cdc_profiles(&data_root);
+    let placement: RdsPlacement = discover_rds_placement(hints).await?;
 
     // ── region (always pinned to the RDS's region) ──
     let region: String = {
@@ -836,14 +892,17 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
          • AmazonEC2FullAccess\n\
          • AmazonRDSReadOnlyAccess\n\n\
          These give discovery (rds:DescribeDBInstances, ec2:Describe*), provisioning (EC2/SG/EIP/KeyPair), \
-         and the one cross-resource action that replaces the VPN: AuthorizeSecurityGroupIngress on the \
-         RDS SG (lets Bittice's SG talk to MySQL inside the VPC)."
+         and the cross-resource action that replaces the VPN: AuthorizeSecurityGroupIngress on each \
+         target RDS SG (lets Bittice's SG talk to MySQL inside the VPC)."
     );
 
     // ── confirm ──
+    let rds_list = placement.targets.iter()
+        .map(|t| format!("{}:{}", t.identifier, t.port))
+        .collect::<Vec<_>>().join(", ");
     let summary = format!(
-        "(name: {app_name}, region: {}, VM: {instance_type}, VPC: {} same as RDS {}:{})",
-        placement.region, placement.vpc_id, placement.rds_identifier, placement.rds_port
+        "(name: {app_name}, region: {}, VM: {instance_type}, VPC: {} → RDS [{rds_list}])",
+        placement.region, placement.vpc_id
     );
     let go: u8 = match select(format!("Create AWS resources? {summary}"))
         .item(0u8, "Yes — provision and deploy", "")
@@ -876,31 +935,6 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     let _ = log::success(format!("EC2 Elastic IP: {ip}"));
 
     finish_deploy(&ip, &ssh_priv, &image, &data_root)
-}
-
-async fn deploy_to_existing(
-    tf_bin: &Path, tf_dir: &PathBuf, data_root: &PathBuf, image: &str,
-) -> Result<()> {
-    let ip = terraform_output(tf_bin, tf_dir, "public_ip")?;
-    let _ = log::success(format!("EC2 IP: {ip}"));
-
-    // Prefer the auto-managed key (this is how every same-account deploy is
-    // provisioned now); fall back to ~/.ssh/id_rsa only if it's missing.
-    let home = home_dir().unwrap_or_else(|| "~".into());
-    let auto_key = format!("{home}/.bittice/ssh/bittice_id_ed25519");
-    let default_priv = if std::path::Path::new(&auto_key).is_file() {
-        auto_key
-    } else {
-        format!("{home}/.ssh/id_rsa")
-    };
-    let _ = log::info("Provide the same private key used when provisioning this instance.");
-    let ssh_priv: String = match input("SSH private key path").default_input(&default_priv).interact() {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-
-    finish_deploy(&ip, ssh_priv.trim(), image, data_root)
 }
 
 fn finish_deploy(
