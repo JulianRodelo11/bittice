@@ -51,6 +51,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          # Windows post-job cache save often fails (tar/zstd, disk, 10GB limit).
+          # Restore still works; other matrix jobs populate the shared registry cache.
+          save-if: ${{ runner.os != 'Windows' }}
 
       - name: Build Binary
         shell: bash
