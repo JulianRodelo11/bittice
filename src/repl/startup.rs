@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
 use crate::core::cdc::CdcWorker;
-use crate::core::vpn::VpnManager;
-use tracing::{info, warn};
+use tracing::warn;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 #[cfg(unix)]
@@ -36,7 +35,6 @@ struct CdcInfo {
     #[serde(default)]
     scoped_sync: Option<HashMap<String, Vec<String>>>,
     entity: String,
-    vpn_file: Option<String>,
 }
 
 enum WizardOutcome {
@@ -203,150 +201,6 @@ fn save_cdc_config(info: &CdcInfo) -> anyhow::Result<()> {
     }
     let json = serde_json::to_string_pretty(info)?;
     std::fs::write(path, json)?;
-    Ok(())
-}
-
-fn list_available_ovpn_configs(vpn_storage: &std::path::Path) -> Vec<String> {
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(vpn_storage) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".ovpn") {
-                    files.push(name);
-                }
-            }
-        }
-    }
-    files.sort();
-    files
-}
-
-/// Persists a user's .ovpn (path, http(s) URL, or pasted content) into `vpn_storage`.
-/// Returns the path string of the stored file (for `cdc_config` or logs).
-async fn copy_ovpn_input_to_vpn_storage(
-    input_val: &str,
-    vpn_storage: &std::path::Path,
-) -> Result<String> {
-    if input_val.is_empty() {
-        return Err(anyhow::anyhow!("VPN configuration cannot be empty."));
-    }
-
-    if input_val.starts_with("http://") || input_val.starts_with("https://") {
-        let s = spinner();
-        s.start("Downloading VPN configuration...");
-        let response = reqwest::get(input_val).await?;
-        let bytes = response.bytes().await?;
-        let file_name = input_val.split('/').last().unwrap_or("downloaded.ovpn");
-        let dest_path = vpn_storage.join(file_name);
-        std::fs::write(&dest_path, bytes)?;
-        let final_vpn_path = dest_path.to_string_lossy().to_string();
-        s.stop("✓ Download complete.");
-        return Ok(final_vpn_path);
-    }
-
-    if input_val.contains("client") && input_val.contains("dev") {
-        let dest_path = vpn_storage.join("pasted_config.ovpn");
-        std::fs::write(&dest_path, input_val)?;
-        info!("Using pasted VPN configuration.");
-        return Ok(dest_path.to_string_lossy().to_string());
-    }
-
-    let normalized_input = input_val.replace("\\", "/");
-    let parts: Vec<&str> = normalized_input
-        .split('/')
-        .filter(|s: &&str| !s.is_empty())
-        .collect();
-
-    let mut found_path = None;
-    if std::path::Path::new(input_val).exists() {
-        found_path = Some(input_val.to_string());
-    } else {
-        let is_linux = cfg!(target_os = "linux");
-        if is_linux
-            && (input_val.starts_with("/Users/")
-                || input_val.starts_with("C:\\")
-                || input_val.starts_with("/home/"))
-        {
-            return Err(anyhow::anyhow!(
-                "Path Error: You are using a local machine path ('{}') on a cloud Linux instance.\n\n1. Open the .ovpn on your computer.\n2. Copy the full text.\n3. Paste it here.",
-                input_val
-            ));
-        }
-
-        for i in 0..parts.len() {
-            let sub_path = parts[i..].join("/");
-            let candidate = format!("/app/host_home/{}", sub_path);
-            if std::path::Path::new(&candidate).exists() {
-                found_path = Some(candidate);
-                break;
-            }
-        }
-    }
-
-    let final_path_to_copy = found_path.ok_or_else(|| {
-        anyhow::anyhow!(
-            "File not found at: {}.\n- Ensure the path is valid, or paste the .ovpn text (must include client and dev).",
-            input_val
-        )
-    })?;
-
-    let path = std::path::Path::new(&final_path_to_copy);
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
-    let dest_path = vpn_storage.join(file_name);
-    if path != dest_path {
-        std::fs::copy(path, &dest_path)
-            .map_err(|e| anyhow::anyhow!("Failed to copy VPN file: {}", e))?;
-    }
-    Ok(dest_path.to_string_lossy().to_string())
-}
-
-/// Browse folders (cliclack `select`) or type path / URL / pasted `.ovpn` text.
-async fn read_ovpn_source_interactive() -> io::Result<String> {
-    // Hints stay empty: long (hint) text breaks line-wrap alignment with the frame bar in cliclack.
-    println!("\x1b[90m│\x1b[0m  \x1b[90mBrowse: type to filter; pick a file or “text input” at the bottom.\x1b[0m");
-    let how: u8 = match select("How do you want to add the OpenVPN file?")
-        .item(0u8, "Browse folders and pick an .ovpn", "")
-        .item(1u8, "Type path, URL, or paste .ovpn text", "")
-        .interact()
-    {
-        Ok(x) => x,
-        Err(e) => return Err(e),
-    };
-
-    if how == 0u8 {
-        match super::ovpn_picker::browse_for_ovpn_path() {
-            Ok(Some(s)) => return Ok(s),
-            Ok(None) => {}
-            Err(e) => return Err(e),
-        }
-    }
-
-    match input("OpenVPN: path, http(s) URL, or full .ovpn text")
-        .placeholder("/path/file.ovpn or https://... ")
-        .interact()
-    {
-        Ok(s) => Ok(s),
-        Err(e) => Err(e),
-    }
-}
-
-/// Add an .ovpn for later Docker / export-server-bundle; does not start OpenVPN.
-#[allow(dead_code)]
-async fn add_ovpn_profile_to_storage_for_deploy() -> Result<()> {
-    let vpn_storage = VpnManager::storage_dir();
-    std::fs::create_dir_all(&vpn_storage)?;
-    println!("\x1b[90m│\x1b[0m  \x1b[90mOnly needed when a sync profile has OpenVPN (`vpn_file` in cdc_config); skip if RDS/MySQL is reachable directly from EC2.\x1b[0m");
-    println!("\x1b[90m│\x1b[0m  \x1b[90mStores under {} — shipped as ./vpn on EC2 and under data/vpn via rsync.\x1b[0m", vpn_storage.display());
-    let input_val: String = match read_ovpn_source_interactive().await {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let saved = copy_ovpn_input_to_vpn_storage(&input_val, &vpn_storage).await?;
-    println!("\x1b[32m◆\x1b[0m  Saved OpenVPN profile: \x1b[1m{}\x1b[0m", saved);
     Ok(())
 }
 
@@ -612,110 +466,10 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         (database, false, entity, tables, None)
     };
 
-    let is_docker_container = std::path::Path::new("/.dockerenv").exists();
-    let is_cloud_env = is_docker_container;
-
-    let use_vpn: bool = if is_docker_container {
-        let v: u8 = interact_or_cancel!({
-            select("Use internal VPN for database connection?")
-                .item(0u8, "Yes", "")
-                .item(1u8, "No", "")
-                .item(SEL_BACK_MAIN, "« Back to main menu", "")
-                .interact()
-        });
-        match v {
-            SEL_BACK_MAIN => return Ok(WizardOutcome::Cancelled),
-            0 => true,
-            _ => false,
-        }
-    } else {
-        false
-    };
-
-    let mut vpn_file = None;
-    if use_vpn {
-        let vpn_provider: u8 = interact_or_cancel!({
-            select("Select VPN provider")
-                .item(0u8, "OpenVPN", "")
-                .item(1u8, "My provider is not listed", "")
-                .item(SEL_BACK_MAIN, "« Back to main menu", "")
-                .interact()
-        });
-
-        if vpn_provider == SEL_BACK_MAIN {
-            return Ok(WizardOutcome::Cancelled);
-        }
-
-        if vpn_provider == 1 {
-            println!("\x1b[90m│\x1b[0m");
-            println!("\x1b[33m▲\x1b[0m  \x1b[1mProvider not yet supported\x1b[0m");
-            println!("\x1b[90m│\x1b[0m  \x1b[90mCurrently we only support OpenVPN. Please contact support to add your provider.\x1b[0m");
-            println!("\x1b[90m│\x1b[0m");
-            return Ok(WizardOutcome::Cancelled);
-        }
-
-        let vpn_storage = crate::core::vpn::VpnManager::storage_dir();
-        std::fs::create_dir_all(&vpn_storage)?;
-        let available_configs = list_available_ovpn_configs(&vpn_storage);
-
-        let input_val = if is_cloud_env {
-            if available_configs.is_empty() {
-                println!("\x1b[34m│\x1b[0m");
-                println!("\x1b[33m▲\x1b[0m  \x1b[1mNo uploaded VPN configs found\x1b[0m");
-                println!("\x1b[90m│\x1b[0m  \x1b[90mUpload your .ovpn file to {} and run setup again.\x1b[0m", vpn_storage.display());
-                println!("\x1b[90m│\x1b[0m  \x1b[90mExample: scp -i key.pem my-vpn.ovpn ec2-user@<ip>:{}/\x1b[0m", vpn_storage.display());
-                return Ok(WizardOutcome::Cancelled);
-            }
-
-            let back_idx = available_configs.len();
-            let mut picker = select("Select the uploaded OpenVPN config");
-            for (i, file) in available_configs.iter().enumerate() {
-                let label = if file.chars().count() > 48 {
-                    format!("{}…", file.chars().take(47).collect::<String>())
-                } else {
-                    file.clone()
-                };
-                picker = picker.item(i, label, "");
-            }
-            picker = picker.item(back_idx, "« Back to main menu", "");
-            let chosen_idx: usize = interact_or_cancel!({ picker.interact() });
-            if chosen_idx == back_idx {
-                return Ok(WizardOutcome::Cancelled);
-            }
-            vpn_storage.join(&available_configs[chosen_idx]).to_string_lossy().to_string()
-        } else {
-            match read_ovpn_source_interactive().await {
-                Ok(s) => s,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    return Ok(WizardOutcome::Cancelled);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
-
-        let final_vpn_path: String = copy_ovpn_input_to_vpn_storage(&input_val, &vpn_storage).await?;
-
-        if !VpnManager::is_installed() {
-            let install_vpn: u8 = interact_or_cancel!({
-                select("OpenVPN is not installed. Install it now?")
-                    .item(0u8, "Yes (needs sudo for apt)", "")
-                    .item(1u8, "No", "")
-                    .item(SEL_BACK_MAIN, "« Back to main menu", "")
-                    .interact()
-            });
-
-            match install_vpn {
-                SEL_BACK_MAIN => return Ok(WizardOutcome::Cancelled),
-                0 => VpnManager::install()?,
-                _ => return Err(anyhow::anyhow!("OpenVPN is required for this connection.")),
-            }
-        }
-
-        let prepared_path = VpnManager::prepare_ovpn_file(&final_vpn_path, &host)?;
-        VpnManager::start(&prepared_path)?;
-        vpn_file = Some(final_vpn_path);
-    }
-
+    // VPN is no longer a Bittice concern. Cloud deploy places the EC2 in the same
+    // VPC as the target RDS (no tunnel needed). For local development, users
+    // connect via their OS's native OpenVPN client before running Bittice — we
+    // don't auto-start or manage tunnels anymore.
     let cdc_info = CdcInfo {
         host,
         port,
@@ -726,7 +480,6 @@ async fn run_connect_wizard() -> Result<WizardOutcome> {
         tables,
         scoped_sync,
         entity,
-        vpn_file,
     };
 
     let _ = save_cdc_config(&cdc_info);

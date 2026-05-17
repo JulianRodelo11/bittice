@@ -1,9 +1,12 @@
 //! Interactive cloud-VM deploy via Terraform.
-//! Provisions an EC2 instance, syncs data/, and starts the Bittice engine container.
+//!
+//! Provisions an EC2 instance in the same VPC as the user's target RDS, so CDC
+//! reaches MySQL natively through AWS internal networking. No VPN, no tunnels —
+//! the wizard discovers VPC/subnet/SG via `aws rds describe-db-instances` and
+//! Terraform places everything (EC2, SG, EIP, key pair) plus a single inbound
+//! rule on the RDS SG that allows the new EC2 to reach MySQL on port 3306.
 //!
 //! Terraform is downloaded automatically on first use (~70 MB, cached in ~/.bittice/bin/).
-//! When sync profiles reference `vpn_file`, deploy auto-starts an OpenVPN Docker sidecar
-//! (same stack as `deploy/docker-compose.local.yaml`) and waits until CDC reaches Phase 4.
 
 use anyhow::{bail, Context, Result};
 use cliclack::{input, log, note, select, spinner};
@@ -18,7 +21,6 @@ const TF_MAIN: &str = include_str!("../../deploy/terraform/main.tf");
 const TF_OUTPUTS: &str = include_str!("../../deploy/terraform/outputs.tf");
 
 const TERRAFORM_VERSION: &str = "1.9.8";
-const EC2_OVPN_NAME: &str = crate::core::data_paths::DEPLOY_OVPN_NAME;
 
 // ── terraform auto-download ───────────────────────────────────────────────────
 
@@ -211,56 +213,10 @@ fn wait_for_ssh(ip: &str, ssh_key: &str) -> Result<()> {
 
 // ── compose generation ────────────────────────────────────────────────────────
 
-const DEFAULT_VPN_CIDRS: &str = "10.0.0.0/8,172.31.0.0/16";
-
-/// When VPN is required, OpenVPN runs in a sidecar (`network_mode: service:vpn`) — same
-/// layout as `deploy/docker-compose.local.yaml`, fully automated on `compose up`.
-fn generate_compose(image: &str, with_vpn: bool) -> String {
-    let bittice_env = r#"      - BITTICE_HOST=0.0.0.0
-      - BITTICE_ENGINE_ONLY=1
-      - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
-      - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
-      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
-      - BITTICE_SKIP_STARTUP_COMPACT=1"#;
-
-    if with_vpn {
-        return format!(
-r#"services:
-  vpn:
-    image: dperson/openvpn-client:latest
-    container_name: bittice-vpn
-    cap_add: [NET_ADMIN, NET_RAW]
-    devices: ["/dev/net/tun"]
-    volumes:
-      - /opt/bittice/data/vpn:/vpn
-    ports:
-      - "0.0.0.0:3000:3000"
-      - "0.0.0.0:8080:8080"
-      - "0.0.0.0:50051:50051"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "ip", "link", "show", "tun0"]
-      interval: 5s
-      timeout: 3s
-      retries: 24
-      start_period: 15s
-
-  bittice:
-    image: "{image}"
-    container_name: bittice
-    network_mode: "service:vpn"
-    depends_on:
-      vpn:
-        condition: service_healthy
-    volumes:
-      - /opt/bittice/data:/app/data
-    environment:
-{bittice_env}
-    restart: unless-stopped
-"#
-        );
-    }
-
+/// Bittice runs as a plain docker bridge container. EC2 lives in the same VPC as
+/// the target RDS (placed there by Terraform), so CDC reaches MySQL through AWS
+/// internal networking — no VPN, no sidecar, no policy routing.
+fn generate_compose(image: &str) -> String {
     format!(
 r#"services:
   bittice:
@@ -273,18 +229,24 @@ r#"services:
     volumes:
       - /opt/bittice/data:/app/data
     environment:
-{bittice_env}
+      - BITTICE_HOST=0.0.0.0
+      - BITTICE_ENGINE_ONLY=1
+      - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
+      - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
+      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
+      - BITTICE_SKIP_STARTUP_COMPACT=1
     restart: unless-stopped
 "#
     )
 }
 
-fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) -> Result<()> {
+fn deploy_compose(ip: &str, ssh_key: &str, image: &str) -> Result<()> {
     if let (Ok(token), Ok(user)) = (std::env::var("GHCR_TOKEN"), std::env::var("GHCR_USER")) {
         ssh_run(ip, ssh_key, &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"))?;
     }
 
-    // Tear down previous stack (host systemd VPN from older deploys included).
+    // Tear down previous stack. The systemctl/docker rm of legacy VPN units is
+    // kept so re-deploys on top of an older VPN-era EC2 do a clean cutover.
     ssh_run(ip, ssh_key,
         "sudo chown -R ubuntu:ubuntu /opt/bittice; \
          sudo systemctl stop 'openvpn@*' 'openvpn-client@*' 2>/dev/null || true; \
@@ -292,13 +254,6 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
          docker rm -f bittice bittice-vpn 2>/dev/null || true; \
          cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true"
     )?;
-
-    if vpn_configured {
-        ssh_run(ip, ssh_key, &format!(
-            "test -f /opt/bittice/data/vpn/{EC2_OVPN_NAME} || (echo 'missing {EC2_OVPN_NAME} under data/vpn' >&2; exit 1); \
-             cp /opt/bittice/data/vpn/{EC2_OVPN_NAME} /opt/bittice/data/vpn/vpn.conf"
-        ))?;
-    }
 
     // Install docker-compose if not already present.
     ssh_run(ip, ssh_key,
@@ -309,7 +264,7 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
     )?;
 
     // Write docker-compose.yml
-    let compose = generate_compose(image, vpn_configured);
+    let compose = generate_compose(image);
     ssh_run(ip, ssh_key, &format!(
         "cat > /opt/bittice/docker-compose.yml << 'COMPEOF'\n{compose}COMPEOF"
     ))?;
@@ -356,16 +311,17 @@ fn wait_for_cdc_live(ip: &str, ssh_key: &str, expected_profiles: usize) -> Resul
             || logs.contains("request_engine_shutdown_from_cdc")
         {
             ws.stop("CDC failed during startup.");
-            let vpn_hint = if logs.contains("Connection timed out")
+            let net_hint = if logs.contains("Connection timed out")
                 || logs.contains("Connection timeout")
             {
-                "\n\nLikely cause: MySQL is only reachable over VPN but the deploy stack has no VPN sidecar.\n\
-                 Ensure data/vpn/bittice-ec2.ovpn exists locally, then redeploy (the CLI will start bittice-vpn + bittice)."
+                "\n\nLikely cause: the Bittice SG cannot reach the RDS on its MySQL port.\n\
+                 Check that AmazonRDSReadOnlyAccess + AmazonEC2FullAccess gave Terraform permission to add \
+                 the inbound rule on the RDS SG, and that the RDS is in the same VPC the wizard placed Bittice in."
             } else {
                 ""
             };
             bail!(
-                "CDC did not start on the server.{vpn_hint}\n\
+                "CDC did not start on the server.{net_hint}\n\
                  ssh -i {ssh_key} ubuntu@{ip} 'docker logs bittice 2>&1 | tail -n 80'"
             );
         }
@@ -382,125 +338,6 @@ fn wait_for_cdc_live(ip: &str, ssh_key: &str, expected_profiles: usize) -> Resul
     );
 }
 
-// ── SSH key ───────────────────────────────────────────────────────────────────
-
-/// Derives the SSH public key from a private key (.pem or id_rsa).
-fn derive_public_key(private_key_path: &str) -> Result<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(private_key_path, std::fs::Permissions::from_mode(0o600));
-    }
-    let out = Command::new("ssh-keygen").args(["-y", "-f", private_key_path])
-        .output().context("Failed to run ssh-keygen — is OpenSSH installed?")?;
-    if !out.status.success() {
-        bail!(
-            "Could not derive public key from '{private_key_path}'.\n\
-             Make sure it is a valid PEM or OpenSSH private key.\n\
-             Error: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-// ── VPN setup on EC2 ──────────────────────────────────────────────────────────
-
-/// Converts "10.0.0.0/8" to ("10.0.0.0", "255.0.0.0") for OpenVPN's classic
-/// `route <network> <netmask>` directive.
-fn cidr_to_route(cidr: &str) -> Result<(String, String)> {
-    let (ip, prefix) = cidr.split_once('/')
-        .with_context(|| format!("CIDR must be in form ip/prefix (got '{cidr}')"))?;
-    let prefix: u32 = prefix.trim().parse()
-        .with_context(|| format!("Invalid CIDR prefix in '{cidr}'"))?;
-    if prefix > 32 { bail!("CIDR prefix must be 0-32 (got /{prefix})"); }
-    let mask: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix) };
-    let netmask = format!(
-        "{}.{}.{}.{}",
-        (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff, mask & 0xff,
-    );
-    Ok((ip.trim().to_string(), netmask))
-}
-
-/// Rewrites a raw .ovpn for host-OpenVPN with split-tunnel routing:
-/// only the listed CIDRs flow through tun0 — default route stays on eth0, so
-/// Bittice's inbound REST/gRPC and outbound to the public internet are
-/// unaffected. Accepts a comma- or whitespace-separated list of CIDRs because
-/// the database VPC's range is rarely the only network you need to reach
-/// (e.g. `10.0.0.0/8,172.31.0.0/16`).
-fn prepare_ovpn_content(raw: &str, cidrs_csv: &str) -> Result<String> {
-    let cidrs: Vec<&str> = cidrs_csv
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    if cidrs.is_empty() {
-        bail!("No CIDR provided — pass at least one (e.g. 10.0.0.0/8).");
-    }
-    let mut route_lines = Vec::with_capacity(cidrs.len());
-    for cidr in &cidrs {
-        let (net, mask) = cidr_to_route(cidr)?;
-        route_lines.push(format!("route {net} {mask}"));
-    }
-
-    // Drop any prior route/up/keepalive directives baked in from a previous prepare
-    // or the raw upstream profile — we'll rewrite them with the right values.
-    let mut content: String = raw
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            !(t.starts_with("route ")
-                || t.starts_with("route-nopull")
-                || t == "redirect-gateway def1"
-                || t.starts_with("redirect-gateway ")
-                || t.starts_with("up ")
-                || t.starts_with("up-restart")
-                || t.starts_with("keepalive ")
-                || t.starts_with("ping ")
-                || t.starts_with("ping-restart "))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !content.ends_with('\n') { content.push('\n'); }
-
-    // Baseline compatibility.
-    for opt in ["client", "dev tun", "mssfix 1400"] {
-        if !content.contains(opt) {
-            content.push_str(opt);
-            content.push('\n');
-        }
-    }
-
-    // Stability layer.
-    // Use `ping` + `ping-restart` *separately* (NOT `keepalive 10 60`, which is
-    // shorthand for `ping 10 ; ping-restart 60` — a 60s restart window is far too
-    // aggressive: every transient UDP blip on a long-haul tunnel triggers a soft
-    // restart that kills all in-flight TCP connections (incl. the MySQL binlog
-    // stream). 300s lets the tunnel ride out short network hiccups; if MySQL
-    // really stopped responding, Bittice's BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS
-    // (90s) fires first and force-reconnects the stream on the app layer.
-    if !content.contains("\nping ") && !content.starts_with("ping ") {
-        content.push_str("ping 10\n");
-    }
-    if !content.contains("ping-restart ") {
-        content.push_str("ping-restart 300\n");
-    }
-    if !content.contains("pull-filter ignore \"ping-restart\"") {
-        content.push_str("pull-filter ignore \"ping-restart\"\n");
-    }
-    if !content.contains("reneg-sec ") {
-        content.push_str("reneg-sec 0\n");
-    }
-
-    // Split-tunnel: ignore the server's pushed default route; install only the
-    // explicit routes to the database CIDRs.
-    content.push_str("route-nopull\n");
-    for line in &route_lines {
-        content.push_str(line);
-        content.push('\n');
-    }
-
-    Ok(content)
-}
-
 fn ssh_capture(ip: &str, ssh_key: &str, cmd: &str) -> String {
     let mut args = ssh_common_args(ssh_key, ip);
     args.push(cmd.to_string());
@@ -509,219 +346,6 @@ fn ssh_capture(ip: &str, ssh_key: &str, cmd: &str) -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
-}
-
-// ── .ovpn collection ──────────────────────────────────────────────────────────
-
-/// Build `data/vpn/bittice-ec2.ovpn` from an existing profile `vpn_file` when the deploy bundle omits it.
-fn bootstrap_ec2_ovpn_from_profiles(data_root: &Path) -> Result<bool> {
-    let dest = data_root.join("vpn").join(EC2_OVPN_NAME);
-    if dest.is_file() {
-        return Ok(true);
-    }
-
-    for config_path in crate::core::data_paths::scan_all_cdc_config_paths_in_data_root(data_root) {
-        let Ok(content) = std::fs::read_to_string(&config_path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let Some(vpn_ref) = json
-            .get("vpn_file")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-
-        let file_name = std::path::Path::new(vpn_ref)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| vpn_ref.to_string());
-        let candidates = [
-            data_root.join("vpn").join(&file_name),
-            crate::core::data_paths::vpn_storage_dir().join(&file_name),
-            std::path::PathBuf::from(vpn_ref),
-        ];
-        let Some(src) = candidates.iter().find(|p| p.is_file()) else {
-            continue;
-        };
-
-        let raw = std::fs::read_to_string(src)
-            .with_context(|| format!("read VPN profile {}", src.display()))?;
-        let prepared =
-            prepare_ovpn_content(&raw, DEFAULT_VPN_CIDRS).context("prepare deploy .ovpn")?;
-        std::fs::create_dir_all(data_root.join("vpn")).context("create data/vpn")?;
-        std::fs::write(&dest, prepared).context("write deploy .ovpn")?;
-        let _ = log::success(format!(
-            "Prepared {} from sync profile (split-tunnel [{DEFAULT_VPN_CIDRS}])",
-            dest.display()
-        ));
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
-/// Copy `bittice-ec2.ovpn` → `vpn.conf` for the dperson/openvpn-client sidecar.
-fn ensure_vpn_conf_in_bundle(data_root: &Path) -> Result<()> {
-    let vpn_dir = data_root.join("vpn");
-    let conf = vpn_dir.join("vpn.conf");
-    if conf.is_file() {
-        return Ok(());
-    }
-    let bundled = vpn_dir.join(EC2_OVPN_NAME);
-    if bundled.is_file() {
-        std::fs::copy(&bundled, &conf).context("copy bittice-ec2.ovpn → vpn.conf")?;
-        return Ok(());
-    }
-    bail!(
-        "VPN sidecar needs data/vpn/{} or data/vpn/vpn.conf — add it via Deploy → OpenVPN profile.",
-        EC2_OVPN_NAME
-    );
-}
-
-/// Ensures VPN material exists when profiles, hostnames, or data/vpn/ indicate a tunnel.
-async fn ensure_vpn_ready_for_deploy(data_root: &Path) -> Result<bool> {
-    if !crate::core::data_paths::deploy_requires_vpn_sidecar(data_root) {
-        return Ok(false);
-    }
-
-    if crate::core::data_paths::deploy_vpn_material_present(data_root) {
-        ensure_vpn_conf_in_bundle(data_root)?;
-        let _ = log::info(
-            "Found OpenVPN under data/vpn/ — deploy will start VPN + Bittice sidecars.",
-        );
-        return Ok(true);
-    }
-
-    if crate::core::data_paths::any_cdc_host_suggests_vpn(data_root) {
-        let _ = log::info(
-            "MySQL host looks VPC/VPN-only — OpenVPN is required on the server.",
-        );
-    } else {
-        let _ = log::info(
-            "Detected OpenVPN in your sync profile(s) — deploy will start a VPN sidecar automatically.",
-        );
-    }
-
-    if bootstrap_ec2_ovpn_from_profiles(data_root)? {
-        ensure_vpn_conf_in_bundle(data_root)?;
-        return Ok(true);
-    }
-
-    let _ = log::info("Add the .ovpn file once; it is stored under data/vpn/ and reused on every deploy.");
-    let ok = collect_and_store_ovpn(data_root).await?;
-    if ok {
-        ensure_vpn_conf_in_bundle(data_root)?;
-    }
-    Ok(ok)
-}
-
-async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
-    let _ = log::info("OpenVPN runs in a Docker sidecar (same as local docker-compose.local.yaml).");
-    let _ = log::info(format!(
-        "Only these CIDRs use the tunnel by default: [{DEFAULT_VPN_CIDRS}]."
-    ));
-
-    let source: u8 = match select("How do you want to provide the .ovpn file?")
-        .item(0u8, "File path on this machine", "")
-        .item(1u8, "HTTP(S) URL", "")
-        .item(2u8, "Paste the .ovpn content", "")
-        .item(255u8, "Skip — database is reachable from EC2 directly", "")
-        .interact()
-    {
-        Ok(x) => x,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    if source == 255 { return Ok(false); }
-
-    let raw: String = match source {
-        0 => {
-            let path: String = match input("Path to .ovpn file").placeholder("/path/to/file.ovpn").interact() {
-                Ok(s) => s,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(false),
-                Err(e) => return Err(e.into()),
-            };
-            std::fs::read_to_string(path.trim()).context("Could not read .ovpn file")?
-        }
-        1 => {
-            let url: String = match input("URL of the .ovpn file").placeholder("https://...").interact() {
-                Ok(s) => s,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(false),
-                Err(e) => return Err(e.into()),
-            };
-            let s = spinner();
-            s.start("Downloading .ovpn…");
-            let text = reqwest::get(url.trim()).await?.text().await?;
-            s.stop("Downloaded.");
-            text
-        }
-        _ => {
-            let _ = log::info("Paste the full .ovpn text (must contain 'client' and 'dev'):");
-            match input("Paste .ovpn content").interact() {
-                Ok(s) => s,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(false),
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
-
-    if !raw.contains("client") || !raw.contains("dev") {
-        bail!("The content does not look like a valid .ovpn file (missing 'client' or 'dev').");
-    }
-
-    // CIDR(s) to route through the tunnel (everything else stays on eth0).
-    // Default covers both 10.x (typical private VPCs) and 172.31.x (AWS default-VPC
-    // range used by peered accounts) — the user's own subnet's more-specific route
-    // (usually /20 on ens5) wins, so this is safe.
-    let _ = log::info(
-        "Comma-separated list of CIDRs to route through VPN. Common targets:\n\
-         • 10.0.0.0/8        — most private VPCs\n\
-         • 172.31.0.0/16     — AWS default-VPC range (covers RDS in peered default VPCs)\n\
-         • 192.168.0.0/16    — on-prem / SOHO networks"
-    );
-    let cidrs: String = loop {
-        let entered: String = match input("CIDRs to route through VPN (comma-separated)")
-            .default_input("10.0.0.0/8,172.31.0.0/16")
-            .interact()
-        {
-            Ok(s) => s,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        let mut bad: Option<String> = None;
-        for c in entered.split(|c: char| c == ',' || c.is_whitespace())
-            .map(|s| s.trim()).filter(|s| !s.is_empty())
-        {
-            if let Err(e) = cidr_to_route(c) {
-                bad = Some(format!("{c}: {e}"));
-                break;
-            }
-        }
-        match bad {
-            None => break entered.trim().to_string(),
-            Some(msg) => {
-                let _ = log::warning(format!(
-                    "Invalid CIDR ({msg}). Try again (e.g. 10.0.0.0/8,172.31.0.0/16)."
-                ));
-            }
-        }
-    };
-
-    let vpn_dir = data_root.join("vpn");
-    std::fs::create_dir_all(&vpn_dir).context("create data/vpn")?;
-    let dest = vpn_dir.join(EC2_OVPN_NAME);
-    let prepared = prepare_ovpn_content(&raw, &cidrs).context("prepare .ovpn content")?;
-    std::fs::write(&dest, prepared).context("write .ovpn")?;
-    let _ = log::success(format!(
-        "Saved {} with split-tunnel routes [{cidrs}] (will be rsynced to EC2)",
-        dest.display()
-    ));
-    Ok(true)
 }
 
 // ── AWS RDS discovery (same-account placement, no VPN) ──────────────────────
@@ -1142,58 +766,27 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         if action == 0 { return deploy_to_existing(&tf_bin, &tf_dir, &data_root, &image).await; }
     }
 
-    // ── connectivity mode ─────────────────────────────────────────────────────
-    // Decides whether we go RDS-aware (auto-discover, no VPN, auto SSH key)
-    // or legacy (default VPC, prompt for .pem, optional VPN sidecar).
+    // ── RDS discovery (mandatory) ─────────────────────────────────────────────
+    // Same-account placement is the ONLY supported mode: Bittice's EC2 goes into
+    // the same VPC as the target RDS so CDC reaches MySQL natively. No tunnels,
+    // no public-RDS fallback — if the user can't satisfy this, the wizard bails
+    // with a helpful error rather than silently falling back to a fragile path.
+    if !aws_cli_available() {
+        bail!(
+            "`aws` CLI not found on PATH — install it from https://aws.amazon.com/cli/ \
+             and run `aws configure` (or set AWS_PROFILE / AWS_ACCESS_KEY_ID).\n\n\
+             Cloud deploy requires AWS credentials so it can discover your target RDS's \
+             VPC and place Bittice in the same network."
+        );
+    }
     let (hint_id, hint_region) = extract_rds_hint_from_cdc_profiles(&data_root)
         .map(|(i, r)| (Some(i), Some(r))).unwrap_or((None, None));
-    let aws_ok = aws_cli_available();
-    let _ = log::info(if aws_ok {
-        "Detected `aws` CLI on PATH — same-account RDS auto-discovery available."
-    } else {
-        "`aws` CLI not found — only the legacy flow (default VPC, optional OpenVPN) is available."
-    });
+    let placement: RdsPlacement = discover_rds_placement(hint_id, hint_region).await?;
 
-    let mode: u8 = if aws_ok {
-        match select("How does Bittice reach your database?")
-            .item(0u8, "AWS RDS in this account (auto-discover VPC, no VPN, no .pem)", "RECOMMENDED")
-            .item(1u8, "Reachable directly from the internet (public RDS or non-AWS)", "")
-            .item(2u8, "Behind OpenVPN — start a sidecar tunnel", "")
-            .item(255u8, "« Back", "")
-            .interact()
-        {
-            Ok(x) => x,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-    } else { 1 };
-    if mode == 255 { return Ok(()); }
-
-    // RDS-aware path: discover up-front so the rest of the wizard can adapt
-    // (region pinned, no SSH prompt, no VPN prompt).
-    let placement: Option<RdsPlacement> = if mode == 0 {
-        Some(discover_rds_placement(hint_id, hint_region).await?)
-    } else { None };
-
-    // ── region ──
-    let region: String = if let Some(p) = &placement {
-        let _ = log::step(format!("Region pinned to RDS location: {}", p.region));
-        p.region.clone()
-    } else {
-        match select("AWS region")
-            .item("us-east-1",      "us-east-1      — N. Virginia", "")
-            .item("us-west-2",      "us-west-2      — Oregon", "")
-            .item("eu-west-1",      "eu-west-1      — Ireland", "")
-            .item("eu-central-1",   "eu-central-1   — Frankfurt", "")
-            .item("ap-southeast-1", "ap-southeast-1 — Singapore", "")
-            .item("ap-northeast-1", "ap-northeast-1 — Tokyo", "")
-            .item("sa-east-1",      "sa-east-1      — São Paulo", "")
-            .interact()
-        {
-            Ok(x) => x.to_string(),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
+    // ── region (always pinned to the RDS's region) ──
+    let region: String = {
+        let _ = log::step(format!("Region pinned to RDS location: {}", placement.region));
+        placement.region.clone()
     };
 
     // ── instance type ──
@@ -1210,28 +803,11 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     };
 
     // ── SSH key ──
-    // Auto-managed in AWS-discovered mode (we already have AWS creds, no point
-    // asking the user for a .pem); manual .pem path otherwise.
-    let (ssh_priv, ssh_pub_key): (String, String) = if placement.is_some() {
+    // Auto-managed: we already have AWS creds, no point asking for a .pem.
+    let (ssh_priv, ssh_pub_key) = {
         let kp = ensure_ssh_keypair_auto()?;
         let _ = log::success(format!("Using auto-managed SSH key: {}", kp.private_path));
         (kp.private_path, kp.public_key)
-    } else {
-        let default_priv = format!("{}/.ssh/id_rsa", home_dir().unwrap_or_else(|| "~".into()));
-        let _ = log::info("Provide the private key AWS gave you (.pem) or your local id_rsa.");
-        let p: String = match input("SSH private key path (.pem or id_rsa)")
-            .default_input(&default_priv).interact()
-        {
-            Ok(s) => s,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        let priv_path = p.trim().to_string();
-        let ks = spinner();
-        ks.start("Deriving public key…");
-        let pub_res = derive_public_key(&priv_path);
-        if pub_res.is_ok() { ks.stop("Public key derived."); } else { ks.stop("Failed to derive public key."); }
-        (priv_path, pub_res?)
     };
 
     // ── deployment name (used for EC2 Name tag + SG/key/EIP resource names) ──
@@ -1253,41 +829,22 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         }
     };
 
-    // ── VPN ── only in legacy mode; RDS-in-account placement reaches MySQL natively.
-    let vpn_configured = if placement.is_some() {
-        let _ = log::info("Same-account placement: skipping VPN setup (EC2 reaches RDS via VPC SG rule).");
-        false
-    } else {
-        let v = ensure_vpn_ready_for_deploy(&data_root).await?;
-        if crate::core::data_paths::any_cdc_host_suggests_vpn(&data_root) && !v {
-            bail!(
-                "MySQL hostnames look VPN-only but no .ovpn is under data/vpn/.\n\
-                 Add it via Deploy → OpenVPN profile before provisioning."
-            );
-        }
-        v
-    };
-
     // ── IAM permissions note ──
     let _ = note(
         "AWS IAM permissions required",
-        "Your IAM user needs EC2 access (and, for RDS auto-discovery mode, \
-         rds:DescribeDBInstances + ec2:DescribeSubnets/Vpcs + ec2:AuthorizeSecurityGroupIngress \
-         on the target VPC and the RDS SG).\n\n\
-         Easiest fix: attach AmazonEC2FullAccess and AmazonRDSReadOnlyAccess to your IAM user."
+        "Your IAM user needs:\n\
+         • AmazonEC2FullAccess\n\
+         • AmazonRDSReadOnlyAccess\n\n\
+         These give discovery (rds:DescribeDBInstances, ec2:Describe*), provisioning (EC2/SG/EIP/KeyPair), \
+         and the one cross-resource action that replaces the VPN: AuthorizeSecurityGroupIngress on the \
+         RDS SG (lets Bittice's SG talk to MySQL inside the VPC)."
     );
 
     // ── confirm ──
-    let summary = match &placement {
-        Some(p) => format!(
-            "(name: {app_name}, region: {}, VM: {instance_type}, VPC: {} same as RDS {}:{} — no VPN)",
-            p.region, p.vpc_id, p.rds_identifier, p.rds_port
-        ),
-        None => format!(
-            "(name: {app_name}, region: {region}, VM: {instance_type}, VPN: {})",
-            if vpn_configured { "OpenVPN" } else { "none" }
-        ),
-    };
+    let summary = format!(
+        "(name: {app_name}, region: {}, VM: {instance_type}, VPC: {} same as RDS {}:{})",
+        placement.region, placement.vpc_id, placement.rds_identifier, placement.rds_port
+    );
     let go: u8 = match select(format!("Create AWS resources? {summary}"))
         .item(0u8, "Yes — provision and deploy", "")
         .item(255u8, "No — cancel", "")
@@ -1304,7 +861,7 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     ws.start("Writing Terraform files…");
     let write_res = write_terraform_files(
         &tf_dir,
-        &build_tfvars(&region, instance_type, &ssh_pub_key, &app_name, placement.as_ref()),
+        &build_tfvars(&region, instance_type, &ssh_pub_key, &app_name, Some(&placement)),
     );
     if write_res.is_ok() { ws.stop("Terraform files ready."); } else { ws.stop("Failed to write files."); }
     write_res?;
@@ -1318,7 +875,7 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     let ip = terraform_output(&tf_bin, &tf_dir, "public_ip")?;
     let _ = log::success(format!("EC2 Elastic IP: {ip}"));
 
-    finish_deploy(&ip, &ssh_priv, &image, &data_root, vpn_configured)
+    finish_deploy(&ip, &ssh_priv, &image, &data_root)
 }
 
 async fn deploy_to_existing(
@@ -1327,8 +884,8 @@ async fn deploy_to_existing(
     let ip = terraform_output(tf_bin, tf_dir, "public_ip")?;
     let _ = log::success(format!("EC2 IP: {ip}"));
 
-    // Prefer the auto-managed key when present (this is how AWS-discovered
-    // deploys provisioned the EC2); fall back to ~/.ssh/id_rsa.
+    // Prefer the auto-managed key (this is how every same-account deploy is
+    // provisioned now); fall back to ~/.ssh/id_rsa only if it's missing.
     let home = home_dir().unwrap_or_else(|| "~".into());
     let auto_key = format!("{home}/.bittice/ssh/bittice_id_ed25519");
     let default_priv = if std::path::Path::new(&auto_key).is_file() {
@@ -1337,30 +894,13 @@ async fn deploy_to_existing(
         format!("{home}/.ssh/id_rsa")
     };
     let _ = log::info("Provide the same private key used when provisioning this instance.");
-    let ssh_priv: String = match input("SSH private key path (.pem, id_rsa, or auto-managed)").default_input(&default_priv).interact() {
+    let ssh_priv: String = match input("SSH private key path").default_input(&default_priv).interact() {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
         Err(e) => return Err(e.into()),
     };
 
-    let vpn_configured = ensure_vpn_ready_for_deploy(data_root).await?;
-    if crate::core::data_paths::any_cdc_host_suggests_vpn(data_root) && !vpn_configured {
-        bail!(
-            "MySQL hostnames look VPN-only (e.g. *openvpn* in RDS name) but no .ovpn is under data/vpn/.\n\
-             Use Deploy → add OpenVPN profile, or paste your .ovpn when prompted."
-        );
-    }
-
-    finish_deploy(&ip, ssh_priv.trim(), image, data_root, vpn_configured)
-}
-
-fn remote_has_deploy_vpn_material(ip: &str, ssh_key: &str) -> bool {
-    let path = format!("/opt/bittice/data/vpn/{EC2_OVPN_NAME}");
-    ssh_capture(
-        ip,
-        ssh_key,
-        &format!("test -f {path} && echo yes || test -f /opt/bittice/data/vpn/vpn.conf && echo yes"),
-    ) == "yes"
+    finish_deploy(&ip, ssh_priv.trim(), image, data_root)
 }
 
 fn finish_deploy(
@@ -1368,7 +908,6 @@ fn finish_deploy(
     ssh_priv: &str,
     image: &str,
     data_root: &Path,
-    mut vpn_configured: bool,
 ) -> Result<()> {
     let profile_count = crate::core::data_paths::cdc_profile_count(data_root);
     if profile_count == 0 {
@@ -1386,23 +925,8 @@ fn finish_deploy(
     )?;
     rsync_data(data_root, ip, ssh_priv)?;
 
-    if !vpn_configured && remote_has_deploy_vpn_material(ip, ssh_priv) {
-        let _ = log::info("Using OpenVPN profile already on the server (data/vpn/).");
-        vpn_configured = true;
-    }
-    if crate::core::data_paths::any_cdc_host_suggests_vpn(data_root) && !vpn_configured {
-        bail!(
-            "MySQL requires VPN but no data/vpn/{} on this machine or the server.\n\
-             Use Deploy → add OpenVPN profile, then redeploy.",
-            EC2_OVPN_NAME
-        );
-    }
-
-    let _ = log::step(format!(
-        "Deploying {image}{}…",
-        if vpn_configured { " (VPN sidecar + Bittice)" } else { "" }
-    ));
-    deploy_compose(ip, ssh_priv, image, vpn_configured)?;
+    let _ = log::step(format!("Deploying {image}…"));
+    deploy_compose(ip, ssh_priv, image)?;
 
     wait_for_cdc_live(ip, ssh_priv, profile_count)?;
 
@@ -1419,11 +943,6 @@ fn finish_deploy(
     let _ = log::info(format!("REST   http://{ip}:3000"));
     let _ = log::info(format!("Admin  http://{ip}:8080"));
     let _ = log::info(format!("gRPC   {ip}:50051"));
-    if vpn_configured {
-        let _ = log::info(format!(
-            "VPN    ssh -i {ssh_priv} ubuntu@{ip} 'docker logs -f bittice-vpn'"
-        ));
-    }
     let _ = log::info(format!("Logs   ssh -i {ssh_priv} ubuntu@{ip} 'docker logs -f bittice'"));
     Ok(())
 }
