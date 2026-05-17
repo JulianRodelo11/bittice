@@ -183,6 +183,37 @@ fn aws_security_group_id(name: &str, vpc_id: &str, region: &str) -> Result<Optio
         .map(String::from))
 }
 
+/// Check whether the inbound rule "tcp:port from <source_sg_id>" already exists
+/// on the target SG. Used to decide if we need to `terraform import` a duplicate.
+fn rds_ingress_rule_exists(
+    rds_sg_id: &str,
+    source_sg_id: &str,
+    port: u16,
+    region: &str,
+) -> Result<bool> {
+    let v = aws_json(&[
+        "ec2", "describe-security-groups",
+        "--region", region,
+        "--group-ids", rds_sg_id,
+        "--output", "json",
+    ])?;
+    let perms = v.pointer("/SecurityGroups/0/IpPermissions")
+        .and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    for p in perms {
+        if p.get("IpProtocol").and_then(|x| x.as_str()) != Some("tcp") { continue; }
+        if p.get("FromPort").and_then(|x| x.as_u64()) != Some(port as u64) { continue; }
+        if p.get("ToPort").and_then(|x| x.as_u64()) != Some(port as u64) { continue; }
+        let pairs = p.get("UserIdGroupPairs")
+            .and_then(|a| a.as_array()).cloned().unwrap_or_default();
+        for pair in pairs {
+            if pair.get("GroupId").and_then(|x| x.as_str()) == Some(source_sg_id) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Bittice should "if exists, use it" — adopt orphan AWS resources from prior
 /// failed deploys into Terraform state instead of crashing on duplicate-create.
 /// Runs after `terraform init`, before `terraform apply`. Idempotent.
@@ -190,9 +221,10 @@ fn reconcile_terraform_orphans(
     tf_bin: &Path,
     tf_dir: &Path,
     app_name: &str,
-    vpc_id: &str,
-    region: &str,
+    placement: &RdsPlacement,
 ) -> Result<()> {
+    let vpc_id = &placement.vpc_id;
+    let region = &placement.region;
     let managed = terraform_state_list(tf_bin, tf_dir);
 
     // ── key pair ───────────────────────────────────────────────────────────
@@ -206,14 +238,43 @@ fn reconcile_terraform_orphans(
         }
     }
 
-    // ── security group ─────────────────────────────────────────────────────
+    // ── bittice security group ─────────────────────────────────────────────
+    let bittice_sg_name = format!("{app_name}-sg");
     if !managed.iter().any(|l| l == "aws_security_group.bittice") {
-        let sg_name = format!("{app_name}-sg");
-        if let Some(sg_id) = aws_security_group_id(&sg_name, vpc_id, region).unwrap_or(None) {
+        if let Some(sg_id) = aws_security_group_id(&bittice_sg_name, vpc_id, region).unwrap_or(None) {
             let _ = log::info(format!(
-                "Found orphan security group '{sg_name}' ({sg_id}) — importing into Terraform state."
+                "Found orphan security group '{bittice_sg_name}' ({sg_id}) — importing into Terraform state."
             ));
             terraform_import(tf_bin, tf_dir, "aws_security_group.bittice", &sg_id)?;
+        }
+    }
+
+    // ── RDS ingress rules: one per target RDS SG ───────────────────────────
+    // Format for `terraform import aws_security_group_rule`:
+    //   <sg_id>_<type>_<protocol>_<from_port>_<to_port>_<source_sg_id>
+    let bittice_sg_id = aws_security_group_id(&bittice_sg_name, vpc_id, region)
+        .ok().flatten();
+
+    if let Some(bittice_sg_id) = bittice_sg_id {
+        // Refresh state list — we may have imported the bittice SG just above.
+        let managed = terraform_state_list(tf_bin, tf_dir);
+        for (i, target) in placement.targets.iter().enumerate() {
+            let addr = format!("aws_security_group_rule.rds_ingress_from_bittice[{i}]");
+            if managed.iter().any(|l| l == &addr) { continue; }
+            let exists = rds_ingress_rule_exists(
+                &target.security_group_id, &bittice_sg_id, target.port, region,
+            ).unwrap_or(false);
+            if exists {
+                let import_id = format!(
+                    "{}_ingress_tcp_{port}_{port}_{}",
+                    target.security_group_id, bittice_sg_id, port = target.port,
+                );
+                let _ = log::info(format!(
+                    "Found orphan ingress rule on RDS SG {} (tcp:{} from {}) — importing.",
+                    target.security_group_id, target.port, bittice_sg_id,
+                ));
+                terraform_import(tf_bin, tf_dir, &addr, &import_id)?;
+            }
         }
     }
 
@@ -1178,8 +1239,8 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
 
     // Adopt any leftover AWS resources from a previous failed deploy ("if
     // exists, use it"). This prevents `terraform apply` from crashing with
-    // InvalidKeyPair.Duplicate / InvalidGroup.Duplicate.
-    reconcile_terraform_orphans(&tf_bin, &tf_dir, &app_name, &placement.vpc_id, &region)?;
+    // InvalidKeyPair.Duplicate / InvalidGroup.Duplicate / InvalidPermission.Duplicate.
+    reconcile_terraform_orphans(&tf_bin, &tf_dir, &app_name, &placement)?;
 
     let _ = log::step("Running terraform apply…");
     terraform_run(&tf_bin, &tf_dir, &["apply", "-auto-approve"])?;
