@@ -213,10 +213,26 @@ fn wait_for_ssh(ip: &str, ssh_key: &str) -> Result<()> {
 
 // ── compose generation ────────────────────────────────────────────────────────
 
+/// Identity injected by the wizard so the engine can authenticate heartbeats
+/// against the control plane. None means "skip heartbeats" — local mode.
+#[derive(Debug, Clone)]
+struct EngineIdentity {
+    pub deployment_id: String,
+    pub instance_token: String,
+    pub control_plane_url: String,
+}
+
 /// Bittice runs as a plain docker bridge container. EC2 lives in the same VPC as
 /// the target RDS (placed there by Terraform), so CDC reaches MySQL through AWS
 /// internal networking — no VPN, no sidecar, no policy routing.
-fn generate_compose(image: &str) -> String {
+fn generate_compose(image: &str, ident: Option<&EngineIdentity>) -> String {
+    let identity_block = match ident {
+        Some(i) => format!(
+            "      - BITTICE_DEPLOYMENT_ID={}\n      - BITTICE_INSTANCE_TOKEN={}\n      - BITTICE_CONTROL_PLANE_URL={}\n",
+            i.deployment_id, i.instance_token, i.control_plane_url,
+        ),
+        None => String::new(),
+    };
     format!(
 r#"services:
   bittice:
@@ -235,12 +251,12 @@ r#"services:
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
       - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
       - BITTICE_SKIP_STARTUP_COMPACT=1
-    restart: unless-stopped
+{identity_block}    restart: unless-stopped
 "#
     )
 }
 
-fn deploy_compose(ip: &str, ssh_key: &str, image: &str) -> Result<()> {
+fn deploy_compose(ip: &str, ssh_key: &str, image: &str, ident: Option<&EngineIdentity>) -> Result<()> {
     if let (Ok(token), Ok(user)) = (std::env::var("GHCR_TOKEN"), std::env::var("GHCR_USER")) {
         ssh_run(ip, ssh_key, &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"))?;
     }
@@ -264,7 +280,7 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str) -> Result<()> {
     )?;
 
     // Write docker-compose.yml
-    let compose = generate_compose(image);
+    let compose = generate_compose(image, ident);
     ssh_run(ip, ssh_key, &format!(
         "cat > /opt/bittice/docker-compose.yml << 'COMPEOF'\n{compose}COMPEOF"
     ))?;
@@ -915,6 +931,41 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     };
     if go == 255 { return Ok(()); }
 
+    // ── register deployment with the control plane (auth + billing entry point) ──
+    // We do this BEFORE `terraform apply` so the EC2 already knows its
+    // deployment_id / instance_token via env vars when the engine first boots.
+    let creds = match crate::core::credentials::load() {
+        Ok(c) => c,
+        Err(e) => bail!(
+            "Cloud deploy requires authentication against the Bittice control plane.\n\
+             Run `bittice login` first, then re-run this wizard.\n\nDetails: {e}"
+        ),
+    };
+    let ident: EngineIdentity = {
+        let s = spinner();
+        s.start("Registering deployment with control plane…");
+        let req = crate::core::control_plane::CreateDeploymentRequest {
+            name: app_name.clone(),
+            cloud_provider: "aws".into(),
+            region: placement.region.clone(),
+            instance_type: instance_type.to_string(),
+            source_db_engine: placement.targets.first()
+                .map(|_| "mysql".to_string()).unwrap_or_else(|| "mysql".into()),
+            source_db_version: None,
+            source_profile_count: Some(
+                crate::core::data_paths::cdc_profile_count(&data_root) as u32
+            ),
+            vpc_id: Some(placement.vpc_id.clone()),
+        };
+        let resp = crate::core::control_plane::create_deployment(&creds.api_key, &req).await?;
+        s.stop(format!("Deployment registered: {}", resp.deployment_id));
+        EngineIdentity {
+            deployment_id: resp.deployment_id,
+            instance_token: resp.instance_token,
+            control_plane_url: creds.control_plane_url.clone(),
+        }
+    };
+
     // ── write terraform files ──
     let ws = spinner();
     ws.start("Writing Terraform files…");
@@ -934,7 +985,7 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     let ip = terraform_output(&tf_bin, &tf_dir, "public_ip")?;
     let _ = log::success(format!("EC2 Elastic IP: {ip}"));
 
-    finish_deploy(&ip, &ssh_priv, &image, &data_root)
+    finish_deploy(&ip, &ssh_priv, &image, &data_root, Some(&ident))
 }
 
 fn finish_deploy(
@@ -942,6 +993,7 @@ fn finish_deploy(
     ssh_priv: &str,
     image: &str,
     data_root: &Path,
+    ident: Option<&EngineIdentity>,
 ) -> Result<()> {
     let profile_count = crate::core::data_paths::cdc_profile_count(data_root);
     if profile_count == 0 {
@@ -960,7 +1012,7 @@ fn finish_deploy(
     rsync_data(data_root, ip, ssh_priv)?;
 
     let _ = log::step(format!("Deploying {image}…"));
-    deploy_compose(ip, ssh_priv, image)?;
+    deploy_compose(ip, ssh_priv, image, ident)?;
 
     wait_for_cdc_live(ip, ssh_priv, profile_count)?;
 

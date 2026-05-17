@@ -79,7 +79,66 @@ async fn main() -> Result<()> {
             Commands::Setup => {
                 let _ = bittice::repl::startup::run_startup_cliclack().await?;
             }
-            // ... rest of commands ...
+            Commands::Login { key, url } => {
+                use bittice::core::{credentials, control_plane};
+                use std::io::{self, BufRead, Write};
+
+                let api_key = match key {
+                    Some(k) => k.trim().to_string(),
+                    None => {
+                        print!("API key (bk_live_…): ");
+                        io::stdout().flush().ok();
+                        let mut line = String::new();
+                        io::stdin().lock().read_line(&mut line)?;
+                        line.trim().to_string()
+                    }
+                };
+                if !api_key.starts_with("bk_live_") {
+                    anyhow::bail!("API key must start with 'bk_live_'.");
+                }
+                // Stash the URL into env so resolved_control_plane_url() picks it
+                // up during the login call (this also lets the user override the
+                // default for self-hosted control planes).
+                let url_resolved = url
+                    .map(|s| s.trim_end_matches('/').to_string())
+                    .unwrap_or_else(|| credentials::resolved_control_plane_url());
+                std::env::set_var("BITTICE_CONTROL_PLANE_URL", &url_resolved);
+
+                let me = control_plane::login(&api_key).await?;
+                credentials::save(&credentials::Credentials {
+                    version: 1,
+                    control_plane_url: url_resolved,
+                    api_key,
+                    user_id: me.user_id.clone(),
+                    email: me.email.clone(),
+                })?;
+                println!("✓ Logged in as {} ({}, plan: {})",
+                    me.email,
+                    me.name.unwrap_or_else(|| "—".into()),
+                    me.plan);
+            }
+            Commands::Whoami => {
+                use bittice::core::credentials;
+                match credentials::load() {
+                    Ok(c) => println!(
+                        "Email:             {}\nUser ID:           {}\nControl plane:     {}\nCredentials file:  {}",
+                        c.email, c.user_id, c.control_plane_url,
+                        credentials::credentials_path()?.display()),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Commands::Logout => {
+                use bittice::core::credentials;
+                if credentials::clear()? {
+                    println!("✓ Logged out (credentials file removed).");
+                } else {
+                    println!("Not logged in — nothing to remove.");
+                }
+            }
+            // ── rest of commands below ──
 
             Commands::Cdc { url, entity, database, sync_all } => {
                 // Bittice does not manage tunnels: users with VPN-only MySQL
