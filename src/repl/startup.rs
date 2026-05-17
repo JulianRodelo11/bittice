@@ -382,7 +382,7 @@ async fn run_interactive_local_docker_run() -> Result<()> {
         return Ok(());
     }
 
-    println!("\x1b[90m│\x1b[0m  \x1b[90mDocker deploy no longer starts OpenVPN inside the container.\x1b[0m");
+    println!("\x1b[90m│\x1b[0m  \x1b[90mIf your sync profile uses VPN, deploy starts an OpenVPN sidecar automatically.\x1b[0m");
     println!("\x1b[90m│\x1b[0m  \x1b[90mKeep your host OpenVPN app/session active while Bittice runs in Docker.\x1b[0m");
 
     let res = tokio::task::spawn_blocking(move || {

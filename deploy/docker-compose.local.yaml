@@ -29,7 +29,7 @@ services:
       start_period: 10s
 
   bittice:
-    image: "ghcr.io/julianrodelo11/bittice:v0.1.97"
+    image: ${BITTICE_IMAGE:?set BITTICE_IMAGE}
     container_name: bittice-local
     network_mode: "service:vpn"
     depends_on:

@@ -286,6 +286,31 @@ pub fn vpn_storage_dir() -> PathBuf {
     resolved_data_root().join("vpn")
 }
 
+/// `true` when any profile's `cdc_config.json` references OpenVPN (`vpn_file` non-empty).
+pub fn any_cdc_profile_uses_vpn(data_root: &Path) -> bool {
+    scan_all_cdc_config_paths_in_data_root(data_root)
+        .iter()
+        .any(|config_path| cdc_config_has_vpn_file(config_path))
+}
+
+pub fn cdc_config_has_vpn_file(config_path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    json.get("vpn_file")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Number of CDC profiles under `data_root` (for post-deploy health checks).
+pub fn cdc_profile_count(data_root: &Path) -> usize {
+    scan_all_cdc_config_paths_in_data_root(data_root).len()
+}
+
 /// Entity roots that contain table data (mirror + legacy flat mirror dirs).
 pub fn iter_mirror_entity_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();

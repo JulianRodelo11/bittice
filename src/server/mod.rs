@@ -262,7 +262,18 @@ pub async fn start_all_servers(
     // --- AUTO-START CDC WORKERS (sequential: HTTP only after each profile signals Phase 4) ---
     if cdc_autostart_enabled() {
         let specs = collect_cdc_spawn_specs(&entity_filter, &active_workers);
-        if !specs.is_empty() {
+        if specs.is_empty() {
+            let n = crate::core::data_paths::cdc_profile_count(
+                &crate::core::data_paths::resolved_data_root(),
+            );
+            if n == 0 {
+                warn!(
+                    "CDC autostart: no profiles/*/cdc_config.json under {} — serving static mirror data only. \
+                     Sync on your PC (Connect and sync) or redeploy data/ to this host.",
+                    crate::core::data_paths::resolved_data_root().display()
+                );
+            }
+        } else {
             info!(
                 "CDC: Staged startup — {} profile(s) run one after another; ports 3000/8080 open only after each finishes Phase 4.",
                 specs.len()

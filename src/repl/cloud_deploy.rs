@@ -2,12 +2,8 @@
 //! Provisions an EC2 instance, syncs data/, and starts the Bittice engine container.
 //!
 //! Terraform is downloaded automatically on first use (~70 MB, cached in ~/.bittice/bin/).
-//! When VPN is needed, OpenVPN runs on the EC2 host as a systemd service
-//! (openvpn-client@bittice) with split-tunnel routing: only the configured CIDR (the
-//! network where MySQL lives) flows through tun0; everything else (SSH, REST/gRPC
-//! inbound, image pulls) stays on eth0. Bittice runs in a normal Docker bridge
-//! container with port mappings — VPN reconnects do not move the container's
-//! network around, so inbound traffic is never interrupted.
+//! When sync profiles reference `vpn_file`, deploy auto-starts an OpenVPN Docker sidecar
+//! (same stack as `deploy/docker-compose.local.yaml`) and waits until CDC reaches Phase 4.
 
 use anyhow::{bail, Context, Result};
 use cliclack::{input, log, note, select, spinner};
@@ -197,11 +193,56 @@ fn wait_for_ssh(ip: &str, ssh_key: &str) -> Result<()> {
 
 // ── compose generation ────────────────────────────────────────────────────────
 
-/// Bittice runs in a normal Docker bridge container regardless of VPN. When VPN is
-/// configured, OpenVPN runs on the host (systemd) with split-tunnel routing, so the
-/// container's outbound traffic to the configured CIDR follows the host's kernel
-/// routing table through tun0 — no namespace sharing, no policy routing dance.
-fn generate_compose(image: &str) -> String {
+const DEFAULT_VPN_CIDRS: &str = "10.0.0.0/8,172.31.0.0/16";
+
+/// When VPN is required, OpenVPN runs in a sidecar (`network_mode: service:vpn`) — same
+/// layout as `deploy/docker-compose.local.yaml`, fully automated on `compose up`.
+fn generate_compose(image: &str, with_vpn: bool) -> String {
+    let bittice_env = r#"      - BITTICE_HOST=0.0.0.0
+      - BITTICE_ENGINE_ONLY=1
+      - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
+      - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
+      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
+      - BITTICE_SKIP_STARTUP_COMPACT=1"#;
+
+    if with_vpn {
+        return format!(
+r#"services:
+  vpn:
+    image: dperson/openvpn-client:latest
+    container_name: bittice-vpn
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: ["/dev/net/tun"]
+    volumes:
+      - /opt/bittice/data/vpn:/vpn
+    ports:
+      - "0.0.0.0:3000:3000"
+      - "0.0.0.0:8080:8080"
+      - "0.0.0.0:50051:50051"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ip", "link", "show", "tun0"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 15s
+
+  bittice:
+    image: "{image}"
+    container_name: bittice
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    volumes:
+      - /opt/bittice/data:/app/data
+    environment:
+{bittice_env}
+    restart: unless-stopped
+"#
+        );
+    }
+
     format!(
 r#"services:
   bittice:
@@ -211,89 +252,34 @@ r#"services:
       - "0.0.0.0:3000:3000"
       - "0.0.0.0:8080:8080"
       - "0.0.0.0:50051:50051"
-    volumes: ["/opt/bittice/data:/app/data"]
+    volumes:
+      - /opt/bittice/data:/app/data
     environment:
-      - BITTICE_HOST=0.0.0.0
-      - BITTICE_ENGINE_ONLY=1
-      - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
-      - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
-      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
-      - BITTICE_SKIP_STARTUP_COMPACT=1
+{bittice_env}
     restart: unless-stopped
 "#
     )
 }
-
-/// systemd drop-in to force `Restart=always` (the shipped unit defaults to on-failure).
-const SYSTEMD_RESTART_DROPIN: &str = "[Service]\nRestart=always\nRestartSec=5\n";
 
 fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) -> Result<()> {
     if let (Ok(token), Ok(user)) = (std::env::var("GHCR_TOKEN"), std::env::var("GHCR_USER")) {
         ssh_run(ip, ssh_key, &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"))?;
     }
 
-    // Ensure /opt/bittice is writable by ubuntu and clean up old deployment (sidecar
-    // and previous host systemd VPN — both are torn down before re-deploying).
+    // Tear down previous stack (host systemd VPN from older deploys included).
     ssh_run(ip, ssh_key,
         "sudo chown -R ubuntu:ubuntu /opt/bittice; \
          sudo systemctl stop 'openvpn@*' 'openvpn-client@*' 2>/dev/null || true; \
          sudo systemctl disable 'openvpn@bittice' 'openvpn-client@bittice' 2>/dev/null || true; \
          docker rm -f bittice bittice-vpn 2>/dev/null || true; \
-         cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true; \
-         sudo rm -rf /opt/bittice/vpn 2>/dev/null || true"
+         cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true"
     )?;
 
     if vpn_configured {
-        // Install OpenVPN host package + place the prepared profile where the
-        // openvpn-client@.service unit expects it.
-        ssh_run(ip, ssh_key,
-            "command -v openvpn >/dev/null 2>&1 || \
-             (sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openvpn)"
-        )?;
         ssh_run(ip, ssh_key, &format!(
-            "sudo install -m 0600 /opt/bittice/data/vpn/{EC2_OVPN_NAME} /etc/openvpn/client/bittice.conf"
+            "test -f /opt/bittice/data/vpn/{EC2_OVPN_NAME} || (echo 'missing {EC2_OVPN_NAME} under data/vpn' >&2; exit 1); \
+             cp /opt/bittice/data/vpn/{EC2_OVPN_NAME} /opt/bittice/data/vpn/vpn.conf"
         ))?;
-        // Drop-in unit override: Restart=always + 5s backoff.
-        let dropin = SYSTEMD_RESTART_DROPIN;
-        ssh_run(ip, ssh_key, &format!(
-            "sudo mkdir -p /etc/systemd/system/openvpn-client@bittice.service.d && \
-             sudo tee /etc/systemd/system/openvpn-client@bittice.service.d/override.conf >/dev/null << 'DROPEOF'\n{dropin}DROPEOF\n\
-             sudo systemctl daemon-reload && \
-             sudo systemctl enable --now openvpn-client@bittice.service"
-        ))?;
-
-        // Wait for tun0 on the host. systemd starts OpenVPN immediately, but
-        // the tunnel handshake takes a few seconds.
-        const MAX_VPN: u32 = 24;
-        let ws = spinner();
-        ws.start(format!("Waiting for VPN tunnel (tun0 on host)… (1/{MAX_VPN})"));
-        let mut vpn_up = false;
-        for attempt in 1..=MAX_VPN {
-            ws.set_message(format!("Waiting for VPN tunnel (tun0 on host)… ({attempt}/{MAX_VPN})"));
-            let ok = Command::new("ssh")
-                .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-                       "-i", ssh_key, &format!("ubuntu@{ip}"),
-                       "ip link show tun0 2>/dev/null"])
-                .stdout(Stdio::null()).stderr(Stdio::null())
-                .status().map(|s| s.success()).unwrap_or(false);
-            if ok { vpn_up = true; break; }
-            if attempt < MAX_VPN {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-            }
-        }
-        if vpn_up {
-            ws.stop("VPN tunnel established (tun0 up on host).");
-        } else {
-            ws.stop("VPN tunnel not detected after 2 minutes.");
-            let logs = ssh_capture(ip, ssh_key,
-                "sudo journalctl -u openvpn-client@bittice --no-pager -n 30 2>&1");
-            let _ = log::warning(format!(
-                "openvpn-client@bittice logs:\n{logs}\n\n\
-                 To debug: ssh -i {ssh_key} ubuntu@{ip} \
-                 'sudo journalctl -u openvpn-client@bittice -f'"
-            ));
-        }
     }
 
     // Install docker-compose if not already present.
@@ -305,7 +291,7 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
     )?;
 
     // Write docker-compose.yml
-    let compose = generate_compose(image);
+    let compose = generate_compose(image, vpn_configured);
     ssh_run(ip, ssh_key, &format!(
         "cat > /opt/bittice/docker-compose.yml << 'COMPEOF'\n{compose}COMPEOF"
     ))?;
@@ -317,6 +303,57 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, vpn_configured: bool) ->
     )?;
 
     Ok(())
+}
+
+/// After `compose up`, wait until staged CDC reports live replication for every profile.
+fn wait_for_cdc_live(ip: &str, ssh_key: &str, expected_profiles: usize) -> Result<()> {
+    if expected_profiles == 0 {
+        return Ok(());
+    }
+
+    const MAX_ATTEMPTS: u32 = 180;
+    let ws = spinner();
+    ws.start(format!(
+        "Waiting for CDC live replication ({expected_profiles} profile(s))… (1/{MAX_ATTEMPTS})"
+    ));
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        ws.set_message(format!(
+            "Waiting for CDC live replication ({expected_profiles} profile(s))… ({attempt}/{MAX_ATTEMPTS})"
+        ));
+        let logs = ssh_capture(
+            ip,
+            ssh_key,
+            "docker logs bittice 2>&1 | tail -n 120",
+        );
+        let finished = logs.matches("finished Phase 4").count();
+        if finished >= expected_profiles {
+            ws.stop(format!(
+                "CDC live — {finished} profile(s) reached Phase 4 (real-time replication)."
+            ));
+            return Ok(());
+        }
+        if logs.contains("staged startup aborted")
+            || (logs.contains("CDC worker") && logs.contains("failed"))
+            || logs.contains("request_engine_shutdown_from_cdc")
+        {
+            ws.stop("CDC failed during startup.");
+            bail!(
+                "CDC did not start on the server. Check VPN and MySQL reachability:\n\
+                 ssh -i {ssh_key} ubuntu@{ip} 'docker logs bittice 2>&1 | tail -n 80'"
+            );
+        }
+        if attempt < MAX_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+
+    ws.stop("CDC did not reach Phase 4 in time.");
+    bail!(
+        "Timed out waiting for live CDC ({} profile(s)). The API may serve a static mirror only.\n\
+         ssh -i {ssh_key} ubuntu@{ip} 'docker logs -f bittice'",
+        expected_profiles
+    );
 }
 
 // ── SSH key ───────────────────────────────────────────────────────────────────
@@ -449,9 +486,81 @@ fn ssh_capture(ip: &str, ssh_key: &str, cmd: &str) -> String {
 
 // ── .ovpn collection ──────────────────────────────────────────────────────────
 
+/// Build `data/vpn/bittice-ec2.ovpn` from an existing profile `vpn_file` when the deploy bundle omits it.
+fn bootstrap_ec2_ovpn_from_profiles(data_root: &Path) -> Result<bool> {
+    let dest = data_root.join("vpn").join(EC2_OVPN_NAME);
+    if dest.is_file() {
+        return Ok(true);
+    }
+
+    for config_path in crate::core::data_paths::scan_all_cdc_config_paths_in_data_root(data_root) {
+        let Ok(content) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(vpn_ref) = json
+            .get("vpn_file")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+
+        let file_name = std::path::Path::new(vpn_ref)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| vpn_ref.to_string());
+        let candidates = [
+            data_root.join("vpn").join(&file_name),
+            crate::core::data_paths::vpn_storage_dir().join(&file_name),
+            std::path::PathBuf::from(vpn_ref),
+        ];
+        let Some(src) = candidates.iter().find(|p| p.is_file()) else {
+            continue;
+        };
+
+        let raw = std::fs::read_to_string(src)
+            .with_context(|| format!("read VPN profile {}", src.display()))?;
+        let prepared =
+            prepare_ovpn_content(&raw, DEFAULT_VPN_CIDRS).context("prepare deploy .ovpn")?;
+        std::fs::create_dir_all(data_root.join("vpn")).context("create data/vpn")?;
+        std::fs::write(&dest, prepared).context("write deploy .ovpn")?;
+        let _ = log::success(format!(
+            "Prepared {} from sync profile (split-tunnel [{DEFAULT_VPN_CIDRS}])",
+            dest.display()
+        ));
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Ensures VPN material exists when any CDC profile references `vpn_file`.
+async fn ensure_vpn_ready_for_deploy(data_root: &Path) -> Result<bool> {
+    if !crate::core::data_paths::any_cdc_profile_uses_vpn(data_root) {
+        return Ok(false);
+    }
+
+    let _ = log::info(
+        "Detected OpenVPN in your sync profile(s) — deploy will start a VPN sidecar automatically.",
+    );
+
+    if bootstrap_ec2_ovpn_from_profiles(data_root)? {
+        return Ok(true);
+    }
+
+    let _ = log::info("Add the .ovpn file once; it is stored under data/vpn/ and reused on every deploy.");
+    collect_and_store_ovpn(data_root).await
+}
+
 async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
-    let _ = log::info("OpenVPN will run on the EC2 host (systemd) with split-tunnel routing.");
-    let _ = log::info("Only the configured CIDR (where MySQL lives) goes through tun0; everything else stays on eth0.");
+    let _ = log::info("OpenVPN runs in a Docker sidecar (same as local docker-compose.local.yaml).");
+    let _ = log::info(format!(
+        "Only these CIDRs use the tunnel by default: [{DEFAULT_VPN_CIDRS}]."
+    ));
 
     let source: u8 = match select("How do you want to provide the .ovpn file?")
         .item(0u8, "File path on this machine", "")
@@ -705,17 +814,8 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     if pub_key_res.is_ok() { ks.stop("Public key derived."); } else { ks.stop("Failed to derive public key."); }
     let ssh_pub_key = pub_key_res?;
 
-    // ── VPN ──
-    let needs_vpn: bool = match select("Does the database require VPN to be reached from EC2?")
-        .item(0u8, "No  — database is directly reachable", "")
-        .item(1u8, "Yes — configure OpenVPN on the EC2 instance", "")
-        .interact()
-    {
-        Ok(x) => x == 1,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let vpn_configured = if needs_vpn { collect_and_store_ovpn(&data_root).await? } else { false };
+    // ── VPN (auto from cdc_config `vpn_file`, prompt only if .ovpn still missing) ──
+    let vpn_configured = ensure_vpn_ready_for_deploy(&data_root).await?;
 
     // ── IAM permissions note ──
     let _ = note(
@@ -774,33 +874,20 @@ async fn deploy_to_existing(
         Err(e) => return Err(e.into()),
     };
 
-    let existing_ovpn = data_root.join("vpn").join(EC2_OVPN_NAME);
-    let vpn_configured: bool = if existing_ovpn.is_file() {
-        match select("VPN profile")
-            .item(0u8, "Use existing profile (already on EC2)", "")
-            .item(1u8, "Update with a new .ovpn file", "")
-            .item(2u8, "Disable VPN for this deploy", "")
-            .interact()
-        {
-            Ok(0) => true,
-            Ok(1) => collect_and_store_ovpn(data_root).await?,
-            _ => false,
-        }
-    } else {
-        match select("VPN")
-            .item(0u8, "No VPN needed", "")
-            .item(1u8, "Configure OpenVPN now", "")
-            .interact()
-        {
-            Ok(1) => collect_and_store_ovpn(data_root).await?,
-            _ => false,
-        }
-    };
+    let vpn_configured = ensure_vpn_ready_for_deploy(data_root).await?;
 
     finish_deploy(&ip, ssh_priv.trim(), image, data_root, vpn_configured)
 }
 
 fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_configured: bool) -> Result<()> {
+    let profile_count = crate::core::data_paths::cdc_profile_count(data_root);
+    if profile_count == 0 {
+        let _ = log::warning(
+            "No CDC profiles under data/profiles/ — deploy will start the API with static data only.\n\
+             Connect and sync on your PC first, then redeploy.",
+        );
+    }
+
     wait_for_ssh(ip, ssh_priv)?;
 
     let _ = log::step("Syncing data/…");
@@ -812,7 +899,8 @@ fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_co
     let _ = log::step(format!("Deploying {image}…"));
     deploy_compose(ip, ssh_priv, image, vpn_configured)?;
 
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    wait_for_cdc_live(ip, ssh_priv, profile_count)?;
+
     let ok = Command::new("ssh")
         .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                "-i", ssh_priv, &format!("ubuntu@{ip}"), "curl -sf http://localhost:8080"])
@@ -820,7 +908,7 @@ fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_co
         .status().map(|s| s.success()).unwrap_or(false);
 
     let _ = log::success(format!(
-        "Bittice engine running at {ip}  (health: {})",
+        "Bittice running at {ip}  (HTTP admin: {}, CDC profiles: {profile_count})",
         if ok { "OK" } else { "check pending" }
     ));
     let _ = log::info(format!("REST   http://{ip}:3000"));
@@ -828,7 +916,7 @@ fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_co
     let _ = log::info(format!("gRPC   {ip}:50051"));
     if vpn_configured {
         let _ = log::info(format!(
-            "VPN    ssh -i {ssh_priv} ubuntu@{ip} 'sudo journalctl -u openvpn-client@bittice -f'"
+            "VPN    ssh -i {ssh_priv} ubuntu@{ip} 'docker logs -f bittice-vpn'"
         ));
     }
     let _ = log::info(format!("Logs   ssh -i {ssh_priv} ubuntu@{ip} 'docker logs -f bittice'"));
