@@ -32,3 +32,34 @@ variable "data_volume_size_gb" {
   description = "Root EBS volume size in GB"
   default     = 20
 }
+
+# ── RDS-aware placement (multi-tenant) ──────────────────────────────────────
+# When the user's RDS lives in their own AWS account, the wizard discovers the
+# RDS's VPC/subnet/SG and passes them here. Bittice is then placed in the same
+# VPC, eliminating the VPN entirely. When empty (default), Bittice falls back
+# to the AWS account's default VPC and the user must arrange connectivity
+# (OpenVPN sidecar, public RDS, etc.).
+
+variable "target_vpc_id" {
+  description = "VPC to place Bittice in. Empty = use default VPC."
+  type        = string
+  default     = ""
+}
+
+variable "target_subnet_id" {
+  description = "Subnet for the Bittice EC2 (must be public — needs IGW for SSH/REST/gRPC ingress)."
+  type        = string
+  default     = ""
+}
+
+variable "target_rds_security_group_id" {
+  description = "Security group of the target RDS. When set, an inbound rule on 3306 from the Bittice SG is added so CDC can reach MySQL."
+  type        = string
+  default     = ""
+}
+
+variable "rds_port" {
+  description = "Port to open from Bittice EC2 toward the RDS SG."
+  type        = number
+  default     = 3306
+}

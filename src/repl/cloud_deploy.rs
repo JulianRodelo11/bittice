@@ -724,6 +724,276 @@ async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+// ── AWS RDS discovery (same-account placement, no VPN) ──────────────────────
+//
+// When the user's MySQL lives in their own AWS account, the wizard queries the
+// RDS via `aws rds describe-db-instances`, picks a public subnet in the RDS's
+// VPC, and Terraform places the Bittice EC2 there. The SG of the RDS gets an
+// inbound rule from the new EC2's SG so CDC can reach MySQL natively — zero
+// VPN, zero tunnel restart problems.
+
+#[derive(Debug, Clone)]
+struct RdsPlacement {
+    rds_identifier: String,
+    region: String,
+    vpc_id: String,
+    subnet_id: String,
+    rds_security_group_id: String,
+    rds_port: u16,
+    vpc_cidr: String,
+}
+
+fn aws_cli_available() -> bool {
+    Command::new("aws").arg("--version")
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
+}
+
+fn aws_json(args: &[&str]) -> Result<serde_json::Value> {
+    let out = Command::new("aws").args(args).output()
+        .context("running aws CLI — install it from https://aws.amazon.com/cli/")?;
+    if !out.status.success() {
+        bail!(
+            "aws {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let txt = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&txt).with_context(|| format!(
+        "parsing aws CLI JSON output (aws {})", args.join(" ")
+    ))
+}
+
+/// Scans data/profiles/*/cdc_config.json for the first MySQL host matching the
+/// AWS RDS endpoint pattern `<id>.<random>.<region>.rds.amazonaws.com`.
+/// Returns `(db_instance_identifier, region)` so the wizard can pre-fill them.
+fn extract_rds_hint_from_cdc_profiles(data_root: &Path) -> Option<(String, String)> {
+    for cfg in crate::core::data_paths::scan_all_cdc_config_paths_in_data_root(data_root) {
+        let Ok(txt) = std::fs::read_to_string(&cfg) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+        let Some(host) = v.get("host").and_then(|h| h.as_str()) else { continue };
+        let host = host.trim().trim_end_matches('.').to_lowercase();
+        if !host.ends_with(".rds.amazonaws.com") { continue; }
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() < 6 { continue; }
+        return Some((parts[0].to_string(), parts[2].to_string()));
+    }
+    None
+}
+
+/// Returns `(vpc_id, port, primary_sg_id)` for the RDS instance.
+fn describe_rds(identifier: &str, region: &str) -> Result<(String, u16, String)> {
+    let v = aws_json(&[
+        "rds", "describe-db-instances",
+        "--db-instance-identifier", identifier,
+        "--region", region,
+        "--output", "json",
+    ])?;
+    let inst = v.pointer("/DBInstances/0")
+        .with_context(|| format!("RDS '{identifier}' not found in region {region}"))?;
+    let vpc_id = inst.pointer("/DBSubnetGroup/VpcId").and_then(|x| x.as_str())
+        .context("VpcId missing on RDS DBSubnetGroup")?.to_string();
+    let port: u16 = inst.pointer("/Endpoint/Port").and_then(|x| x.as_u64())
+        .context("Endpoint.Port missing on RDS")? as u16;
+    let sg_id = inst.pointer("/VpcSecurityGroups/0/VpcSecurityGroupId").and_then(|x| x.as_str())
+        .context("RDS has no VPC security group attached")?.to_string();
+    Ok((vpc_id, port, sg_id))
+}
+
+/// All subnets in a VPC with `MapPublicIpOnLaunch=true`. Returns
+/// `Vec<(subnet_id, az, cidr, name_tag)>` ordered by AZ for stable display.
+fn find_public_subnets(vpc_id: &str, region: &str)
+    -> Result<Vec<(String, String, String, String)>>
+{
+    let v = aws_json(&[
+        "ec2", "describe-subnets",
+        "--region", region,
+        "--filters", &format!("Name=vpc-id,Values={vpc_id}"),
+        "--output", "json",
+    ])?;
+    let mut out: Vec<(String, String, String, String)> = Vec::new();
+    let arr = v.get("Subnets").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    for s in arr {
+        if !s.get("MapPublicIpOnLaunch").and_then(|x| x.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let subnet_id = s.get("SubnetId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if subnet_id.is_empty() { continue; }
+        let az   = s.get("AvailabilityZone").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let cidr = s.get("CidrBlock").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let name = s.get("Tags").and_then(|t| t.as_array())
+            .and_then(|tags| tags.iter().find(|t| t.get("Key").and_then(|k| k.as_str()) == Some("Name")))
+            .and_then(|t| t.get("Value").and_then(|v| v.as_str()))
+            .unwrap_or("").to_string();
+        out.push((subnet_id, az, cidr, name));
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
+}
+
+fn get_vpc_cidr(vpc_id: &str, region: &str) -> Result<String> {
+    let v = aws_json(&[
+        "ec2", "describe-vpcs",
+        "--vpc-ids", vpc_id,
+        "--region", region,
+        "--output", "json",
+    ])?;
+    v.pointer("/Vpcs/0/CidrBlock").and_then(|x| x.as_str()).map(String::from)
+        .with_context(|| format!("CidrBlock not found for VPC {vpc_id}"))
+}
+
+/// Full discovery: from a guessed identifier/region, returns everything Terraform
+/// needs to place the EC2 in the RDS's VPC. Prompts the user to pick a public
+/// subnet when the VPC has more than one.
+async fn discover_rds_placement(
+    rds_identifier_hint: Option<String>,
+    region_hint: Option<String>,
+) -> Result<RdsPlacement> {
+    if !aws_cli_available() {
+        bail!("aws CLI not installed — install from https://aws.amazon.com/cli/ and run `aws configure`");
+    }
+    let raw_id: String = match input("RDS instance identifier (not the endpoint hostname)")
+        .default_input(rds_identifier_hint.as_deref().unwrap_or(""))
+        .interact()
+    {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => bail!("cancelled"),
+        Err(e) => return Err(e.into()),
+    };
+    let identifier = raw_id.trim().to_string();
+    if identifier.is_empty() { bail!("RDS identifier is required"); }
+
+    let raw_region: String = match input("AWS region of that RDS")
+        .default_input(region_hint.as_deref().unwrap_or("us-east-1"))
+        .interact()
+    {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => bail!("cancelled"),
+        Err(e) => return Err(e.into()),
+    };
+    let region = raw_region.trim().to_string();
+
+    let s = spinner();
+    s.start(format!("Querying RDS '{identifier}' in {region}…"));
+    let (vpc_id, rds_port, rds_sg_id) = match describe_rds(&identifier, &region) {
+        Ok(v) => { s.stop(format!("RDS found in VPC {}.", v.0)); v }
+        Err(e) => { s.stop("RDS lookup failed."); return Err(e); }
+    };
+
+    let s = spinner();
+    s.start(format!("Listing public subnets in {vpc_id}…"));
+    let publics = match find_public_subnets(&vpc_id, &region) {
+        Ok(v) => v,
+        Err(e) => { s.stop("Subnet listing failed."); return Err(e); }
+    };
+    if publics.is_empty() {
+        s.stop("No public subnets in this VPC.");
+        bail!(
+            "VPC {vpc_id} has no subnet with MapPublicIpOnLaunch=true.\n\
+             Bittice needs a public subnet to receive SSH and REST/gRPC ingress.\n\
+             Create one (or enable auto-assign public IPv4 on an existing subnet) and retry."
+        );
+    }
+    s.stop(format!("{} public subnet(s) available.", publics.len()));
+
+    let subnet_id: String = if publics.len() == 1 {
+        let (sid, az, cidr, name) = &publics[0];
+        let _ = log::info(format!(
+            "Auto-selected only public subnet: {sid}  ({az}, {cidr}{})",
+            if name.is_empty() { "".into() } else { format!(", \"{name}\"") }
+        ));
+        sid.clone()
+    } else {
+        let mut sel = select("Pick a public subnet for the Bittice EC2");
+        for (sid, az, cidr, name) in &publics {
+            let label = if name.is_empty() {
+                format!("{sid}  ({az}, {cidr})")
+            } else {
+                format!("{sid}  ({az}, {cidr}, \"{name}\")")
+            };
+            sel = sel.item(sid.clone(), label, "");
+        }
+        match sel.interact() {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => bail!("cancelled"),
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    let s = spinner();
+    s.start(format!("Fetching CIDR of {vpc_id}…"));
+    let vpc_cidr = match get_vpc_cidr(&vpc_id, &region) {
+        Ok(c) => { s.stop(format!("VPC CIDR: {c}.")); c }
+        Err(e) => { s.stop("VPC CIDR lookup failed."); return Err(e); }
+    };
+
+    Ok(RdsPlacement {
+        rds_identifier: identifier,
+        region,
+        vpc_id,
+        subnet_id,
+        rds_security_group_id: rds_sg_id,
+        rds_port,
+        vpc_cidr,
+    })
+}
+
+// ── SSH key auto-generation (no .pem required in AWS-managed mode) ──────────
+//
+// When deploying via AWS-discovered placement, the user already has credentials
+// configured for `aws` — asking them for a separate .pem is redundant. We
+// generate an ed25519 keypair once in ~/.bittice/ssh/ and reuse it for every
+// future deploy. Pure Terraform-managed (registered as aws_key_pair).
+
+struct AutoKeypair {
+    private_path: String,
+    public_key:   String,
+}
+
+fn ensure_ssh_keypair_auto() -> Result<AutoKeypair> {
+    let home = home_dir().context("HOME env var not set — cannot store SSH key")?;
+    let dir = PathBuf::from(&home).join(".bittice").join("ssh");
+    std::fs::create_dir_all(&dir).context("create ~/.bittice/ssh/")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let priv_path = dir.join("bittice_id_ed25519");
+    let pub_path  = dir.join("bittice_id_ed25519.pub");
+
+    if !priv_path.is_file() {
+        let s = spinner();
+        s.start("Generating SSH keypair at ~/.bittice/ssh/bittice_id_ed25519…");
+        let status = Command::new("ssh-keygen")
+            .args([
+                "-t", "ed25519",
+                "-N", "",
+                "-C", "bittice-cloud-deploy",
+                "-f", priv_path.to_string_lossy().as_ref(),
+            ])
+            .status().context("running ssh-keygen — is OpenSSH installed?")?;
+        if !status.success() {
+            s.stop("ssh-keygen failed.");
+            bail!("Could not generate SSH keypair at {}", priv_path.display());
+        }
+        s.stop("SSH keypair generated.");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600));
+    }
+    let public_key = std::fs::read_to_string(&pub_path)
+        .with_context(|| format!("read public key at {}", pub_path.display()))?
+        .trim().to_string();
+    Ok(AutoKeypair {
+        private_path: priv_path.to_string_lossy().to_string(),
+        public_key,
+    })
+}
+
 // ── image detection ───────────────────────────────────────────────────────────
 
 fn detect_image() -> Result<String> {
@@ -764,12 +1034,53 @@ fn detect_image() -> Result<String> {
 
 // ── wizard ────────────────────────────────────────────────────────────────────
 
-fn build_tfvars(region: &str, instance_type: &str, ssh_pub_key: &str) -> String {
-    format!(
+fn build_tfvars(
+    region: &str,
+    instance_type: &str,
+    ssh_pub_key: &str,
+    app_name: &str,
+    placement: Option<&RdsPlacement>,
+) -> String {
+    let mut s = format!(
         "aws_region     = \"{region}\"\n\
          instance_type  = \"{instance_type}\"\n\
-         ssh_public_key = \"{ssh_pub_key}\"\n"
-    )
+         ssh_public_key = \"{ssh_pub_key}\"\n\
+         app_name       = \"{app_name}\"\n"
+    );
+    if let Some(p) = placement {
+        s.push_str(&format!(
+            "target_vpc_id                = \"{}\"\n\
+             target_subnet_id             = \"{}\"\n\
+             target_rds_security_group_id = \"{}\"\n\
+             rds_port                     = {}\n\
+             allowed_admin_cidr           = \"{}\"\n",
+            p.vpc_id, p.subnet_id, p.rds_security_group_id, p.rds_port, p.vpc_cidr,
+        ));
+    }
+    s
+}
+
+/// AWS resource names must be 3–32 chars, start with a letter, and contain only
+/// lowercase letters, digits, and hyphens (no spaces, no leading/trailing dash).
+/// Used both for the EC2 Name tag and as a prefix for SG/key/EIP names.
+fn validate_deployment_name(name: &str) -> Result<()> {
+    let n = name.trim();
+    if n.len() < 3 || n.len() > 32 {
+        bail!("Name must be 3–32 characters (got {}).", n.len());
+    }
+    let first = n.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() || !first.is_ascii_lowercase() {
+        bail!("Name must start with a lowercase letter (got '{first}').");
+    }
+    if n.ends_with('-') {
+        bail!("Name cannot end with '-'.");
+    }
+    for c in n.chars() {
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            bail!("Name can only contain lowercase letters, digits, and hyphens (offending char: '{c}').");
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_cloud_deploy_wizard() -> Result<()> {
@@ -831,20 +1142,58 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         if action == 0 { return deploy_to_existing(&tf_bin, &tf_dir, &data_root, &image).await; }
     }
 
+    // ── connectivity mode ─────────────────────────────────────────────────────
+    // Decides whether we go RDS-aware (auto-discover, no VPN, auto SSH key)
+    // or legacy (default VPC, prompt for .pem, optional VPN sidecar).
+    let (hint_id, hint_region) = extract_rds_hint_from_cdc_profiles(&data_root)
+        .map(|(i, r)| (Some(i), Some(r))).unwrap_or((None, None));
+    let aws_ok = aws_cli_available();
+    let _ = log::info(if aws_ok {
+        "Detected `aws` CLI on PATH — same-account RDS auto-discovery available."
+    } else {
+        "`aws` CLI not found — only the legacy flow (default VPC, optional OpenVPN) is available."
+    });
+
+    let mode: u8 = if aws_ok {
+        match select("How does Bittice reach your database?")
+            .item(0u8, "AWS RDS in this account (auto-discover VPC, no VPN, no .pem)", "RECOMMENDED")
+            .item(1u8, "Reachable directly from the internet (public RDS or non-AWS)", "")
+            .item(2u8, "Behind OpenVPN — start a sidecar tunnel", "")
+            .item(255u8, "« Back", "")
+            .interact()
+        {
+            Ok(x) => x,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+    } else { 1 };
+    if mode == 255 { return Ok(()); }
+
+    // RDS-aware path: discover up-front so the rest of the wizard can adapt
+    // (region pinned, no SSH prompt, no VPN prompt).
+    let placement: Option<RdsPlacement> = if mode == 0 {
+        Some(discover_rds_placement(hint_id, hint_region).await?)
+    } else { None };
+
     // ── region ──
-    let region: &str = match select("AWS region")
-        .item("us-east-1",      "us-east-1      — N. Virginia", "")
-        .item("us-west-2",      "us-west-2      — Oregon", "")
-        .item("eu-west-1",      "eu-west-1      — Ireland", "")
-        .item("eu-central-1",   "eu-central-1   — Frankfurt", "")
-        .item("ap-southeast-1", "ap-southeast-1 — Singapore", "")
-        .item("ap-northeast-1", "ap-northeast-1 — Tokyo", "")
-        .item("sa-east-1",      "sa-east-1      — São Paulo", "")
-        .interact()
-    {
-        Ok(x) => x,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-        Err(e) => return Err(e.into()),
+    let region: String = if let Some(p) = &placement {
+        let _ = log::step(format!("Region pinned to RDS location: {}", p.region));
+        p.region.clone()
+    } else {
+        match select("AWS region")
+            .item("us-east-1",      "us-east-1      — N. Virginia", "")
+            .item("us-west-2",      "us-west-2      — Oregon", "")
+            .item("eu-west-1",      "eu-west-1      — Ireland", "")
+            .item("eu-central-1",   "eu-central-1   — Frankfurt", "")
+            .item("ap-southeast-1", "ap-southeast-1 — Singapore", "")
+            .item("ap-northeast-1", "ap-northeast-1 — Tokyo", "")
+            .item("sa-east-1",      "sa-east-1      — São Paulo", "")
+            .interact()
+        {
+            Ok(x) => x.to_string(),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
     };
 
     // ── instance type ──
@@ -860,47 +1209,86 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    // ── SSH key (.pem or id_rsa — public key is derived automatically) ──
-    let default_priv = format!("{}/.ssh/id_rsa", home_dir().unwrap_or_else(|| "~".into()));
-    let _ = log::info("Provide the private key AWS gave you (.pem) or your local id_rsa.");
-    let ssh_priv_path: String = match input("SSH private key path (.pem or id_rsa)")
-        .default_input(&default_priv).interact()
-    {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-        Err(e) => return Err(e.into()),
+    // ── SSH key ──
+    // Auto-managed in AWS-discovered mode (we already have AWS creds, no point
+    // asking the user for a .pem); manual .pem path otherwise.
+    let (ssh_priv, ssh_pub_key): (String, String) = if placement.is_some() {
+        let kp = ensure_ssh_keypair_auto()?;
+        let _ = log::success(format!("Using auto-managed SSH key: {}", kp.private_path));
+        (kp.private_path, kp.public_key)
+    } else {
+        let default_priv = format!("{}/.ssh/id_rsa", home_dir().unwrap_or_else(|| "~".into()));
+        let _ = log::info("Provide the private key AWS gave you (.pem) or your local id_rsa.");
+        let p: String = match input("SSH private key path (.pem or id_rsa)")
+            .default_input(&default_priv).interact()
+        {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let priv_path = p.trim().to_string();
+        let ks = spinner();
+        ks.start("Deriving public key…");
+        let pub_res = derive_public_key(&priv_path);
+        if pub_res.is_ok() { ks.stop("Public key derived."); } else { ks.stop("Failed to derive public key."); }
+        (priv_path, pub_res?)
     };
-    let ssh_priv = ssh_priv_path.trim().to_string();
 
-    let ks = spinner();
-    ks.start("Deriving public key…");
-    let pub_key_res = derive_public_key(&ssh_priv);
-    if pub_key_res.is_ok() { ks.stop("Public key derived."); } else { ks.stop("Failed to derive public key."); }
-    let ssh_pub_key = pub_key_res?;
+    // ── deployment name (used for EC2 Name tag + SG/key/EIP resource names) ──
+    // Lets the user deploy multiple Bittices in the same account without
+    // resource-name collisions. Default "bittice" keeps the existing UX.
+    let app_name: String = loop {
+        let raw: String = match input("Name for this deployment (EC2 Name tag + resource prefix)")
+            .default_input("bittice")
+            .interact()
+        {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let candidate = raw.trim().to_string();
+        match validate_deployment_name(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) => { let _ = log::warning(format!("{e} Try again.")); }
+        }
+    };
 
-    // ── VPN (auto from cdc_config `vpn_file`, prompt only if .ovpn still missing) ──
-    let vpn_configured = ensure_vpn_ready_for_deploy(&data_root).await?;
-    if crate::core::data_paths::any_cdc_host_suggests_vpn(&data_root) && !vpn_configured {
-        bail!(
-            "MySQL hostnames look VPN-only but no .ovpn is under data/vpn/.\n\
-             Add it via Deploy → OpenVPN profile before provisioning."
-        );
-    }
+    // ── VPN ── only in legacy mode; RDS-in-account placement reaches MySQL natively.
+    let vpn_configured = if placement.is_some() {
+        let _ = log::info("Same-account placement: skipping VPN setup (EC2 reaches RDS via VPC SG rule).");
+        false
+    } else {
+        let v = ensure_vpn_ready_for_deploy(&data_root).await?;
+        if crate::core::data_paths::any_cdc_host_suggests_vpn(&data_root) && !v {
+            bail!(
+                "MySQL hostnames look VPN-only but no .ovpn is under data/vpn/.\n\
+                 Add it via Deploy → OpenVPN profile before provisioning."
+            );
+        }
+        v
+    };
 
     // ── IAM permissions note ──
     let _ = note(
         "AWS IAM permissions required",
-        "Your IAM user needs EC2 access. Easiest fix:\n\
-         Go to IAM → Users → your user → Add permissions\n\
-         → Attach policy → AmazonEC2FullAccess\n\n\
-         Or attach a custom policy allowing: ec2:* on resource *"
+        "Your IAM user needs EC2 access (and, for RDS auto-discovery mode, \
+         rds:DescribeDBInstances + ec2:DescribeSubnets/Vpcs + ec2:AuthorizeSecurityGroupIngress \
+         on the target VPC and the RDS SG).\n\n\
+         Easiest fix: attach AmazonEC2FullAccess and AmazonRDSReadOnlyAccess to your IAM user."
     );
 
     // ── confirm ──
-    let go: u8 = match select(format!(
-        "Create AWS resources? (region: {region}, VM: {instance_type}, VPN: {})",
-        if vpn_configured { "OpenVPN" } else { "none" }
-    ))
+    let summary = match &placement {
+        Some(p) => format!(
+            "(name: {app_name}, region: {}, VM: {instance_type}, VPC: {} same as RDS {}:{} — no VPN)",
+            p.region, p.vpc_id, p.rds_identifier, p.rds_port
+        ),
+        None => format!(
+            "(name: {app_name}, region: {region}, VM: {instance_type}, VPN: {})",
+            if vpn_configured { "OpenVPN" } else { "none" }
+        ),
+    };
+    let go: u8 = match select(format!("Create AWS resources? {summary}"))
         .item(0u8, "Yes — provision and deploy", "")
         .item(255u8, "No — cancel", "")
         .interact()
@@ -914,7 +1302,10 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     // ── write terraform files ──
     let ws = spinner();
     ws.start("Writing Terraform files…");
-    let write_res = write_terraform_files(&tf_dir, &build_tfvars(region, instance_type, &ssh_pub_key));
+    let write_res = write_terraform_files(
+        &tf_dir,
+        &build_tfvars(&region, instance_type, &ssh_pub_key, &app_name, placement.as_ref()),
+    );
     if write_res.is_ok() { ws.stop("Terraform files ready."); } else { ws.stop("Failed to write files."); }
     write_res?;
 
@@ -936,9 +1327,17 @@ async fn deploy_to_existing(
     let ip = terraform_output(tf_bin, tf_dir, "public_ip")?;
     let _ = log::success(format!("EC2 IP: {ip}"));
 
-    let default_priv = format!("{}/.ssh/id_rsa", home_dir().unwrap_or_else(|| "~".into()));
-    let _ = log::info("Provide the same .pem or id_rsa used when provisioning this instance.");
-    let ssh_priv: String = match input("SSH private key path (.pem or id_rsa)").default_input(&default_priv).interact() {
+    // Prefer the auto-managed key when present (this is how AWS-discovered
+    // deploys provisioned the EC2); fall back to ~/.ssh/id_rsa.
+    let home = home_dir().unwrap_or_else(|| "~".into());
+    let auto_key = format!("{home}/.bittice/ssh/bittice_id_ed25519");
+    let default_priv = if std::path::Path::new(&auto_key).is_file() {
+        auto_key
+    } else {
+        format!("{home}/.ssh/id_rsa")
+    };
+    let _ = log::info("Provide the same private key used when provisioning this instance.");
+    let ssh_priv: String = match input("SSH private key path (.pem, id_rsa, or auto-managed)").default_input(&default_priv).interact() {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
         Err(e) => return Err(e.into()),
