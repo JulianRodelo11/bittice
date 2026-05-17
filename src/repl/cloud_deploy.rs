@@ -18,7 +18,7 @@ const TF_MAIN: &str = include_str!("../../deploy/terraform/main.tf");
 const TF_OUTPUTS: &str = include_str!("../../deploy/terraform/outputs.tf");
 
 const TERRAFORM_VERSION: &str = "1.9.8";
-const EC2_OVPN_NAME: &str = "bittice-ec2.ovpn";
+const EC2_OVPN_NAME: &str = crate::core::data_paths::DEPLOY_OVPN_NAME;
 
 // ── terraform auto-download ───────────────────────────────────────────────────
 
@@ -128,22 +128,38 @@ fn terraform_output(tf_bin: &Path, tf_dir: &Path, key: &str) -> Result<String> {
 
 // ── remote helpers ────────────────────────────────────────────────────────────
 
+fn ssh_common_args(ssh_key: &str, ip: &str) -> Vec<String> {
+    vec![
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "ConnectTimeout=20".into(),
+        "-i".into(),
+        ssh_key.to_string(),
+        format!("ubuntu@{ip}"),
+    ]
+}
+
 fn ssh_run(ip: &str, ssh_key: &str, cmd: &str) -> Result<()> {
-    let status = Command::new("ssh")
-        .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=20",
-               "-i", ssh_key, &format!("ubuntu@{ip}"), cmd])
-        .status().context("ssh")?;
+    let mut args = ssh_common_args(ssh_key, ip);
+    args.push(cmd.to_string());
+    let status = Command::new("ssh").args(&args).status().context("ssh")?;
     if !status.success() { bail!("Remote command failed: {cmd}"); }
     Ok(())
 }
 
 fn rsync_data(data_root: &Path, ip: &str, ssh_key: &str) -> Result<()> {
+    let ssh_transport = format!(
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {ssh_key}"
+    );
     let status = Command::new("rsync")
         .args([
             "-avz", "--progress",
             "--exclude=server.log", "--exclude=.layout_v2",
             "--exclude=terraform", "--exclude=.terraform-bin",
-            "-e", &format!("ssh -o StrictHostKeyChecking=no -i {ssh_key}"),
+            "-e", &ssh_transport,
             &format!("{}/", data_root.display()),
             &format!("ubuntu@{ip}:/opt/bittice/data/"),
         ])
@@ -158,18 +174,20 @@ fn wait_for_ssh(ip: &str, ssh_key: &str) -> Result<()> {
     ws.start(format!("Waiting for SSH on {ip}… (1/{MAX})"));
     for attempt in 1..=MAX {
         ws.set_message(format!("Waiting for SSH on {ip}… ({attempt}/{MAX})"));
+        let mut args = ssh_common_args(ssh_key, ip);
+        args.extend([
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "PasswordAuthentication=no".into(),
+            "-o".into(),
+            "ServerAliveInterval=5".into(),
+            "-o".into(),
+            "ServerAliveCountMax=1".into(),
+            "echo ok".into(),
+        ]);
         let ok = Command::new("ssh")
-            .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=8",
-                "-o", "BatchMode=yes",
-                "-o", "PasswordAuthentication=no",
-                "-o", "ServerAliveInterval=5",
-                "-o", "ServerAliveCountMax=1",
-                "-i", ssh_key,
-                &format!("ubuntu@{ip}"),
-                "echo ok",
-            ])
+            .args(&args)
             .stdout(Stdio::null()).stderr(Stdio::null())
             .status().map(|s| s.success()).unwrap_or(false);
         if ok {
@@ -338,8 +356,16 @@ fn wait_for_cdc_live(ip: &str, ssh_key: &str, expected_profiles: usize) -> Resul
             || logs.contains("request_engine_shutdown_from_cdc")
         {
             ws.stop("CDC failed during startup.");
+            let vpn_hint = if logs.contains("Connection timed out")
+                || logs.contains("Connection timeout")
+            {
+                "\n\nLikely cause: MySQL is only reachable over VPN but the deploy stack has no VPN sidecar.\n\
+                 Ensure data/vpn/bittice-ec2.ovpn exists locally, then redeploy (the CLI will start bittice-vpn + bittice)."
+            } else {
+                ""
+            };
             bail!(
-                "CDC did not start on the server. Check VPN and MySQL reachability:\n\
+                "CDC did not start on the server.{vpn_hint}\n\
                  ssh -i {ssh_key} ubuntu@{ip} 'docker logs bittice 2>&1 | tail -n 80'"
             );
         }
@@ -476,9 +502,10 @@ fn prepare_ovpn_content(raw: &str, cidrs_csv: &str) -> Result<String> {
 }
 
 fn ssh_capture(ip: &str, ssh_key: &str, cmd: &str) -> String {
+    let mut args = ssh_common_args(ssh_key, ip);
+    args.push(cmd.to_string());
     Command::new("ssh")
-        .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-               "-i", ssh_key, &format!("ubuntu@{ip}"), cmd])
+        .args(&args)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
@@ -538,22 +565,59 @@ fn bootstrap_ec2_ovpn_from_profiles(data_root: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Ensures VPN material exists when any CDC profile references `vpn_file`.
+/// Copy `bittice-ec2.ovpn` → `vpn.conf` for the dperson/openvpn-client sidecar.
+fn ensure_vpn_conf_in_bundle(data_root: &Path) -> Result<()> {
+    let vpn_dir = data_root.join("vpn");
+    let conf = vpn_dir.join("vpn.conf");
+    if conf.is_file() {
+        return Ok(());
+    }
+    let bundled = vpn_dir.join(EC2_OVPN_NAME);
+    if bundled.is_file() {
+        std::fs::copy(&bundled, &conf).context("copy bittice-ec2.ovpn → vpn.conf")?;
+        return Ok(());
+    }
+    bail!(
+        "VPN sidecar needs data/vpn/{} or data/vpn/vpn.conf — add it via Deploy → OpenVPN profile.",
+        EC2_OVPN_NAME
+    );
+}
+
+/// Ensures VPN material exists when profiles, hostnames, or data/vpn/ indicate a tunnel.
 async fn ensure_vpn_ready_for_deploy(data_root: &Path) -> Result<bool> {
-    if !crate::core::data_paths::any_cdc_profile_uses_vpn(data_root) {
+    if !crate::core::data_paths::deploy_requires_vpn_sidecar(data_root) {
         return Ok(false);
     }
 
-    let _ = log::info(
-        "Detected OpenVPN in your sync profile(s) — deploy will start a VPN sidecar automatically.",
-    );
+    if crate::core::data_paths::deploy_vpn_material_present(data_root) {
+        ensure_vpn_conf_in_bundle(data_root)?;
+        let _ = log::info(
+            "Found OpenVPN under data/vpn/ — deploy will start VPN + Bittice sidecars.",
+        );
+        return Ok(true);
+    }
+
+    if crate::core::data_paths::any_cdc_host_suggests_vpn(data_root) {
+        let _ = log::info(
+            "MySQL host looks VPC/VPN-only — OpenVPN is required on the server.",
+        );
+    } else {
+        let _ = log::info(
+            "Detected OpenVPN in your sync profile(s) — deploy will start a VPN sidecar automatically.",
+        );
+    }
 
     if bootstrap_ec2_ovpn_from_profiles(data_root)? {
+        ensure_vpn_conf_in_bundle(data_root)?;
         return Ok(true);
     }
 
     let _ = log::info("Add the .ovpn file once; it is stored under data/vpn/ and reused on every deploy.");
-    collect_and_store_ovpn(data_root).await
+    let ok = collect_and_store_ovpn(data_root).await?;
+    if ok {
+        ensure_vpn_conf_in_bundle(data_root)?;
+    }
+    Ok(ok)
 }
 
 async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
@@ -816,6 +880,12 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
 
     // ── VPN (auto from cdc_config `vpn_file`, prompt only if .ovpn still missing) ──
     let vpn_configured = ensure_vpn_ready_for_deploy(&data_root).await?;
+    if crate::core::data_paths::any_cdc_host_suggests_vpn(&data_root) && !vpn_configured {
+        bail!(
+            "MySQL hostnames look VPN-only but no .ovpn is under data/vpn/.\n\
+             Add it via Deploy → OpenVPN profile before provisioning."
+        );
+    }
 
     // ── IAM permissions note ──
     let _ = note(
@@ -875,11 +945,32 @@ async fn deploy_to_existing(
     };
 
     let vpn_configured = ensure_vpn_ready_for_deploy(data_root).await?;
+    if crate::core::data_paths::any_cdc_host_suggests_vpn(data_root) && !vpn_configured {
+        bail!(
+            "MySQL hostnames look VPN-only (e.g. *openvpn* in RDS name) but no .ovpn is under data/vpn/.\n\
+             Use Deploy → add OpenVPN profile, or paste your .ovpn when prompted."
+        );
+    }
 
     finish_deploy(&ip, ssh_priv.trim(), image, data_root, vpn_configured)
 }
 
-fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_configured: bool) -> Result<()> {
+fn remote_has_deploy_vpn_material(ip: &str, ssh_key: &str) -> bool {
+    let path = format!("/opt/bittice/data/vpn/{EC2_OVPN_NAME}");
+    ssh_capture(
+        ip,
+        ssh_key,
+        &format!("test -f {path} && echo yes || test -f /opt/bittice/data/vpn/vpn.conf && echo yes"),
+    ) == "yes"
+}
+
+fn finish_deploy(
+    ip: &str,
+    ssh_priv: &str,
+    image: &str,
+    data_root: &Path,
+    mut vpn_configured: bool,
+) -> Result<()> {
     let profile_count = crate::core::data_paths::cdc_profile_count(data_root);
     if profile_count == 0 {
         let _ = log::warning(
@@ -896,7 +987,22 @@ fn finish_deploy(ip: &str, ssh_priv: &str, image: &str, data_root: &Path, vpn_co
     )?;
     rsync_data(data_root, ip, ssh_priv)?;
 
-    let _ = log::step(format!("Deploying {image}…"));
+    if !vpn_configured && remote_has_deploy_vpn_material(ip, ssh_priv) {
+        let _ = log::info("Using OpenVPN profile already on the server (data/vpn/).");
+        vpn_configured = true;
+    }
+    if crate::core::data_paths::any_cdc_host_suggests_vpn(data_root) && !vpn_configured {
+        bail!(
+            "MySQL requires VPN but no data/vpn/{} on this machine or the server.\n\
+             Use Deploy → add OpenVPN profile, then redeploy.",
+            EC2_OVPN_NAME
+        );
+    }
+
+    let _ = log::step(format!(
+        "Deploying {image}{}…",
+        if vpn_configured { " (VPN sidecar + Bittice)" } else { "" }
+    ));
     deploy_compose(ip, ssh_priv, image, vpn_configured)?;
 
     wait_for_cdc_live(ip, ssh_priv, profile_count)?;

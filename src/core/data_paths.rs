@@ -311,6 +311,54 @@ pub fn cdc_profile_count(data_root: &Path) -> usize {
     scan_all_cdc_config_paths_in_data_root(data_root).len()
 }
 
+pub const DEPLOY_OVPN_NAME: &str = "bittice-ec2.ovpn";
+
+/// OpenVPN material shipped under `data/vpn/` for EC2/docker sidecar deploy.
+pub fn deploy_vpn_material_present(data_root: &Path) -> bool {
+    let vpn_dir = data_root.join("vpn");
+    if vpn_dir.join(DEPLOY_OVPN_NAME).is_file() || vpn_dir.join("vpn.conf").is_file() {
+        return true;
+    }
+    let Ok(rd) = fs::read_dir(&vpn_dir) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        e.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && e.file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".ovpn")
+    })
+}
+
+/// Hostnames that clearly require a private tunnel (e.g. RDS only reachable over OpenVPN).
+pub fn any_cdc_host_suggests_vpn(data_root: &Path) -> bool {
+    scan_all_cdc_config_paths_in_data_root(data_root)
+        .iter()
+        .any(|config_path| {
+            let Ok(content) = fs::read_to_string(config_path) else {
+                return false;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+                return false;
+            };
+            json.get("host")
+                .and_then(|v| v.as_str())
+                .map(|host| {
+                    let h = host.to_ascii_lowercase();
+                    h.contains("openvpn") || h.ends_with(".internal")
+                })
+                .unwrap_or(false)
+        })
+}
+
+/// Whether cloud/local docker deploy should start the OpenVPN sidecar.
+pub fn deploy_requires_vpn_sidecar(data_root: &Path) -> bool {
+    any_cdc_profile_uses_vpn(data_root)
+        || deploy_vpn_material_present(data_root)
+        || any_cdc_host_suggests_vpn(data_root)
+}
+
 /// Entity roots that contain table data (mirror + legacy flat mirror dirs).
 pub fn iter_mirror_entity_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();

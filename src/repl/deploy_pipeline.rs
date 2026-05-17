@@ -87,7 +87,7 @@ fn detect_ghcr_repo(project_root: &Path) -> Result<String> {
     Ok(repo)
 }
 
-const EC2_OVPN_NAME: &str = "bittice-ec2.ovpn";
+const EC2_OVPN_NAME: &str = crate::core::data_paths::DEPLOY_OVPN_NAME;
 
 /// `vpn.conf` for dperson/openvpn-client (from deploy profile or existing bundle file).
 fn ensure_vpn_conf_for_compose(data_root: &Path) -> Result<()> {
@@ -214,7 +214,7 @@ pub fn run_local_docker_container(project_root: &Path) -> Result<()> {
         })
         .unwrap_or_else(|| project_root.join("data"));
 
-    let with_vpn = crate::core::data_paths::any_cdc_profile_uses_vpn(&data_root);
+    let with_vpn = crate::core::data_paths::deploy_requires_vpn_sidecar(&data_root);
 
     if with_vpn {
         println!(
