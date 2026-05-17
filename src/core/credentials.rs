@@ -23,7 +23,7 @@ use std::fs;
 use std::path::PathBuf;
 
 const FILE_NAME: &str = "credentials.json";
-pub const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bittice.dev";
+pub const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bittice.com";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
