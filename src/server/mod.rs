@@ -341,8 +341,6 @@ struct CdcSpawnSpec {
     sync_all: bool,
     cleanup_single_db_lock: Option<String>,
     db_name_for_log: String,
-    vpn_file: Option<String>,
-    vpn_host: String,
 }
 
 /// Build launch plans for every CDC profile that should auto-start (same rules as historical `scan_and_start_cdc`).
@@ -409,17 +407,11 @@ fn collect_cdc_spawn_specs(
             "3306".to_string()
         };
 
-        let vpn_file = config["vpn_file"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string());
-
         let is_docker =
             std::path::Path::new("/.dockerenv").exists() || std::env::var("BITTICE_HOST").is_ok();
         if (host == "localhost" || host == "0.0.0.0") && is_docker {
             host = "host.docker.internal".to_string();
         }
-        let vpn_host = host.clone();
 
         let single_db_lock_key = format!(
             "{}:{}:{}",
@@ -472,8 +464,6 @@ Mirror '{}' will stay static unless you enable sync_all_databases on one profile
                 Some(single_db_lock_key)
             },
             db_name_for_log,
-            vpn_file,
-            vpn_host,
         });
     }
 
@@ -486,31 +476,6 @@ fn spawn_cdc_worker_thread(
     active_workers: Arc<StdRwLock<HashSet<String>>>,
     startup_report_tx: Option<mpsc::Sender<crate::core::cdc::CdcStartupReport>>,
 ) {
-    let docker_env = std::path::Path::new("/.dockerenv").exists()
-        || std::env::var("BITTICE_ENGINE_ONLY")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
-    if !docker_env {
-        if let Some(ref vpn_path) = spec.vpn_file {
-            info!(
-                "CDC: Auto-starting VPN from saved config for entity '{}'...",
-                spec.entity
-            );
-            match crate::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &spec.vpn_host) {
-                Ok(prepared) => {
-                    if let Err(e) = crate::core::vpn::VpnManager::start(&prepared) {
-                        warn!("CDC: Failed to start VPN for entity '{}': {}", spec.entity, e);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "CDC: Failed to prepare VPN file for entity '{}': {}",
-                        spec.entity, e
-                    );
-                }
-            }
-        }
-    }
 
     let cleanup_entity_key = spec.entity_key.clone();
     let cleanup_single_db_lock = spec.cleanup_single_db_lock.clone();

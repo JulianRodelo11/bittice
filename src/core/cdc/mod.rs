@@ -579,47 +579,6 @@ impl CdcWorker {
         }
     }
 
-    fn configured_vpn_file_for_entity(&self) -> Option<String> {
-        let cfg_path = crate::core::data_paths::profile_dir(&self.entity).join("cdc_config.json");
-        let content = std::fs::read_to_string(cfg_path).ok()?;
-        let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
-        let vpn_file = json.get("vpn_file")?.as_str()?.trim();
-        if vpn_file.is_empty() {
-            None
-        } else {
-            Some(vpn_file.to_string())
-        }
-    }
-
-    fn try_restart_openvpn_for_route_loss(&self, db_host: &str) -> bool {
-        if std::path::Path::new("/.dockerenv").exists() {
-            return false;
-        }
-        let Some(vpn_file) = self.configured_vpn_file_for_entity() else {
-            return false;
-        };
-        self.log_warn(format!(
-            "CDC: attempting OpenVPN restart for profile '{}' after route loss.",
-            self.entity
-        ));
-        match crate::core::vpn::VpnManager::prepare_ovpn_file(&vpn_file, db_host) {
-            Ok(prepared) => match crate::core::vpn::VpnManager::start(&prepared) {
-                Ok(()) => {
-                    self.log_info("CDC: OpenVPN restarted; waiting for MySQL route recovery.".to_string());
-                    true
-                }
-                Err(e) => {
-                    self.log_warn(format!("CDC: OpenVPN restart failed: {}", e));
-                    false
-                }
-            },
-            Err(e) => {
-                self.log_warn(format!("CDC: OpenVPN config prepare failed: {}", e));
-                false
-            }
-        }
-    }
-
     fn empty_cdc_state() -> CdcState {
         CdcState {
             binlog_file: String::new(),
@@ -2460,13 +2419,6 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 .unwrap_or(3);
             let infinite_health_retries = max_health_check_failures == 0;
             let mut consecutive_health_failures: u32 = 0;
-            let vpn_restart_cooldown = std::time::Duration::from_secs(
-                std::env::var("BITTICE_CDC_VPN_RESTART_COOLDOWN_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(20),
-            );
-            let mut last_vpn_restart_attempt: Option<std::time::Instant> = None;
             // Maximum silence from MySQL before treating the stream as dead (no heartbeats → hung).
             // MySQL sends Heartbeat_log_event every slave_net_timeout/2 (default 15s). 90s gives
             // 3 missed heartbeats before declaring the connection stale and restarting Phase 1.
@@ -2571,14 +2523,6 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                                 _ => {
                                     consecutive_health_failures =
                                         consecutive_health_failures.saturating_add(1);
-                                    let can_restart_vpn = last_vpn_restart_attempt
-                                        .map(|t| t.elapsed() >= vpn_restart_cooldown)
-                                        .unwrap_or(true);
-                                    if can_restart_vpn
-                                        && self.try_restart_openvpn_for_route_loss(&health_host)
-                                    {
-                                        last_vpn_restart_attempt = Some(std::time::Instant::now());
-                                    }
                                     if infinite_health_retries {
                                         self.log_warn(format!(
                                             "CDC: transient MySQL route failure #{} for {}:{}; retrying (infinite mode).",

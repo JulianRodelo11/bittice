@@ -17,7 +17,6 @@ pub mod core {
     pub mod migrate_exact_index;
     pub mod update;
     pub mod uninstall;
-    pub mod vpn;
 }
 
 pub mod commands {}

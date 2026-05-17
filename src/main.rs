@@ -82,20 +82,10 @@ async fn main() -> Result<()> {
             // ... rest of commands ...
 
             Commands::Cdc { url, entity, database, sync_all } => {
-                // Check if there's a saved config with VPN for this entity
-                let config_path = bittice::core::data_paths::profile_dir(&entity).join("cdc_config.json");
-                if let Ok(content) = std::fs::read_to_string(&config_path) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(vpn_path) = json.get("vpn_file").and_then(|v| v.as_str()) {
-                            info!("Auto-starting VPN from saved config for entity '{}'...", entity);
-                            if let Ok(prepared) = bittice::core::vpn::VpnManager::prepare_ovpn_file(vpn_path, &url.split('@').last().unwrap_or("").split(':').next().unwrap_or("")) {
-                                let _ = bittice::core::vpn::VpnManager::start(&prepared);
-                            }
-                        }
-                    }
-                }
+                // Bittice does not manage tunnels: users with VPN-only MySQL
+                // must already have their OS-native VPN client up before running this.
 
-                // Start server automatically for CDC
+                // Start server automatically for CDC.
                 let server_entity = entity.clone();
                 tokio::spawn(async move {
                     let _ = bittice::server::start_all_servers(Some(server_entity), true).await;

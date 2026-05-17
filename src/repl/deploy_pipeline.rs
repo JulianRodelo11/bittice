@@ -1,5 +1,4 @@
 //! Local Docker runner — pulls the published GHCR image and runs it with local data mounts.
-//! When sync profiles use OpenVPN, starts the same VPN sidecar stack as EC2 deploy.
 
 use std::path::{Path, PathBuf};
 
@@ -87,54 +86,6 @@ fn detect_ghcr_repo(project_root: &Path) -> Result<String> {
     Ok(repo)
 }
 
-const EC2_OVPN_NAME: &str = crate::core::data_paths::DEPLOY_OVPN_NAME;
-
-/// `vpn.conf` for dperson/openvpn-client (from deploy profile or existing bundle file).
-fn ensure_vpn_conf_for_compose(data_root: &Path) -> Result<()> {
-    let vpn_dir = data_root.join("vpn");
-    let conf = vpn_dir.join("vpn.conf");
-    if conf.is_file() {
-        return Ok(());
-    }
-    let bundled = vpn_dir.join(EC2_OVPN_NAME);
-    if bundled.is_file() {
-        std::fs::copy(&bundled, &conf).context("copy bittice-ec2.ovpn → vpn.conf")?;
-        return Ok(());
-    }
-    bail!(
-        "Sync profile uses VPN but {} is missing.\n\
-         Use Deploy → add OpenVPN profile, or Deploy to cloud VM once (creates {EC2_OVPN_NAME}).",
-        bundled.display()
-    );
-}
-
-fn run_compose_local(project_root: &Path, data_root: &Path, image: &str) -> Result<()> {
-    ensure_vpn_conf_for_compose(data_root)?;
-
-    let compose_file = project_root.join("deploy/docker-compose.local.yaml");
-    if !compose_file.is_file() {
-        bail!("Missing {}", compose_file.display());
-    }
-
-    let _ = std::process::Command::new("docker")
-        .args(["compose", "-f", compose_file.to_str().unwrap(), "down"])
-        .current_dir(project_root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let status = std::process::Command::new("docker")
-        .args(["compose", "-f", compose_file.to_str().unwrap(), "up", "-d"])
-        .current_dir(project_root)
-        .env("BITTICE_IMAGE", image)
-        .status()
-        .context("docker compose up")?;
-    if !status.success() {
-        bail!("docker compose up failed.");
-    }
-    Ok(())
-}
-
 fn run_plain_container(data_root: &Path, image: &str) -> Result<()> {
     let _ = std::process::Command::new("docker")
         .args(["stop", "bittice", "bittice-local", "bittice-vpn-local"])
@@ -181,7 +132,6 @@ fn run_plain_container(data_root: &Path, image: &str) -> Result<()> {
 }
 
 /// Run the Bittice container locally using the published GHCR image for the latest tag.
-/// Uses VPN sidecar compose when any CDC profile references `vpn_file`.
 pub fn run_local_docker_container(project_root: &Path) -> Result<()> {
     check_docker_prerequisites()?;
 
@@ -214,29 +164,13 @@ pub fn run_local_docker_container(project_root: &Path) -> Result<()> {
         })
         .unwrap_or_else(|| project_root.join("data"));
 
-    let with_vpn = crate::core::data_paths::deploy_requires_vpn_sidecar(&data_root);
+    run_plain_container(&data_root, &image)?;
 
-    if with_vpn {
-        println!(
-            "\x1b[34m→\x1b[0m  VPN sidecar enabled (sync profile uses OpenVPN).\n"
-        );
-    }
-
-    if with_vpn {
-        run_compose_local(project_root, &data_root, &image)?;
-    } else {
-        run_plain_container(&data_root, &image)?;
-    }
-
-    let container = if with_vpn { "bittice-local" } else { "bittice" };
     println!(
-        "\n\x1b[32m◆\x1b[0m  Container \x1b[1m{}\x1b[0m is running with image \x1b[1m{}\x1b[0m",
-        container, image
+        "\n\x1b[32m◆\x1b[0m  Container \x1b[1mbittice\x1b[0m is running with image \x1b[1m{}\x1b[0m",
+        image
     );
-    println!("\n\x1b[90m│\x1b[0m  View logs:    docker logs -f {}", container);
-    if with_vpn {
-        println!("\x1b[90m│\x1b[0m  VPN logs:     docker logs -f bittice-vpn-local");
-    }
-    println!("\x1b[90m│\x1b[0m  Stop:         docker compose -f deploy/docker-compose.local.yaml down");
+    println!("\n\x1b[90m│\x1b[0m  View logs:    docker logs -f bittice");
+    println!("\x1b[90m│\x1b[0m  Stop:         docker stop bittice");
     Ok(())
 }
