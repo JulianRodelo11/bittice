@@ -81,23 +81,27 @@ async fn main() -> Result<()> {
             }
             Commands::Whoami => {
                 use bittice::core::credentials;
-                match credentials::load() {
-                    Ok(c) => println!(
-                        "Email:             {}\nUser ID:           {}\nControl plane:     {}\nCredentials file:  {}",
-                        c.email, c.user_id, c.control_plane_url,
-                        credentials::credentials_path()?.display()),
-                    Err(e) => {
-                        eprintln!("{e}");
-                        std::process::exit(1);
-                    }
-                }
+                // The credentials file only contains hints (last email + URL).
+                // API keys are never stored — they're prompted on every cloud deploy.
+                let hints = credentials::load().unwrap_or_default();
+                println!(
+                    "Last login (hint):  {}\n\
+                     Last user ID:       {}\n\
+                     Control plane URL:  {}\n\
+                     Hints file:         {}\n\n\
+                     (No API key is stored on this machine — the cloud-deploy wizard prompts for it on every deploy.)",
+                    hints.last_email.as_deref().unwrap_or("(never logged in)"),
+                    hints.last_user_id.as_deref().unwrap_or("—"),
+                    hints.control_plane_url,
+                    credentials::credentials_path()?.display(),
+                );
             }
             Commands::Logout => {
                 use bittice::core::credentials;
                 if credentials::clear()? {
-                    println!("✓ Logged out (credentials file removed).");
+                    println!("✓ Profile hints cleared. (There was no stored API key — Bittice never saves it.)");
                 } else {
-                    println!("Not logged in — nothing to remove.");
+                    println!("No profile hints to clear.");
                 }
             }
             // ── rest of commands below ──

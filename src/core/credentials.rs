@@ -1,23 +1,21 @@
-//! Persistent storage for the API key the user obtained from the Bittice
-//! control plane. Local CLI commands (Test, Cdc, MigrateExactIndex, etc.) do
-//! NOT require this — only the cloud deploy flow does. Stored at
-//! `~/.bittice/credentials.json` with chmod 0600.
+//! Saved profile hints for the cloud-deploy wizard. **Never stores the API key**
+//! — that is prompted on every deploy and lives only in memory during the run.
 //!
-//! Format:
+//! The file at `~/.bittice/credentials.json` (chmod 0600) holds:
 //! ```json
 //! {
-//!   "version": 1,
-//!   "control_plane_url": "https://api.bittice.dev",
-//!   "api_key": "bk_live_…",
-//!   "user_id": "01HXYZ…",
-//!   "email": "you@example.com"
+//!   "version": 2,
+//!   "control_plane_url": "https://api.bittice.com",
+//!   "last_email":   "you@example.com",
+//!   "last_user_id": "01HXYZ…"
 //! }
 //! ```
 //!
-//! The control_plane_url is captured at login time so subsequent CLI calls
-//! always hit the same backend the user authenticated against.
+//! `last_email` is a UX hint ("Welcome back you@example.com — paste your API
+//! key:"), not a secret. `control_plane_url` lets self-hosted users keep their
+//! endpoint without re-typing.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -25,14 +23,24 @@ use std::path::PathBuf;
 const FILE_NAME: &str = "credentials.json";
 pub const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bittice.com";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Credentials {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProfileHints {
+    #[serde(default = "default_version")]
     pub version: u8,
+    #[serde(default = "default_url")]
     pub control_plane_url: String,
-    pub api_key: String,
-    pub user_id: String,
-    pub email: String,
+    #[serde(default)]
+    pub last_email: Option<String>,
+    #[serde(default)]
+    pub last_user_id: Option<String>,
+    // Tolerate old key without complaining — we just ignore it from now on.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub api_key: Option<String>,
 }
+
+fn default_version() -> u8 { 2 }
+fn default_url() -> String { DEFAULT_CONTROL_PLANE_URL.to_string() }
 
 fn credentials_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set; cannot locate credentials file")?;
@@ -45,7 +53,7 @@ pub fn credentials_path() -> Result<PathBuf> {
 
 /// Override-aware control plane URL. Order:
 ///   1. `BITTICE_CONTROL_PLANE_URL` env var (escape hatch / local dev)
-///   2. `control_plane_url` from saved credentials
+///   2. `control_plane_url` from saved profile hints
 ///   3. `DEFAULT_CONTROL_PLANE_URL` constant
 pub fn resolved_control_plane_url() -> String {
     if let Ok(v) = std::env::var("BITTICE_CONTROL_PLANE_URL") {
@@ -54,29 +62,33 @@ pub fn resolved_control_plane_url() -> String {
             return t.trim_end_matches('/').to_string();
         }
     }
-    if let Ok(creds) = load() {
-        return creds.control_plane_url.trim_end_matches('/').to_string();
+    if let Ok(p) = load() {
+        return p.control_plane_url.trim_end_matches('/').to_string();
     }
     DEFAULT_CONTROL_PLANE_URL.to_string()
 }
 
-pub fn load() -> Result<Credentials> {
+/// Read the profile hints file. Returns the default ProfileHints when the file
+/// doesn't exist (so callers don't have to special-case first-run).
+pub fn load() -> Result<ProfileHints> {
     let path = credentials_path()?;
     if !path.is_file() {
-        bail!(
-            "You are not logged in. Run `bittice login` first.\n\
-             (Credentials are stored at {}.)",
-            path.display()
-        );
+        return Ok(ProfileHints {
+            version: default_version(),
+            control_plane_url: default_url(),
+            last_email: None,
+            last_user_id: None,
+            api_key: None,
+        });
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("read {}", path.display()))?;
-    let creds: Credentials = serde_json::from_str(&raw)
+    let hints: ProfileHints = serde_json::from_str(&raw)
         .with_context(|| format!("parse {}", path.display()))?;
-    Ok(creds)
+    Ok(hints)
 }
 
-pub fn save(creds: &Credentials) -> Result<()> {
+pub fn save(hints: &ProfileHints) -> Result<()> {
     let dir = credentials_dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     #[cfg(unix)]
@@ -85,7 +97,9 @@ pub fn save(creds: &Credentials) -> Result<()> {
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     }
     let path = dir.join(FILE_NAME);
-    let json = serde_json::to_string_pretty(creds)?;
+    // Strip api_key on write — defensive: even if somehow set in memory, never persist.
+    let safe = ProfileHints { api_key: None, ..hints.clone() };
+    let json = serde_json::to_string_pretty(&safe)?;
     fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
     #[cfg(unix)]
     {

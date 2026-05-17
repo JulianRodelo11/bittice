@@ -640,27 +640,39 @@ async fn discover_rds_placement(hints: Vec<(String, String)>) -> Result<RdsPlace
 
 // ── inline auth (no separate `bittice login` step) ──────────────────────────
 //
-// First cloud deploy from a machine: prompt for the API key, validate it
-// against the control plane, save to ~/.bittice/credentials.json (chmod 0600).
-// Subsequent deploys load the file silently. To switch accounts: `bittice logout`
-// (which deletes the file) → next deploy re-prompts.
+// **The API key is NEVER persisted.** Every cloud deploy asks for it explicitly;
+// the key lives only in process memory for the duration of the wizard and is
+// dropped at the end. The file at `~/.bittice/credentials.json` only stores
+// non-secret hints (last email + control plane URL) so the prompt can say
+// "Welcome back you@example.com" instead of asking for everything from scratch.
 
-async fn ensure_authenticated() -> Result<crate::core::credentials::Credentials> {
+/// In-memory result of authenticating for one deploy.
+struct AuthCtx {
+    pub control_plane_url: String,
+    pub api_key: String,         // memory-only, never written to disk
+    #[allow(dead_code)]
+    pub user_id: String,
+    pub email: String,
+}
+
+async fn ensure_authenticated() -> Result<AuthCtx> {
     use crate::core::{credentials, control_plane};
 
-    // Happy path: saved on disk from a previous deploy.
-    if let Ok(c) = credentials::load() {
-        let _ = log::step(format!(
-            "Using saved credentials for {} (run `bittice logout` to switch accounts).",
-            c.email,
-        ));
-        return Ok(c);
-    }
+    let hints = credentials::load().unwrap_or_default();
+    let url = credentials::resolved_control_plane_url();
+    std::env::set_var("BITTICE_CONTROL_PLANE_URL", &url);
 
-    let _ = log::info(
-        "First cloud deploy from this machine — authenticate with your Bittice API key.\n\
-         The key starts with `bk_live_…` and you'll find it in your Bittice account dashboard."
-    );
+    // Show context so the user knows which account they're about to charge.
+    if let Some(ref email) = hints.last_email {
+        let _ = log::info(format!(
+            "Last login on this machine: {email}. Paste your API key to authenticate this deploy."
+        ));
+    } else {
+        let _ = log::info(
+            "Authenticate this cloud deploy with your Bittice API key.\n\
+             It starts with `bk_live_…` (find it in your Bittice account dashboard)."
+        );
+    }
 
     let raw_key: String = match input("Bittice API key")
         .placeholder("bk_live_…")
@@ -675,11 +687,6 @@ async fn ensure_authenticated() -> Result<crate::core::credentials::Credentials>
         bail!("API key must start with 'bk_live_' (got something else — paste again).");
     }
 
-    // Resolved URL honors BITTICE_CONTROL_PLANE_URL env var; otherwise uses the
-    // baked-in default (https://api.bittice.com). Self-hosters override via env.
-    let url = credentials::resolved_control_plane_url();
-    std::env::set_var("BITTICE_CONTROL_PLANE_URL", &url);
-
     let s = spinner();
     s.start(format!("Validating API key against {url}…"));
     let me = match control_plane::login(&api_key).await {
@@ -693,18 +700,21 @@ async fn ensure_authenticated() -> Result<crate::core::credentials::Credentials>
         }
     };
 
-    let creds = credentials::Credentials {
-        version: 1,
+    // Persist HINTS only (no api_key) so the next deploy's prompt is friendlier.
+    let _ = credentials::save(&credentials::ProfileHints {
+        version: 2,
+        control_plane_url: url.clone(),
+        last_email: Some(me.email.clone()),
+        last_user_id: Some(me.user_id.clone()),
+        api_key: None,
+    });
+
+    Ok(AuthCtx {
         control_plane_url: url,
         api_key,
         user_id: me.user_id,
         email: me.email,
-    };
-    credentials::save(&creds)?;
-    let _ = log::success(format!(
-        "Saved credentials to ~/.bittice/credentials.json — future deploys won't ask again."
-    ));
-    Ok(creds)
+    })
 }
 
 // ── SSH key auto-generation (no .pem required in AWS-managed mode) ──────────
@@ -1003,10 +1013,9 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     // ── register deployment with the control plane (auth + billing entry point) ──
     // We do this BEFORE `terraform apply` so the EC2 already knows its
     // deployment_id / instance_token via env vars when the engine first boots.
-    // Authentication is implicit: the first time you cloud-deploy from this
-    // machine the wizard asks for your API key and saves it; later deploys
-    // re-use the saved credentials without prompting.
-    let creds = ensure_authenticated().await?;
+    // Authentication: the wizard prompts for your API key right now. The key
+    // is NEVER saved to disk; it lives only in this process for one deploy.
+    let auth = ensure_authenticated().await?;
     let ident: EngineIdentity = {
         let s = spinner();
         s.start("Registering deployment with control plane…");
@@ -1023,14 +1032,17 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
             ),
             vpc_id: Some(placement.vpc_id.clone()),
         };
-        let resp = crate::core::control_plane::create_deployment(&creds.api_key, &req).await?;
-        s.stop(format!("Deployment registered: {}", resp.deployment_id));
+        let resp = crate::core::control_plane::create_deployment(&auth.api_key, &req).await?;
+        s.stop(format!("Deployment registered: {} (user: {})", resp.deployment_id, auth.email));
         EngineIdentity {
             deployment_id: resp.deployment_id,
             instance_token: resp.instance_token,
-            control_plane_url: creds.control_plane_url.clone(),
+            control_plane_url: auth.control_plane_url.clone(),
         }
     };
+    // After this point the api_key drops out of scope and is freed; only the
+    // short-lived instance_token (which is bound to *this* deployment only)
+    // continues to live in the EC2's container env.
 
     // ── write terraform files ──
     let ws = spinner();
