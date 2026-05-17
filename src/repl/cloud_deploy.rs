@@ -650,6 +650,10 @@ async fn ensure_authenticated() -> Result<crate::core::credentials::Credentials>
 
     // Happy path: saved on disk from a previous deploy.
     if let Ok(c) = credentials::load() {
+        let _ = log::step(format!(
+            "Using saved credentials for {} (run `bittice logout` to switch accounts).",
+            c.email,
+        ));
         return Ok(c);
     }
 
