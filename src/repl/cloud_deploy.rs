@@ -257,6 +257,24 @@ r#"services:
 }
 
 fn deploy_compose(ip: &str, ssh_key: &str, image: &str, ident: Option<&EngineIdentity>) -> Result<()> {
+    // Wait for cloud-init to finish before touching anything Docker-related.
+    // EC2 returns SSH responsive as soon as sshd is up, but Terraform's user_data
+    // (apt-get install docker.io) runs in parallel and can take 1-3 minutes.
+    // Without this gate the first `docker pull` lands on a host where docker
+    // doesn't exist yet.
+    ssh_run(ip, ssh_key,
+        "echo 'Waiting for cloud-init (Docker install)…'; \
+         sudo cloud-init status --wait 2>/dev/null || echo '(cloud-init not present, continuing)'; \
+         if ! command -v docker >/dev/null 2>&1; then \
+           echo 'Docker missing after cloud-init — installing now…'; \
+           sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io && \
+           sudo systemctl enable --now docker && \
+           sudo usermod -aG docker ubuntu; \
+         fi; \
+         docker --version || { echo 'Docker install FAILED' >&2; exit 1; }"
+    )?;
+
     if let (Ok(token), Ok(user)) = (std::env::var("GHCR_TOKEN"), std::env::var("GHCR_USER")) {
         ssh_run(ip, ssh_key, &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"))?;
     }
