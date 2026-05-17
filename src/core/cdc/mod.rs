@@ -95,7 +95,7 @@ pub struct CdcWorker {
     state_path: String,
     table_manager: Arc<TableManager>,
     column_maps: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    date_columns: Arc<RwLock<HashMap<String, Vec<String>>>>, // table -> list of date column names
+    date_columns: Arc<RwLock<HashMap<String, HashSet<String>>>>, // table -> set of date column names (O(1) contains in parse_row hot path)
     enum_maps: Arc<RwLock<HashMap<String, HashMap<String, Vec<String>>>>>, // table -> column -> values
     table_map_events: Arc<RwLock<HashMap<u64, TableMapEvent<'static>>>>,
     log_tx: Option<tokio::sync::mpsc::Sender<String>>,
@@ -1165,7 +1165,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
     async fn fetch_schema_columns_bulk(
         conn: &mut Conn,
         schema: &str,
-    ) -> HashMap<String, (Vec<String>, Vec<String>)> {
+    ) -> HashMap<String, (Vec<String>, HashSet<String>)> {
         let sql = format!(
             "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE \
              FROM information_schema.COLUMNS \
@@ -1177,12 +1177,12 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             Ok(r) => r,
             Err(_) => return HashMap::new(),
         };
-        let mut result: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+        let mut result: HashMap<String, (Vec<String>, HashSet<String>)> = HashMap::new();
         for (table, col_name, data_type, _col_type) in rows {
-            let entry = result.entry(table).or_insert_with(|| (Vec::new(), Vec::new()));
+            let entry = result.entry(table).or_insert_with(|| (Vec::new(), HashSet::new()));
             let dt_lower = data_type.to_lowercase();
             if dt_lower.contains("date") || dt_lower.contains("timestamp") || dt_lower.contains("time") {
-                entry.1.push(col_name.clone());
+                entry.1.insert(col_name.clone());
             }
             entry.0.push(col_name);
         }
@@ -1195,13 +1195,13 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         schema: &str,
         qualified_table_key: &str,
         table_name: &str,
-    ) -> Result<(Vec<String>, Vec<String>)> {
+    ) -> Result<(Vec<String>, HashSet<String>)> {
         let fq = Self::qualified_schema_table(schema, table_name);
         let rows: Vec<(String, String, String, String, Option<String>, String)> =
             conn.query(format!("DESCRIBE {}", fq)).await?;
 
-        let mut all_cols = Vec::new();
-        let mut date_cols = Vec::new();
+        let mut all_cols = Vec::with_capacity(rows.len());
+        let mut date_cols: HashSet<String> = HashSet::new();
         let mut enum_info = HashMap::new();
 
         for row in rows {
@@ -1211,7 +1211,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             all_cols.push(col_name.clone());
 
             if col_type_lower.contains("date") || col_type_lower.contains("timestamp") {
-                date_cols.push(col_name.clone());
+                date_cols.insert(col_name.clone());
             }
 
             // Detect ENUM and extract values (Preserving Case)
@@ -2819,7 +2819,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
             };
             let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
             let data = self.parse_row(row, qkey)?;
-            table.insert(data.clone())?;
+            table.insert(data)?;
             applied += 1;
         }
         if applied > 0 {
@@ -3298,12 +3298,19 @@ if this persists, verify ROW-format binlog and run a current Bittice build (WRIT
     }
 
     fn parse_row(&self, row: Row, table_name: &str) -> Result<HashMap<String, String>> {
-        let mut map = HashMap::new();
+        let row_len = row.len();
+        // Pre-size: row_len entries + up to 3 derived date fields per date column.
+        // Slight over-allocation is cheaper than rehashing 1-2 times during fill.
+        let mut map: HashMap<String, String> = HashMap::with_capacity(row_len + 4);
+
         let maps = self.column_maps.read().unwrap();
         let columns_names = maps.get(table_name).context("Column map not found for table")?;
-        
+
+        // Hold read guards for the whole row parse so we never clone the Vec/HashSet
+        // contents per row (parse_row runs once per binlog event row — clone-per-row
+        // here was the dominant alloc cost for tables with many date columns).
         let d_maps = self.date_columns.read().unwrap();
-        let dates = d_maps.get(table_name).cloned().unwrap_or_default();
+        let date_set: Option<&HashSet<String>> = d_maps.get(table_name);
 
         let e_maps = self.enum_maps.read().unwrap();
         let table_enums = e_maps.get(table_name);
@@ -3313,67 +3320,74 @@ if this persists, verify ROW-format binlog and run a current Bittice build (WRIT
         // legacy ordinal path when lengths match (query/bootstrap paths).
         let cols_meta = row.columns_ref();
         let use_binlog_names =
-            cols_meta.len() == row.len() && cols_meta.len() != columns_names.len();
+            cols_meta.len() == row_len && cols_meta.len() != columns_names.len();
 
-        for i in 0..row.len() {
+        for i in 0..row_len {
             let col_name = if use_binlog_names {
                 Self::binlog_column_display_name(&cols_meta[i], columns_names)
             } else {
                 columns_names.get(i).cloned().unwrap_or_else(|| format!("col_{}", i))
             };
-            
+
+            // Direct variant match: avoids the old `format!("{:?}", v)` + string
+            // re-parsing pipeline that allocated 2 Strings and did 2 substring
+            // scans for every Int/UInt cell, and silently mis-stored Float/Double
+            // values as their Debug representation.
             let mut val_str = match row.get_opt::<mysql_common::Value, usize>(i) {
                 Some(Ok(v)) => match v {
-                    mysql_common::Value::NULL => "".to_string(),
-                    mysql_common::Value::Bytes(ref b) => String::from_utf8_lossy(b).to_string(),
-                    mysql_common::Value::Date(y, m, d, h, min, s, ms) => format!("{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", y, m, d, h, min, s, ms),
-                    _ => format!("{:?}", v),
+                    mysql_common::Value::NULL          => String::new(),
+                    mysql_common::Value::Bytes(ref b)  => String::from_utf8_lossy(b).into_owned(),
+                    mysql_common::Value::Int(n)        => n.to_string(),
+                    mysql_common::Value::UInt(n)       => n.to_string(),
+                    mysql_common::Value::Float(f)      => f.to_string(),
+                    mysql_common::Value::Double(d)     => d.to_string(),
+                    mysql_common::Value::Date(y, m, d, h, min, s, ms) =>
+                        format!("{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", y, m, d, h, min, s, ms),
+                    mysql_common::Value::Time(neg, days, h, m, s, _us) => {
+                        let total_hours = (days as u32) * 24 + (h as u32);
+                        let sign = if neg { "-" } else { "" };
+                        format!("{}{:02}:{:02}:{:02}", sign, total_hours, m, s)
+                    }
                 },
-                _ => "".to_string(),
+                _ => String::new(),
             };
 
-            if val_str.starts_with("Int(") || val_str.starts_with("UInt(") {
-                if let Some(start) = val_str.find('(') {
-                    if let Some(end) = val_str.find(')') {
-                        val_str = val_str[start+1..end].to_string();
-                    }
-                }
-            }
-
-            // Dynamic ENUM translation (MySQL Binlog sends numeric indices)
+            // Dynamic ENUM translation (MySQL Binlog sends numeric indices).
+            // parse::<usize>() already validates digit-only, so the explicit
+            // chars().all() pre-check is redundant — let parse return Err for non-numeric.
             if let Some(enums) = table_enums {
                 if let Some(values) = enums.get(&col_name) {
-                    if !val_str.is_empty() && val_str.chars().all(|c| c.is_ascii_digit()) {
-                        if let Ok(idx) = val_str.parse::<usize>() {
-                            if idx > 0 && idx <= values.len() {
-                                val_str = values[idx - 1].clone();
-                            }
+                    if let Ok(idx) = val_str.parse::<usize>() {
+                        if idx > 0 && idx <= values.len() {
+                            val_str = values[idx - 1].clone();
                         }
                     }
                 }
             }
 
-            // If it is a known date column but comes as a number (TIMESTAMP in binlog),
-            // convert it to a readable format so that the date expansion works.
-            if dates.contains(&col_name) && !val_str.is_empty() && val_str.chars().all(|c| c.is_ascii_digit()) {
+            let is_date_col = date_set.map(|s| s.contains(&col_name)).unwrap_or(false);
+
+            // Known date column arriving as a unix timestamp number (binlog TIMESTAMP encoding).
+            if is_date_col && !val_str.is_empty() {
                 if let Ok(timestamp) = val_str.parse::<i64>() {
-                    // Only convert if it seems like a timestamp ( > year 2000 approx )
+                    // Year 2000 floor → discard small integers that aren't really timestamps.
                     if timestamp > 946684800 {
                         use chrono::{TimeZone, Utc};
-                        let dt = Utc.timestamp_opt(timestamp, 0).single();
-                        if let Some(dt) = dt {
+                        if let Some(dt) = Utc.timestamp_opt(timestamp, 0).single() {
                             val_str = dt.format("%Y-%m-%d %H:%M:%S").to_string();
                         }
                     }
                 }
             }
 
-            // Date expansion
-            if dates.contains(&col_name) && is_date_format(&val_str) {
-                if let Some(d) = extract_day(&val_str) { map.insert(format!("{}_day", col_name), d); }
+            // Date expansion into _day / _month / _hour_bucket derived columns.
+            if is_date_col && is_date_format(&val_str) {
+                if let Some(d) = extract_day(&val_str)   { map.insert(format!("{}_day",   col_name), d); }
                 if let Some(m) = extract_month(&val_str) { map.insert(format!("{}_month", col_name), m); }
                 if has_time_component(&val_str) {
-                    if let Some(h) = extract_hour_bucket(&val_str) { map.insert(format!("{}_hour_bucket", col_name), h); }
+                    if let Some(h) = extract_hour_bucket(&val_str) {
+                        map.insert(format!("{}_hour_bucket", col_name), h);
+                    }
                 }
             }
 
