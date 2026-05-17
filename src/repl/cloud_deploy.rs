@@ -119,6 +119,107 @@ fn terraform_run(tf_bin: &Path, tf_dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Lines currently in `terraform state list` (each is e.g. "aws_key_pair.bittice").
+/// Empty Vec on fresh state. Treats "no state" as no managed resources, not an error.
+fn terraform_state_list(tf_bin: &Path, tf_dir: &Path) -> Vec<String> {
+    let out = match Command::new(tf_bin)
+        .args(["state", "list"])
+        .current_dir(tf_dir)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if !out.status.success() { return Vec::new(); }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `terraform import <addr> <id>` — adopts an existing AWS resource into state.
+/// Bubbles up the error if import itself fails (e.g. resource not found in AWS).
+fn terraform_import(tf_bin: &Path, tf_dir: &Path, addr: &str, id: &str) -> Result<()> {
+    let status = Command::new(tf_bin)
+        .args(["import", addr, id])
+        .current_dir(tf_dir)
+        .status()
+        .with_context(|| format!("running terraform import {addr} {id}"))?;
+    if !status.success() {
+        bail!("terraform import {addr} {id} failed");
+    }
+    Ok(())
+}
+
+/// Look up an EC2 key pair by name; returns Some(name) if it exists. Uses
+/// `--filters` (not `--key-names`) so a missing key returns an empty array
+/// instead of throwing AccessDenied / InvalidKeyPair.NotFound.
+fn aws_key_pair_exists(key_name: &str, region: &str) -> Result<bool> {
+    let v = aws_json(&[
+        "ec2", "describe-key-pairs",
+        "--region", region,
+        "--filters", &format!("Name=key-name,Values={key_name}"),
+        "--output", "json",
+    ])?;
+    Ok(v.get("KeyPairs")
+        .and_then(|a| a.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false))
+}
+
+/// Look up an SG by name within a VPC; returns its GroupId or None.
+fn aws_security_group_id(name: &str, vpc_id: &str, region: &str) -> Result<Option<String>> {
+    let v = aws_json(&[
+        "ec2", "describe-security-groups",
+        "--region", region,
+        "--filters",
+        &format!("Name=group-name,Values={name}"),
+        &format!("Name=vpc-id,Values={vpc_id}"),
+        "--output", "json",
+    ])?;
+    Ok(v.pointer("/SecurityGroups/0/GroupId")
+        .and_then(|x| x.as_str())
+        .map(String::from))
+}
+
+/// Bittice should "if exists, use it" — adopt orphan AWS resources from prior
+/// failed deploys into Terraform state instead of crashing on duplicate-create.
+/// Runs after `terraform init`, before `terraform apply`. Idempotent.
+fn reconcile_terraform_orphans(
+    tf_bin: &Path,
+    tf_dir: &Path,
+    app_name: &str,
+    vpc_id: &str,
+    region: &str,
+) -> Result<()> {
+    let managed = terraform_state_list(tf_bin, tf_dir);
+
+    // ── key pair ───────────────────────────────────────────────────────────
+    if !managed.iter().any(|l| l == "aws_key_pair.bittice") {
+        let key_name = format!("{app_name}-key");
+        if aws_key_pair_exists(&key_name, region).unwrap_or(false) {
+            let _ = log::info(format!(
+                "Found orphan key pair '{key_name}' in AWS — importing into Terraform state."
+            ));
+            terraform_import(tf_bin, tf_dir, "aws_key_pair.bittice", &key_name)?;
+        }
+    }
+
+    // ── security group ─────────────────────────────────────────────────────
+    if !managed.iter().any(|l| l == "aws_security_group.bittice") {
+        let sg_name = format!("{app_name}-sg");
+        if let Some(sg_id) = aws_security_group_id(&sg_name, vpc_id, region).unwrap_or(None) {
+            let _ = log::info(format!(
+                "Found orphan security group '{sg_name}' ({sg_id}) — importing into Terraform state."
+            ));
+            terraform_import(tf_bin, tf_dir, "aws_security_group.bittice", &sg_id)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn terraform_output(tf_bin: &Path, tf_dir: &Path, key: &str) -> Result<String> {
     let out = Command::new(tf_bin).args(["output", "-raw", key])
         .current_dir(tf_dir).output().context("terraform output")?;
@@ -1074,6 +1175,11 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
 
     let _ = log::step("Running terraform init…");
     terraform_run(&tf_bin, &tf_dir, &["init", "-upgrade"])?;
+
+    // Adopt any leftover AWS resources from a previous failed deploy ("if
+    // exists, use it"). This prevents `terraform apply` from crashing with
+    // InvalidKeyPair.Duplicate / InvalidGroup.Duplicate.
+    reconcile_terraform_orphans(&tf_bin, &tf_dir, &app_name, &placement.vpc_id, &region)?;
 
     let _ = log::step("Running terraform apply…");
     terraform_run(&tf_bin, &tf_dir, &["apply", "-auto-approve"])?;
