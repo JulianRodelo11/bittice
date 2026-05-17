@@ -217,7 +217,7 @@ r#"services:
       - BITTICE_ENGINE_ONLY=1
       - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
-      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=300
+      - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
       - BITTICE_SKIP_STARTUP_COMPACT=1
     restart: unless-stopped
 "#
@@ -360,14 +360,26 @@ fn cidr_to_route(cidr: &str) -> Result<(String, String)> {
 }
 
 /// Rewrites a raw .ovpn for host-OpenVPN with split-tunnel routing:
-/// only `cidr` flows through tun0 — default route stays on eth0, so Bittice's
-/// inbound REST/gRPC and outbound to the public internet are unaffected.
-fn prepare_ovpn_content(raw: &str, cidr: &str) -> Result<String> {
-    let (route_net, route_mask) = cidr_to_route(cidr)?;
-    let route_line = format!("route {route_net} {route_mask}");
+/// only the listed CIDRs flow through tun0 — default route stays on eth0, so
+/// Bittice's inbound REST/gRPC and outbound to the public internet are
+/// unaffected. Accepts a comma- or whitespace-separated list of CIDRs because
+/// the database VPC's range is rarely the only network you need to reach
+/// (e.g. `10.0.0.0/8,172.31.0.0/16`).
+fn prepare_ovpn_content(raw: &str, cidrs_csv: &str) -> Result<String> {
+    let cidrs: Vec<&str> = cidrs_csv
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if cidrs.is_empty() {
+        bail!("No CIDR provided — pass at least one (e.g. 10.0.0.0/8).");
+    }
+    let mut route_lines = Vec::with_capacity(cidrs.len());
+    for cidr in &cidrs {
+        let (net, mask) = cidr_to_route(cidr)?;
+        route_lines.push(format!("route {net} {mask}"));
+    }
 
-    // Drop any prior route/up directives baked in from a previous prepare or the
-    // raw upstream profile — we'll rewrite them.
+    // Drop any prior route/up/keepalive directives baked in from a previous prepare
+    // or the raw upstream profile — we'll rewrite them with the right values.
     let mut content: String = raw
         .lines()
         .filter(|l| {
@@ -377,7 +389,10 @@ fn prepare_ovpn_content(raw: &str, cidr: &str) -> Result<String> {
                 || t == "redirect-gateway def1"
                 || t.starts_with("redirect-gateway ")
                 || t.starts_with("up ")
-                || t.starts_with("up-restart"))
+                || t.starts_with("up-restart")
+                || t.starts_with("keepalive ")
+                || t.starts_with("ping ")
+                || t.starts_with("ping-restart "))
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -391,9 +406,19 @@ fn prepare_ovpn_content(raw: &str, cidr: &str) -> Result<String> {
         }
     }
 
-    // Stability: keep TCP healthy, never let the server force a tunnel restart.
-    if !content.contains("keepalive ") {
-        content.push_str("keepalive 10 60\n");
+    // Stability layer.
+    // Use `ping` + `ping-restart` *separately* (NOT `keepalive 10 60`, which is
+    // shorthand for `ping 10 ; ping-restart 60` — a 60s restart window is far too
+    // aggressive: every transient UDP blip on a long-haul tunnel triggers a soft
+    // restart that kills all in-flight TCP connections (incl. the MySQL binlog
+    // stream). 300s lets the tunnel ride out short network hiccups; if MySQL
+    // really stopped responding, Bittice's BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS
+    // (90s) fires first and force-reconnects the stream on the app layer.
+    if !content.contains("\nping ") && !content.starts_with("ping ") {
+        content.push_str("ping 10\n");
+    }
+    if !content.contains("ping-restart ") {
+        content.push_str("ping-restart 300\n");
     }
     if !content.contains("pull-filter ignore \"ping-restart\"") {
         content.push_str("pull-filter ignore \"ping-restart\"\n");
@@ -403,9 +428,12 @@ fn prepare_ovpn_content(raw: &str, cidr: &str) -> Result<String> {
     }
 
     // Split-tunnel: ignore the server's pushed default route; install only the
-    // explicit route to the MySQL CIDR.
+    // explicit routes to the database CIDRs.
     content.push_str("route-nopull\n");
-    content.push_str(&format!("{route_line}\n"));
+    for line in &route_lines {
+        content.push_str(line);
+        content.push('\n');
+    }
 
     Ok(content)
 }
@@ -473,20 +501,40 @@ async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
         bail!("The content does not look like a valid .ovpn file (missing 'client' or 'dev').");
     }
 
-    // CIDR to route through the tunnel (everything else stays on eth0).
-    let cidr: String = loop {
-        let entered: String = match input("CIDR to route through VPN (network where MySQL lives)")
-            .default_input("10.0.0.0/8")
+    // CIDR(s) to route through the tunnel (everything else stays on eth0).
+    // Default covers both 10.x (typical private VPCs) and 172.31.x (AWS default-VPC
+    // range used by peered accounts) — the user's own subnet's more-specific route
+    // (usually /20 on ens5) wins, so this is safe.
+    let _ = log::info(
+        "Comma-separated list of CIDRs to route through VPN. Common targets:\n\
+         • 10.0.0.0/8        — most private VPCs\n\
+         • 172.31.0.0/16     — AWS default-VPC range (covers RDS in peered default VPCs)\n\
+         • 192.168.0.0/16    — on-prem / SOHO networks"
+    );
+    let cidrs: String = loop {
+        let entered: String = match input("CIDRs to route through VPN (comma-separated)")
+            .default_input("10.0.0.0/8,172.31.0.0/16")
             .interact()
         {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(false),
             Err(e) => return Err(e.into()),
         };
-        match cidr_to_route(entered.trim()) {
-            Ok(_) => break entered.trim().to_string(),
-            Err(e) => {
-                let _ = log::warning(format!("Invalid CIDR: {e}. Try again (e.g. 10.0.0.0/8)."));
+        let mut bad: Option<String> = None;
+        for c in entered.split(|c: char| c == ',' || c.is_whitespace())
+            .map(|s| s.trim()).filter(|s| !s.is_empty())
+        {
+            if let Err(e) = cidr_to_route(c) {
+                bad = Some(format!("{c}: {e}"));
+                break;
+            }
+        }
+        match bad {
+            None => break entered.trim().to_string(),
+            Some(msg) => {
+                let _ = log::warning(format!(
+                    "Invalid CIDR ({msg}). Try again (e.g. 10.0.0.0/8,172.31.0.0/16)."
+                ));
             }
         }
     };
@@ -494,10 +542,10 @@ async fn collect_and_store_ovpn(data_root: &Path) -> Result<bool> {
     let vpn_dir = data_root.join("vpn");
     std::fs::create_dir_all(&vpn_dir).context("create data/vpn")?;
     let dest = vpn_dir.join(EC2_OVPN_NAME);
-    let prepared = prepare_ovpn_content(&raw, &cidr).context("prepare .ovpn content")?;
+    let prepared = prepare_ovpn_content(&raw, &cidrs).context("prepare .ovpn content")?;
     std::fs::write(&dest, prepared).context("write .ovpn")?;
     let _ = log::success(format!(
-        "Saved {} with split-tunnel route {cidr} (will be rsynced to EC2)",
+        "Saved {} with split-tunnel routes [{cidrs}] (will be rsynced to EC2)",
         dest.display()
     ));
     Ok(true)

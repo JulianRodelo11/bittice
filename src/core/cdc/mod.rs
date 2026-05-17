@@ -2290,6 +2290,26 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                     .await?;
             }
 
+            // Ask MySQL to send Heartbeat_log_event during idle periods so the binlog
+            // stream never goes silent for more than this interval. Without it, MySQL
+            // sends NOTHING between real events — a quiet table looks identical to a
+            // dead TCP connection, forcing the stream-silence watchdog to trip on
+            // perfectly-healthy streams. Period is in nanoseconds; default 15s gives
+            // 6 heartbeats per stream-silence window (90s) before declaring death.
+            let heartbeat_secs: u64 = std::env::var("BITTICE_CDC_HEARTBEAT_SECS")
+                .ok().and_then(|v| v.parse().ok()).filter(|&n: &u64| n >= 1 && n <= 3600)
+                .unwrap_or(15);
+            let heartbeat_ns: u64 = heartbeat_secs.saturating_mul(1_000_000_000);
+            if let Err(e) = conn
+                .query_drop(format!("SET @master_heartbeat_period = {heartbeat_ns}"))
+                .await
+            {
+                self.log_warn(format!(
+                    "CDC: SET @master_heartbeat_period={heartbeat_secs}s failed: {e} \
+                     — stream may appear silent during idle periods."
+                ));
+            }
+
             if state.binlog_file.is_empty() {
                 self.resolve_binlog_position(&mut conn, &mut state, master_gtid_enabled)
                     .await?;
