@@ -34,19 +34,11 @@ pub enum Commands {
     Uninstall,
     /// Run the interactive configuration wizard
     Setup,
-    /// Authenticate against the Bittice control plane and save the API key locally.
-    /// Local CLI commands work without login; only `cloud deploy` requires it.
-    Login {
-        /// API key (bk_live_…). Omit to be prompted interactively.
-        #[arg(long)]
-        key: Option<String>,
-        /// Control plane URL. Defaults to the official Bittice API; override for self-hosted.
-        #[arg(long)]
-        url: Option<String>,
-    },
-    /// Print the currently logged-in user (reads ~/.bittice/credentials.json).
+    /// Print the currently authenticated Bittice user (reads ~/.bittice/credentials.json).
+    /// You don't log in explicitly — the cloud-deploy wizard prompts for your API key
+    /// the first time and persists it for subsequent deploys.
     Whoami,
-    /// Remove ~/.bittice/credentials.json. Local CLI keeps working; cloud deploy will require login again.
+    /// Remove ~/.bittice/credentials.json. Next cloud deploy will prompt for the API key again.
     Logout,
     /// Migrate exact_<field>.idx files from legacy/v1/v2 to v3 (mmap snapshot)
     MigrateExactIndex {

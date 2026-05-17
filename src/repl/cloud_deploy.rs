@@ -638,6 +638,71 @@ async fn discover_rds_placement(hints: Vec<(String, String)>) -> Result<RdsPlace
     Ok(RdsPlacement { region, vpc_id, subnet_id, vpc_cidr, targets })
 }
 
+// ── inline auth (no separate `bittice login` step) ──────────────────────────
+//
+// First cloud deploy from a machine: prompt for the API key, validate it
+// against the control plane, save to ~/.bittice/credentials.json (chmod 0600).
+// Subsequent deploys load the file silently. To switch accounts: `bittice logout`
+// (which deletes the file) → next deploy re-prompts.
+
+async fn ensure_authenticated() -> Result<crate::core::credentials::Credentials> {
+    use crate::core::{credentials, control_plane};
+
+    // Happy path: saved on disk from a previous deploy.
+    if let Ok(c) = credentials::load() {
+        return Ok(c);
+    }
+
+    let _ = log::info(
+        "First cloud deploy from this machine — authenticate with your Bittice API key.\n\
+         The key starts with `bk_live_…` and you'll find it in your Bittice account dashboard."
+    );
+
+    let raw_key: String = match input("Bittice API key")
+        .placeholder("bk_live_…")
+        .interact()
+    {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => bail!("cancelled"),
+        Err(e) => return Err(e.into()),
+    };
+    let api_key = raw_key.trim().to_string();
+    if !api_key.starts_with("bk_live_") {
+        bail!("API key must start with 'bk_live_' (got something else — paste again).");
+    }
+
+    // Resolved URL honors BITTICE_CONTROL_PLANE_URL env var; otherwise uses the
+    // baked-in default (https://api.bittice.com). Self-hosters override via env.
+    let url = credentials::resolved_control_plane_url();
+    std::env::set_var("BITTICE_CONTROL_PLANE_URL", &url);
+
+    let s = spinner();
+    s.start(format!("Validating API key against {url}…"));
+    let me = match control_plane::login(&api_key).await {
+        Ok(me) => {
+            s.stop(format!("Authenticated as {} (plan: {})", me.email, me.plan));
+            me
+        }
+        Err(e) => {
+            s.stop("Authentication failed.");
+            return Err(e);
+        }
+    };
+
+    let creds = credentials::Credentials {
+        version: 1,
+        control_plane_url: url,
+        api_key,
+        user_id: me.user_id,
+        email: me.email,
+    };
+    credentials::save(&creds)?;
+    let _ = log::success(format!(
+        "Saved credentials to ~/.bittice/credentials.json — future deploys won't ask again."
+    ));
+    Ok(creds)
+}
+
 // ── SSH key auto-generation (no .pem required in AWS-managed mode) ──────────
 //
 // When deploying via AWS-discovered placement, the user already has credentials
@@ -934,13 +999,10 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     // ── register deployment with the control plane (auth + billing entry point) ──
     // We do this BEFORE `terraform apply` so the EC2 already knows its
     // deployment_id / instance_token via env vars when the engine first boots.
-    let creds = match crate::core::credentials::load() {
-        Ok(c) => c,
-        Err(e) => bail!(
-            "Cloud deploy requires authentication against the Bittice control plane.\n\
-             Run `bittice login` first, then re-run this wizard.\n\nDetails: {e}"
-        ),
-    };
+    // Authentication is implicit: the first time you cloud-deploy from this
+    // machine the wizard asks for your API key and saves it; later deploys
+    // re-use the saved credentials without prompting.
+    let creds = ensure_authenticated().await?;
     let ident: EngineIdentity = {
         let s = spinner();
         s.start("Registering deployment with control plane…");
