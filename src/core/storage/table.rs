@@ -1101,13 +1101,79 @@ impl Table {
 
         let t = std::time::Instant::now();
         let path = self.exact_index_path(field);
-        let index: ExactIndex = if path.exists() {
+        let mut index: ExactIndex = if path.exists() {
             ExactIndex::open(&path)?
         } else {
             let mut built = self.build_exact_index(field)?;
             built.bind_path(path.clone());
             built
         };
+
+        // Disk index is persisted only on close()/compact(); any segment rotated
+        // since the last persist lives in memory and is lost on restart. After
+        // an unclean shutdown the disk index points at older segments while
+        // newer segments hold the live rows — lookups follow the index to the
+        // stale segment, see the tombstone in deleted.bitmap, and return 0.
+        // Patch missing segments by reading their bitmaps_<field>.dat directly.
+        let known = index.segment_ids();
+        let mut patched_seg_count = 0usize;
+        for segment in &self.immutable_segments {
+            if known.contains(&segment.id) {
+                continue;
+            }
+            let bitmap_path = segment.path.join(format!("bitmaps_{}.dat", field));
+            if !bitmap_path.exists() {
+                continue;
+            }
+            let file = match fs::File::open(&bitmap_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(
+                        "load_exact_index: open bitmaps file {:?} failed: {} (skipping)",
+                        bitmap_path, e
+                    );
+                    continue;
+                }
+            };
+            let reader = BufReader::new(file);
+            let bitmaps: HashMap<String, RoaringBitmap> =
+                match bincode::deserialize_from(reader) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(
+                            "load_exact_index: decode bitmaps file {:?} failed: {} (skipping)",
+                            bitmap_path, e
+                        );
+                        continue;
+                    }
+                };
+            let non_empty: HashMap<String, RoaringBitmap> = bitmaps
+                .into_iter()
+                .filter(|(_, b)| !b.is_empty())
+                .collect();
+            if !non_empty.is_empty() {
+                index.merge_segment(segment.id, non_empty);
+                patched_seg_count += 1;
+            }
+        }
+        if patched_seg_count > 0 {
+            warn!(
+                "load_exact_index PATCHED table='{}' field='{}' — merged {} segment(s) \
+                 missing from on-disk index (likely a previous unclean shutdown); \
+                 persisting refreshed index to disk.",
+                self.name, field, patched_seg_count
+            );
+            // One-time write at startup, not on the hot path — safe to do disk I/O.
+            // Subsequent restarts skip the rebuild.
+            if let Err(e) = index.save(Some(&path)) {
+                warn!(
+                    "load_exact_index: persist patched index for field='{}' failed: {} \
+                     (in-memory index is still correct; next compact will rewrite)",
+                    field, e
+                );
+            }
+        }
+
         let load_ms = t.elapsed().as_secs_f64() * 1000.0;
         if load_ms > 50.0 {
             warn!(

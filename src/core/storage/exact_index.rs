@@ -387,6 +387,44 @@ impl ExactIndex {
         self.delta.len()
     }
 
+    /// Union of segment IDs referenced by any entry in this index (snapshot + delta).
+    ///
+    /// Used by `Table::load_exact_index` to detect when the on-disk index is missing
+    /// segments that the table's manifest knows about — which happens after any
+    /// non-clean shutdown, since `merge_exact_indexes_for_segment` only updates the
+    /// in-memory cache and disk persistence is deferred to `compact()`/`close()`.
+    /// Without this check, post-restart queries hit only the segments that were
+    /// already persisted, miss live rows in newer segments, and return empty.
+    pub fn segment_ids(&self) -> HashSet<u64> {
+        let mut ids: HashSet<u64> = HashSet::new();
+
+        if let Some(snapshot) = &self.snapshot {
+            for result in snapshot.iter_entries() {
+                let (hash, bitmaps) = match result {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                };
+                // delta overrides snapshot for the same hash; honor that.
+                if self.delta.contains_key(&hash) {
+                    continue;
+                }
+                for (seg_id, _) in bitmaps {
+                    ids.insert(seg_id);
+                }
+            }
+        }
+
+        for entry in self.delta.values() {
+            if let DeltaEntry::Replace(arc) = entry {
+                for (seg_id, _) in arc.iter() {
+                    ids.insert(*seg_id);
+                }
+            }
+        }
+
+        ids
+    }
+
     pub(crate) fn bind_path(&mut self, path: PathBuf) {
         self.path = Some(path);
     }
