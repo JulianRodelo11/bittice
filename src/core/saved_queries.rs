@@ -208,6 +208,21 @@ pub struct SavedAuthConfig {
     pub token_col: String,
     pub id_col: String,
     pub filter_col: String,
+    /// `bittice_api_key` (or `api_key`): Bearer / X-API-Key with `bk_live_…`, prefix lookup + Argon2.
+    /// Omitted or `legacy`: exact match on `token_col` (JWT-style tokens still supported).
+    #[serde(default)]
+    pub scheme: Option<String>,
+}
+
+impl SavedAuthConfig {
+    pub fn uses_bittice_api_key(&self) -> bool {
+        if let Some(scheme) = self.scheme.as_deref() {
+            return scheme.eq_ignore_ascii_case("bittice_api_key")
+                || scheme.eq_ignore_ascii_case("api_key");
+        }
+        self.table.eq_ignore_ascii_case("api_keys")
+            && self.token_col.eq_ignore_ascii_case("prefix")
+    }
 }
 
 fn default_filters_op() -> String {

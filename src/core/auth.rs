@@ -1,10 +1,21 @@
-use std::sync::Arc;
-use crate::server::table_manager::TableManager;
-use crate::core::types::{AuthContext, Filter, ComparisonOp};
-use crate::core::saved_queries::SavedAuthConfig;
-use tracing::{debug, warn, error};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::path::Path;
+use std::sync::Arc;
+
+use argon2::password_hash::{PasswordHash, PasswordVerifier};
+use argon2::Argon2;
+use axum::http::HeaderMap;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::NaiveDateTime;
+use tonic::metadata::MetadataMap;
+use tracing::{debug, error, warn};
+
+use crate::core::saved_queries::SavedAuthConfig;
+use crate::core::types::{AuthContext, ComparisonOp, Filter, LogicalOp};
+use crate::server::table_manager::TableManager;
+
+/// Live API keys use this prefix; lookup uses the first [`API_KEY_LOOKUP_PREFIX_LEN`] bytes.
+pub const API_KEY_PREFIX: &str = "bk_live_";
+pub const API_KEY_LOOKUP_PREFIX_LEN: usize = 12;
 
 pub struct AuthService {
     table_manager: Arc<TableManager>,
@@ -12,21 +23,101 @@ pub struct AuthService {
 
 impl AuthService {
     pub fn new(table_manager: Arc<TableManager>) -> Self {
-        Self {
-            table_manager,
-        }
+        Self { table_manager }
     }
 
-    pub async fn resolve_token(&self, entity: &str, token: &str, config: Option<&SavedAuthConfig>) -> Option<AuthContext> {
+    pub async fn resolve_token(
+        &self,
+        entity: &str,
+        token: &str,
+        config: Option<&SavedAuthConfig>,
+    ) -> Option<AuthContext> {
         let c = config?;
         if !c.enabled {
             return None;
         }
 
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+
+        if c.uses_bittice_api_key() {
+            return self
+                .resolve_bittice_api_key(entity, token, c)
+                .await;
+        }
+
+        self.resolve_legacy_token(entity, token, c).await
+    }
+
+    async fn resolve_bittice_api_key(
+        &self,
+        entity: &str,
+        token: &str,
+        config: &SavedAuthConfig,
+    ) -> Option<AuthContext> {
+        let lookup_prefix = match api_key_lookup_prefix(token) {
+            Some(prefix) => prefix.to_string(),
+            None => {
+                warn!(
+                    "AUTH: API key rejected — must start with '{}' and be at least {} characters",
+                    API_KEY_PREFIX,
+                    API_KEY_LOOKUP_PREFIX_LEN
+                );
+                return None;
+            }
+        };
+
+        let Some(resolved_table_name) =
+            resolve_table_name_case_insensitive(entity, &config.table)
+        else {
+            warn!(
+                "AUTH: Auth table '{}' not found on disk for entity '{}'.",
+                config.table, entity
+            );
+            return None;
+        };
+
+        let tm = self.table_manager.clone();
+        let e_name = entity.to_string();
+        let id_col = config.id_col.clone();
+        let token_owned = token.to_string();
+
+        let user_id = tokio::task::spawn_blocking(move || {
+            lookup_api_key_user_id(
+                &tm,
+                &e_name,
+                &resolved_table_name,
+                &lookup_prefix,
+                &token_owned,
+                &id_col,
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+
+        user_id.map(|uid| AuthContext {
+            user_id: uid,
+            token: token.to_string(),
+            entity: entity.to_string(),
+            filter_col: config.filter_col.clone(),
+        })
+    }
+
+    async fn resolve_legacy_token(
+        &self,
+        entity: &str,
+        token: &str,
+        c: &SavedAuthConfig,
+    ) -> Option<AuthContext> {
         let filter_col = c.filter_col.clone();
 
-        debug!("AUTH: Resolving identity for entity '{}' in table '{}' using col '{}'",
-            entity, c.table, c.token_col);
+        debug!(
+            "AUTH: Legacy resolve entity '{}' table '{}' col '{}'",
+            entity, c.table, c.token_col
+        );
 
         let token_candidates = build_token_candidates(token);
         if token_candidates.is_empty() {
@@ -35,26 +126,18 @@ impl AuthService {
 
         let Some(resolved_table_name) = resolve_table_name_case_insensitive(entity, &c.table) else {
             warn!(
-                "AUTH: Auth table '{}' not found on disk for entity '{}'. Skipping identity resolution.",
-                c.table,
-                entity
+                "AUTH: Auth table '{}' not found on disk for entity '{}'.",
+                c.table, entity
             );
             return None;
         };
-        debug!(
-            "AUTH: Using resolved auth table '{}' (configured '{}'), {} token candidate(s)",
-            resolved_table_name,
-            c.table,
-            token_candidates.len()
-        );
 
-        // Look up in the users table
         let tm = self.table_manager.clone();
         let e_name = entity.to_string();
         let t_name = resolved_table_name;
         let t_col = c.token_col.clone();
         let i_col = c.id_col.clone();
-        let candidates = token_candidates.clone();
+        let candidates = token_candidates;
 
         let user_id = tokio::task::spawn_blocking(move || {
             match tm.get_table(&e_name, &t_name) {
@@ -70,15 +153,25 @@ impl AuthService {
                             field_type: None,
                         };
 
-                        debug!("AUTH: Searching in table '{}' for {} = '{}'...", t_name, t_col, val);
-                        match table.search(&[i_col.clone()], &[filter], &crate::core::types::LogicalOp::And, &[], &[], 1, 0, None) {
+                        debug!(
+                            "AUTH: Searching in table '{}' for {} = '{}'...",
+                            t_name, t_col, val
+                        );
+                        match table.search(
+                            &[i_col.clone()],
+                            &[filter],
+                            &LogicalOp::And,
+                            &[],
+                            &[],
+                            1,
+                            0,
+                            None,
+                        ) {
                             Ok(results) => {
                                 if !results.rows.is_empty() {
-                                    let found_id = results.rows[0].get(0).cloned();
-                                    debug!("AUTH: Match found with candidate '{}'. user_id = {:?}", val, found_id);
-                                    return found_id;
+                                    return results.rows[0].get(0).cloned();
                                 }
-                            },
+                            }
                             Err(e) => {
                                 error!("AUTH: Search error in table '{}': {}", t_name, e);
                                 return None;
@@ -86,35 +179,216 @@ impl AuthService {
                         }
                     }
 
-                    let total_rows: u64 = table.manifest.segments.iter().map(|s| s.record_count).sum();
+                    let total_rows: u64 = table
+                        .manifest
+                        .segments
+                        .iter()
+                        .map(|s| s.record_count)
+                        .sum();
                     warn!(
-                        "AUTH: No record found in table '{}' for any token candidate in column '{}'. Total rows in table: {}",
-                        t_name,
-                        t_col,
-                        total_rows
+                        "AUTH: No record in '{}' for token_col '{}'. Total rows: {}",
+                        t_name, t_col, total_rows
                     );
                     None
-                },
+                }
                 Err(e) => {
-                    error!("AUTH: Could not open table '{}' for entity '{}': {}", t_name, e_name, e);
+                    error!(
+                        "AUTH: Could not open table '{}' for entity '{}': {}",
+                        t_name, e_name, e
+                    );
                     None
                 }
             }
-        }).await.ok().flatten();
+        })
+        .await
+        .ok()
+        .flatten();
 
-        if let Some(uid) = user_id {
-            debug!("AUTH: Identity found! Internal user_id: {}", uid);
-            Some(AuthContext {
-                user_id: uid,
-                token: token.to_string(),
-                entity: entity.to_string(),
-                filter_col,
-            })
-        } else {
-            warn!("AUTH: Identity NOT found in table '{}'", c.table);
-            None
+        user_id.map(|uid| AuthContext {
+            user_id: uid,
+            token: token.to_string(),
+            entity: entity.to_string(),
+            filter_col,
+        })
+    }
+}
+
+/// Extract API key / bearer credential from HTTP headers (`Authorization` or `X-API-Key`).
+pub fn extract_credential_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+    {
+        if let Some(token) = parse_authorization_value(value) {
+            return Some(token);
         }
     }
+
+    headers
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extract API key / bearer credential from gRPC metadata.
+pub fn extract_credential_from_metadata(metadata: &MetadataMap) -> Option<String> {
+    if let Some(value) = metadata
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+    {
+        if let Some(token) = parse_authorization_value(value) {
+            return Some(token);
+        }
+    }
+
+    metadata
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_authorization_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("Bearer ") {
+        let token = rest.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+        return None;
+    }
+    if trimmed.starts_with("Bearer") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+pub fn api_key_lookup_prefix(token: &str) -> Option<&str> {
+    if token.len() < API_KEY_LOOKUP_PREFIX_LEN {
+        return None;
+    }
+    if !token.starts_with(API_KEY_PREFIX) {
+        return None;
+    }
+    Some(&token[..API_KEY_LOOKUP_PREFIX_LEN])
+}
+
+fn lookup_api_key_user_id(
+    tm: &TableManager,
+    entity: &str,
+    table_name: &str,
+    lookup_prefix: &str,
+    token: &str,
+    id_col: &str,
+) -> Option<String> {
+    let table_lock = tm.get_table(entity, table_name).ok()?;
+    let table = table_lock.read().unwrap();
+
+    let search_fields = vec![
+        id_col.to_string(),
+        "key_hash".to_string(),
+        "prefix".to_string(),
+        "revoked_at".to_string(),
+        "expires_at".to_string(),
+    ];
+
+    let filter = Filter {
+        field: "prefix".to_string(),
+        op: ComparisonOp::Eq,
+        value: lookup_prefix.to_string(),
+        value_to: None,
+        value_options: vec![],
+        field_type: None,
+    };
+
+    let results = table
+        .search(
+            &search_fields,
+            &[filter],
+            &LogicalOp::And,
+            &[],
+            &[],
+            32,
+            0,
+            None,
+        )
+        .ok()?;
+
+    let idx = |name: &str| results.headers.iter().position(|h| h == name);
+
+    let id_idx = idx(id_col)?;
+    let hash_idx = idx("key_hash")?;
+    let revoked_idx = idx("revoked_at")?;
+    let expires_idx = idx("expires_at")?;
+
+    for row in &results.rows {
+        let user_id = row.get(id_idx)?.clone();
+        let key_hash = row.get(hash_idx)?;
+        let revoked_at = row.get(revoked_idx).map(String::as_str).unwrap_or("");
+        let expires_at = row.get(expires_idx).map(String::as_str).unwrap_or("");
+
+        if !api_key_row_active(revoked_at, expires_at) {
+            debug!(
+                "AUTH: Skipping api_keys row user_id={} (revoked or expired)",
+                user_id
+            );
+            continue;
+        }
+
+        if verify_api_key_hash(key_hash, token) {
+            debug!(
+                "AUTH: API key verified for user_id={} (prefix={})",
+                user_id, lookup_prefix
+            );
+            return Some(user_id);
+        }
+    }
+
+    warn!(
+        "AUTH: No valid api_keys row for prefix '{}' (candidates={})",
+        lookup_prefix,
+        results.rows.len()
+    );
+    None
+}
+
+fn api_key_row_active(revoked_at: &str, expires_at: &str) -> bool {
+    if !revoked_at.trim().is_empty() {
+        return false;
+    }
+    let expires = expires_at.trim();
+    if expires.is_empty() {
+        return true;
+    }
+    parse_mirror_datetime(expires)
+        .map(|dt| dt > chrono::Utc::now().naive_utc())
+        .unwrap_or(false)
+}
+
+fn parse_mirror_datetime(raw: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .or_else(|| NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok())
+}
+
+fn verify_api_key_hash(stored_hash: &str, token: &str) -> bool {
+    let trimmed = stored_hash.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = PasswordHash::new(trimmed) else {
+        warn!("AUTH: Could not parse key_hash as PHC string");
+        return false;
+    };
+    Argon2::default()
+        .verify_password(token.as_bytes(), &parsed)
+        .is_ok()
 }
 
 fn build_token_candidates(token: &str) -> Vec<String> {
@@ -197,4 +471,53 @@ fn read_table_record_count(table_path: &Path) -> u64 {
                 .sum::<u64>()
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_prefix_is_first_12_chars() {
+        let token = "bk_live_eksfs5pmtacc1tsr1r70onpaw14mro2z";
+        assert_eq!(api_key_lookup_prefix(token), Some("bk_live_eksf"));
+    }
+
+    #[test]
+    fn rejects_short_or_wrong_prefix() {
+        assert_eq!(api_key_lookup_prefix("bk_live_"), None);
+        assert_eq!(api_key_lookup_prefix("sk_live_xxxx"), None);
+    }
+
+    #[test]
+    fn parse_bearer_authorization() {
+        assert_eq!(
+            parse_authorization_value("Bearer bk_live_abc"),
+            Some("bk_live_abc".to_string())
+        );
+        assert_eq!(parse_authorization_value("bk_live_abc"), Some("bk_live_abc".to_string()));
+    }
+
+    #[test]
+    fn auth_config_detects_bittice_api_key_scheme() {
+        let cfg = SavedAuthConfig {
+            enabled: true,
+            table: "api_keys".to_string(),
+            token_col: "prefix".to_string(),
+            id_col: "user_id".to_string(),
+            filter_col: "user_id".to_string(),
+            scheme: None,
+        };
+        assert!(cfg.uses_bittice_api_key());
+
+        let legacy = SavedAuthConfig {
+            enabled: true,
+            table: "users".to_string(),
+            token_col: "email".to_string(),
+            id_col: "id".to_string(),
+            filter_col: "user_id".to_string(),
+            scheme: None,
+        };
+        assert!(!legacy.uses_bittice_api_key());
+    }
 }

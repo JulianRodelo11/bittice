@@ -230,17 +230,20 @@ impl MyDatabase {
         }
     }
 
-    async fn extract_auth_context(&self, metadata: &tonic::metadata::MetadataMap, config: Option<&crate::core::saved_queries::SavedAuthConfig>) -> Option<crate::core::types::AuthContext> {
-        let token = metadata.get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-        
-        if let Some(t) = token {
-            let entity = self.entity_filter.clone().unwrap_or_else(|| "default".to_string());
-            self.auth_service.resolve_token(&entity, t, config).await
-        } else {
-            None
-        }
+    async fn extract_auth_context(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        config: Option<&crate::core::saved_queries::SavedAuthConfig>,
+        query_entity: Option<&str>,
+    ) -> Option<crate::core::types::AuthContext> {
+        let token = crate::core::auth::extract_credential_from_metadata(metadata)?;
+        let entity = query_entity
+            .map(str::to_string)
+            .or_else(|| self.entity_filter.clone())
+            .unwrap_or_else(|| "default".to_string());
+        self.auth_service
+            .resolve_token(&entity, &token, config)
+            .await
     }
 
     async fn get_operations(&self) -> Arc<Vec<SavedOperation>> {
@@ -282,7 +285,9 @@ impl MyDatabase {
                         }
                     }
 
-                    let auth_ctx = self.extract_auth_context(metadata, q.auth_config.as_ref()).await;
+                    let auth_ctx = self
+                        .extract_auth_context(metadata, q.auth_config.as_ref(), Some(q.entity.as_str()))
+                        .await;
                     match execute_query_result_internal(
                         q.clone(),
                         targeted_params,
@@ -945,7 +950,7 @@ impl Database for MyDatabase {
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStream>, Status> {
         let metadata = request.metadata().clone();
-        let auth_ctx = self.extract_auth_context(&metadata, None).await;
+        let auth_ctx = self.extract_auth_context(&metadata, None, None).await;
         let req = request.into_inner();
         let entity = req.entity.clone();
         let table_name = req.table.clone();
@@ -1035,7 +1040,7 @@ impl Database for MyDatabase {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchUnaryResponse>, Status> {
         let metadata = request.metadata().clone();
-        let auth_ctx = self.extract_auth_context(&metadata, None).await;
+        let auth_ctx = self.extract_auth_context(&metadata, None, None).await;
         let req = request.into_inner();
         
         let query = SavedQuery {
@@ -1110,7 +1115,11 @@ impl Database for MyDatabase {
                         {
                             if split.mode == "split_enrichment" {
                                 let auth_ctx = self
-                                    .extract_auth_context(&metadata, q.auth_config.as_ref())
+                                    .extract_auth_context(
+                                        &metadata,
+                                        q.auth_config.as_ref(),
+                                        Some(q.entity.as_str()),
+                                    )
                                     .await;
                                 let result = execute_split_enrichment_result(
                                     q,
@@ -1177,7 +1186,13 @@ impl Database for MyDatabase {
                 return Err(Status::not_found("Query not found"));
             };
 
-        let auth_ctx = self.extract_auth_context(&metadata, query.auth_config.as_ref()).await;
+        let auth_ctx = self
+            .extract_auth_context(
+                &metadata,
+                query.auth_config.as_ref(),
+                Some(query.entity.as_str()),
+            )
+            .await;
 
         let query_for_pagination = query.clone();
         let params_for_pagination = params.clone();
@@ -1258,7 +1273,13 @@ impl Database for MyDatabase {
                     if query_uses_rest_only_aggregations(q).map_err(Status::invalid_argument)? {
                         return Err(Status::invalid_argument("Collect aggregation is currently supported only by the REST API"));
                     }
-                    let auth_ctx = self.extract_auth_context(&metadata, q.auth_config.as_ref()).await;
+                    let auth_ctx = self
+                        .extract_auth_context(
+                            &metadata,
+                            q.auth_config.as_ref(),
+                            Some(q.entity.as_str()),
+                        )
+                        .await;
 
                     if let Some(ref profile) = q.execution_profile {
                         if let crate::core::saved_queries::SavedExecutionProfile::Split(split) = profile {

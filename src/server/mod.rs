@@ -826,11 +826,7 @@ async fn handle_request(
     
     let op_name = path.trim_start_matches('/').to_string();
     
-    // Read token straight from headers to avoid extension-related issues
-    let raw_auth_token = headers.get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string());
+    let raw_auth_token = crate::core::auth::extract_credential_from_headers(&headers);
 
     // Non-blocking log send to avoid hanging the request
     info!("{} /{}", method, op_name);
@@ -1009,9 +1005,9 @@ async fn handle_request(
                             // Strict: bearer token is missing
                             warn!("-> 401 Unauthorized (No token provided for {})", op_name);
                             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ 
-                                "error": "Unauthorized", 
-                                "details": "Bearer token is required for this operation." 
-                            }))).into_response();
+                                    "error": "Unauthorized", 
+                                    "details": "Authorization: Bearer <api_key> or X-API-Key header is required for this operation." 
+                                }))).into_response();
                         }
                     }
                 }
