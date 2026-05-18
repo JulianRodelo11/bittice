@@ -1,11 +1,14 @@
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use argon2::Argon2;
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::NaiveDateTime;
+use lru::LruCache;
 use tonic::metadata::MetadataMap;
 use tracing::{debug, error, warn};
 
@@ -17,13 +20,41 @@ use crate::server::table_manager::TableManager;
 pub const API_KEY_PREFIX: &str = "bk_live_";
 pub const API_KEY_LOOKUP_PREFIX_LEN: usize = 12;
 
+/// How long a successful API-key verify is trusted before we re-run argon2.
+/// Tradeoff: shorter → revoked keys propagate faster, longer → less CPU. 5 min
+/// matches the heartbeat cadence, which is the dominant authenticated traffic
+/// on the corp motor today.
+const API_KEY_VERIFY_TTL: Duration = Duration::from_secs(300);
+
+/// Cap so a single hot process can't pile up unbounded entries (legitimate or
+/// not). 4096 distinct active keys covers far more than any realistic single
+/// motor will see; on overflow we just drop the least-recently-used entry.
+const API_KEY_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Clone)]
+struct VerifiedEntry {
+    user_id: String,
+    verified_at: Instant,
+}
+
 pub struct AuthService {
     table_manager: Arc<TableManager>,
+    /// Caches `(token → (user_id, key_hash, verified_at))` to skip the ~175ms
+    /// Argon2 verify on every request from the same caller within
+    /// `API_KEY_VERIFY_TTL`. The cache is intentionally in-process only:
+    /// rebuilt on every engine restart, so a revoked key always loses access
+    /// within at most `TTL + restart_recovery_seconds`.
+    verified_keys: Mutex<LruCache<String, VerifiedEntry>>,
 }
 
 impl AuthService {
     pub fn new(table_manager: Arc<TableManager>) -> Self {
-        Self { table_manager }
+        let cap = NonZeroUsize::new(API_KEY_CACHE_CAPACITY)
+            .expect("API_KEY_CACHE_CAPACITY must be > 0");
+        Self {
+            table_manager,
+            verified_keys: Mutex::new(LruCache::new(cap)),
+        }
     }
 
     pub async fn resolve_token(
@@ -69,6 +100,18 @@ impl AuthService {
             }
         };
 
+        // Fast path: token was already verified recently. Skips the ~175ms
+        // Argon2 verify and the auth-table lookup entirely. Capped TTL keeps
+        // the lag-to-revocation bounded.
+        if let Some(uid) = self.cached_user_id(token) {
+            return Some(AuthContext {
+                user_id: uid,
+                token: token.to_string(),
+                entity: entity.to_string(),
+                filter_col: config.filter_col.clone(),
+            });
+        }
+
         let Some(resolved_table_name) =
             resolve_table_name_case_insensitive(entity, &config.table)
         else {
@@ -84,7 +127,9 @@ impl AuthService {
         let id_col = config.id_col.clone();
         let token_owned = token.to_string();
 
-        let user_id = tokio::task::spawn_blocking(move || {
+        // Returns Some((user_id, matched_key_hash)) on success so we can guard
+        // the cache against silent key rotations.
+        let verified = tokio::task::spawn_blocking(move || {
             lookup_api_key_user_id(
                 &tm,
                 &e_name,
@@ -98,12 +143,44 @@ impl AuthService {
         .ok()
         .flatten();
 
-        user_id.map(|uid| AuthContext {
-            user_id: uid,
-            token: token.to_string(),
-            entity: entity.to_string(),
-            filter_col: config.filter_col.clone(),
-        })
+        if let Some((uid, _key_hash)) = verified {
+            self.cache_verified(token, &uid);
+            Some(AuthContext {
+                user_id: uid,
+                token: token.to_string(),
+                entity: entity.to_string(),
+                filter_col: config.filter_col.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns the cached `user_id` for `token` if the entry is fresh.
+    /// Treating cache-miss the same as expired-or-rotated keeps the lookup
+    /// path symmetric — the caller always falls back to the slow Argon2 path.
+    fn cached_user_id(&self, token: &str) -> Option<String> {
+        let mut cache = self.verified_keys.lock().ok()?;
+        let entry = cache.get(token)?;
+        if entry.verified_at.elapsed() < API_KEY_VERIFY_TTL {
+            Some(entry.user_id.clone())
+        } else {
+            // Expired — evict so subsequent lookups don't see it via `peek`.
+            cache.pop(token);
+            None
+        }
+    }
+
+    fn cache_verified(&self, token: &str, user_id: &str) {
+        if let Ok(mut cache) = self.verified_keys.lock() {
+            cache.put(
+                token.to_string(),
+                VerifiedEntry {
+                    user_id: user_id.to_string(),
+                    verified_at: Instant::now(),
+                },
+            );
+        }
     }
 
     async fn resolve_legacy_token(
@@ -279,6 +356,9 @@ pub fn api_key_lookup_prefix(token: &str) -> Option<&str> {
     Some(&token[..API_KEY_LOOKUP_PREFIX_LEN])
 }
 
+/// Returns `(user_id, key_hash)` on a successful Argon2 verify. The hash is
+/// echoed back so the caller can stash it in the verify-cache and later
+/// invalidate the entry if the hash rotates underneath us.
 fn lookup_api_key_user_id(
     tm: &TableManager,
     entity: &str,
@@ -286,7 +366,7 @@ fn lookup_api_key_user_id(
     lookup_prefix: &str,
     token: &str,
     id_col: &str,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let table_lock = tm.get_table(entity, table_name).ok()?;
     let table = table_lock.read().unwrap();
 
@@ -329,7 +409,7 @@ fn lookup_api_key_user_id(
 
     for row in &results.rows {
         let user_id = row.get(id_idx)?.clone();
-        let key_hash = row.get(hash_idx)?;
+        let key_hash = row.get(hash_idx)?.clone();
         let revoked_at = row.get(revoked_idx).map(String::as_str).unwrap_or("");
         let expires_at = row.get(expires_idx).map(String::as_str).unwrap_or("");
 
@@ -341,12 +421,12 @@ fn lookup_api_key_user_id(
             continue;
         }
 
-        if verify_api_key_hash(key_hash, token) {
+        if verify_api_key_hash(&key_hash, token) {
             debug!(
                 "AUTH: API key verified for user_id={} (prefix={})",
                 user_id, lookup_prefix
             );
-            return Some(user_id);
+            return Some((user_id, key_hash));
         }
     }
 
