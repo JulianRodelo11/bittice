@@ -513,8 +513,27 @@ impl Table {
             let op = WalOperation::Delete { id: id.to_string() };
             self.wal.append(&op)?;
             if let Some(writer) = &mut self.active_segment {
-                if writer.segment.id == seg_id { writer.segment.mark_deleted(local_id)?; }
-                else if let Some(seg) = self.immutable_segments.iter_mut().find(|s| s.id == seg_id) { seg.mark_deleted(local_id)?; }
+                if writer.segment.id == seg_id {
+                    // Active segment: in-memory deleted_bitmap is fine — it gets
+                    // serialized on rotation (`flush_active_segment` → `writer.flush`
+                    // → `persist_deleted_bitmap`) and the WAL Delete entry above
+                    // covers crash recovery.
+                    writer.segment.mark_deleted(local_id)?;
+                } else if let Some(seg) = self.immutable_segments.iter_mut().find(|s| s.id == seg_id) {
+                    // Immutable segment: persist the bitmap *now*. Otherwise the
+                    // tombstone lives only in this process's memory until the
+                    // next rotation, and a SIGKILL between events (Watchtower
+                    // doing `docker stop` past the grace period, OOM-killer,
+                    // host reboot) drops it. The WAL Delete entry is in the
+                    // file, but WAL replay on restart can't reapply it: by
+                    // then `primary_index` (already persisted before our
+                    // process died) no longer maps `id → (seg, local)`, so the
+                    // replay has nothing to mark. The fix is to make the
+                    // tombstone durable at the source. ~18 bytes per delete,
+                    // synchronous; cheap even at thousands of UPDATEs/sec.
+                    seg.mark_deleted(local_id)?;
+                    seg.persist_deleted_bitmap()?;
+                }
             }
         }
         Ok(())
