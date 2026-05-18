@@ -422,7 +422,11 @@ r#"services:
       - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
       - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
-      - BITTICE_SKIP_STARTUP_COMPACT=1
+      # NOTE: BITTICE_SKIP_STARTUP_COMPACT is intentionally NOT set here.
+      # Compact folds the mini-segment explosion from CDC write paths into a
+      # small number of large segments; skipping it on customer instances would
+      # let segments grow unbounded over time. We only skip on the corp
+      # dev instance where startup speed beats long-term shape.
 {identity_block}    restart: unless-stopped
 
   watchtower:
