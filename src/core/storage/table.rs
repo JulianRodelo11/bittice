@@ -125,6 +125,13 @@ impl Table {
             let _ = writer.persist_bitmaps();
         }
         let _ = self.wal.flush_writes();
+        // Persist every immutable segment's `deleted.bitmap`. Without this,
+        // rows tombstoned by `delete()` since the last `flush_active_segment`
+        // sit only in memory — close() (or process exit through close()) drops
+        // them, and on restart the secondary_exact path finds the still-live
+        // entry in the old segment as well as the new copy in the rotated
+        // segment, producing ghost duplicates.
+        let _ = self.persist_all_deleted_bitmaps();
         if !self.primary_index.is_empty() {
             let _ = self.save_manifest();
             let _ = self.save_primary_index();
@@ -549,6 +556,12 @@ impl Table {
     /// entries survive a process crash without the expensive full segment flush.
     pub fn flush_wal_only(&mut self) -> Result<()> {
         self.wal.flush_writes()?;
+        // Also persist every immutable segment's `deleted.bitmap`. Without this,
+        // rows tombstoned by `delete()` since the last `flush_active_segment`
+        // live only in memory — `fast_exit_flush` (DDL detect → process::exit,
+        // engine halt requested, etc.) would lose them and they'd reappear on
+        // restart as ghost duplicates against the freshly-inserted live row.
+        self.persist_all_deleted_bitmaps()?;
         Ok(())
     }
 
