@@ -103,6 +103,15 @@ pub struct HeartbeatRequest {
     /// deployment is later resized.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance_type: Option<String>,
+    /// Free-form diagnostics for the control plane's "is this customer
+    /// healthy?" view. Today the engine fills in:
+    ///   - `binlog_file`, `binlog_pos`     (current CDC position)
+    ///   - `bootstrapped_tables`           (count of tables in the mirror)
+    ///   - `last_mirror_batch_age_secs`    (how stale the mirror is now)
+    /// The Lambda stores the whole blob in `deployments.current_extra`,
+    /// so we can grow this dict without DB migrations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 /// Heartbeat uses a different auth than the user-facing endpoints: the engine

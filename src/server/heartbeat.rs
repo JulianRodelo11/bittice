@@ -73,6 +73,7 @@ pub fn spawn_if_configured() {
                 ec2_instance_id: None,  // could be filled from IMDS in a future iteration
                 aws_account_id: None,
                 instance_type: instance_type.clone(),
+                extra: cdc_state_snapshot(),
             };
             match heartbeat(&url, &dep_id, &token, &req).await {
                 Ok(()) => debug!("Heartbeat sent to {url} (uptime={uptime_secs}s, live={live}/{total})."),
@@ -81,6 +82,59 @@ pub fn spawn_if_configured() {
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
         }
     });
+}
+
+/// Snapshot of `cdc_state.json` reshaped for the control plane's health view.
+/// Stored on `deployments.current_extra` (JSON column), so the control plane
+/// can answer "which customer's mirror is falling behind?" without an admin
+/// SSH'ing into the customer EC2.
+///
+/// Walks `<data_root>/profiles/*/cdc_state.json`; in the single-engine deploy
+/// (the only shape that uses the control plane today) there is exactly one
+/// profile dir. Returns `None` on any error — heartbeat must keep running
+/// even if the state file is missing or being rewritten as we read it.
+fn cdc_state_snapshot() -> Option<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    struct Stub {
+        #[serde(default)]
+        binlog_file: String,
+        #[serde(default)]
+        binlog_pos: u32,
+        #[serde(default)]
+        bootstrapped_tables: Vec<String>,
+        #[serde(default)]
+        last_mirror_batch_unix_ms: Option<u64>,
+    }
+
+    let profiles_dir = crate::core::data_paths::resolved_data_root().join("profiles");
+    let entries = std::fs::read_dir(&profiles_dir).ok()?;
+
+    for entry in entries.flatten() {
+        let state_path = entry.path().join("cdc_state.json");
+        if !state_path.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&state_path).ok()?;
+        let stub: Stub = serde_json::from_str(&raw).ok()?;
+
+        let mut blob = serde_json::Map::new();
+        blob.insert("binlog_file".into(), serde_json::Value::String(stub.binlog_file));
+        blob.insert("binlog_pos".into(), serde_json::json!(stub.binlog_pos));
+        blob.insert("bootstrapped_tables".into(), serde_json::json!(stub.bootstrapped_tables.len()));
+        if let Some(ms) = stub.last_mirror_batch_unix_ms {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // saturating_sub: if NTP runs backwards or the file timestamp is in the
+            // future, report 0 instead of underflowing to a huge u64 that would
+            // make a healthy mirror look stale.
+            let lag_secs = now_ms.saturating_sub(ms) / 1000;
+            blob.insert("last_mirror_batch_age_secs".into(), serde_json::json!(lag_secs));
+        }
+        return Some(serde_json::Value::Object(blob));
+    }
+    None
 }
 
 /// Read the EC2 instance type from the Instance Metadata Service (IMDSv2).
