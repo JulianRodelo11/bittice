@@ -97,6 +97,12 @@ pub struct HeartbeatRequest {
     pub ec2_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws_account_id: Option<String>,
+    /// EC2 instance type (e.g. `t3.micro`). Read from IMDS at heartbeat
+    /// startup; the control plane snapshots it into `usage_hours.instance_type`
+    /// so billing reflects what was actually running each hour even if the
+    /// deployment is later resized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 /// Heartbeat uses a different auth than the user-facing endpoints: the engine

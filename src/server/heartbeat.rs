@@ -53,6 +53,14 @@ pub fn spawn_if_configured() {
 
     tokio::spawn(async move {
         tokio::time::sleep(INITIAL_DELAY).await;
+        // One-shot IMDS read at task start — instance_type can only change via
+        // stop/resize/start, which restarts the container, which re-runs this.
+        // Repeating the call on every heartbeat would add network jitter without
+        // ever observing a different value mid-run.
+        let instance_type = imds_instance_type().await;
+        if instance_type.is_none() {
+            debug!("Heartbeat: IMDS instance-type read failed — not on EC2 or IMDS disabled.");
+        }
         loop {
             let uptime_secs = started_at.elapsed().as_secs();
             let (total, live) = profile_counts();
@@ -64,6 +72,7 @@ pub fn spawn_if_configured() {
                 public_ip: None,        // server can capture from request peer IP if needed
                 ec2_instance_id: None,  // could be filled from IMDS in a future iteration
                 aws_account_id: None,
+                instance_type: instance_type.clone(),
             };
             match heartbeat(&url, &dep_id, &token, &req).await {
                 Ok(()) => debug!("Heartbeat sent to {url} (uptime={uptime_secs}s, live={live}/{total})."),
@@ -72,6 +81,48 @@ pub fn spawn_if_configured() {
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
         }
     });
+}
+
+/// Read the EC2 instance type from the Instance Metadata Service (IMDSv2).
+/// Returns `None` on any error (not on EC2, IMDS disabled, network glitch).
+/// Never panics, never propagates — heartbeat must keep running either way.
+async fn imds_instance_type() -> Option<String> {
+    const IMDS_BASE: &str = "http://169.254.169.254";
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+        .ok()?;
+
+    // IMDSv2 requires a session token first (PUT, 6h TTL). Many AMIs disable
+    // v1 nowadays so we don't bother with the v1 fallback — if v2 fails the
+    // value just stays None and the control plane keeps the previous value
+    // via COALESCE.
+    let token = client
+        .put(format!("{IMDS_BASE}/latest/api/token"))
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+
+    let value = client
+        .get(format!("{IMDS_BASE}/latest/meta-data/instance-type"))
+        .header("X-aws-ec2-metadata-token", token)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Reads `(profiles_total, profiles_live)` from the same data the engine uses.
