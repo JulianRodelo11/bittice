@@ -429,6 +429,11 @@ r#"services:
     image: containrrr/watchtower:latest
     container_name: watchtower
     restart: unless-stopped
+    environment:
+      # Ubuntu 22.04+ ships Docker daemon API 1.44+, which rejects watchtower's
+      # default older client API. Pinning here unblocks the docker.sock
+      # handshake. Bump if AWS Ubuntu AMIs ever ship Docker >= 30.x.
+      - DOCKER_API_VERSION=1.44
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command:
