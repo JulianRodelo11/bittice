@@ -1119,12 +1119,19 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
 
     /// Load column metadata for ALL tables in a schema with a single
     /// `information_schema.COLUMNS` query instead of one `DESCRIBE` per table.
-    /// Returns `HashMap<table_name_lower, (ordered_col_names, date_col_names)>`.
+    /// Returns `(ordered_col_names, date_col_names, enum_col_values)` per table.
     /// Falls back to an empty map on error (callers fall back to per-table DESCRIBE).
+    ///
+    /// ENUM values MUST come back here too: callers that hit this bulk cache on
+    /// a re-start (i.e. tables already in `bootstrapped_tables`) skip
+    /// `fetch_column_info`, so this is the only chance to seed `enum_maps`. If
+    /// we drop ENUM info on the floor, `parse_row` later sees the binlog
+    /// ordinal (`2`) instead of the label (`"active"`) and the mirror diverges
+    /// from the snapshot for that row (the original "ghost row" bug).
     async fn fetch_schema_columns_bulk(
         conn: &mut Conn,
         schema: &str,
-    ) -> HashMap<String, (Vec<String>, HashSet<String>)> {
+    ) -> HashMap<String, (Vec<String>, HashSet<String>, HashMap<String, Vec<String>>)> {
         let sql = format!(
             "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE \
              FROM information_schema.COLUMNS \
@@ -1136,16 +1143,40 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             Ok(r) => r,
             Err(_) => return HashMap::new(),
         };
-        let mut result: HashMap<String, (Vec<String>, HashSet<String>)> = HashMap::new();
-        for (table, col_name, data_type, _col_type) in rows {
-            let entry = result.entry(table).or_insert_with(|| (Vec::new(), HashSet::new()));
+        let mut result: HashMap<String, (Vec<String>, HashSet<String>, HashMap<String, Vec<String>>)> =
+            HashMap::new();
+        for (table, col_name, data_type, col_type) in rows {
+            let entry = result
+                .entry(table)
+                .or_insert_with(|| (Vec::new(), HashSet::new(), HashMap::new()));
             let dt_lower = data_type.to_lowercase();
             if dt_lower.contains("date") || dt_lower.contains("timestamp") || dt_lower.contains("time") {
                 entry.1.insert(col_name.clone());
             }
+            if let Some(values) = Self::parse_enum_column_type(&col_type) {
+                entry.2.insert(col_name.clone(), values);
+            }
             entry.0.push(col_name);
         }
         result
+    }
+
+    /// Parse a MySQL `COLUMN_TYPE` like `enum('a','b','c')` into the ordered
+    /// list of label values. Returns `None` when the column isn't an ENUM.
+    fn parse_enum_column_type(col_type: &str) -> Option<Vec<String>> {
+        if !col_type.to_lowercase().starts_with("enum(") {
+            return None;
+        }
+        let values_str = col_type
+            .trim_start_matches(|c| c != '(')
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        Some(
+            values_str
+                .split(',')
+                .map(|v| v.trim_matches('\'').to_string())
+                .collect(),
+        )
     }
 
     async fn fetch_column_info(
@@ -1173,16 +1204,7 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
                 date_cols.insert(col_name.clone());
             }
 
-            // Detect ENUM and extract values (Preserving Case)
-            if col_type_lower.starts_with("enum(") {
-                let values_str = col_type_raw
-                    .trim_start_matches(|c| c != '(')
-                    .trim_start_matches('(')
-                    .trim_end_matches(')');
-                let values: Vec<String> = values_str
-                    .split(',')
-                    .map(|v| v.trim_matches('\'').to_string())
-                    .collect();
+            if let Some(values) = Self::parse_enum_column_type(&col_type_raw) {
                 enum_info.insert(col_name, values);
             }
         }
@@ -1891,17 +1913,23 @@ so the account can read coordinates."
                     } else {
                         // Use bulk-loaded column info; fall back to per-table DESCRIBE only
                         // if the bulk query didn't include this table (e.g. it was created
-                        // after the bulk fetch ran or the query failed).
-                        let (cols, dates) = if let Some((c, d)) = bulk_cols.get(table_name.as_str())
+                        // after the bulk fetch ran or the query failed). The bulk path
+                        // returns enums too — write them through to `enum_maps`, otherwise
+                        // `parse_row` sees the binlog ordinal and the mirror diverges
+                        // from the snapshot label.
+                        let (cols, dates, enums) = if let Some((c, d, e)) = bulk_cols
+                            .get(table_name.as_str())
                             .or_else(|| bulk_cols.get(table_name.to_lowercase().as_str()))
                         {
-                            (c.clone(), d.clone())
+                            (c.clone(), d.clone(), e.clone())
                         } else {
                             match self
                                 .fetch_column_info(&mut conn, &schema, &qkey, table_name)
                                 .await
                             {
-                                Ok(info) => info,
+                                // fetch_column_info already wrote `enum_maps`, so leave
+                                // the local map empty for the merge below.
+                                Ok((c, d)) => (c, d, HashMap::new()),
                                 Err(e) => {
                                     Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                                     return self
@@ -1918,6 +1946,10 @@ so the account can read coordinates."
                             maps.insert(qkey.clone(), cols);
                             let mut d_maps = self.date_columns.write().unwrap();
                             d_maps.insert(qkey.clone(), dates);
+                            if !enums.is_empty() {
+                                let mut e_maps = self.enum_maps.write().unwrap();
+                                e_maps.insert(qkey.clone(), enums);
+                            }
                         }
                     }
                 }
@@ -1990,10 +2022,14 @@ so the account can read coordinates."
                     state.bootstrapped_tables.push(qkey.clone());
                     self.save_state(&state)?;
                 } else {
-                    let (cols, dates) = if let Some((c, d)) = bulk_cols.get(table_name.as_str())
+                    // Bulk-loaded column info carries enums too — write them through to
+                    // `enum_maps`, otherwise `parse_row` sees the binlog ordinal and the
+                    // mirror diverges from the snapshot label.
+                    let (cols, dates, enums) = if let Some((c, d, e)) = bulk_cols
+                        .get(table_name.as_str())
                         .or_else(|| bulk_cols.get(table_name.to_lowercase().as_str()))
                     {
-                        (c.clone(), d.clone())
+                        (c.clone(), d.clone(), e.clone())
                     } else {
                         match self
                             .fetch_column_info(
@@ -2004,7 +2040,8 @@ so the account can read coordinates."
                             )
                             .await
                         {
-                            Ok(info) => info,
+                            // fetch_column_info already wrote `enum_maps`.
+                            Ok((c, d)) => (c, d, HashMap::new()),
                             Err(e) => {
                                 Self::rollback_consistent_snapshot(&mut conn, rr_snapshot_active).await;
                                 return self
@@ -2021,6 +2058,10 @@ so the account can read coordinates."
                         maps.insert(qkey.clone(), cols);
                         let mut d_maps = self.date_columns.write().unwrap();
                         d_maps.insert(qkey.clone(), dates);
+                        if !enums.is_empty() {
+                            let mut e_maps = self.enum_maps.write().unwrap();
+                            e_maps.insert(qkey.clone(), enums);
+                        }
                     }
                 }
             }
