@@ -1397,6 +1397,203 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         Ok(())
     }
 
+    /// Path on disk to the mirror dir for a given (schema, table) pair, used by the
+    /// startup health check + DDL recovery code to read manifest.json or remove the
+    /// dir without going through `TableManager::get_table` (which opens primary
+    /// indexes etc. — expensive and unnecessary for a metadata-only check).
+    fn mirror_table_dir(&self, schema: &str, table_name: &str) -> std::path::PathBuf {
+        let disk_entity = if self.sync_all_databases {
+            schema.to_lowercase()
+        } else {
+            self.entity.clone()
+        };
+        let mirror_table = Self::resolve_mirror_table_dir(&disk_entity, table_name);
+        crate::core::data_paths::resolved_data_root()
+            .join("mirror")
+            .join(&disk_entity)
+            .join(&mirror_table)
+    }
+
+    /// At startup, for every table in `state.bootstrapped_tables`, verify that
+    /// the column list MySQL reports right now matches `manifest.original_fields`
+    /// on disk. Drop any drifted (or missing) entry from `bootstrapped_tables`
+    /// and `pk_map`, and remove its mirror dir — the regular bootstrap loop
+    /// later in `run_impl` then picks them up and runs a fresh `FullSnapshot`.
+    ///
+    /// This is the safety net for the "customer ALTERs a table while the engine
+    /// was off (Watchtower update, reboot, crash)" path: we never had access to
+    /// the customer's EC2 to do a manual refresh, so the engine has to detect
+    /// drift on its own and self-recover. The complementary live path —
+    /// detecting DDL in the binlog stream — just triggers a process restart so
+    /// this same check kicks in.
+    async fn validate_bootstrapped_schemas(
+        &self,
+        conn: &mut Conn,
+        state: &mut CdcState,
+    ) -> Result<()> {
+        if state.bootstrapped_tables.is_empty() {
+            return Ok(());
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ManifestStub {
+            #[serde(default)]
+            original_fields: Vec<String>,
+        }
+
+        let mut to_invalidate: Vec<String> = Vec::new();
+        let qkeys: Vec<String> = state.bootstrapped_tables.clone();
+
+        for qkey in qkeys {
+            let (schema_name, table_name) = if self.sync_all_databases {
+                match qkey.split_once('.') {
+                    Some((s, t)) => (s.to_string(), t.to_string()),
+                    None => continue,
+                }
+            } else {
+                (self.database.clone(), qkey.clone())
+            };
+
+            // Read recorded schema from manifest. If the file is missing or the
+            // field is empty, treat as "no recorded schema" — drop and re-bootstrap
+            // (safer than guessing).
+            let manifest_path = self.mirror_table_dir(&schema_name, &table_name).join("manifest.json");
+            let recorded: Vec<String> = match std::fs::read_to_string(&manifest_path) {
+                Ok(s) => match serde_json::from_str::<ManifestStub>(&s) {
+                    Ok(m) => m.original_fields,
+                    Err(e) => {
+                        self.log_warn(format!(
+                            "CDC: validate_schemas: manifest for '{}' is unreadable ({}); will re-bootstrap.",
+                            qkey, e
+                        ));
+                        to_invalidate.push(qkey.clone());
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    self.log_warn(format!(
+                        "CDC: validate_schemas: mirror dir missing for '{}'; will re-bootstrap.",
+                        qkey
+                    ));
+                    to_invalidate.push(qkey.clone());
+                    continue;
+                }
+            };
+
+            // Fetch current schema from source.
+            let live_rows: Vec<(String,)> = match conn
+                .exec(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                     ORDER BY ORDINAL_POSITION",
+                    (schema_name.as_str(), table_name.as_str()),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    self.log_warn(format!(
+                        "CDC: validate_schemas: cannot fetch columns for '{}' ({}); skipping check.",
+                        qkey, e
+                    ));
+                    continue;
+                }
+            };
+            let live: Vec<String> = live_rows.into_iter().map(|t| t.0).collect();
+
+            if live.is_empty() {
+                self.log_warn(format!(
+                    "CDC: validate_schemas: source table '{}' missing (dropped upstream?); removing from bootstrapped set.",
+                    qkey
+                ));
+                to_invalidate.push(qkey.clone());
+                continue;
+            }
+
+            // Case-insensitive compare on ordered column list (MySQL identifiers
+            // are case-insensitive on most platforms; storage may have different
+            // case in manifest).
+            let same = recorded.len() == live.len()
+                && recorded.iter().zip(live.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b));
+            if !same {
+                self.log_warn(format!(
+                    "CDC: validate_schemas: '{}' schema drift detected — \
+                     mirror={:?} live={:?} — will re-bootstrap.",
+                    qkey, recorded, live
+                ));
+                to_invalidate.push(qkey.clone());
+            }
+        }
+
+        if to_invalidate.is_empty() {
+            return Ok(());
+        }
+
+        for qkey in &to_invalidate {
+            let (schema_name, table_name) = if self.sync_all_databases {
+                match qkey.split_once('.') {
+                    Some((s, t)) => (s.to_string(), t.to_string()),
+                    None => continue,
+                }
+            } else {
+                (self.database.clone(), qkey.clone())
+            };
+
+            // Wipe on-disk mirror dir so the bootstrap loop produces a clean
+            // snapshot (otherwise it would skip the table as "already done").
+            let mirror_path = self.mirror_table_dir(&schema_name, &table_name);
+            if mirror_path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&mirror_path) {
+                    self.log_warn(format!(
+                        "CDC: validate_schemas: remove '{}' failed: {}",
+                        mirror_path.display(),
+                        e
+                    ));
+                }
+            }
+            // Drop in-memory caches (column_maps / date_columns / enum_maps)
+            // so parse_row doesn't apply stale metadata after the rebootstrap.
+            self.column_maps.write().unwrap().remove(qkey);
+            self.date_columns.write().unwrap().remove(qkey);
+            self.enum_maps.write().unwrap().remove(qkey);
+
+            state.bootstrapped_tables.retain(|k| k != qkey);
+            state.pk_map.remove(qkey);
+        }
+        self.save_state(state)?;
+        self.log_info(format!(
+            "CDC: validate_schemas: invalidated {} table(s); they will be re-bootstrapped: {:?}",
+            to_invalidate.len(),
+            to_invalidate
+        ));
+        Ok(())
+    }
+
+    /// True if a binlog `QueryEvent` is a structural DDL on a base table
+    /// (ALTER/DROP/CREATE/RENAME/TRUNCATE). Index-only or non-DDL statements
+    /// (CREATE INDEX, SET, BEGIN, COMMIT, GRANT…) don't change column layout
+    /// and don't need a re-bootstrap; this check skips them.
+    fn query_is_structural_ddl(query: &str) -> bool {
+        let trimmed = query.trim_start();
+        // Strip a leading `/* … */` block comment some clients prepend.
+        let after_comment = if let Some(rest) = trimmed.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(end) => rest[end + 2..].trim_start(),
+                None => trimmed,
+            }
+        } else {
+            trimmed
+        };
+        let head: String = after_comment.chars().take(24).collect::<String>().to_uppercase();
+        // ALTER TABLE / DROP TABLE / CREATE TABLE / RENAME TABLE / TRUNCATE [TABLE]
+        head.starts_with("ALTER TABLE")
+            || head.starts_with("DROP TABLE")
+            || head.starts_with("CREATE TABLE")
+            || head.starts_with("RENAME TABLE")
+            || head.starts_with("TRUNCATE TABLE")
+            || head.starts_with("TRUNCATE ")
+    }
+
     /// After losing binlog replay position (purged logs / 1236), reload every bootstrapped table via `SELECT *`
     /// inside `START TRANSACTION WITH CONSISTENT SNAPSHOT`, matching bootstrap semantics so offline commits are not skipped.
     async fn resync_mirror_after_checkpoint_loss_mvcc(
@@ -1698,6 +1895,18 @@ set BITTICE_CDC_DURABILITY=strict|balanced|throughput",
         // `@@GLOBAL.gtid_executed` into an empty `gtid_executed` — the server would skip transactions the mirror
         // never applied (data loss after restarts).
         let had_checkpoint_at_start = !state.binlog_file.is_empty();
+
+        // Health check: compare each bootstrapped table's recorded schema vs the
+        // current live schema. Anything that drifted (ALTER while engine was off,
+        // mirror dir manually deleted, table dropped upstream) is removed from
+        // `bootstrapped_tables` so the bootstrap loop below re-snapshots it
+        // cleanly. Logs every drift; safe to fail (it's best-effort recovery).
+        if let Err(e) = self.validate_bootstrapped_schemas(&mut conn, &mut state).await {
+            self.log_warn(format!(
+                "CDC: validate_bootstrapped_schemas failed ({}); continuing without it.",
+                e
+            ));
+        }
         if self.sync_all_databases {
             let all_simple = !state.bootstrapped_tables.is_empty()
                 && state.bootstrapped_tables.iter().all(|k| !k.contains('.'));
@@ -2756,6 +2965,41 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                         }
                         state.binlog_file = rotate_data.name().to_string();
                         state.binlog_pos = rotate_data.position() as u32;
+                    }
+                    Some(EventData::QueryEvent(qe)) => {
+                        // Most QueryEvents on a ROW-format binlog are transactional
+                        // bookkeeping (BEGIN/COMMIT/SET …); only structural DDL on
+                        // a base table changes the schema. When that happens, exit
+                        // cleanly — docker restarts the container, and
+                        // `validate_bootstrapped_schemas` at the next startup detects
+                        // the column-list drift and re-bootstraps the affected
+                        // table(s) via the regular `FullSnapshot` path.  Doing the
+                        // re-bootstrap mid-stream is tempting but messy: we'd need
+                        // to suspend the read loop, sync to a consistent snapshot,
+                        // and resume from the new binlog coords — all the pieces
+                        // exist already on the startup path, so reuse them.
+                        let query = qe.query();
+                        if Self::query_is_structural_ddl(&query) {
+                            let preview: String = query.chars().take(160).collect();
+                            self.log_warn(format!(
+                                "CDC: DDL detected in binlog (schema='{}' query='{}') — \
+                                 persisting state and exiting so the next startup re-validates \
+                                 schemas and re-bootstraps the affected table(s).",
+                                qe.schema(),
+                                preview
+                            ));
+                            // Persist position so we don't re-read events up to the DDL.
+                            // The startup validator will wipe affected mirrors anyway, but
+                            // we'd otherwise re-read every binlog event up to here.
+                            Self::apply_binlog_file_pos(&mut state, next_pos);
+                            self.fast_exit_flush();
+                            let _ = self.save_state(&state);
+                            // exit(0) over exit(1): docker `restart: always/unless-stopped`
+                            // restarts either way, but 0 keeps logs/dashboards clean — this
+                            // is an orderly shutdown for a *known* condition, not a crash.
+                            std::process::exit(0);
+                        }
+                        Self::apply_binlog_file_pos(&mut state, next_pos);
                     }
                     _ => {
                         Self::apply_binlog_file_pos(&mut state, next_pos);
