@@ -118,6 +118,11 @@ impl Table {
         }
         if let Some(mut writer) = self.active_segment.take() {
             let _ = writer.flush();
+            // Same reason as in `flush_active_segment`: `SegmentWriter::flush`
+            // only writes bitmaps every N flushes; close() is the last chance
+            // before the active segment becomes a sealed immutable segment,
+            // so force the final persist.
+            let _ = writer.persist_bitmaps();
         }
         let _ = self.wal.flush_writes();
         if !self.primary_index.is_empty() {
@@ -581,6 +586,13 @@ impl Table {
     pub fn flush_active_segment(&mut self) -> Result<()> {
         if let Some(mut writer) = self.active_segment.take() {
             writer.flush()?;
+            // The throttle in `SegmentWriter::flush` (`flush_count % N == 0`)
+            // is for mid-segment rewrites only — at rotation we MUST persist
+            // the bitmaps so the sealed segment is queryable after a restart.
+            // Without this, ~4 out of every 5 segments lose their per-column
+            // value→row-set bitmaps; filtered queries skip those segments and
+            // the mirror appears to drop rows.
+            writer.persist_bitmaps()?;
             self.merge_exact_indexes_for_segment(writer.segment.id, &writer.bitmaps)?;
             let meta = writer.segment.to_meta();
             self.manifest.add_segment(meta);

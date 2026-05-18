@@ -569,14 +569,29 @@ impl SegmentWriter {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(5);
         if self.flush_count % bitmap_rewrite_interval == 0 {
-            for (col, map) in &self.bitmaps {
-                let path = self.segment.path.join(format!("bitmaps_{}.dat", col));
-                let file = File::create(path)?;
-                bincode::serialize_into(file, map)?;
-            }
+            self.persist_bitmaps()?;
         }
         self.dirty = false;
         self.segment.invalidate_mmap_cache();
+        Ok(())
+    }
+
+    /// Serialize every column's value→row-set bitmap to its `bitmaps_<col>.dat`.
+    /// Called unconditionally by `Table::flush_active_segment` right before the
+    /// segment is sealed and moved to `immutable_segments` — without this, only
+    /// every Nth segment had its bitmaps on disk (the `flush_count % N` heuristic
+    /// in `flush` was meant to throttle mid-segment rewrites, not to gate the
+    /// final write). Missing files broke `get_bitmaps_cached` on restart: it
+    /// returned an empty HashMap, filtered queries skipped the segment, and the
+    /// mirror appeared to lose rows.
+    pub fn persist_bitmaps(&self) -> Result<()> {
+        for (col, map) in &self.bitmaps {
+            let path = self.segment.path.join(format!("bitmaps_{}.dat", col));
+            let file = File::create(&path)
+                .with_context(|| format!("create bitmap file {:?}", path))?;
+            bincode::serialize_into(file, map)
+                .with_context(|| format!("serialize bitmap for column {col}"))?;
+        }
         Ok(())
     }
 
