@@ -7,8 +7,31 @@ use anyhow::{Result, Context};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WalOperation {
     Insert { id: String, data: Vec<u8> },
-    Delete { id: String },
-    Update { id: String, data: Vec<u8> },
+    /// The Delete variant must carry the row's *physical location* so that WAL
+    /// replay can mark the tombstone even when `primary_index` on disk (which
+    /// was persisted to a more recent state pre-crash) no longer maps the id.
+    /// Without this, a SIGKILL between `WAL.append(Delete)` and the next
+    /// successful checkpoint silently drops the tombstone on restart — the
+    /// "ghost row" bug we chased across v0.1.123..0.1.129.
+    Delete {
+        id: String,
+        #[serde(default)]
+        seg_id: u64,
+        #[serde(default)]
+        local_id: u32,
+    },
+    /// Same rationale as `Delete`: replay needs the old physical location to
+    /// mark the previous version dead. (Today the engine uses
+    /// `delete + insert` instead of `Update`, but the variant is kept in WAL
+    /// for forward-compat and replays correctly either way.)
+    Update {
+        id: String,
+        data: Vec<u8>,
+        #[serde(default)]
+        seg_id: u64,
+        #[serde(default)]
+        local_id: u32,
+    },
 }
 
 pub struct Wal {

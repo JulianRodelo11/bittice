@@ -197,11 +197,20 @@ impl Table {
     }
 
     fn replay_wal(&mut self) -> Result<()> {
-        if !self.primary_index.is_empty() {
-            self.wal.flush_writes()?;
-            self.wal.truncate()?;
-            return Ok(());
-        }
+        // ALWAYS replay. Earlier this method had an early-return when
+        // `primary_index` on disk was non-empty: that was a wrong
+        // optimization. `primary_index` is saved periodically while WAL
+        // entries are appended on every event; between a primary_index save
+        // and the next checkpoint, the WAL holds Delete/Insert pairs whose
+        // tombstones live only in-memory in the segments. A SIGKILL in that
+        // window combined with the old early-return *truncated the WAL
+        // silently*, dropping the tombstones forever — the row in the old
+        // segment stayed live and the new row landed in another segment, so
+        // queries returned two copies of the same PK. This is the root cause
+        // of the ghost-row bug that we worked around in v0.1.123..0.1.129
+        // by persisting `deleted.bitmap` synchronously; with WAL replay
+        // restored, those persistents become a fast path, not the only line
+        // of defense.
         let ops = self.wal.replay()?;
         if ops.is_empty() {
             return Ok(());
@@ -221,7 +230,6 @@ impl Table {
                     } else {
                         &self.manifest.primary_key
                     };
-                    // Normalize PK to NFC for consistency with hash-based index.
                     if let Some(pk_raw) = row_data.get(pk_field).cloned() {
                         let normalized: String = pk_raw.nfc().collect();
                         if normalized != pk_raw {
@@ -229,40 +237,83 @@ impl Table {
                         }
                     }
                     let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
+                    // Idempotent: if `primary_index` already maps this PK
+                    // (because the pre-crash Insert reached both segment and
+                    // index disk), skip the re-append. Otherwise the same
+                    // row would appear twice in the active segment.
+                    if self.primary_index.get(&pk_val).is_some() {
+                        debug!(
+                            "Table '{}': WAL Insert id='{}' skipped — already in primary_index",
+                            self.name, pk_val
+                        );
+                        continue;
+                    }
                     if let Some(writer) = &mut self.active_segment {
                         let local_id = writer.segment.record_count as u32;
                         writer.append_record(&row_data)?;
                         self.primary_index.insert(&pk_val, (writer.segment.id, local_id));
                     }
                 }
-                WalOperation::Delete { id } => {
-                    // Normalize PK to NFC for consistency with hash-based index.
-                    // Defensive: WAL entries from pre-1c code may have non-normalized PKs.
+                WalOperation::Delete { id, seg_id, local_id } => {
                     let normalized_id: String = id.nfc().collect();
-                    if let Some((seg_id, local_id)) = self.primary_index.remove(&normalized_id) {
-                        if let Some(writer) = &mut self.active_segment {
-                            if writer.segment.id == seg_id {
-                                writer.segment.mark_deleted(local_id)?;
-                            } else if let Some(seg) =
-                                self.immutable_segments.iter_mut().find(|s| s.id == seg_id)
-                            {
-                                seg.mark_deleted(local_id)?;
+                    // Drop from primary_index if the in-disk version still
+                    // pointed at the deleted row (it may have moved to a new
+                    // location via a later Insert in this same replay).
+                    if let Some((cur_seg, cur_local)) = self.primary_index.get(&normalized_id) {
+                        if cur_seg == seg_id && cur_local == local_id {
+                            self.primary_index.remove(&normalized_id);
+                        }
+                    }
+                    // Mark + persist on the exact segment the original delete
+                    // targeted. This is what makes replay correct even when
+                    // primary_index has already moved on.
+                    if let Some(writer) = &mut self.active_segment {
+                        if writer.segment.id == seg_id {
+                            writer.segment.mark_deleted(local_id)?;
+                            writer.segment.persist_deleted_bitmap()?;
+                            continue;
+                        }
+                    }
+                    if let Some(seg) = self.immutable_segments.iter_mut().find(|s| s.id == seg_id) {
+                        seg.mark_deleted(local_id)?;
+                        seg.persist_deleted_bitmap()?;
+                    } else {
+                        // Pre-replay WAL entries from older versions had no
+                        // seg_id/local_id (defaulted to 0). Best-effort
+                        // fallback: try to find the row via primary_index
+                        // like the old code did.
+                        if let Some((fallback_seg, fallback_local)) =
+                            self.primary_index.remove(&normalized_id)
+                        {
+                            if let Some(writer) = &mut self.active_segment {
+                                if writer.segment.id == fallback_seg {
+                                    writer.segment.mark_deleted(fallback_local)?;
+                                    writer.segment.persist_deleted_bitmap()?;
+                                } else if let Some(seg) = self
+                                    .immutable_segments
+                                    .iter_mut()
+                                    .find(|s| s.id == fallback_seg)
+                                {
+                                    seg.mark_deleted(fallback_local)?;
+                                    seg.persist_deleted_bitmap()?;
+                                }
                             }
                         }
                     }
                 }
-                WalOperation::Update { id, data } => {
+                WalOperation::Update { id, data, seg_id, local_id } => {
                     let mut row_data: HashMap<String, String> = serde_json::from_slice(&data)
                         .unwrap_or_default();
-                    if let Some((seg_id, local_id)) = self.primary_index.remove(&id) {
-                        if let Some(writer) = &mut self.active_segment {
-                            if writer.segment.id == seg_id {
-                                writer.segment.mark_deleted(local_id)?;
-                            } else if let Some(seg) =
-                                self.immutable_segments.iter_mut().find(|s| s.id == seg_id)
-                            {
-                                seg.mark_deleted(local_id)?;
-                            }
+                    // Mark the old version dead at its known location.
+                    if let Some(writer) = &mut self.active_segment {
+                        if writer.segment.id == seg_id {
+                            writer.segment.mark_deleted(local_id)?;
+                            writer.segment.persist_deleted_bitmap()?;
+                        } else if let Some(seg) =
+                            self.immutable_segments.iter_mut().find(|s| s.id == seg_id)
+                        {
+                            seg.mark_deleted(local_id)?;
+                            seg.persist_deleted_bitmap()?;
                         }
                     }
                     let pk_field = if self.manifest.primary_key.is_empty() {
@@ -270,7 +321,6 @@ impl Table {
                     } else {
                         &self.manifest.primary_key
                     };
-                    // Normalize PK to NFC for consistency.
                     if let Some(pk_raw) = row_data.get(pk_field).cloned() {
                         let normalized: String = pk_raw.nfc().collect();
                         if normalized != pk_raw {
@@ -278,10 +328,19 @@ impl Table {
                         }
                     }
                     let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
+                    // Same idempotency check as Insert.
+                    if let Some((cur_seg, cur_local)) = self.primary_index.get(&pk_val) {
+                        if cur_seg != seg_id || cur_local != local_id {
+                            // primary_index already points at the new row;
+                            // the segment append from before the crash got
+                            // through. Don't re-append.
+                            continue;
+                        }
+                    }
                     if let Some(writer) = &mut self.active_segment {
-                        let local_id = writer.segment.record_count as u32;
+                        let new_local_id = writer.segment.record_count as u32;
                         writer.append_record(&row_data)?;
-                        self.primary_index.insert(&pk_val, (writer.segment.id, local_id));
+                        self.primary_index.insert(&pk_val, (writer.segment.id, new_local_id));
                     }
                 }
             }
@@ -510,28 +569,21 @@ impl Table {
 
     pub fn delete(&mut self, id: &str) -> Result<()> {
         if let Some((seg_id, local_id)) = self.primary_index.remove(id) {
-            let op = WalOperation::Delete { id: id.to_string() };
+            // WAL Delete now carries the physical location, so even if a SIGKILL
+            // wins the race against the bitmap persist below, replay_wal can
+            // still mark the right segment on the next startup. The in-line
+            // persist that follows is a fast path, not the only safety net.
+            let op = WalOperation::Delete {
+                id: id.to_string(),
+                seg_id,
+                local_id,
+            };
             self.wal.append(&op)?;
             if let Some(writer) = &mut self.active_segment {
                 if writer.segment.id == seg_id {
-                    // ACTIVE segment: mark and persist *now*. Earlier versions
-                    // assumed the rotation flush (`flush_active_segment` →
-                    // `writer.flush` → `persist_deleted_bitmap`) would write
-                    // the bitmap before any harm could happen, but a SIGKILL
-                    // between heartbeats (Watchtower `docker stop` past the
-                    // grace window, OOM, kill -9) hits often enough that we
-                    // routinely lost the deletion of the previous heartbeat's
-                    // row when its replacement landed in the same active
-                    // segment. Persisting unconditionally costs ~18B per
-                    // delete and survives any crash mode.
                     writer.segment.mark_deleted(local_id)?;
                     writer.segment.persist_deleted_bitmap()?;
                 } else if let Some(seg) = self.immutable_segments.iter_mut().find(|s| s.id == seg_id) {
-                    // Immutable segment: same reasoning, but for rows that
-                    // were already rotated out. WAL replay on restart can't
-                    // reapply the Delete because `primary_index` (already
-                    // persisted before our process died) no longer maps
-                    // `id → (seg, local)`, so the replay has nothing to mark.
                     seg.mark_deleted(local_id)?;
                     seg.persist_deleted_bitmap()?;
                 }
