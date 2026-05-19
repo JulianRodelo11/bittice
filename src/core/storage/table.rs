@@ -184,19 +184,34 @@ impl Table {
         table.ensure_active_segment()?;
         table.load_primary_index()?;
         table.replay_wal()?;
-        // After WAL replay finishes, `primary_index` is the engine's source of
-        // truth for "where each PK lives right now". Any row sitting in a
-        // segment whose (seg, local) pair isn't pointed at by primary_index
-        // is an orphan — usually left behind by a SIGKILL that interrupted
-        // the rotate-after-delete sequence (the PK was already in WAL/disk in
-        // its new location, but the old segment never got its tombstone
-        // persisted). Without this pass those orphans show up as ghost
-        // duplicates in secondary_exact lookups.
+        // After WAL replay finishes, walk the segments and dedupe by physical
+        // ordering (highest seg_id wins per PK) — kills any orphan left behind
+        // by a SIGKILL or partial flush.
         if let Err(e) = table.reconcile_orphan_rows() {
             warn!(
                 "Table '{}': reconcile_orphan_rows failed ({}); some segments may still hold stale rows.",
                 table.name, e
             );
+        }
+        // If WAL replay appended any rows to the active segment, rotate it so
+        // those rows enter `immutable_segments` and `secondary_exact` (the
+        // saved-op query path uses the exact index for filters and doesn't
+        // scan active by itself). Without this, a query right after a SIGKILL
+        // recovery — before the next CDC event triggers a natural rotation —
+        // returns zero rows even though the data is durably on disk.
+        let active_has_rows = table
+            .active_segment
+            .as_ref()
+            .map(|w| w.segment.record_count > 0)
+            .unwrap_or(false);
+        if active_has_rows {
+            if let Err(e) = table.flush_active_segment() {
+                warn!(
+                    "Table '{}': post-replay flush_active_segment failed ({}); replayed rows may be \
+                     invisible to secondary_exact until the next natural rotation.",
+                    table.name, e
+                );
+            }
         }
         // One-time cleanup: remove `exact_<PK>.idx` left over from sessions before the PK
         // skip was added.  The file is hundreds of MB on tables with many distinct keys and
@@ -390,17 +405,15 @@ impl Table {
                         }
                     }
                     let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
-                    // Idempotent: if `primary_index` already maps this PK
-                    // (because the pre-crash Insert reached both segment and
-                    // index disk), skip the re-append. Otherwise the same
-                    // row would appear twice in the active segment.
-                    if self.primary_index.get(&pk_val).is_some() {
-                        debug!(
-                            "Table '{}': WAL Insert id='{}' skipped — already in primary_index",
-                            self.name, pk_val
-                        );
-                        continue;
-                    }
+                    // Always re-append, even when primary_index already has this
+                    // PK. Earlier we skipped on "already there" to avoid
+                    // duplicates, but the assumption — that the pre-crash row
+                    // really made it to disk at the location primary_index points
+                    // to — doesn't hold when a SIGKILL drops a buffered write.
+                    // The skip then leaves the mirror with zero live rows for
+                    // that PK. Re-appending is the safe move: if the original
+                    // row IS on disk, reconcile_orphan_rows tombstones the older
+                    // copy (lower seg_id, local_id) so only one ends up live.
                     if let Some(writer) = &mut self.active_segment {
                         let local_id = writer.segment.record_count as u32;
                         writer.append_record(&row_data)?;
