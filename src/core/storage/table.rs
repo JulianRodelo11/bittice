@@ -210,17 +210,20 @@ impl Table {
         Ok(table)
     }
 
-    /// Walk every immutable segment's persisted PK→row-set bitmap. For each
-    /// row, ask `primary_index` whether (segment_id, local_id) is the
-    /// currently-authoritative location for that PK. Anything else is dead
-    /// (an older version that was supposed to be tombstoned but wasn't, e.g.
-    /// because a SIGKILL interrupted the heartbeat that would have done so).
+    /// Reconciles "ghost" rows surviving across SIGKILL/crash boundaries.
+    /// The data on disk — not `primary_index` — is the source of truth:
+    /// `primary_index` is persisted periodically, so right after a hard kill
+    /// it can lag behind the actual rows on disk. Using primary_index to
+    /// decide who's-the-live-row could mark the legitimately current row as
+    /// dead and leave a stale one alive. Instead, this pass uses *physical
+    /// segment ordering*: for any PK that appears live in multiple segments,
+    /// the row in the highest `(seg_id, local_id)` wins, the others get
+    /// tombstoned. `primary_index` is then re-pointed at the winner.
     ///
-    /// Conservative on uncertainty: if `primary_index` doesn't know about the
-    /// PK at all, leave the row alone — the table may still be mid-bootstrap
-    /// or replaying, and erasing rows whose PK simply hasn't been re-recorded
-    /// yet would be worse than leaving them. (`validate_bootstrapped_schemas`
-    /// and `compact()` handle that case eventually.)
+    /// Segment IDs increase monotonically as rotations happen, and the
+    /// active segment always has the highest ID. So the "newest physical
+    /// location" really is the most-recent version regardless of how stale
+    /// `primary_index` got.
     fn reconcile_orphan_rows(&mut self) -> Result<()> {
         let pk_field = if self.manifest.primary_key.is_empty() {
             "PK".to_string()
@@ -228,15 +231,13 @@ impl Table {
             self.manifest.primary_key.clone()
         };
 
-        // Phase 1 — read-only scan to find orphans per segment. We can't
-        // mutate `immutable_segments` while iterating it, so collect.
-        let mut updates: Vec<(usize, Vec<u32>)> = Vec::new();
-        for (idx, seg) in self.immutable_segments.iter().enumerate() {
+        // Phase 1: collect every live (pk → [(seg_id, local_id), ...]) location.
+        let mut all_locations: HashMap<String, Vec<(u64, u32)>> = HashMap::new();
+
+        // Immutable segments — read persisted PK bitmaps from disk.
+        for seg in &self.immutable_segments {
             let bitmap_path = seg.path.join(format!("bitmaps_{}.dat", pk_field));
             if !bitmap_path.exists() {
-                // No PK bitmap on disk → either pre-rotation segment whose
-                // bitmaps were never persisted, or PK isn't indexed. Either
-                // way we have no efficient way to enumerate rows; skip.
                 continue;
             }
             let file = match fs::File::open(&bitmap_path) {
@@ -248,49 +249,103 @@ impl Table {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-
-            let mut local_orphans: Vec<u32> = Vec::new();
             for (pk_val, bitmap) in &bitmaps {
                 for local_id in bitmap.iter() {
                     if seg.deleted_bitmap.contains(local_id) {
-                        continue; // already tombstoned
+                        continue;
                     }
-                    match self.primary_index.get(pk_val) {
-                        Some((cur_seg, cur_local))
-                            if cur_seg == seg.id && cur_local == local_id =>
-                        {
-                            // This is the live row for this PK. Keep.
-                        }
-                        Some(_) => {
-                            // primary_index points elsewhere for this PK — this
-                            // row is a stale older version.
-                            local_orphans.push(local_id);
-                        }
-                        None => {
-                            // primary_index has no entry for this PK. Don't
-                            // touch (see fn docstring).
-                        }
-                    }
+                    all_locations
+                        .entry(pk_val.clone())
+                        .or_default()
+                        .push((seg.id, local_id));
                 }
-            }
-            if !local_orphans.is_empty() {
-                updates.push((idx, local_orphans));
             }
         }
 
-        // Phase 2 — mutate + persist.
-        for (idx, orphans) in updates {
-            let seg = &mut self.immutable_segments[idx];
-            let count = orphans.len();
-            for local_id in orphans {
-                seg.mark_deleted(local_id)?;
+        // Active segment — bitmaps live in memory, not on disk yet.
+        if let Some(writer) = &self.active_segment {
+            if let Some(pk_bitmaps) = writer.bitmaps.get(&pk_field) {
+                for (pk_val, bitmap) in pk_bitmaps {
+                    for local_id in bitmap.iter() {
+                        if writer.segment.deleted_bitmap.contains(local_id) {
+                            continue;
+                        }
+                        all_locations
+                            .entry(pk_val.clone())
+                            .or_default()
+                            .push((writer.segment.id, local_id));
+                    }
+                }
             }
-            seg.persist_deleted_bitmap()?;
-            info!(
-                "Table '{}': reconcile_orphan_rows marked {} orphan row(s) deleted in seg {}",
-                self.name, count, seg.id
-            );
         }
+
+        // Phase 2: per PK pick the winner = max (seg_id, local_id). Build
+        // a per-segment list of orphans to tombstone.
+        let mut orphans_by_seg: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut latest_per_pk: HashMap<String, (u64, u32)> = HashMap::new();
+        for (pk, locations) in &all_locations {
+            // unwrap safe: vec was created via `or_default().push(...)` so non-empty
+            let &latest = locations.iter().max().expect("locations vec non-empty");
+            latest_per_pk.insert(pk.clone(), latest);
+            if locations.len() < 2 {
+                continue;
+            }
+            for &(seg_id, local_id) in locations {
+                if (seg_id, local_id) != latest {
+                    orphans_by_seg.entry(seg_id).or_default().push(local_id);
+                }
+            }
+        }
+
+        // Phase 3: mark + persist tombstones.
+        for (seg_id, orphans) in &orphans_by_seg {
+            // Active segment is mutable separately from immutable_segments.
+            if let Some(writer) = &mut self.active_segment {
+                if writer.segment.id == *seg_id {
+                    for local_id in orphans {
+                        writer.segment.mark_deleted(*local_id)?;
+                    }
+                    writer.segment.persist_deleted_bitmap()?;
+                    info!(
+                        "Table '{}': reconcile_orphan_rows tombstoned {} stale row(s) in active seg {}",
+                        self.name,
+                        orphans.len(),
+                        seg_id
+                    );
+                    continue;
+                }
+            }
+            if let Some(seg) = self.immutable_segments.iter_mut().find(|s| s.id == *seg_id) {
+                for local_id in orphans {
+                    seg.mark_deleted(*local_id)?;
+                }
+                seg.persist_deleted_bitmap()?;
+                info!(
+                    "Table '{}': reconcile_orphan_rows tombstoned {} stale row(s) in seg {}",
+                    self.name,
+                    orphans.len(),
+                    seg_id
+                );
+            }
+        }
+
+        // Phase 4: bring `primary_index` in line with the physical truth we
+        // just established. Anything pointing at a now-tombstoned row gets
+        // re-pointed at the winner; PKs that have a winner but weren't in
+        // primary_index get added. PKs that disappeared from segments
+        // entirely (none of `latest_per_pk`) are not touched here — that
+        // would be a deletion-without-tombstone case which compact() owns.
+        for (pk, latest) in &latest_per_pk {
+            let needs_update = self
+                .primary_index
+                .get(pk)
+                .map(|cur| cur != *latest)
+                .unwrap_or(true);
+            if needs_update {
+                self.primary_index.insert(pk, *latest);
+            }
+        }
+
         Ok(())
     }
 
