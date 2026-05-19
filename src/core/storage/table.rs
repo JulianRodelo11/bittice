@@ -184,6 +184,20 @@ impl Table {
         table.ensure_active_segment()?;
         table.load_primary_index()?;
         table.replay_wal()?;
+        // After WAL replay finishes, `primary_index` is the engine's source of
+        // truth for "where each PK lives right now". Any row sitting in a
+        // segment whose (seg, local) pair isn't pointed at by primary_index
+        // is an orphan — usually left behind by a SIGKILL that interrupted
+        // the rotate-after-delete sequence (the PK was already in WAL/disk in
+        // its new location, but the old segment never got its tombstone
+        // persisted). Without this pass those orphans show up as ghost
+        // duplicates in secondary_exact lookups.
+        if let Err(e) = table.reconcile_orphan_rows() {
+            warn!(
+                "Table '{}': reconcile_orphan_rows failed ({}); some segments may still hold stale rows.",
+                table.name, e
+            );
+        }
         // One-time cleanup: remove `exact_<PK>.idx` left over from sessions before the PK
         // skip was added.  The file is hundreds of MB on tables with many distinct keys and
         // has no benefit (PK Eq/IN now go through `primary_index`).
@@ -194,6 +208,90 @@ impl Table {
             }
         }
         Ok(table)
+    }
+
+    /// Walk every immutable segment's persisted PK→row-set bitmap. For each
+    /// row, ask `primary_index` whether (segment_id, local_id) is the
+    /// currently-authoritative location for that PK. Anything else is dead
+    /// (an older version that was supposed to be tombstoned but wasn't, e.g.
+    /// because a SIGKILL interrupted the heartbeat that would have done so).
+    ///
+    /// Conservative on uncertainty: if `primary_index` doesn't know about the
+    /// PK at all, leave the row alone — the table may still be mid-bootstrap
+    /// or replaying, and erasing rows whose PK simply hasn't been re-recorded
+    /// yet would be worse than leaving them. (`validate_bootstrapped_schemas`
+    /// and `compact()` handle that case eventually.)
+    fn reconcile_orphan_rows(&mut self) -> Result<()> {
+        let pk_field = if self.manifest.primary_key.is_empty() {
+            "PK".to_string()
+        } else {
+            self.manifest.primary_key.clone()
+        };
+
+        // Phase 1 — read-only scan to find orphans per segment. We can't
+        // mutate `immutable_segments` while iterating it, so collect.
+        let mut updates: Vec<(usize, Vec<u32>)> = Vec::new();
+        for (idx, seg) in self.immutable_segments.iter().enumerate() {
+            let bitmap_path = seg.path.join(format!("bitmaps_{}.dat", pk_field));
+            if !bitmap_path.exists() {
+                // No PK bitmap on disk → either pre-rotation segment whose
+                // bitmaps were never persisted, or PK isn't indexed. Either
+                // way we have no efficient way to enumerate rows; skip.
+                continue;
+            }
+            let file = match fs::File::open(&bitmap_path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let reader = BufReader::new(file);
+            let bitmaps: HashMap<String, RoaringBitmap> = match bincode::deserialize_from(reader) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let mut local_orphans: Vec<u32> = Vec::new();
+            for (pk_val, bitmap) in &bitmaps {
+                for local_id in bitmap.iter() {
+                    if seg.deleted_bitmap.contains(local_id) {
+                        continue; // already tombstoned
+                    }
+                    match self.primary_index.get(pk_val) {
+                        Some((cur_seg, cur_local))
+                            if cur_seg == seg.id && cur_local == local_id =>
+                        {
+                            // This is the live row for this PK. Keep.
+                        }
+                        Some(_) => {
+                            // primary_index points elsewhere for this PK — this
+                            // row is a stale older version.
+                            local_orphans.push(local_id);
+                        }
+                        None => {
+                            // primary_index has no entry for this PK. Don't
+                            // touch (see fn docstring).
+                        }
+                    }
+                }
+            }
+            if !local_orphans.is_empty() {
+                updates.push((idx, local_orphans));
+            }
+        }
+
+        // Phase 2 — mutate + persist.
+        for (idx, orphans) in updates {
+            let seg = &mut self.immutable_segments[idx];
+            let count = orphans.len();
+            for local_id in orphans {
+                seg.mark_deleted(local_id)?;
+            }
+            seg.persist_deleted_bitmap()?;
+            info!(
+                "Table '{}': reconcile_orphan_rows marked {} orphan row(s) deleted in seg {}",
+                self.name, count, seg.id
+            );
+        }
+        Ok(())
     }
 
     fn replay_wal(&mut self) -> Result<()> {
