@@ -514,7 +514,116 @@ pub struct SegmentWriter {
 
 impl SegmentWriter {
     pub fn new(segment: Segment) -> Self {
-        SegmentWriter { segment, writers: HashMap::new(), bitmaps: HashMap::new(), dirty: false, flush_count: 0 }
+        let mut writer = SegmentWriter {
+            segment,
+            writers: HashMap::new(),
+            bitmaps: HashMap::new(),
+            dirty: false,
+            flush_count: 0,
+        };
+        // Rehydrate per-column value→row-set bitmaps for any segment that
+        // already has rows on disk (e.g. an active segment from before a
+        // crash that didn't rotate). Without this, writer.bitmaps starts
+        // empty and any filtered query that hits the active segment after
+        // restart finds zero rows for filters whose values were inserted
+        // before the crash — even though the data files (.dat/.offsets)
+        // are physically on disk. This was the index-lag bug observed in
+        // v0.1.133 (JOIN returns 62 rows when the table has 66).
+        //
+        // Errors are swallowed deliberately: an unreadable bitmap should
+        // not block engine startup. Worst case is search/filter still
+        // misses rows in this segment, which the consistency-check cron
+        // catches and auto-heals via re-bootstrap.
+        if writer.segment.record_count > 0 {
+            if let Err(e) = writer.rehydrate_bitmaps_from_disk() {
+                tracing::warn!(
+                    "SegmentWriter::new: rehydrate_bitmaps_from_disk failed for seg {}: {}",
+                    writer.segment.id, e
+                );
+            }
+        }
+        writer
+    }
+
+    /// Rebuild `self.bitmaps` from on-disk state. For each column found in
+    /// the segment directory (identified by `<col>.offsets`), prefer the
+    /// persisted `bitmaps_<col>.dat`; fall back to scanning `<col>.dat +
+    /// <col>.offsets` row-by-row when the file is missing. Honors the
+    /// segment's `deleted_bitmap` so tombstoned rows don't get re-indexed.
+    fn rehydrate_bitmaps_from_disk(&mut self) -> Result<()> {
+        let dir = match std::fs::read_dir(&self.segment.path) {
+            Ok(d) => d,
+            Err(_) => return Ok(()),
+        };
+        let mut cols: Vec<String> = Vec::new();
+        for entry in dir.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(col) = name.strip_suffix(".offsets") {
+                    cols.push(col.to_string());
+                }
+            }
+        }
+        for col in cols {
+            let bitmap_path = self.segment.path.join(format!("bitmaps_{}.dat", col));
+            let bitmaps: HashMap<String, RoaringBitmap> = if bitmap_path.exists() {
+                match File::open(&bitmap_path) {
+                    Ok(f) => bincode::deserialize_from(BufReader::new(f))
+                        .unwrap_or_else(|_| HashMap::new()),
+                    Err(_) => HashMap::new(),
+                }
+            } else {
+                self.rebuild_bitmap_from_data(&col).unwrap_or_default()
+            };
+            if !bitmaps.is_empty() {
+                self.bitmaps.insert(col, bitmaps);
+            }
+        }
+        Ok(())
+    }
+
+    /// Scan `<col>.dat` + `<col>.offsets` and rebuild the value→row-set
+    /// bitmap for this column from raw record data. Used as the recovery
+    /// path when `bitmaps_<col>.dat` is missing (active segment that never
+    /// got rotated before a crash). Skips rows in `deleted_bitmap`.
+    fn rebuild_bitmap_from_data(&self, col: &str) -> Result<HashMap<String, RoaringBitmap>> {
+        let dat_path = self.segment.path.join(format!("{}.dat", col));
+        let off_path = self.segment.path.join(format!("{}.offsets", col));
+        if !dat_path.exists() || !off_path.exists() {
+            return Ok(HashMap::new());
+        }
+        let dat = std::fs::read(&dat_path)?;
+        let offsets = std::fs::read(&off_path)?;
+        let n_offsets = offsets.len() / 8;
+        let mut bitmaps: HashMap<String, RoaringBitmap> = HashMap::new();
+        for local_id in 0..n_offsets {
+            if self.segment.deleted_bitmap.contains(local_id as u32) {
+                continue;
+            }
+            let start = u64::from_le_bytes(
+                offsets[local_id * 8..local_id * 8 + 8].try_into().unwrap_or([0; 8]),
+            ) as usize;
+            let end = if local_id + 1 < n_offsets {
+                u64::from_le_bytes(
+                    offsets[(local_id + 1) * 8..(local_id + 1) * 8 + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                ) as usize
+            } else {
+                dat.len()
+            };
+            if end <= start || end > dat.len() {
+                continue;
+            }
+            let val: String = match bincode::deserialize(&dat[start..end]) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            bitmaps
+                .entry(val)
+                .or_insert_with(RoaringBitmap::new)
+                .insert(local_id as u32);
+        }
+        Ok(bitmaps)
     }
 
     pub fn append_record(&mut self, row: &HashMap<String, String>) -> Result<()> {

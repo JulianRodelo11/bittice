@@ -183,6 +183,14 @@ impl Table {
         table.load_segments()?;
         table.ensure_active_segment()?;
         table.load_primary_index()?;
+        // Sync primary_index with whatever the active segment's writer.bitmaps
+        // contain after rehydrate. If primary_index wasn't saved between the
+        // last segment append and the crash, it lags behind the data on disk.
+        // Without registering those PKs here, WAL replay's idempotent insert
+        // can't recognize them as already-applied and re-appends — producing
+        // duplicates that reconcile_orphan_rows then has to clean up
+        // (sometimes incompletely, per the v0.1.133 history).
+        table.sync_primary_index_to_active_bitmaps();
         table.replay_wal()?;
         // After WAL replay finishes, walk the segments and dedupe by physical
         // ordering (highest seg_id wins per PK) — kills any orphan left behind
@@ -223,6 +231,48 @@ impl Table {
             }
         }
         Ok(table)
+    }
+
+    /// For every PK present in the active segment's rehydrated bitmaps that
+    /// isn't yet in primary_index, register it. This bridges the gap between
+    /// the persisted primary_index (saved periodically) and the active
+    /// segment's data files (durable per CDC flush). After this runs,
+    /// `replay_wal`'s idempotent insert can correctly recognize rows that
+    /// are already on disk and skip re-appending them.
+    fn sync_primary_index_to_active_bitmaps(&mut self) {
+        let pk_field = if self.manifest.primary_key.is_empty() {
+            "PK".to_string()
+        } else {
+            self.manifest.primary_key.clone()
+        };
+        let (seg_id, additions): (u64, Vec<(String, u32)>) = match &self.active_segment {
+            Some(writer) => {
+                let pk_bitmaps = match writer.bitmaps.get(&pk_field) {
+                    Some(b) => b,
+                    None => return,
+                };
+                let mut adds: Vec<(String, u32)> = Vec::new();
+                for (pk_val, bitmap) in pk_bitmaps {
+                    // A PK may appear at multiple local_ids if the segment had
+                    // an in-place update before the crash. Pick the highest —
+                    // that is the latest write. Older locations will be
+                    // tombstoned later by reconcile_orphan_rows.
+                    if let Some(max_local) = bitmap.iter().max() {
+                        if writer.segment.deleted_bitmap.contains(max_local) {
+                            continue;
+                        }
+                        adds.push((pk_val.clone(), max_local));
+                    }
+                }
+                (writer.segment.id, adds)
+            }
+            None => return,
+        };
+        for (pk, local_id) in additions {
+            if self.primary_index.get(&pk).is_none() {
+                self.primary_index.insert(&pk, (seg_id, local_id));
+            }
+        }
     }
 
     /// Reconciles "ghost" rows surviving across SIGKILL/crash boundaries.
@@ -856,6 +906,14 @@ impl Table {
     pub fn flush_active_segment_buffers(&mut self) -> Result<()> {
         if let Some(writer) = &mut self.active_segment {
             writer.flush_buffers()?;
+            // Persist per-column bitmaps for the active segment. Without
+            // this, a crash before segment rotation leaves the active
+            // segment on disk with rows but no `bitmaps_<col>.dat` files;
+            // on restart, filtered queries miss those rows entirely (the
+            // index-lag bug). SegmentWriter::new now rehydrates from disk
+            // as a safety net, but persisting on every buffer flush keeps
+            // the happy path fast (no scan-from-data on startup).
+            writer.persist_bitmaps()?;
         }
         self.wal.flush_writes()?;
         self.flush_count_since_index_save += 1;
