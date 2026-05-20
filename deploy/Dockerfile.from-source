@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml build.rs ./
 COPY src ./src
 COPY proto ./proto
+COPY benches ./benches
 # If you version Cargo.lock in the repo, add `COPY Cargo.lock ./` and use `cargo build --locked`
 RUN cargo build --release
 

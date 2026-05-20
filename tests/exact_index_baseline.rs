@@ -392,7 +392,82 @@ fn baseline_compact_purges_exact_index() {
 }
 
 // ===========================================================================
-// Test 12: MOVED — NFC equivalence is verified by Phase 1c
+// Test 12: Stale on-disk exact index + cache primed by rotation (index-lag class)
+// ===========================================================================
+
+#[test]
+fn baseline_exact_index_cache_patch_after_stale_disk() -> Result<()> {
+    use std::fs;
+    use std::io::BufReader;
+
+    use bittice::core::storage::exact_index::ExactIndex;
+
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("e12");
+
+    // Segment 1: 5 red rows, flushed and indexed.
+    {
+        let mut t = open_table(&dir, "tbl", "PK", &["PK", "Color"])?;
+        for i in 0..5u32 {
+            insert(&mut t, "PK", &format!("pk_{}", i), &[("Color", "red")]);
+        }
+        t.flush_active_segment()?;
+        t.close()?;
+    }
+
+    // Segment 2: another 5 red rows; replace on-disk exact index with seg-1-only snapshot.
+    let exact_path = dir.join("tbl/secondary_exact/exact_Color.idx");
+    {
+        let mut t = open_table(&dir, "tbl", "PK", &["PK", "Color"])?;
+        for i in 5..10u32 {
+            insert(&mut t, "PK", &format!("pk_{}", i), &[("Color", "red")]);
+        }
+        t.flush_active_segment()?;
+        // Build a deliberately stale index: only the first sealed segment on disk.
+        let segments_dir = dir.join("tbl/segments");
+        let mut seg_dirs: Vec<_> = fs::read_dir(&segments_dir)?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .collect();
+        seg_dirs.sort_by_key(|e| e.file_name());
+        let seg1_path = seg_dirs[0].path();
+        let seg1_id: u64 = seg1_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("seg_"))
+            .and_then(|n| n.parse().ok())
+            .expect("segment dir name is seg_XXXX");
+        let bitmap_path = seg1_path.join("bitmaps_Color.dat");
+        let file = fs::File::open(&bitmap_path)?;
+        let bitmaps: HashMap<String, roaring::RoaringBitmap> =
+            bincode::deserialize_from(BufReader::new(file))?;
+        let mut stale = ExactIndex::new();
+        stale.merge_segment(seg1_id, bitmaps);
+        fs::create_dir_all(exact_path.parent().unwrap())?;
+        stale.save(Some(&exact_path))?;
+        // Active rows that force post-replay-style rotation on reopen.
+        for i in 10..12u32 {
+            insert(&mut t, "PK", &format!("pk_{}", i), &[("Color", "red")]);
+        }
+        t.flush_active_segment_buffers()?;
+        t.close()?;
+    }
+
+    // Reopen: merge_exact_indexes may prime cache from stale disk; search must still see 12 reds.
+    {
+        let t = Table::open(&dir, "tbl")?;
+        assert_eq!(
+            count_matches(&t, &["PK", "Color"], "Color", "red"),
+            12,
+            "cached exact index must be patched to include all immutable segments"
+        );
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// Test 12 (moved): MOVED — NFC equivalence is verified by Phase 1c
 // exact_index_nfc_equivalence moved to tests/exact_index_hash.rs after Phase 1c
 // (Now a first-class passing test: exact_index_nfc_end_to_end)
 // ===========================================================================

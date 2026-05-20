@@ -1449,16 +1449,46 @@ impl Table {
     /// Callers that need the active-segment view (e.g. `exact_matches_for_field_value`) merge
     /// `writer.bitmaps[field]` themselves, which is cheap (a single HashMap lookup, no disk I/O).
     fn load_exact_index(&self, field: &str) -> Result<Arc<StdRwLock<ExactIndex>>> {
-        if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
-            return Ok(cached.clone());
-        }
-
         // Short-circuit for skipped fields (PK + operator-listed columns) — return an
         // empty index without touching disk.  Callers (e.g. exact_matches_for_field_value)
         // treat empty as "no exact-index match" and fall back to the proper code path
         // (primary_index for PK Eq/IN, scan_segments_parallel for everything else).
         if self.should_skip_exact_index(field) {
             return Ok(Arc::new(StdRwLock::new(ExactIndex::new())));
+        }
+
+        if let Some(cached) = self.exact_index_cache.read().unwrap().get(field) {
+            let needs_patch = {
+                let guard = cached.read().unwrap();
+                self.exact_index_missing_immutable_segments(field, &guard)
+            };
+            if !needs_patch {
+                return Ok(cached.clone());
+            }
+            let path = self.exact_index_path(field);
+            let patched_seg_count = {
+                let mut guard = cached.write().unwrap();
+                let n = self.patch_exact_index_missing_segments(field, &mut guard)?;
+                if n > 0 {
+                    if let Err(e) = guard.save(Some(&path)) {
+                        warn!(
+                            "load_exact_index: persist patched index for field='{}' failed: {} \
+                             (in-memory index is still correct; next compact will rewrite)",
+                            field, e
+                        );
+                    }
+                }
+                n
+            };
+            if patched_seg_count > 0 {
+                warn!(
+                    "load_exact_index PATCHED table='{}' field='{}' — merged {} segment(s) \
+                     missing from cached index (likely merge_exact_indexes before first load); \
+                     persisting refreshed index to disk.",
+                    self.name, field, patched_seg_count
+                );
+            }
+            return Ok(cached.clone());
         }
 
         let t = std::time::Instant::now();
@@ -1471,53 +1501,7 @@ impl Table {
             built
         };
 
-        // Disk index is persisted only on close()/compact(); any segment rotated
-        // since the last persist lives in memory and is lost on restart. After
-        // an unclean shutdown the disk index points at older segments while
-        // newer segments hold the live rows — lookups follow the index to the
-        // stale segment, see the tombstone in deleted.bitmap, and return 0.
-        // Patch missing segments by reading their bitmaps_<field>.dat directly.
-        let known = index.segment_ids();
-        let mut patched_seg_count = 0usize;
-        for segment in &self.immutable_segments {
-            if known.contains(&segment.id) {
-                continue;
-            }
-            let bitmap_path = segment.path.join(format!("bitmaps_{}.dat", field));
-            if !bitmap_path.exists() {
-                continue;
-            }
-            let file = match fs::File::open(&bitmap_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(
-                        "load_exact_index: open bitmaps file {:?} failed: {} (skipping)",
-                        bitmap_path, e
-                    );
-                    continue;
-                }
-            };
-            let reader = BufReader::new(file);
-            let bitmaps: HashMap<String, RoaringBitmap> =
-                match bincode::deserialize_from(reader) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(
-                            "load_exact_index: decode bitmaps file {:?} failed: {} (skipping)",
-                            bitmap_path, e
-                        );
-                        continue;
-                    }
-                };
-            let non_empty: HashMap<String, RoaringBitmap> = bitmaps
-                .into_iter()
-                .filter(|(_, b)| !b.is_empty())
-                .collect();
-            if !non_empty.is_empty() {
-                index.merge_segment(segment.id, non_empty);
-                patched_seg_count += 1;
-            }
-        }
+        let patched_seg_count = self.patch_exact_index_missing_segments(field, &mut index)?;
         if patched_seg_count > 0 {
             warn!(
                 "load_exact_index PATCHED table='{}' field='{}' — merged {} segment(s) \
@@ -1559,6 +1543,69 @@ impl Table {
         }
         let entry = cache.entry(field.to_string()).or_insert_with(|| cached.clone());
         Ok(entry.clone())
+    }
+
+    /// True when the index omits at least one immutable segment that has a persisted
+    /// `bitmaps_<field>.dat` on disk (stale exact index after unclean shutdown).
+    fn exact_index_missing_immutable_segments(&self, field: &str, index: &ExactIndex) -> bool {
+        let known = index.segment_ids();
+        self.immutable_segments.iter().any(|segment| {
+            if known.contains(&segment.id) {
+                return false;
+            }
+            segment.path.join(format!("bitmaps_{}.dat", field)).exists()
+        })
+    }
+
+    /// Merge any immutable segments present on disk but absent from `index`.
+    /// Returns how many segments were patched.
+    fn patch_exact_index_missing_segments(
+        &self,
+        field: &str,
+        index: &mut ExactIndex,
+    ) -> Result<usize> {
+        let known = index.segment_ids();
+        let mut patched_seg_count = 0usize;
+        for segment in &self.immutable_segments {
+            if known.contains(&segment.id) {
+                continue;
+            }
+            let bitmap_path = segment.path.join(format!("bitmaps_{}.dat", field));
+            if !bitmap_path.exists() {
+                continue;
+            }
+            let file = match fs::File::open(&bitmap_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(
+                        "patch_exact_index: open bitmaps file {:?} failed: {} (skipping)",
+                        bitmap_path, e
+                    );
+                    continue;
+                }
+            };
+            let reader = BufReader::new(file);
+            let bitmaps: HashMap<String, RoaringBitmap> = match bincode::deserialize_from(reader)
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        "patch_exact_index: decode bitmaps file {:?} failed: {} (skipping)",
+                        bitmap_path, e
+                    );
+                    continue;
+                }
+            };
+            let non_empty: HashMap<String, RoaringBitmap> = bitmaps
+                .into_iter()
+                .filter(|(_, b)| !b.is_empty())
+                .collect();
+            if !non_empty.is_empty() {
+                index.merge_segment(segment.id, non_empty);
+                patched_seg_count += 1;
+            }
+        }
+        Ok(patched_seg_count)
     }
 
     fn build_exact_index(&self, field: &str) -> Result<ExactIndex> {
@@ -1674,14 +1721,19 @@ impl Table {
             } else {
                 // Cache miss: load from disk (read is cheap) so the merged result also covers
                 // segments persisted by previous sessions.  We still avoid writing back here.
+                // Apply the same segment patch as `load_exact_index` — without it, a
+                // post-replay `flush_active_segment` can populate the cache from a stale
+                // on-disk index and every later `load_exact_index` would hit the cache
+                // without ever merging missing immutable segments (JOIN N-1 vs count N).
                 let path = self.exact_index_path(field);
-                let initial: ExactIndex = if path.exists() {
+                let mut initial: ExactIndex = if path.exists() {
                     ExactIndex::open(&path).unwrap_or_default()
                 } else {
                     let mut idx = ExactIndex::new();
                     idx.bind_path(path);
                     idx
                 };
+                let _ = self.patch_exact_index_missing_segments(field, &mut initial);
                 let new_arc = Arc::new(StdRwLock::new(initial));
                 let mut cache = self.exact_index_cache.write().unwrap();
                 cache.entry(field.clone()).or_insert_with(|| new_arc.clone()).clone()
