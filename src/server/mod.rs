@@ -1345,10 +1345,23 @@ async fn execute_read_operation(
     }).collect();
     
     let param_fields: Vec<String> = params.get("fields").map(|s| s.split(',').map(|f| f.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    // Limit precedence (highest → lowest):
+    //   1. ?limit=N query param (or whatever `limit_param` declared by the
+    //      saved op, if any) — runtime override
+    //   2. saved op's static `limit`
+    //   3. default 100
+    //
+    // The hard upper bound below protects against unbounded scans on large
+    // tables (a saved op with `limit: 10_000_000` could otherwise drag the
+    // server). Saved ops that legitimately need more should paginate via
+    // `?page=N`. The previous `.min(100)` was too strict — diagnostic
+    // saved ops (e.g. `list-recent-checks` for stale detection) need to
+    // see ~5k rows to compute aggregates client-side.
+    const HARD_MAX_LIMIT: usize = 10_000;
     let limit = if let Some(ref param) = query.limit_param {
         let key = param_key(param).unwrap_or(param);
         params.get(key).and_then(|s| s.parse::<usize>().ok()).or(query.limit)
-    } else { query.limit }.unwrap_or(100).min(100);
+    } else { query.limit }.unwrap_or(100).min(HARD_MAX_LIMIT);
     let page = params
         .get("page")
         .or_else(|| params.get("pagination"))

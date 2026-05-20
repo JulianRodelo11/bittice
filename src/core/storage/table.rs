@@ -390,77 +390,64 @@ impl Table {
         );
         for op in ops {
             match op {
-                WalOperation::Insert { id, data } => {
-                    let mut row_data: HashMap<String, String> = serde_json::from_slice(&data)
+                WalOperation::Insert { id: _, data } => {
+                    let row_data: HashMap<String, String> = serde_json::from_slice(&data)
                         .unwrap_or_default();
-                    let pk_field = if self.manifest.primary_key.is_empty() {
-                        "PK"
-                    } else {
-                        &self.manifest.primary_key
-                    };
-                    if let Some(pk_raw) = row_data.get(pk_field).cloned() {
-                        let normalized: String = pk_raw.nfc().collect();
-                        if normalized != pk_raw {
-                            row_data.insert(pk_field.to_string(), normalized);
-                        }
-                    }
-                    let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
-                    // Always re-append, even when primary_index already has this
-                    // PK. Earlier we skipped on "already there" to avoid
-                    // duplicates, but the assumption — that the pre-crash row
-                    // really made it to disk at the location primary_index points
-                    // to — doesn't hold when a SIGKILL drops a buffered write.
-                    // The skip then leaves the mirror with zero live rows for
-                    // that PK. Re-appending is the safe move: if the original
-                    // row IS on disk, reconcile_orphan_rows tombstones the older
-                    // copy (lower seg_id, local_id) so only one ends up live.
-                    if let Some(writer) = &mut self.active_segment {
-                        let local_id = writer.segment.record_count as u32;
-                        writer.append_record(&row_data)?;
-                        self.primary_index.insert(&pk_val, (writer.segment.id, local_id));
-                    }
+                    // Delegate to Table::insert: it is idempotent (compares
+                    // existing on-disk row against `row_data` and either no-ops
+                    // when equal or tombstone-and-replaces when different). This
+                    // is what closes the ghost-row class of bugs: re-delivered
+                    // binlog events AND re-played WAL entries both converge to
+                    // a single live row per PK without leaving stale copies in
+                    // older segments.
+                    //
+                    // The extra WAL append that `insert` performs is harmless:
+                    // we truncate the WAL a few lines below this loop, so any
+                    // ops re-appended during replay are wiped together with
+                    // the originals.
+                    self.insert(row_data)?;
                 }
                 WalOperation::Delete { id, seg_id, local_id } => {
                     let normalized_id: String = id.nfc().collect();
-                    // Drop from primary_index if the in-disk version still
-                    // pointed at the deleted row (it may have moved to a new
-                    // location via a later Insert in this same replay).
-                    if let Some((cur_seg, cur_local)) = self.primary_index.get(&normalized_id) {
-                        if cur_seg == seg_id && cur_local == local_id {
-                            self.primary_index.remove(&normalized_id);
-                        }
-                    }
-                    // Mark + persist on the exact segment the original delete
-                    // targeted. This is what makes replay correct even when
-                    // primary_index has already moved on.
+                    // The Delete WAL entry carries the row's location at the
+                    // moment of the original delete(). But this replay may have
+                    // ALREADY re-applied an Insert for the same PK (via the
+                    // idempotent self.insert above), which means primary_index
+                    // now points at a NEW (seg, local) for this id. We must
+                    // tombstone *both*: the stored WAL location AND wherever
+                    // primary_index currently points, then drop the id from
+                    // primary_index. Otherwise the replayed Insert leaves a
+                    // live row that the test (and binlog semantics) say should
+                    // not exist.
+                    let primary_loc = self.primary_index.remove(&normalized_id);
+                    // Tombstone the WAL-recorded location.
                     if let Some(writer) = &mut self.active_segment {
                         if writer.segment.id == seg_id {
                             writer.segment.mark_deleted(local_id)?;
                             writer.segment.persist_deleted_bitmap()?;
-                            continue;
+                        } else if let Some(seg) = self
+                            .immutable_segments
+                            .iter_mut()
+                            .find(|s| s.id == seg_id)
+                        {
+                            seg.mark_deleted(local_id)?;
+                            seg.persist_deleted_bitmap()?;
                         }
                     }
-                    if let Some(seg) = self.immutable_segments.iter_mut().find(|s| s.id == seg_id) {
-                        seg.mark_deleted(local_id)?;
-                        seg.persist_deleted_bitmap()?;
-                    } else {
-                        // Pre-replay WAL entries from older versions had no
-                        // seg_id/local_id (defaulted to 0). Best-effort
-                        // fallback: try to find the row via primary_index
-                        // like the old code did.
-                        if let Some((fallback_seg, fallback_local)) =
-                            self.primary_index.remove(&normalized_id)
-                        {
+                    // Additionally tombstone the replay-re-inserted copy, if
+                    // primary_index pointed somewhere else.
+                    if let Some((cur_seg, cur_local)) = primary_loc {
+                        if (cur_seg, cur_local) != (seg_id, local_id) {
                             if let Some(writer) = &mut self.active_segment {
-                                if writer.segment.id == fallback_seg {
-                                    writer.segment.mark_deleted(fallback_local)?;
+                                if writer.segment.id == cur_seg {
+                                    writer.segment.mark_deleted(cur_local)?;
                                     writer.segment.persist_deleted_bitmap()?;
                                 } else if let Some(seg) = self
                                     .immutable_segments
                                     .iter_mut()
-                                    .find(|s| s.id == fallback_seg)
+                                    .find(|s| s.id == cur_seg)
                                 {
-                                    seg.mark_deleted(fallback_local)?;
+                                    seg.mark_deleted(cur_local)?;
                                     seg.persist_deleted_bitmap()?;
                                 }
                             }
@@ -657,18 +644,69 @@ impl Table {
     }
 
     pub fn insert(&mut self, row_data: HashMap<String, String>) -> Result<()> {
-        let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
+        let pk_field_owned = if self.manifest.primary_key.is_empty() {
+            "PK".to_string()
+        } else {
+            self.manifest.primary_key.clone()
+        };
         // Normalize PK value to NFC before storing, so canonically equivalent
         // strings (e.g. NFC vs NFD) are stored identically and hash consistently.
         let mut row_data = row_data;
-        if let Some(pk_val) = row_data.get(pk_field).cloned() {
+        if let Some(pk_val) = row_data.get(&pk_field_owned).cloned() {
             let normalized: String = pk_val.nfc().collect();
             if normalized != pk_val {
-                row_data.insert(pk_field.to_string(), normalized);
+                row_data.insert(pk_field_owned.clone(), normalized);
             }
         }
+        let id = row_data
+            .get(&pk_field_owned)
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // ── Idempotency guard ───────────────────────────────────────────────
+        // Binlog events can be re-delivered to the motor after a crash that
+        // happened between applying the event (durable in segments + WAL) and
+        // persisting `cdc_state.json` (periodic). Without this guard, the
+        // re-delivery appends a duplicate physical row for the same PK,
+        // primary_index gets re-pointed at the new copy, and the old copy
+        // becomes a live ghost (no tombstone) — that is the root cause of the
+        // ghost-row class of bugs.
+        //
+        // Three cases:
+        //   1. PK not in primary_index → fall through, append normally.
+        //   2. PK present and the on-disk row equals `row_data` →
+        //      event already applied. No-op (no WAL append either: the WAL
+        //      entry from the original apply is gone after truncate, and
+        //      re-appending would just bloat the WAL).
+        //   3. PK present but row differs (real UPDATE, OR pre-existing row
+        //      was lost in a partial flush so it reads back as empty) →
+        //      tombstone the old copy at its known location, then append the
+        //      new one as a normal insert.
+        if let Some((existing_seg, existing_local)) = self.primary_index.get(&id) {
+            let existing = self.get_row_as_map(&id)?;
+            if matches!(&existing, Some(map) if *map == row_data) {
+                // Already applied. WAL is truncated periodically, so the
+                // skipped WAL append here doesn't risk losing the row.
+                return Ok(());
+            }
+            // Different content (or unreadable from disk): tombstone the old
+            // location on the exact segment, then fall through and append.
+            if let Some(writer) = &mut self.active_segment {
+                if writer.segment.id == existing_seg {
+                    writer.segment.mark_deleted(existing_local)?;
+                    writer.segment.persist_deleted_bitmap()?;
+                } else if let Some(seg) = self
+                    .immutable_segments
+                    .iter_mut()
+                    .find(|s| s.id == existing_seg)
+                {
+                    seg.mark_deleted(existing_local)?;
+                    seg.persist_deleted_bitmap()?;
+                }
+            }
+        }
+
         let row_bytes = serde_json::to_vec(&row_data)?;
-        let id = row_data.get(pk_field).cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let op = WalOperation::Insert { id: id.clone(), data: row_bytes };
         self.wal.append(&op)?;
         if let Some(writer) = &mut self.active_segment {
@@ -965,7 +1003,10 @@ impl Table {
         offset: usize,
         auth_context: Option<&crate::core::types::AuthContext>,
     ) -> Result<QueryResult> {
-        let limit = limit.min(100);
+        // Hard ceiling to prevent unbounded scans; matches the HTTP layer's
+        // HARD_MAX_LIMIT (see src/server/mod.rs). The previous cap of 100
+        // forced diagnostic saved ops to paginate even for small fleets.
+        let limit = limit.min(10_000);
         let start_time = std::time::Instant::now();
 
         // Security Filter Injection (Row-Level Security)
