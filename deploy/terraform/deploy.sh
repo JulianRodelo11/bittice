@@ -43,6 +43,16 @@ else
   log "data/ no encontrado, saltando rsync."
 fi
 
+# 1b. Fleet ops (consistency-check cron — no va en la imagen del motor)
+if [ -d "$REPO_ROOT/deploy/ops" ]; then
+  log "Sincronizando deploy/ops/ (fleet scripts)..."
+  ssh_run "mkdir -p /opt/bittice/ops"
+  rsync -avz \
+    -e "ssh -o StrictHostKeyChecking=no -i $SSH_KEY" \
+    "$REPO_ROOT/deploy/ops/" ubuntu@"$EC2_IP":/opt/bittice/ops/
+  ssh_run "chmod +x /opt/bittice/ops/*.sh 2>/dev/null || true"
+fi
+
 # 2. Autenticar en GHCR (solo si la imagen es privada)
 if [ -n "${GHCR_TOKEN:-}" ]; then
   log "Autenticando en GHCR..."

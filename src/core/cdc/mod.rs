@@ -274,6 +274,34 @@ impl CdcWorker {
             .unwrap_or("table allowlist")
     }
 
+    /// Heartbeat tables get one CDC UPDATE per interval; each update tombstones+appends and
+    /// can leave hundreds of 1-row micro-segments. Compact when live PK count is tiny but
+    /// segment count exploded (manifest `deleted_count` sync alone is not enough).
+    fn maybe_auto_compact_after_update(table: &mut crate::core::storage::table::Table, entity: &str, mirror_table: &str) {
+        let live = table.live_row_count();
+        let segs = table.immutable_segment_count();
+        if segs < 20 {
+            return;
+        }
+        if segs <= (live as usize).saturating_mul(4) {
+            return;
+        }
+        match table.compact() {
+            Ok(removed) if removed > 0 => {
+                info!(
+                    "CDC: auto-compact {entity}/{mirror_table} removed {removed} segment(s) (live_rows={live}, had {segs})",
+                );
+                let _ = table.sync_manifest_deleted_counts();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "CDC: auto-compact {entity}/{mirror_table} failed: {e:#}",
+                );
+            }
+        }
+    }
+
     fn load_config_table_names(entity: &str) -> Option<Vec<String>> {
         let path = crate::core::data_paths::profile_dir(entity).join("cdc_config.json");
         let content = std::fs::read_to_string(&path).ok()?;
@@ -3470,6 +3498,9 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 if do_buffer_flush {
                     table.flush_active_segment_buffers()?;
                 }
+            }
+            if op_label == "UPDATE" {
+                Self::maybe_auto_compact_after_update(&mut table, &disk_entity, &mirror_table);
             }
         }
         self.maybe_log_mysql_row_batch(

@@ -1,0 +1,47 @@
+{
+  "type": "read",
+  "details": {
+    "name": "open-incidents",
+    "entity": "bittice",
+    "table": "drift_incidents",
+    "table_alias": "di",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "deployments",
+        "alias": "d",
+        "on": [
+          { "left": "di.deployment_id", "op": "Eq", "right": "d.id" }
+        ]
+      },
+      {
+        "type": "Inner",
+        "table": "users",
+        "alias": "u",
+        "on": [
+          { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+        ]
+      }
+    ],
+    "filters": [
+      { "field": "di.status", "op": "Eq", "value": "open" }
+    ],
+    "select": [
+      { "field": "di.id", "as": "incident_id" },
+      { "field": "di.table_name", "as": "table" },
+      { "field": "di.status", "as": "status" },
+      { "field": "di.last_diff", "as": "current_diff" },
+      { "field": "di.max_diff", "as": "max_diff" },
+      { "field": "di.first_seen_at", "as": "opened_at" },
+      { "field": "di.last_seen_at", "as": "last_seen_at" },
+      { "field": "di.notes", "as": "notes" },
+      { "field": "d.public_id", "as": "deployment_id" },
+      { "field": "d.name", "as": "deployment_name" },
+      { "field": "d.state", "as": "deployment_state" },
+      { "field": "u.email", "as": "user_email" }
+    ],
+    "order_by": [
+      { "field": "di.last_seen_at", "direction": "Desc" }
+    ]
+  }
+}

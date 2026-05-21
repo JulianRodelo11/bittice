@@ -289,7 +289,7 @@ impl Table {
     /// active segment always has the highest ID. So the "newest physical
     /// location" really is the most-recent version regardless of how stale
     /// `primary_index` got.
-    fn reconcile_orphan_rows(&mut self) -> Result<()> {
+    pub fn reconcile_orphan_rows(&mut self) -> Result<()> {
         let pk_field = if self.manifest.primary_key.is_empty() {
             "PK".to_string()
         } else {
@@ -849,6 +849,15 @@ impl Table {
     pub fn update(&mut self, id: &str, row_data: HashMap<String, String>) -> Result<()> {
         self.delete(id)?;
         self.insert(row_data)?;
+        // Heartbeat-style UPDATEs tombstone+append in place; reconcile keeps one live
+        // physical row per PK when segment metadata or index lagged behind.
+        if let Err(e) = self.reconcile_orphan_rows() {
+            warn!(
+                "Table '{}': reconcile_orphan_rows after update failed ({}); mirror may retain extra tombstones until compact.",
+                self.name, e
+            );
+        }
+        let _ = self.sync_manifest_deleted_counts();
         Ok(())
     }
 
@@ -970,13 +979,53 @@ impl Table {
         Ok(())
     }
 
-    fn persist_all_deleted_bitmaps(&self) -> Result<()> {
+    fn persist_all_deleted_bitmaps(&mut self) -> Result<()> {
         for seg in &self.immutable_segments {
             if seg.has_deletions() {
                 seg.persist_deleted_bitmap()?;
             }
         }
+        if let Some(writer) = &self.active_segment {
+            if writer.segment.has_deletions() {
+                writer.segment.persist_deleted_bitmap()?;
+            }
+        }
+        self.sync_manifest_deleted_counts()?;
         Ok(())
+    }
+
+    /// Keep `manifest.json` `deleted_count` aligned with on-disk `deleted.bitmap` files.
+    /// UPDATE paths tombstone old rows without rotating segments; manifest meta was only
+    /// snapshotted at rotation time, so external row-count tools otherwise over-count ghosts.
+    pub fn sync_manifest_deleted_counts(&mut self) -> Result<()> {
+        let segments_dir = self.base_path.join("segments");
+        for meta in &mut self.manifest.segments {
+            if let Some(seg) = self.immutable_segments.iter().find(|s| s.id == meta.id) {
+                meta.record_count = seg.record_count;
+                meta.deleted_count = seg.deleted_bitmap.len() as u64;
+                continue;
+            }
+            if let Some(writer) = &self.active_segment {
+                if writer.segment.id == meta.id {
+                    meta.record_count = writer.segment.record_count;
+                    meta.deleted_count = writer.segment.deleted_bitmap.len() as u64;
+                    continue;
+                }
+            }
+            let seg_path = segments_dir.join(format!("seg_{:04}", meta.id));
+            if seg_path.is_dir() {
+                if let Ok(seg) = Segment::load(&seg_path, Some(meta)) {
+                    meta.record_count = seg.record_count;
+                    meta.deleted_count = seg.deleted_bitmap.len() as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Live rows visible to queries (one entry per PK in `primary_index`).
+    pub fn live_row_count(&self) -> u64 {
+        self.primary_index.len() as u64
     }
 
     fn sync_base_dir(&self) -> Result<()> {

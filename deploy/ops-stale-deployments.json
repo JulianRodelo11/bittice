@@ -1,0 +1,42 @@
+{
+  "type": "read",
+  "details": {
+    "name": "stale-deployments",
+    "entity": "bittice",
+    "table": "deployments",
+    "table_alias": "d",
+    "joins": [
+      {
+        "type": "Inner",
+        "table": "users",
+        "alias": "u",
+        "on": [
+          { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+        ]
+      },
+      {
+        "type": "Left",
+        "table": "consistency_checks",
+        "alias": "cc",
+        "on": [
+          { "left": "cc.deployment_id", "op": "Eq", "right": "d.id" }
+        ],
+        "count_matches_as": "check_count"
+      }
+    ],
+    "filters": [
+      { "field": "d.state", "op": "Eq", "value": "active" },
+      { "field": "cc.check_count", "op": "Eq", "value": "0" }
+    ],
+    "select": [
+      { "field": "u.email", "as": "user_email" },
+      { "field": "d.public_id", "as": "deployment_id" },
+      { "field": "d.name", "as": "deployment_name" },
+      { "field": "d.last_heartbeat_at", "as": "last_heartbeat_at" },
+      { "field": "cc.check_count", "as": "check_count" }
+    ],
+    "order_by": [
+      { "field": "d.last_heartbeat_at", "direction": "Desc" }
+    ]
+  }
+}

@@ -1,0 +1,218 @@
+[
+  {
+    "type": "read",
+    "details": {
+      "name": "user-deployments-by-email",
+      "entity": "bittice",
+      "table": "users",
+      "table_alias": "u",
+      "joins": [
+        {
+          "type": "Inner",
+          "table": "deployments",
+          "alias": "d",
+          "on": [
+            { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+          ]
+        }
+      ],
+      "filters": [
+        { "field": "u.email", "op": "Eq", "value": "$email" }
+      ],
+      "select": [
+        { "field": "u.email", "as": "email" },
+        { "field": "u.name", "as": "user_name" },
+        { "field": "u.plan", "as": "plan" },
+        { "field": "d.public_id", "as": "deployment_id" },
+        { "field": "d.name", "as": "deployment_name" },
+        { "field": "d.state", "as": "state" },
+        { "field": "d.aws_region", "as": "aws_region" },
+        { "field": "d.instance_type", "as": "instance_type" },
+        { "field": "d.public_ip", "as": "public_ip" },
+        { "field": "d.ec2_instance_id", "as": "ec2_instance_id" },
+        { "field": "d.last_heartbeat_at", "as": "last_heartbeat_at" },
+        { "field": "d.created_at", "as": "created_at" },
+        { "field": "d.activated_at", "as": "activated_at" },
+        { "field": "d.terminated_at", "as": "terminated_at" }
+      ],
+      "order_by": [
+        { "field": "d.created_at", "direction": "Desc" }
+      ]
+    }
+  },
+  {
+    "type": "read",
+    "details": {
+      "name": "active-deployments",
+      "entity": "bittice",
+      "table": "deployments",
+      "table_alias": "d",
+      "joins": [
+        {
+          "type": "Inner",
+          "table": "users",
+          "alias": "u",
+          "on": [
+            { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+          ]
+        }
+      ],
+      "filters": [
+        { "field": "d.state", "op": "Eq", "value": "active" }
+      ],
+      "select": [
+        { "field": "d.public_id", "as": "deployment_id" },
+        { "field": "d.name", "as": "deployment_name" },
+        { "field": "d.state", "as": "state" },
+        { "field": "u.email", "as": "email" },
+        { "field": "u.plan", "as": "plan" },
+        { "field": "d.aws_region", "as": "aws_region" },
+        { "field": "d.instance_type", "as": "instance_type" },
+        { "field": "d.public_ip", "as": "public_ip" },
+        { "field": "d.ec2_instance_id", "as": "ec2_instance_id" },
+        { "field": "d.last_heartbeat_at", "as": "last_heartbeat_at" },
+        { "field": "d.current_uptime_secs", "as": "uptime_secs" },
+        { "field": "d.current_cdc_profiles_live", "as": "cdc_profiles_live" },
+        { "field": "d.created_at", "as": "created_at" }
+      ],
+      "order_by": [
+        { "field": "d.last_heartbeat_at", "direction": "Desc" }
+      ]
+    }
+  },
+  {
+    "type": "read",
+    "details": {
+      "name": "open-incidents",
+      "entity": "bittice",
+      "table": "drift_incidents",
+      "table_alias": "di",
+      "joins": [
+        {
+          "type": "Inner",
+          "table": "deployments",
+          "alias": "d",
+          "on": [
+            { "left": "di.deployment_id", "op": "Eq", "right": "d.id" }
+          ]
+        },
+        {
+          "type": "Inner",
+          "table": "users",
+          "alias": "u",
+          "on": [
+            { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+          ]
+        }
+      ],
+      "filters": [
+        { "field": "di.status", "op": "Eq", "value": "open" }
+      ],
+      "select": [
+        { "field": "di.id", "as": "incident_id" },
+        { "field": "di.table_name", "as": "table" },
+        { "field": "di.status", "as": "status" },
+        { "field": "di.last_diff", "as": "current_diff" },
+        { "field": "di.max_diff", "as": "max_diff" },
+        { "field": "di.first_seen_at", "as": "opened_at" },
+        { "field": "di.last_seen_at", "as": "last_seen_at" },
+        { "field": "di.notes", "as": "notes" },
+        { "field": "d.public_id", "as": "deployment_id" },
+        { "field": "d.name", "as": "deployment_name" },
+        { "field": "d.state", "as": "deployment_state" },
+        { "field": "u.email", "as": "user_email" }
+      ],
+      "order_by": [
+        { "field": "di.last_seen_at", "direction": "Desc" }
+      ]
+    }
+  },
+  {
+    "type": "read",
+    "details": {
+      "name": "list-recent-checks",
+      "entity": "bittice",
+      "table": "consistency_checks",
+      "table_alias": "cc",
+      "joins": [
+        {
+          "type": "Inner",
+          "table": "deployments",
+          "alias": "d",
+          "on": [
+            { "left": "cc.deployment_id", "op": "Eq", "right": "d.id" }
+          ]
+        },
+        {
+          "type": "Inner",
+          "table": "users",
+          "alias": "u",
+          "on": [
+            { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+          ]
+        }
+      ],
+      "filters": [],
+      "select": [
+        { "field": "cc.id", "as": "check_id" },
+        { "field": "cc.checked_at", "as": "checked_at" },
+        { "field": "cc.table_name", "as": "table_name" },
+        { "field": "cc.source_count", "as": "source_count" },
+        { "field": "cc.mirror_count", "as": "mirror_count" },
+        { "field": "cc.diff", "as": "diff" },
+        { "field": "d.public_id", "as": "deployment_id" },
+        { "field": "d.name", "as": "deployment_name" },
+        { "field": "d.state", "as": "deployment_state" },
+        { "field": "d.last_heartbeat_at", "as": "last_heartbeat_at" },
+        { "field": "u.email", "as": "email" }
+      ],
+      "order_by": [
+        { "field": "cc.checked_at", "direction": "Desc" }
+      ],
+      "limit": 100,
+      "limit_param": "$limit"
+    }
+  },
+  {
+    "type": "read",
+    "details": {
+      "name": "stale-deployments",
+      "entity": "bittice",
+      "table": "deployments",
+      "table_alias": "d",
+      "joins": [
+        {
+          "type": "Inner",
+          "table": "users",
+          "alias": "u",
+          "on": [
+            { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+          ]
+        },
+        {
+          "type": "Left",
+          "table": "consistency_checks",
+          "alias": "cc",
+          "on": [
+            { "left": "cc.deployment_id", "op": "Eq", "right": "d.id" }
+          ],
+          "count_matches_as": "check_count"
+        }
+      ],
+      "filters": [
+        { "field": "d.state", "op": "Eq", "value": "active" },
+        { "field": "cc.check_count", "op": "Eq", "value": "0" }
+      ],
+      "select": [
+        { "field": "u.email", "as": "user_email" },
+        { "field": "d.public_id", "as": "deployment_id" },
+        { "field": "d.name", "as": "deployment_name" },
+        { "field": "d.last_heartbeat_at", "as": "last_heartbeat_at" },
+        { "field": "cc.check_count", "as": "check_count" }
+      ],
+      "order_by": [
+        { "field": "d.last_heartbeat_at", "direction": "Desc" }
+      ]
+    }
+  }
+]

@@ -186,6 +186,21 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Commands::CompactMirror { entity, table, all_tables } => {
+                if all_tables {
+                    let results = bittice::core::mirror_maintenance::compact_mirror_entity(&entity)?;
+                    for (name, removed) in &results {
+                        println!("{entity}/{name}: compacted {removed} segment(s)");
+                    }
+                } else {
+                    let tbl = table.ok_or_else(|| {
+                        anyhow::anyhow!("Specify <TABLE> or use --all-tables")
+                    })?;
+                    let removed =
+                        bittice::core::mirror_maintenance::compact_mirror_table(&entity, &tbl)?;
+                    println!("{entity}/{tbl}: compacted {removed} segment(s)");
+                }
+            }
             Commands::MigratePrimaryIndex { entity, table, all, dry_run, keep_backup, force } => {
                 if all {
                     let data_root = bittice::core::data_paths::resolved_data_root();

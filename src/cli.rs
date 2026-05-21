@@ -64,6 +64,18 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Compact mirror segment files (reconcile tombstones + merge micro-segments).
+    /// Run in a one-shot container while the engine is stopped, or on a copy of data/.
+    CompactMirror {
+        /// Mirror entity / schema folder (e.g. bittice).
+        entity: String,
+        /// Table directory name. Omit with --all-tables.
+        #[arg()]
+        table: Option<String>,
+        /// Compact every table under the entity mirror dir.
+        #[arg(long, default_value_t = false)]
+        all_tables: bool,
+    },
     /// Migrate primary.idx from legacy/v1 format to v2 (hash-based)
     MigratePrimaryIndex {
         /// Entity (schema) name. Mutually exclusive with --all.
