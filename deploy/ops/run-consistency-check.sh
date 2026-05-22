@@ -6,8 +6,13 @@ OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_ROOT="${BITTICE_DATA_ROOT:-/opt/bittice/data}"
 ENV_FILE="${OPS_DIR}/runtime.env"
 CONTAINER="${BITTICE_CONTAINER_NAME:-bittice}"
+# /var/log often needs root on first write; fall back to ops dir
+LOG_FILE="${CONSISTENCY_LOG:-/var/log/bittice-consistency.log}"
+if [[ ! -w "$(dirname "${LOG_FILE}")" ]] 2>/dev/null; then
+  LOG_FILE="${OPS_DIR}/consistency.log"
+fi
 
-log() { echo "[consistency-check] $*"; }
+log() { echo "[consistency-check] $(date -Is) $*"; }
 
 if ! command -v python3 >/dev/null 2>&1; then
   log "python3 not found. Run: sudo apt-get install -y python3 python3-pip"
@@ -45,4 +50,5 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 
+log "start"
 exec python3 "${OPS_DIR}/consistency_check_reporter.py" "$@"

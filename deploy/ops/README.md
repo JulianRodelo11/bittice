@@ -36,12 +36,65 @@ ssh -i ~/.ssh/id_rsa ubuntu@"$EC2_IP" \
 - EC2 can reach the customer MySQL host in `cdc_config.json` (same VPC/security groups as CDC).
 - Data at `/opt/bittice/data` (default), with `profiles/*/cdc_state.json` listing `bootstrapped_tables`.
 
+### Tablas que se comparan
+
+Por defecto el cron **solo** reporta tablas de negocio/catálogo. **No** compara:
+
+- `bittice.consistency_checks` — historial de cada reporte (append-only)
+- `bittice.drift_incidents` — historial de incidentes
+- `bittice.schema_migrations` — migraciones aplicadas
+
+Compararlas con `COUNT(*)` siempre generaba drift falso. Para incluirlas: `BITTICE_OPS_INCLUDE_AUDIT=1`.
+
+El conteo en mirror usa `deleted_count` del `manifest.json` (motor v0.1.137+). No hace falta `pip install roaring` en EC2; si lo instalas, el reporter puede validar contra el bitmap en disco.
+
 ### Verify
 
 ```sql
 SELECT * FROM consistency_checks
 ORDER BY checked_at DESC LIMIT 20;
 ```
+
+Si quedaron incidentes abiertos en tablas de auditoría por un run anterior:
+
+```sql
+UPDATE drift_incidents SET status='resolved', resolved_at=NOW(3)
+WHERE table_name IN ('bittice.consistency_checks','bittice.drift_incidents')
+  AND status='open';
+```
+
+Si el API devuelve 500 al cerrar un incidente con drift=0, aplica la migración
+`bittice-db/migrations/0018_drift_incidents_open_only_unique.sql` (índice único
+solo para filas `open`).
+
+### Evitar bloqueo RDS `Host is blocked` (error 1129)
+
+MySQL cuenta **cada intento de conexión TCP fallido** hacia la IP de la EC2. El script viejo abría **una conexión por tabla** (~11 cada 5 min) y sin TLS; eso llenaba el `host_cache` y RDS bloqueaba `172.31.x.x`.
+
+**Qué hicimos en el script (v2):**
+
+| Cambio | Por qué |
+|--------|---------|
+| **1 conexión MySQL por perfil** por ejecución del cron | Menos handshakes |
+| **TLS** hacia `*.rds.amazonaws.com` | Evita fallos SSL que cuentan como error |
+| **Salida inmediata** si ya hay 1129 | No dispara 11 intentos seguidos |
+
+**Si la EC2 ya está bloqueada**, el cron no puede desbloquearse solo. Desde tu Mac (IP permitida en el SG de RDS):
+
+```bash
+./deploy/ops/flush-mysql-host-cache.sh
+# usa bittice-db/.env por defecto
+```
+
+**Prevención en RDS (recomendado):** en el parameter group de la instancia MySQL, subir:
+
+```text
+max_connect_errors = 1000000
+```
+
+(AWS Console → RDS → Parameter groups → Modify → Apply pending reboot si hace falta.)
+
+**Log del cron:** por defecto `/var/log/bittice-consistency.log`; si no hay permiso de escritura, `install-cron.sh` usa `/opt/bittice/ops/consistency.log`.
 
 CloudWatch alarm `bittice-deployment-stale` uses metric `StaleDeploymentCount` (published by your separate metric script from the `stale-deployments` saved op on `engine.bittice.com`).
 
