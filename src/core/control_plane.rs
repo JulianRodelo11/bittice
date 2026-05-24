@@ -98,9 +98,10 @@ pub struct HeartbeatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws_account_id: Option<String>,
     /// EC2 instance type (e.g. `t3.micro`). Read from IMDS at heartbeat
-    /// startup; the control plane snapshots it into `usage_hours.instance_type`
-    /// so billing reflects what was actually running each hour even if the
-    /// deployment is later resized.
+    /// startup and stored on `deployments.instance_type` as metadata only
+    /// — billing has moved to per-operation in v0.1.141 (`request_buckets`),
+    /// so this field no longer drives charges. Kept for the dashboard
+    /// view and for future ops-margin analysis by SKU.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance_type: Option<String>,
     /// Free-form diagnostics for the control plane's "is this customer

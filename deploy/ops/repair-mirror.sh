@@ -3,7 +3,13 @@
 # Requires a bittice image that includes the `compact-mirror` CLI (v0.1.136+).
 #
 # Usage on EC2 (engine stopped briefly):
-#   sudo /opt/bittice/ops/repair-mirror.sh bittice deployments usage_hours api_keys
+#   sudo /opt/bittice/ops/repair-mirror.sh bittice deployments request_buckets api_keys
+#
+# Tables prone to segment bloat are those with heavy UPDATE traffic — every
+# upsert creates a new segment and tombstones the old one. In the control
+# plane that's `deployments` (heartbeat-driven rolling state), `request_buckets`
+# (op-counter upserts every heartbeat), and any table the customer's own
+# workload hammers with UPDATEs.
 #
 # Run after Watchtower has pulled the new :stable image (tag → Actions → GHCR → EC2).
 # Override only for debugging: BITTICE_IMAGE=ghcr.io/.../bittice:v0.1.136

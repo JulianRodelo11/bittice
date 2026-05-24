@@ -207,6 +207,20 @@ impl TableManager {
         self.dirty_tables.write().unwrap().insert(key);
     }
 
+    /// Periodic CDC save tick. Persists WAL + per-column bitmaps for every
+    /// dirty table WITHOUT rotating the active segment. Rotation creates
+    /// a brand new immutable segment, which is wildly wasteful for tables
+    /// that take an UPDATE every few minutes with only one live row
+    /// (heartbeat-driven `deployments`, op-metered `request_buckets`):
+    /// each periodic save was minting a 1-row immutable segment and
+    /// tombstoning the previous one, producing thousands of dead segments
+    /// per day and turning a 1-row join into a ~600 ms scan.
+    ///
+    /// Rotation now happens only where it should: when the active segment
+    /// hits BITTICE_CDC_SEGMENT_MAX_ROWS (default 50k) inside the CDC
+    /// applier, or at engine shutdown via `flush_active_segment`. The
+    /// cheap buffer-flush below still guarantees durability — WAL +
+    /// bitmaps fsynced — without minting a segment.
     pub fn flush_dirty_tables(&self) {
         let keys: Vec<String> = {
             let mut dirty = self.dirty_tables.write().unwrap();
@@ -219,11 +233,11 @@ impl TableManager {
         for key in &keys {
             if let Some(table_arc) = cache.get(key) {
                 if let Ok(mut t) = table_arc.write() {
-                    let _ = t.flush_active_segment();
+                    let _ = t.flush_active_segment_buffers();
                 }
             }
         }
-        debug!("TableManager: flushed {} dirty table(s)", keys.len());
+        debug!("TableManager: buffer-flushed {} dirty table(s)", keys.len());
     }
 
     fn evict_lru(&self) {
