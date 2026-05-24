@@ -24,6 +24,14 @@ fn docker_engine_deploy_locked() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 panics on the first TLS handshake when multiple crypto
+    // providers are linked but none is registered as process default. Both
+    // `aws-lc-rs` and `ring` end up in the dep tree (reqwest + mysql_async).
+    // Pick one explicitly here so any later TLS user (heartbeat, self_health,
+    // CDC against a TLS-required source) just works. Idempotent — the second
+    // caller gets Err which we discard.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     if !env_truthy("BITTICE_NO_RLIMIT") {
         bittice::core::fd_limits::raise_fd_limits();
     }

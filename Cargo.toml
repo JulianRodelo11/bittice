@@ -1,6 +1,6 @@
 [package]
 name = "bittice"
-version = "0.1.138"
+version = "0.1.139"
 edition = "2021"
 license = "Elastic-2.0"
 
@@ -36,6 +36,12 @@ tokio-stream = "0.1"
 chrono = { version = "0.4.44", features = ["serde"] }
 self_update = { version = "0.41", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "rustls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# Direct dependency only so we can call `install_default()` at process start.
+# Both `aws-lc-rs` and `ring` providers are already in the dep tree (pulled in
+# transitively by reqwest/mysql_async); rustls 0.23 panics at runtime when more
+# than one is present and no default is installed. Picking `ring` here is the
+# tie-breaker, not an extra dependency.
+rustls = { version = "0.23", default-features = false }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 evalexpr = "8.1"
 unicode-normalization = "0.1"
