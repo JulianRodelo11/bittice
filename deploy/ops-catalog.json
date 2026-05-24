@@ -214,5 +214,54 @@
         { "field": "d.last_heartbeat_at", "direction": "Desc" }
       ]
     }
+  },
+  {
+    "type": "read",
+    "details": {
+      "name": "user-operations",
+      "entity": "bittice",
+      "table": "users",
+      "table_alias": "u",
+      "joins": [
+        {
+          "type": "Inner",
+          "table": "deployments",
+          "alias": "d",
+          "on": [
+            { "left": "d.user_id", "op": "Eq", "right": "u.id" }
+          ]
+        },
+        {
+          "type": "Left",
+          "table": "request_buckets",
+          "alias": "rb",
+          "on": [
+            { "left": "rb.deployment_id", "op": "Eq", "right": "d.id" }
+          ],
+          "sum_matches_field": "request_count",
+          "sum_matches_as": "operations_total"
+        }
+      ],
+      "filters": [],
+      "select": [
+        { "field": "u.email", "as": "email" },
+        { "field": "u.plan", "as": "plan" },
+        { "field": "d.public_id", "as": "deployment_id" },
+        { "field": "d.name", "as": "deployment_name" },
+        { "field": "d.state", "as": "state" },
+        { "field": "rb.operations_total", "as": "operations_total" }
+      ],
+      "order_by": [
+        { "field": "rb.operations_total", "direction": "Desc" }
+      ],
+      "auth_config": {
+        "enabled": true,
+        "scheme": "bittice_api_key",
+        "table": "api_keys",
+        "token_col": "prefix",
+        "id_col": "user_id",
+        "filter_col": "u.id"
+      }
+    }
   }
 ]

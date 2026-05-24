@@ -3,6 +3,7 @@ pub mod table_manager;
 pub mod logging;
 pub mod auto_update_hint;
 pub mod heartbeat;
+pub mod op_counter;
 pub mod self_health;
 
 use axum::{
@@ -236,6 +237,11 @@ pub async fn start_all_servers(
     *ENGINE_SHUTDOWN_NOTIFY.lock().unwrap() = Some(shutdown_notify.clone());
     let table_manager = Arc::new(TableManager::new());
     let active_workers = Arc::new(StdRwLock::new(HashSet::new()));
+
+    // Operations counter: in-memory + disk-persisted per-hour buckets.
+    // Spawned before heartbeat so the first heartbeat already carries a
+    // snapshot (which may be 0 / restored from disk).
+    op_counter::init(&crate::core::data_paths::resolved_data_root());
 
     // Heartbeat to the Bittice control plane. Silent no-op when BITTICE_DEPLOYMENT_ID
     // / BITTICE_INSTANCE_TOKEN / BITTICE_CONTROL_PLANE_URL aren't all set (= local mode).
@@ -740,6 +746,11 @@ pub async fn start_server(
             state.clone(),
             auth_middleware,
         ))
+        // Op counter wraps auth+handler so it sees the *final* status:
+        // 401 from auth, 4xx/5xx from handler, 2xx success. Only success
+        // bumps the bill. Lives outside auth so admin endpoints (none on
+        // this router, but defensive) wouldn't be affected anyway.
+        .layer(axum::middleware::from_fn(count_billable_request))
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
         .with_state(state.clone());
@@ -784,6 +795,18 @@ pub async fn auth_middleware(
     // Middleware is a no-op here: identity resolution runs on demand in `handle_request`
     // using each saved operation's auth configuration.
     Ok(next.run(request).await)
+}
+
+/// Wraps the public router. Bumps the op counter exactly once for any
+/// 2xx response (one unary op). 4xx/5xx never bump — failed queries are
+/// free. gRPC and streaming notifications are counted separately in
+/// `grpc.rs`.
+pub async fn count_billable_request(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status().is_success() {
+        op_counter::bump(op_counter::OpType::Unary);
+    }
+    response
 }
 
 #[debug_handler]

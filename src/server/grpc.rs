@@ -1032,6 +1032,7 @@ impl Database for MyDatabase {
             }
         });
 
+        crate::server::op_counter::bump(crate::server::op_counter::OpType::Unary);
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -1074,14 +1075,15 @@ impl Database for MyDatabase {
         };
 
         let resp = execute_query_unary_internal(
-            query, 
-            HashMap::new(), 
+            query,
+            HashMap::new(),
             Arc::clone(&self.table_manager),
             req.limit,
             req.offset,
             auth_ctx,
         ).await?;
 
+        crate::server::op_counter::bump(crate::server::op_counter::OpType::Unary);
         Ok(Response::new(resp))
     }
 
@@ -1173,6 +1175,9 @@ impl Database for MyDatabase {
                                             .await;
                                     }
                                 });
+                                crate::server::op_counter::bump(
+                                    crate::server::op_counter::OpType::Unary,
+                                );
                                 return Ok(Response::new(ReceiverStream::new(rx)));
                             }
                         }
@@ -1253,6 +1258,7 @@ impl Database for MyDatabase {
             }
         });
 
+        crate::server::op_counter::bump(crate::server::op_counter::OpType::Unary);
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -1308,6 +1314,9 @@ impl Database for MyDatabase {
                                     result.headers.len(),
                                 );
 
+                                crate::server::op_counter::bump(
+                                    crate::server::op_counter::OpType::Unary,
+                                );
                                 return Ok(Response::new(SearchUnaryResponse {
                                     headers: result.headers,
                                     rows: proto_rows,
@@ -1322,13 +1331,14 @@ impl Database for MyDatabase {
                     }
 
                     let resp = execute_query_unary_internal(
-                        q.clone(), 
-                        req.params, 
+                        q.clone(),
+                        req.params,
                         Arc::clone(&self.table_manager),
                         req.limit_override,
                         req.offset_override,
                         auth_ctx,
                     ).await?;
+                    crate::server::op_counter::bump(crate::server::op_counter::OpType::Unary);
                     return Ok(Response::new(resp));
                 }
                 SavedOperation::Batch(b) => {
@@ -1337,6 +1347,7 @@ impl Database for MyDatabase {
                         req.params,
                         &metadata
                     ).await?;
+                    crate::server::op_counter::bump(crate::server::op_counter::OpType::Unary);
                     return Ok(Response::new(resp));
                 }
                 _ => return Err(Status::invalid_argument(format!("Operation '{}' is not a read or batch operation and cannot be executed via this endpoint", req.query_name))),
@@ -1421,6 +1432,13 @@ impl Database for MyDatabase {
                         if tx.send(Ok(proto_event)).await.is_err() {
                             break;
                         }
+                        // Each notification successfully delivered to the
+                        // subscriber is a billable op. Subscribe RPC itself
+                        // (the call that opens the stream) is not — only
+                        // delivered events count.
+                        crate::server::op_counter::bump(
+                            crate::server::op_counter::OpType::Notification,
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(

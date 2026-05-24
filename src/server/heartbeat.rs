@@ -93,6 +93,12 @@ pub fn spawn_if_configured() {
 /// (the only shape that uses the control plane today) there is exactly one
 /// profile dir. Returns `None` on any error — heartbeat must keep running
 /// even if the state file is missing or being rewritten as we read it.
+///
+/// Also folds in the operation counter snapshot under
+/// `operations_by_bucket` — the control plane's heartbeat handler upserts
+/// each (hour_bucket, op_type) into `request_buckets`. Done here, not in a
+/// separate field, so we don't widen the HeartbeatRequest schema (which is
+/// versioned by the engine release; the extra blob is free-form by design).
 fn cdc_state_snapshot() -> Option<serde_json::Value> {
     #[derive(serde::Deserialize)]
     struct Stub {
@@ -106,35 +112,49 @@ fn cdc_state_snapshot() -> Option<serde_json::Value> {
         last_mirror_batch_unix_ms: Option<u64>,
     }
 
-    let profiles_dir = crate::core::data_paths::resolved_data_root().join("profiles");
-    let entries = std::fs::read_dir(&profiles_dir).ok()?;
+    let mut blob = serde_json::Map::new();
 
-    for entry in entries.flatten() {
-        let state_path = entry.path().join("cdc_state.json");
-        if !state_path.exists() {
-            continue;
-        }
-        let raw = std::fs::read_to_string(&state_path).ok()?;
-        let stub: Stub = serde_json::from_str(&raw).ok()?;
-
-        let mut blob = serde_json::Map::new();
-        blob.insert("binlog_file".into(), serde_json::Value::String(stub.binlog_file));
-        blob.insert("binlog_pos".into(), serde_json::json!(stub.binlog_pos));
-        blob.insert("bootstrapped_tables".into(), serde_json::json!(stub.bootstrapped_tables.len()));
-        if let Some(ms) = stub.last_mirror_batch_unix_ms {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            // saturating_sub: if NTP runs backwards or the file timestamp is in the
-            // future, report 0 instead of underflowing to a huge u64 that would
-            // make a healthy mirror look stale.
-            let lag_secs = now_ms.saturating_sub(ms) / 1000;
-            blob.insert("last_mirror_batch_age_secs".into(), serde_json::json!(lag_secs));
-        }
-        return Some(serde_json::Value::Object(blob));
+    // Operation counter — current + previous hour. Empty object if the
+    // counter wasn't initialized (= local mode). The control plane's
+    // heartbeat handler iterates `operations_by_bucket` and upserts into
+    // request_buckets with GREATEST() so this never decreases.
+    if let Some(counter) = crate::server::op_counter::instance() {
+        blob.insert("operations_by_bucket".into(), counter.heartbeat_snapshot());
     }
-    None
+
+    let profiles_dir = crate::core::data_paths::resolved_data_root().join("profiles");
+    if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+        for entry in entries.flatten() {
+            let state_path = entry.path().join("cdc_state.json");
+            if !state_path.exists() {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&state_path) else { continue };
+            let Ok(stub) = serde_json::from_str::<Stub>(&raw) else { continue };
+
+            blob.insert("binlog_file".into(), serde_json::Value::String(stub.binlog_file));
+            blob.insert("binlog_pos".into(), serde_json::json!(stub.binlog_pos));
+            blob.insert("bootstrapped_tables".into(), serde_json::json!(stub.bootstrapped_tables.len()));
+            if let Some(ms) = stub.last_mirror_batch_unix_ms {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                // saturating_sub: if NTP runs backwards or the file timestamp is in the
+                // future, report 0 instead of underflowing to a huge u64 that would
+                // make a healthy mirror look stale.
+                let lag_secs = now_ms.saturating_sub(ms) / 1000;
+                blob.insert("last_mirror_batch_age_secs".into(), serde_json::json!(lag_secs));
+            }
+            break;  // single-engine deploy: stop at the first valid profile
+        }
+    }
+
+    if blob.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(blob))
+    }
 }
 
 /// Read the EC2 instance type from the Instance Metadata Service (IMDSv2).
