@@ -138,3 +138,197 @@ pub async fn heartbeat(
     }
     Ok(())
 }
+
+// ─── /v1/config (engine reads its behavior from the control plane) ──────────
+//
+// The engine carries no behavior flags of its own; on startup (and every 60s)
+// it asks the control plane what to do. Per Julian's architecture rule: all
+// toggles (self_health, auto_repair, telemetry, cadence, watch lists) live in
+// the bittice RDS, flipped via UPDATE — never via env vars on the customer VM.
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EffectiveEngineConfig {
+    pub self_health_enabled: bool,
+    pub self_health_interval_secs: u64,
+    pub auto_repair_enabled: bool,
+    pub auto_repair_cap_per_day: u32,
+    pub auto_repair_min_consecutive_drifts: u32,
+    pub telemetry_diagnostics_enabled: bool,
+    #[serde(default)]
+    pub watch_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub watch_denylist: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EngineConfigResponse {
+    pub config_version: String,
+    pub effective_config: EffectiveEngineConfig,
+}
+
+/// Result of a config fetch — either fresh config or a 304 confirming the
+/// cached version is still valid.
+#[derive(Debug)]
+pub enum ConfigFetch {
+    Fresh(EngineConfigResponse),
+    NotModified,
+}
+
+pub async fn fetch_engine_config(
+    control_plane_url: &str,
+    deployment_id: &str,
+    instance_token: &str,
+    if_none_match: Option<&str>,
+) -> Result<ConfigFetch> {
+    let url = format!("{}/v1/config", control_plane_url.trim_end_matches('/'));
+    let mut req = client().get(&url)
+        .bearer_auth(instance_token)
+        .header("X-Bittice-Deployment", deployment_id);
+    if let Some(etag) = if_none_match {
+        req = req.header("If-None-Match", etag);
+    }
+    let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if status.as_u16() == 304 {
+        return Ok(ConfigFetch::NotModified);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("fetch_engine_config failed ({status}): {body}");
+    }
+    let parsed: EngineConfigResponse = serde_json::from_str(&body)
+        .with_context(|| format!("parse /v1/config response: {body}"))?;
+    Ok(ConfigFetch::Fresh(parsed))
+}
+
+// ─── /v1/health/consistency-check ───────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct TableConsistency {
+    pub table: String,
+    pub source_count: u64,
+    pub mirror_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConsistencyCheckRequest {
+    pub checked_at: String, // ISO-8601 UTC
+    pub tables: Vec<TableConsistency>,
+}
+
+pub async fn post_consistency_check(
+    control_plane_url: &str,
+    deployment_id: &str,
+    instance_token: &str,
+    req: &ConsistencyCheckRequest,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/health/consistency-check",
+        control_plane_url.trim_end_matches('/')
+    );
+    let resp = client().post(&url)
+        .bearer_auth(instance_token)
+        .header("X-Bittice-Deployment", deployment_id)
+        .json(req)
+        .send().await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("post_consistency_check failed ({status}): {body}");
+    }
+    Ok(())
+}
+
+// ─── /v1/health/incident-with-diagnostics ───────────────────────────────────
+
+#[derive(Debug, Serialize, Default)]
+pub struct CdcDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binlog_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binlog_pos: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<String>, // "live" | "lagging" | "failed" | "unknown"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct SourceDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mysql_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binlog_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct MirrorDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_write_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct TimingDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_count_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_count_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DriftDiagnosticsRequest {
+    pub captured_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    pub table: String,
+    pub diff: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdc: Option<CdcDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingDiagnostics>,
+    #[serde(default)]
+    pub auto_repair_attempted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_repair_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<serde_json::Value>,
+}
+
+pub async fn post_incident_diagnostics(
+    control_plane_url: &str,
+    deployment_id: &str,
+    instance_token: &str,
+    req: &DriftDiagnosticsRequest,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/health/incident-with-diagnostics",
+        control_plane_url.trim_end_matches('/')
+    );
+    let resp = client().post(&url)
+        .bearer_auth(instance_token)
+        .header("X-Bittice-Deployment", deployment_id)
+        .json(req)
+        .send().await
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("post_incident_diagnostics failed ({status}): {body}");
+    }
+    Ok(())
+}

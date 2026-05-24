@@ -3,6 +3,7 @@ pub mod table_manager;
 pub mod logging;
 pub mod auto_update_hint;
 pub mod heartbeat;
+pub mod self_health;
 
 use axum::{
     debug_handler,
@@ -239,6 +240,11 @@ pub async fn start_all_servers(
     // Heartbeat to the Bittice control plane. Silent no-op when BITTICE_DEPLOYMENT_ID
     // / BITTICE_INSTANCE_TOKEN / BITTICE_CONTROL_PLANE_URL aren't all set (= local mode).
     heartbeat::spawn_if_configured();
+
+    // Self-health (consistency checks + drift diagnostics, fully driven by
+    // GET /v1/config). Same identity gate as heartbeat — local-only deploys
+    // never call out.
+    self_health::spawn_if_configured();
 
     // Convert entity_filter to lowercase and trim it
     let entity_filter = entity_filter.map(|e| e.trim().to_lowercase());

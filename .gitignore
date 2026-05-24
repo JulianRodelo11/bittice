@@ -29,3 +29,6 @@ BITTICE_READ_LAYER_PROMPT.md
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Claude Code session state
+.claude/
