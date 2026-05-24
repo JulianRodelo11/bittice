@@ -5,6 +5,7 @@ set -euo pipefail
 OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_ROOT="${BITTICE_DATA_ROOT:-/opt/bittice/data}"
 ENV_FILE="${OPS_DIR}/runtime.env"
+FLUSH_ENV="${OPS_DIR}/flush-lambda.env"
 CONTAINER="${BITTICE_CONTAINER_NAME:-bittice}"
 # /var/log often needs root on first write; fall back to ops dir
 LOG_FILE="${CONSISTENCY_LOG:-/var/log/bittice-consistency.log}"
@@ -47,6 +48,12 @@ if [[ -f "${ENV_FILE}" ]]; then
   set -a
   # shellcheck source=/dev/null
   source "${ENV_FILE}"
+  set +a
+fi
+if [[ -f "${FLUSH_ENV}" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "${FLUSH_ENV}"
   set +a
 fi
 

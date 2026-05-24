@@ -111,12 +111,68 @@ fn write_terraform_files(tf_dir: &Path, tfvars: &str) -> Result<()> {
 }
 
 fn terraform_run(tf_bin: &Path, tf_dir: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new(tf_bin).args(args).current_dir(tf_dir)
-        .status().context("running terraform")?;
-    if !status.success() {
-        bail!("terraform {} failed", args.first().unwrap_or(&""));
+    let sub = args.first().copied().unwrap_or("");
+    let mut cmd = Command::new(tf_bin);
+    cmd.args(args).current_dir(tf_dir);
+    run_quietly(
+        cmd,
+        &format!("Terraform {sub}…"),
+        &format!("Terraform {sub} done."),
+        &format!("Terraform {sub} failed."),
+        &format!("terraform-{sub}"),
+    )
+}
+
+/// Run a subprocess without leaking its stdout/stderr to the terminal.
+/// Drives a cliclack spinner while it runs; on failure, persists the full
+/// captured output to `<data_root>/.deploy-logs/<slug>.log` and shows the
+/// last ~25 lines inline so the user has enough context to debug.
+fn run_quietly(
+    mut cmd: Command,
+    label: &str,
+    done_msg: &str,
+    fail_msg: &str,
+    log_slug: &str,
+) -> Result<()> {
+    let s = spinner();
+    s.start(label);
+    let out = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("spawning subprocess")?;
+    if out.status.success() {
+        s.stop(done_msg);
+        return Ok(());
     }
-    Ok(())
+    s.stop(fail_msg);
+
+    let log_dir = crate::core::data_paths::resolved_data_root().join(".deploy-logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(format!("{log_slug}.log"));
+    let mut combined = Vec::with_capacity(out.stdout.len() + out.stderr.len());
+    combined.extend_from_slice(&out.stdout);
+    combined.extend_from_slice(&out.stderr);
+    let _ = std::fs::write(&log_path, &combined);
+
+    let text = String::from_utf8_lossy(&combined);
+    let tail: Vec<&str> = text
+        .lines()
+        .rev()
+        .take(25)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let body = if tail.is_empty() {
+        "(no output captured)".to_string()
+    } else {
+        tail.join("\n")
+    };
+    let _ = note("Last output", body);
+    let _ = log::info(format!("Full log: {}", log_path.display()));
+    bail!("{fail_msg}")
 }
 
 /// Lines currently in `terraform state list` (each is e.g. "aws_key_pair.bittice").
@@ -141,15 +197,16 @@ fn terraform_state_list(tf_bin: &Path, tf_dir: &Path) -> Vec<String> {
 /// `terraform import <addr> <id>` — adopts an existing AWS resource into state.
 /// Bubbles up the error if import itself fails (e.g. resource not found in AWS).
 fn terraform_import(tf_bin: &Path, tf_dir: &Path, addr: &str, id: &str) -> Result<()> {
-    let status = Command::new(tf_bin)
-        .args(["import", addr, id])
-        .current_dir(tf_dir)
-        .status()
-        .with_context(|| format!("running terraform import {addr} {id}"))?;
-    if !status.success() {
-        bail!("terraform import {addr} {id} failed");
-    }
-    Ok(())
+    let mut cmd = Command::new(tf_bin);
+    cmd.args(["import", addr, id]).current_dir(tf_dir);
+    let slug = format!("terraform-import-{}", addr.replace('.', "-"));
+    run_quietly(
+        cmd,
+        &format!("Adopting existing AWS resource → {addr}…"),
+        &format!("Adopted {addr}."),
+        &format!("terraform import {addr} failed."),
+        &slug,
+    )
 }
 
 /// Look up an EC2 key pair by name; returns Some(name) if it exists. Uses
@@ -306,30 +363,42 @@ fn ssh_common_args(ssh_key: &str, ip: &str) -> Vec<String> {
     ]
 }
 
-fn ssh_run(ip: &str, ssh_key: &str, cmd: &str) -> Result<()> {
+/// Run a command on the server over SSH. Stdout/stderr are captured; output
+/// is only surfaced on failure (see `run_quietly`). `label` drives the spinner.
+fn ssh_run_labeled(ip: &str, ssh_key: &str, cmd: &str, label: &str) -> Result<()> {
     let mut args = ssh_common_args(ssh_key, ip);
     args.push(cmd.to_string());
-    let status = Command::new("ssh").args(&args).status().context("ssh")?;
-    if !status.success() { bail!("Remote command failed: {cmd}"); }
-    Ok(())
+    let mut command = Command::new("ssh");
+    command.args(&args);
+    run_quietly(
+        command,
+        label,
+        "Remote command finished.",
+        "Remote command failed.",
+        "ssh-remote",
+    )
 }
 
 fn rsync_data(data_root: &Path, ip: &str, ssh_key: &str) -> Result<()> {
     let ssh_transport = format!(
         "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {ssh_key}"
     );
-    let status = Command::new("rsync")
-        .args([
-            "-avz", "--progress",
-            "--exclude=server.log", "--exclude=.layout_v2",
-            "--exclude=terraform", "--exclude=.terraform-bin",
-            "-e", &ssh_transport,
-            &format!("{}/", data_root.display()),
-            &format!("ubuntu@{ip}:/opt/bittice/data/"),
-        ])
-        .status().context("rsync")?;
-    if !status.success() { bail!("rsync of data/ failed"); }
-    Ok(())
+    let mut command = Command::new("rsync");
+    command.args([
+        "-az",
+        "--exclude=server.log", "--exclude=.layout_v2",
+        "--exclude=terraform", "--exclude=.terraform-bin",
+        "-e", &ssh_transport,
+        &format!("{}/", data_root.display()),
+        &format!("ubuntu@{ip}:/opt/bittice/data/"),
+    ]);
+    run_quietly(
+        command,
+        "Syncing data/ to server…",
+        "data/ synced.",
+        "rsync of data/ failed.",
+        "rsync-data",
+    )
 }
 
 fn wait_for_ssh(ip: &str, ssh_key: &str) -> Result<()> {
@@ -455,51 +524,63 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, ident: Option<&EngineIde
     // (apt-get install docker.io) runs in parallel and can take 1-3 minutes.
     // Without this gate the first `docker pull` lands on a host where docker
     // doesn't exist yet.
-    ssh_run(ip, ssh_key,
-        "echo 'Waiting for cloud-init (Docker install)…'; \
-         sudo cloud-init status --wait 2>/dev/null || echo '(cloud-init not present, continuing)'; \
+    ssh_run_labeled(ip, ssh_key,
+        "sudo cloud-init status --wait 2>/dev/null || true; \
          if ! command -v docker >/dev/null 2>&1; then \
-           echo 'Docker missing after cloud-init — installing now…'; \
            sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io && \
            sudo systemctl enable --now docker && \
            sudo usermod -aG docker ubuntu; \
          fi; \
-         docker --version || { echo 'Docker install FAILED' >&2; exit 1; }"
+         docker --version >/dev/null || { echo 'Docker install FAILED' >&2; exit 1; }",
+        "Waiting for Docker on the server…",
     )?;
 
     if let (Ok(token), Ok(user)) = (std::env::var("GHCR_TOKEN"), std::env::var("GHCR_USER")) {
-        ssh_run(ip, ssh_key, &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"))?;
+        ssh_run_labeled(
+            ip,
+            ssh_key,
+            &format!("echo '{token}' | docker login ghcr.io -u '{user}' --password-stdin"),
+            "Logging into GHCR…",
+        )?;
     }
 
     // Tear down previous stack. The systemctl/docker rm of legacy VPN units is
     // kept so re-deploys on top of an older VPN-era EC2 do a clean cutover.
-    ssh_run(ip, ssh_key,
+    ssh_run_labeled(ip, ssh_key,
         "sudo chown -R ubuntu:ubuntu /opt/bittice; \
          sudo systemctl stop 'openvpn@*' 'openvpn-client@*' 2>/dev/null || true; \
          sudo systemctl disable 'openvpn@bittice' 'openvpn-client@bittice' 2>/dev/null || true; \
          docker rm -f bittice bittice-vpn 2>/dev/null || true; \
-         cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true"
+         cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true",
+        "Tearing down previous stack…",
     )?;
 
     // Install docker-compose if not already present.
-    ssh_run(ip, ssh_key,
+    ssh_run_labeled(ip, ssh_key,
         "docker compose version 2>/dev/null || \
          docker-compose version 2>/dev/null || \
          (sudo curl -sSL https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64 \
-          -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose)"
+          -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose)",
+        "Ensuring docker-compose…",
     )?;
 
     // Write docker-compose.yml
     let compose = generate_compose(image, ident);
-    ssh_run(ip, ssh_key, &format!(
+    ssh_run_labeled(ip, ssh_key, &format!(
         "cat > /opt/bittice/docker-compose.yml << 'COMPEOF'\n{compose}COMPEOF"
-    ))?;
+    ), "Writing docker-compose.yml…")?;
 
     // Pull image and start stack.
-    ssh_run(ip, ssh_key, &format!("docker pull '{image}'"))?;
-    ssh_run(ip, ssh_key,
-        "cd /opt/bittice && (docker compose up -d 2>/dev/null || docker-compose up -d)"
+    ssh_run_labeled(
+        ip,
+        ssh_key,
+        &format!("docker pull '{image}'"),
+        &format!("Pulling {image}…"),
+    )?;
+    ssh_run_labeled(ip, ssh_key,
+        "cd /opt/bittice && (docker compose up -d 2>/dev/null || docker-compose up -d)",
+        "Starting Bittice container…",
     )?;
 
     Ok(())
@@ -1268,7 +1349,6 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     if write_res.is_ok() { ws.stop("Terraform files ready."); } else { ws.stop("Failed to write files."); }
     write_res?;
 
-    let _ = log::step("Running terraform init…");
     terraform_run(&tf_bin, &tf_dir, &["init", "-upgrade"])?;
 
     // Adopt any leftover AWS resources from a previous failed deploy ("if
@@ -1276,7 +1356,6 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     // InvalidKeyPair.Duplicate / InvalidGroup.Duplicate / InvalidPermission.Duplicate.
     reconcile_terraform_orphans(&tf_bin, &tf_dir, &app_name, &placement)?;
 
-    let _ = log::step("Running terraform apply…");
     terraform_run(&tf_bin, &tf_dir, &["apply", "-auto-approve"])?;
 
     let ip = terraform_output(&tf_bin, &tf_dir, "public_ip")?;
@@ -1302,13 +1381,14 @@ fn finish_deploy(
 
     wait_for_ssh(ip, ssh_priv)?;
 
-    let _ = log::step("Syncing data/…");
-    ssh_run(ip, ssh_priv,
-        "sudo mkdir -p /opt/bittice/data && sudo chown -R ubuntu:ubuntu /opt/bittice"
+    ssh_run_labeled(
+        ip,
+        ssh_priv,
+        "sudo mkdir -p /opt/bittice/data && sudo chown -R ubuntu:ubuntu /opt/bittice",
+        "Preparing /opt/bittice on server…",
     )?;
     rsync_data(data_root, ip, ssh_priv)?;
 
-    let _ = log::step(format!("Deploying {image}…"));
     deploy_compose(ip, ssh_priv, image, ident)?;
 
     wait_for_cdc_live(ip, ssh_priv, profile_count)?;

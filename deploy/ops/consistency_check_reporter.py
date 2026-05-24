@@ -14,12 +14,14 @@ Optional:
   CONSISTENCY_CHECK_DRY_RUN=1  — print payload, do not POST
   BITTICE_OPS_INCLUDE_AUDIT=1  — also check append-only / audit tables (not recommended)
   BITTICE_OPS_EXTRA_SKIP_TABLES=bittice.foo,bittice.bar  — extra qkeys to skip
+  BITTICE_OPS_FLUSH_URL, BITTICE_OPS_FLUSH_SECRET  — Lambda URL from setup-flush-lambda.sh
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -145,18 +147,45 @@ def _parse_qkey(sync_all: bool, database: str, qkey: str) -> tuple[str, str]:
     return database, qkey
 
 
+def _request_remote_host_cache_flush() -> bool:
+    """Invoke fleet Lambda (non-blocked IP) to TRUNCATE performance_schema.host_cache."""
+    url = (_env("BITTICE_OPS_FLUSH_URL") or "").rstrip("/")
+    secret = _env("BITTICE_OPS_FLUSH_SECRET")
+    if not url or not secret:
+        return False
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        method="POST",
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print(f"Remote host_cache flush → {resp.status} {body}")
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        print(f"Remote flush failed ({e.code}): {detail}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Remote flush failed: {e}", file=sys.stderr)
+        return False
+
+
 def _mysql_ssl_enabled(host: str) -> bool:
     if _env("BITTICE_MYSQL_SSL", "1") == "0":
         return False
     return "rds.amazonaws.com" in host or host.endswith(".amazonaws.com")
 
 
-def _mysql_connect(config: dict[str, Any], database: str | None) -> pymysql.connections.Connection:
-    """One TCP session per profile per cron run — avoids host_cache blocks from N× connects."""
-    host = config["host"]
-    port = int(config.get("port") or 3306)
-    user = config["user"]
-    password = config.get("pass") or config.get("password") or ""
+def _mysql_connect_once(
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: str | None,
+) -> pymysql.connections.Connection:
     kwargs: dict[str, Any] = {
         "host": host,
         "port": port,
@@ -169,20 +198,35 @@ def _mysql_connect(config: dict[str, Any], database: str | None) -> pymysql.conn
     }
     if _mysql_ssl_enabled(host):
         kwargs["ssl"] = {"ssl": {}}
+    return pymysql.connect(**kwargs)
 
-    try:
-        return pymysql.connect(**kwargs)
-    except pymysql_err.OperationalError as e:
-        code = e.args[0] if e.args else None
-        if code == ER_HOST_IS_BLOCKED:
+
+def _mysql_connect(config: dict[str, Any], database: str | None) -> pymysql.connections.Connection:
+    """One TCP session per profile per cron run — avoids host_cache blocks from N× connects."""
+    host = config["host"]
+    port = int(config.get("port") or 3306)
+    user = config["user"]
+    password = config.get("pass") or config.get("password") or ""
+
+    for attempt in range(2):
+        try:
+            return _mysql_connect_once(host, port, user, password, database)
+        except pymysql_err.OperationalError as e:
+            code = e.args[0] if e.args else None
+            if code != ER_HOST_IS_BLOCKED:
+                raise
+            if attempt == 0 and _request_remote_host_cache_flush():
+                print("MySQL 1129 — flushed host_cache remotely, retrying…", file=sys.stderr)
+                time.sleep(2)
+                continue
             print(
                 f"MySQL blocked host {host} (error 1129). "
-                "Run flush-mysql-host-cache.sh from a machine that can still connect, "
-                "or raise RDS max_connect_errors. See deploy/ops/README.md.",
+                "Set BITTICE_OPS_FLUSH_URL (setup-flush-lambda.sh) or run "
+                "flush-mysql-host-cache.sh manually. See deploy/ops/README.md.",
                 file=sys.stderr,
             )
             sys.exit(2)
-        raise
+    raise RuntimeError("unreachable")
 
 
 def _mysql_count_on_conn(

@@ -79,14 +79,34 @@ MySQL cuenta **cada intento de conexión TCP fallido** hacia la IP de la EC2. El
 | **TLS** hacia `*.rds.amazonaws.com` | Evita fallos SSL que cuentan como error |
 | **Salida inmediata** si ya hay 1129 | No dispara 11 intentos seguidos |
 
-**Si la EC2 ya está bloqueada**, el cron no puede desbloquearse solo. Desde tu Mac (IP permitida en el SG de RDS):
+### Auto-recuperación (sin revisar a mano)
+
+Dos capas — configúralas **una vez**:
+
+**1. Prevención (recomendado primero)** — sube el umbral de errores en RDS:
+
+```bash
+AWS_PROFILE=bittice ./deploy/ops/ensure-rds-max-connect-errors.sh
+```
+
+**2. Lambda de rescate** — si aun así aparece el 1129, el cron en EC2 llama a una Lambda en la VPC que hace el `TRUNCATE host_cache` (IP distinta a la EC2, no bloqueada):
+
+```bash
+# En tu Mac, una vez:
+AWS_PROFILE=bittice ./deploy/ops/setup-flush-lambda.sh
+# Genera deploy/ops/flush-lambda.env → cópialo a la EC2:
+scp deploy/ops/flush-lambda.env ubuntu@<EC2>:/opt/bittice/ops/
+```
+
+`run-consistency-check.sh` carga ese archivo; el reporter, al ver error 1129, invoca la URL, espera 2 s y **reintenta** MySQL.
+
+**Rescate manual** (solo si Lambda no está configurada):
 
 ```bash
 ./deploy/ops/flush-mysql-host-cache.sh
-# usa bittice-db/.env por defecto
 ```
 
-**Prevención en RDS (recomendado):** en el parameter group de la instancia MySQL, subir:
+**Prevención en RDS (alternativa manual en consola):** en el parameter group de la instancia MySQL, subir:
 
 ```text
 max_connect_errors = 1000000
