@@ -482,8 +482,17 @@ async fn connect_source(cfg_json: &serde_json::Value) -> Result<Conn> {
         .pass(Some(pass));
 
     if host.contains("rds.amazonaws.com") || host.ends_with(".amazonaws.com") {
-        // RDS terminates TLS. Same heuristic as the Python script.
-        builder = builder.ssl_opts(SslOpts::default());
+        // RDS terminates TLS. Same heuristic + same trust posture as the Python
+        // reporter that ran for months: opportunistic TLS, no cert chain
+        // verification (pymysql `ssl={'ssl':{}}` defaults). The threat model
+        // for engine ⇄ same-VPC RDS is interception by another instance
+        // already inside the VPC — out of scope here. If a future config
+        // needs strict verification it goes through engine_configs, not env.
+        builder = builder.ssl_opts(
+            SslOpts::default()
+                .with_danger_accept_invalid_certs(true)
+                .with_danger_skip_domain_validation(true),
+        );
     }
 
     let opts: Opts = builder.into();
