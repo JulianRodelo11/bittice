@@ -256,7 +256,7 @@
       ],
       "auth_config": {
         "enabled": true,
-        "scheme": "bittice_api_key",
+        "scheme": "api_key_sha256",
         "table": "api_keys",
         "token_col": "prefix",
         "id_col": "user_id",

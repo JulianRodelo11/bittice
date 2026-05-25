@@ -113,6 +113,21 @@ resource "aws_instance" "bittice" {
     encrypted   = true
   }
 
+  # IMDSv2 with hop_limit=2 so the motor (inside a Docker container, behind
+  # the default bridge network) can still reach 169.254.169.254. With the
+  # AWS default of hop_limit=1, the bridge router decrements TTL and drops
+  # the request, IMDS returns nothing, and the motor reports `instance_type
+  # = null` to the control plane on every heartbeat — billing and the
+  # dashboard then keep showing whatever value was set at deploy time and
+  # never reflect resizes.  Verified on 2026-05-25 on this same instance:
+  # after stopping/starting from t3.micro to t3.nano, deployments.instance_type
+  # stayed at t3.micro until hop_limit was bumped + the container restarted.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
   tags = {
     Name = var.app_name
   }
