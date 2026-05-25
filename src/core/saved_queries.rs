@@ -223,6 +223,14 @@ impl SavedAuthConfig {
         self.table.eq_ignore_ascii_case("api_keys")
             && self.token_col.eq_ignore_ascii_case("prefix")
     }
+
+    /// Fast-path scheme: prefix lookup + SHA-256 compare, no Argon2.
+    /// Suitable for high-entropy machine credentials (~140 bits in
+    /// `bk_live_<24 random>`), where the KDF cost of Argon2 buys nothing
+    /// brute-force-resistant that the entropy hasn't already.
+    pub fn uses_api_key_sha256(&self) -> bool {
+        matches!(self.scheme.as_deref(), Some(s) if s.eq_ignore_ascii_case("api_key_sha256"))
+    }
 }
 
 fn default_filters_op() -> String {

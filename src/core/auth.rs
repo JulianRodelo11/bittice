@@ -73,6 +73,10 @@ impl AuthService {
             return None;
         }
 
+        if c.uses_api_key_sha256() {
+            return self.resolve_api_key_sha256(entity, token, c).await;
+        }
+
         if c.uses_bittice_api_key() {
             return self
                 .resolve_bittice_api_key(entity, token, c)
@@ -80,6 +84,63 @@ impl AuthService {
         }
 
         self.resolve_legacy_token(entity, token, c).await
+    }
+
+    /// Fast path: prefix lookup + SHA-256 compare. ~50µs total vs ~180ms
+    /// for the Argon2 path. Skips the verify-cache entirely — there's
+    /// nothing to cache, the lookup IS the cache hit.
+    async fn resolve_api_key_sha256(
+        &self,
+        entity: &str,
+        token: &str,
+        config: &SavedAuthConfig,
+    ) -> Option<AuthContext> {
+        let lookup_prefix = match api_key_lookup_prefix(token) {
+            Some(prefix) => prefix.to_string(),
+            None => {
+                warn!(
+                    "AUTH: API key rejected — must start with '{}' and be at least {} characters",
+                    API_KEY_PREFIX, API_KEY_LOOKUP_PREFIX_LEN
+                );
+                return None;
+            }
+        };
+
+        let Some(resolved_table_name) =
+            resolve_table_name_case_insensitive(entity, &config.table)
+        else {
+            warn!(
+                "AUTH: Auth table '{}' not found on disk for entity '{}'.",
+                config.table, entity
+            );
+            return None;
+        };
+
+        let tm = self.table_manager.clone();
+        let e_name = entity.to_string();
+        let id_col = config.id_col.clone();
+        let token_owned = token.to_string();
+
+        let user_id = tokio::task::spawn_blocking(move || {
+            lookup_api_key_user_id_sha256(
+                &tm,
+                &e_name,
+                &resolved_table_name,
+                &lookup_prefix,
+                &token_owned,
+                &id_col,
+            )
+        })
+        .await
+        .ok()
+        .flatten()?;
+
+        Some(AuthContext {
+            user_id,
+            token: token.to_string(),
+            entity: entity.to_string(),
+            filter_col: config.filter_col.clone(),
+        })
     }
 
     async fn resolve_bittice_api_key(
@@ -432,6 +493,110 @@ fn lookup_api_key_user_id(
 
     warn!(
         "AUTH: No valid api_keys row for prefix '{}' (candidates={})",
+        lookup_prefix,
+        results.rows.len()
+    );
+    None
+}
+
+/// SHA-256 sibling of `lookup_api_key_user_id`. Searches `api_keys` by
+/// `prefix` (narrow set, indexed), then compares each candidate row's
+/// `key_sha256` against `SHA-256(token)` in constant time. Returns the
+/// row's `user_id` on the first match.
+///
+/// Rows with `key_sha256 IS NULL` are skipped — they belong to keys
+/// created before migration 0023 and only have an Argon2 hash. Users
+/// rotate those keys via the regenerate flow; in the meantime they
+/// still authenticate through the legacy bittice_api_key path.
+fn lookup_api_key_user_id_sha256(
+    tm: &TableManager,
+    entity: &str,
+    table_name: &str,
+    lookup_prefix: &str,
+    token: &str,
+    id_col: &str,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+
+    let table_lock = tm.get_table(entity, table_name).ok()?;
+    let table = table_lock.read().unwrap();
+
+    let search_fields = vec![
+        id_col.to_string(),
+        "key_sha256".to_string(),
+        "prefix".to_string(),
+        "revoked_at".to_string(),
+        "expires_at".to_string(),
+    ];
+
+    let filter = Filter {
+        field: "prefix".to_string(),
+        op: ComparisonOp::Eq,
+        value: lookup_prefix.to_string(),
+        value_to: None,
+        value_options: vec![],
+        field_type: None,
+    };
+
+    let results = table
+        .search(
+            &search_fields,
+            &[filter],
+            &LogicalOp::And,
+            &[],
+            &[],
+            32,
+            0,
+            None,
+        )
+        .ok()?;
+
+    let idx = |name: &str| results.headers.iter().position(|h| h == name);
+    let id_idx = idx(id_col)?;
+    let sha_idx = idx("key_sha256")?;
+    let revoked_idx = idx("revoked_at")?;
+    let expires_idx = idx("expires_at")?;
+
+    // Compute the token's SHA-256 once. Lowercase hex to match the
+    // canonical form written by the control plane (Python's hashlib
+    // hexdigest emits lowercase).
+    let expected_hex = {
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for b in digest.iter() {
+            use std::fmt::Write;
+            let _ = write!(out, "{:02x}", b);
+        }
+        out
+    };
+
+    for row in &results.rows {
+        let user_id = row.get(id_idx)?.clone();
+        let stored = row.get(sha_idx).map(String::as_str).unwrap_or("");
+        let revoked_at = row.get(revoked_idx).map(String::as_str).unwrap_or("");
+        let expires_at = row.get(expires_idx).map(String::as_str).unwrap_or("");
+
+        if stored.trim().is_empty() {
+            // Row predates migration 0023; fall back via the legacy path.
+            continue;
+        }
+        if !api_key_row_active(revoked_at, expires_at) {
+            continue;
+        }
+        if stored.as_bytes().ct_eq(expected_hex.as_bytes()).into() {
+            debug!(
+                "AUTH: API key (sha256) verified for user_id={} (prefix={})",
+                user_id, lookup_prefix
+            );
+            return Some(user_id);
+        }
+    }
+
+    warn!(
+        "AUTH: No valid api_keys (sha256) row for prefix '{}' (candidates={})",
         lookup_prefix,
         results.rows.len()
     );
