@@ -262,6 +262,14 @@
           ],
           "sum_matches_field": "request_count",
           "sum_matches_as": "operations_total"
+        },
+        {
+          "type": "Left",
+          "table": "tier_levels",
+          "alias": "t",
+          "on": [
+            { "left": "t.idx", "op": "Eq", "right": "u.current_tier_idx" }
+          ]
         }
       ],
       "filters": [],
@@ -270,7 +278,12 @@
         { "field": "d.public_id", "as": "deployment_id" },
         { "field": "d.name", "as": "deployment_name" },
         { "field": "d.state", "as": "state" },
-        { "field": "rb.operations_total", "as": "operations_total" }
+        { "field": "rb.operations_total", "as": "operations_total" },
+        { "field": "t.name", "as": "plan" },
+        { "field": "t.monthly_price_usd", "as": "monthly_price_usd" },
+        { "field": "t.overage_per_1k_usd", "as": "overage_per_1k_usd" },
+        { "field": "t.hard_cap", "as": "hard_cap" },
+        { "field": "t.max_deployments", "as": "max_deployments" }
       ],
       "order_by": [
         { "field": "rb.operations_total", "direction": "Desc" }
