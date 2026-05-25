@@ -1316,6 +1316,24 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             let table_lock = self.table_manager.get_table(&disk_entity, table_name)?;
             let mut table = table_lock.write().unwrap();
 
+            // FullSnapshot must start from an empty mirror. The
+            // primary_index-based idempotency guard in `Table::insert` is
+            // load-bearing — but it depends on the index being fully
+            // rehydrated before the first row arrives. If it isn't (e.g.
+            // because we got here via a cascade of DDL-triggered restarts
+            // and the active segment hadn't been sealed), the lookup misses,
+            // the insert appends without tombstoning the stale row, and we
+            // accumulate duplicates that surface as drift_incidents with
+            // diff < 0. Wiping unconditionally at the start of FullSnapshot
+            // eliminates the dependency: bootstrap always begins clean.
+            //
+            // No-op on a brand new table (nothing to delete). Negligible
+            // cost on existing tables (`delete_all_rows` tombstones the
+            // primary_index entries and persists the deleted bitmaps).
+            if mode == BootstrapMode::FullSnapshot {
+                table.delete_all_rows()?;
+            }
+
             // Save the original fields in the manifest
             let _ = table.set_original_fields(cols.clone());
 
