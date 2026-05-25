@@ -22,7 +22,6 @@
       "select": [
         { "field": "u.email", "as": "email" },
         { "field": "u.name", "as": "user_name" },
-        { "field": "u.plan", "as": "plan" },
         { "field": "d.public_id", "as": "deployment_id" },
         { "field": "d.name", "as": "deployment_name" },
         { "field": "d.state", "as": "state" },
@@ -65,7 +64,6 @@
         { "field": "d.name", "as": "deployment_name" },
         { "field": "d.state", "as": "state" },
         { "field": "u.email", "as": "email" },
-        { "field": "u.plan", "as": "plan" },
         { "field": "d.aws_region", "as": "aws_region" },
         { "field": "d.instance_type", "as": "instance_type" },
         { "field": "d.public_ip", "as": "public_ip" },
@@ -218,6 +216,30 @@
   {
     "type": "read",
     "details": {
+      "name": "tier-levels",
+      "entity": "bittice",
+      "table": "tier_levels",
+      "table_alias": "t",
+      "filters": [],
+      "select": [
+        { "field": "t.idx", "as": "idx" },
+        { "field": "t.name", "as": "name" },
+        { "field": "t.min_ops", "as": "min_ops" },
+        { "field": "t.max_ops", "as": "max_ops" },
+        { "field": "t.monthly_price_usd", "as": "monthly_price_usd" },
+        { "field": "t.overage_per_1k_usd", "as": "overage_per_1k_usd" },
+        { "field": "t.hard_cap", "as": "hard_cap" },
+        { "field": "t.max_deployments", "as": "max_deployments" },
+        { "field": "t.notes", "as": "notes" }
+      ],
+      "order_by": [
+        { "field": "t.idx", "direction": "Asc" }
+      ]
+    }
+  },
+  {
+    "type": "read",
+    "details": {
       "name": "user-operations",
       "entity": "bittice",
       "table": "users",
@@ -245,7 +267,6 @@
       "filters": [],
       "select": [
         { "field": "u.email", "as": "email" },
-        { "field": "u.plan", "as": "plan" },
         { "field": "d.public_id", "as": "deployment_id" },
         { "field": "d.name", "as": "deployment_name" },
         { "field": "d.state", "as": "state" },
