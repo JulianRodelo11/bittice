@@ -208,26 +208,18 @@ pub struct SavedAuthConfig {
     pub token_col: String,
     pub id_col: String,
     pub filter_col: String,
-    /// `bittice_api_key` (or `api_key`): Bearer / X-API-Key with `bk_live_…`, prefix lookup + Argon2.
-    /// Omitted or `legacy`: exact match on `token_col` (JWT-style tokens still supported).
+    /// `api_key_sha256`: Bearer with `bk_live_…`, prefix lookup +
+    /// constant-time SHA-256 compare. ~50µs per verify. The only
+    /// recommended scheme for new saved ops.
+    /// Omitted or `legacy`: exact match on `token_col` (kept for legacy
+    /// token-in-column schemes that don't use the api_keys table).
     #[serde(default)]
     pub scheme: Option<String>,
 }
 
 impl SavedAuthConfig {
-    pub fn uses_bittice_api_key(&self) -> bool {
-        if let Some(scheme) = self.scheme.as_deref() {
-            return scheme.eq_ignore_ascii_case("bittice_api_key")
-                || scheme.eq_ignore_ascii_case("api_key");
-        }
-        self.table.eq_ignore_ascii_case("api_keys")
-            && self.token_col.eq_ignore_ascii_case("prefix")
-    }
-
-    /// Fast-path scheme: prefix lookup + SHA-256 compare, no Argon2.
-    /// Suitable for high-entropy machine credentials (~140 bits in
-    /// `bk_live_<24 random>`), where the KDF cost of Argon2 buys nothing
-    /// brute-force-resistant that the entropy hasn't already.
+    /// Prefix lookup + SHA-256 compare; the default modern auth path for
+    /// high-entropy machine credentials. See `core::auth`.
     pub fn uses_api_key_sha256(&self) -> bool {
         matches!(self.scheme.as_deref(), Some(s) if s.eq_ignore_ascii_case("api_key_sha256"))
     }
