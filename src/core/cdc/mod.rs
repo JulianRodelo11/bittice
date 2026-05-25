@@ -118,6 +118,17 @@ pub struct CdcWorker {
     table_allowlist_source: Option<&'static str>,
 }
 
+// Last successful auto-compact per table, used to throttle subsequent
+// auto-compact triggers in `maybe_auto_compact_after_update`. Module-level
+// (not per-CdcWorker) so it survives worker restarts within the same
+// process — a customer running a single sync-all profile has exactly one
+// CdcWorker, but Phase 2 bootstrap can drop/recreate it; keeping the
+// throttle keyed by `entity/table` here prevents a restart from
+// re-triggering compact storms.
+static AUTO_COMPACT_LAST_RUN: once_cell::sync::Lazy<
+    std::sync::Mutex<HashMap<String, std::time::Instant>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
 impl CdcWorker {
     pub fn new(url: String, entity: String, database: String) -> Self {
         Self::with_log(url, entity, database, None)
@@ -285,6 +296,25 @@ impl CdcWorker {
         }
         if segs <= (live as usize).saturating_mul(4) {
             return;
+        }
+        // Throttle: at most one auto-compact per table per
+        // AUTO_COMPACT_MIN_INTERVAL. Without this, a table that hits the
+        // heuristic stays above threshold for several heartbeats and
+        // re-triggers compact() on every UPDATE event — a 1-row table
+        // with 2,000 dead segments produced ~12 compact() invocations per
+        // hour, each doing the same expensive work. Compaction is bursty
+        // by nature; cooldown lets the burst settle before re-trying.
+        const AUTO_COMPACT_MIN_INTERVAL: std::time::Duration =
+            std::time::Duration::from_secs(900);
+        let key = format!("{}/{}", entity, mirror_table);
+        {
+            let mut ticks = AUTO_COMPACT_LAST_RUN.lock().unwrap();
+            if let Some(last) = ticks.get(&key) {
+                if last.elapsed() < AUTO_COMPACT_MIN_INTERVAL {
+                    return;
+                }
+            }
+            ticks.insert(key.clone(), std::time::Instant::now());
         }
         match table.compact() {
             Ok(removed) if removed > 0 => {

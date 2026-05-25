@@ -2092,9 +2092,46 @@ impl Table {
     /// Returns the number of segments removed (old_count - new_count).
     ///
     /// Safety: must be called when no concurrent writes are happening.
+    /// Walk every immutable segment in order, return the field names found
+    /// in the first one whose directory is actually readable. Resilient to
+    /// partial corruption: a previous compact that deleted segment dirs
+    /// without updating the manifest leaves the lowest-id segments as
+    /// orphans, but later ones still have `.dat` files we can use.
+    fn discover_segment_fields(&self) -> Vec<String> {
+        for seg in &self.immutable_segments {
+            let Ok(entries) = std::fs::read_dir(&seg.path) else {
+                continue;
+            };
+            let mut found: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.ends_with(".dat") && !name.starts_with("bitmaps_") {
+                        Some(name.trim_end_matches(".dat").to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !found.is_empty() {
+                found.sort();
+                return found;
+            }
+        }
+        Vec::new()
+    }
+
     pub fn compact(&mut self) -> Result<usize> {
-        // 1. Flush active segment so every row is in an immutable segment.
-        self.flush_active_segment()?;
+        // 1. Flush active segment so every row is in an immutable segment —
+        // but only if there's actually something to flush. Calling
+        // flush_active_segment unconditionally rotates an EMPTY active
+        // into a fresh immutable segment, which is how a settled table
+        // (1 live row, no pending writes) ends up with one extra dead
+        // segment per compact() invocation. That accumulation was the
+        // mechanism behind the 2,196-segment `deployments` mirror.
+        if self.active_segment_row_count() > 0 {
+            self.flush_active_segment()?;
+        }
 
         let old_count = self.immutable_segments.len();
 
@@ -2128,26 +2165,23 @@ impl Table {
             self.name, old_count, total_rows, ideal_segments, target_rows
         );
 
-        // 3. Collect field names from the first segment's directory listing.
-        let fields: Vec<String> = if let Some(first_seg) = self.immutable_segments.first() {
-            let mut found: Vec<String> = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&first_seg.path) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.ends_with(".dat") && !name.starts_with("bitmaps_") {
-                            found.push(name.trim_end_matches(".dat").to_string());
-                        }
-                    }
-                }
-            }
-            found.sort();
-            found
-        } else {
-            return Ok(0);
-        };
-
+        // 3. Collect field names from the FIRST READABLE segment's directory.
+        // Walking immutable_segments in order tolerates partial corruption
+        // from a previous half-finished compact (segment dir deleted on
+        // disk but manifest still lists the seg id). Previously this only
+        // tried segments[0]; if that one was missing, fields came back
+        // empty and we silently returned Ok(0), making compact() a no-op
+        // forever on the corrupted table.
+        let fields = self.discover_segment_fields();
         if fields.is_empty() {
-            return Ok(0);
+            anyhow::bail!(
+                "Table '{}': compact aborted — could not read any segment directory \
+                 ({} segments listed in manifest but none have on-disk .dat files). \
+                 Mirror metadata is out of sync with disk; delete the table mirror \
+                 to let CDC re-bootstrap, or restore from backup.",
+                self.name,
+                old_count
+            );
         }
 
         // 4. Write compacted segments into a temporary directory, then rename into place.
