@@ -116,35 +116,81 @@ impl Table {
         if self.discarded {
             return Ok(());
         }
+        // Active segment first: flush its buffers and persist bitmaps so the
+        // on-disk shape matches whatever the in-memory writer just acknowledged.
+        // Failures here log loudly but don't abort the rest of close() — the
+        // immutable-segments path and the WAL contract below stay coherent
+        // regardless.
         if let Some(mut writer) = self.active_segment.take() {
-            let _ = writer.flush();
+            if let Err(e) = writer.flush() {
+                warn!("Table '{}': close: active segment flush failed: {:#}", self.name, e);
+            }
             // Same reason as in `flush_active_segment`: `SegmentWriter::flush`
             // only writes bitmaps every N flushes; close() is the last chance
             // before the active segment becomes a sealed immutable segment,
             // so force the final persist.
-            let _ = writer.persist_bitmaps();
+            if let Err(e) = writer.persist_bitmaps() {
+                warn!("Table '{}': close: active bitmaps persist failed: {:#}", self.name, e);
+            }
         }
-        let _ = self.wal.flush_writes();
+        if let Err(e) = self.wal.flush_writes() {
+            warn!("Table '{}': close: wal flush_writes failed: {:#}", self.name, e);
+        }
         // Persist every immutable segment's `deleted.bitmap`. Without this,
         // rows tombstoned by `delete()` since the last `flush_active_segment`
         // sit only in memory — close() (or process exit through close()) drops
         // them, and on restart the secondary_exact path finds the still-live
         // entry in the old segment as well as the new copy in the rotated
         // segment, producing ghost duplicates.
-        let _ = self.persist_all_deleted_bitmaps();
-        if !self.primary_index.is_empty() {
-            let _ = self.save_manifest();
-            let _ = self.save_primary_index();
+        if let Err(e) = self.persist_all_deleted_bitmaps() {
+            warn!("Table '{}': close: persist_all_deleted_bitmaps failed: {:#}", self.name, e);
+        }
+
+        // Persist manifest + primary_index + exact_indexes. The previous gate
+        // `if !self.primary_index.is_empty()` could skip the entire block when
+        // the in-memory index was empty for any reason (race, post-compact
+        // reset, partial recovery) — even though the segments on disk held
+        // live rows. That left primary_index.dat older than the segments and
+        // caused the "live count lags real data" class of bugs.
+        //
+        // The new gate considers both in-memory and on-disk presence of data:
+        // if there's anything to record (or on-disk state to refresh), persist.
+        //
+        // The WAL truncation is now strictly conditional on a successful
+        // primary_index save. If the save fails, the WAL stays intact so
+        // the next `open()` can replay its operations — losing performance
+        // (startup re-applies the WAL) is much cheaper than losing data
+        // (WAL truncated + index stale = rows disappear from queries).
+        let has_data = !self.primary_index.is_empty() || !self.immutable_segments.is_empty();
+        if has_data {
+            if let Err(e) = self.save_manifest() {
+                warn!("Table '{}': close: save_manifest failed: {:#}", self.name, e);
+            }
+            let index_saved = match self.save_primary_index() {
+                Ok(_) => true,
+                Err(e) => {
+                    warn!(
+                        "Table '{}': close: save_primary_index FAILED ({:#}); WAL will NOT be truncated so open() can replay.",
+                        self.name, e
+                    );
+                    false
+                }
+            };
             // Persist the in-memory exact_index — `merge_exact_indexes_for_segment` skips
             // disk I/O on the CDC hot path to avoid holding the write lock for seconds, so
             // close() is the safety net that ensures the on-disk index reflects the latest
             // rotated segments before the table leaves RAM.
-            let _ = self.persist_all_exact_indexes();
-            // Truncate WAL now that primary_index is persisted and the active segment
-            // is flushed. Without this, large WAL files (100MB–300MB) accumulate for
-            // high-write tables and are fully replayed on every restart, inflating both
-            // startup time and peak RAM. The WAL is redundant once primary_index is saved.
-            let _ = self.wal.truncate();
+            if let Err(e) = self.persist_all_exact_indexes() {
+                warn!("Table '{}': close: persist_all_exact_indexes failed: {:#}", self.name, e);
+            }
+            // Only truncate WAL if primary_index save succeeded above. If it
+            // didn't, the WAL is the only durable record of recent operations
+            // and must survive into the next open().
+            if index_saved {
+                if let Err(e) = self.wal.truncate() {
+                    warn!("Table '{}': close: wal.truncate failed: {:#}", self.name, e);
+                }
+            }
         }
         for seg in &mut self.immutable_segments {
             seg.mmap_cache.write().unwrap().clear();
