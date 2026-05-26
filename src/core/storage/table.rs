@@ -342,6 +342,40 @@ impl Table {
             self.manifest.primary_key.clone()
         };
 
+        // Phase 0: resync manifest.segments[i].deleted_count from each
+        // immutable segment's actual on-disk deleted_bitmap.
+        //
+        // The cached count gets set at segment creation (flush_active_segment
+        // calls to_meta()) but is NOT updated when subsequent CDC delete
+        // events tombstone rows in already-immutable segments. The result:
+        // self_health and any consumer that counts via manifest reports
+        // mirror has more live rows than it actually does (apparent drift),
+        // even though the data, primary_index, and deleted_bitmap on disk
+        // are all consistent. Resync here, once per open, so the manifest
+        // catches up before anything reads it.
+        let mut manifest_dirty = false;
+        for seg in &self.immutable_segments {
+            let actual_dc = seg.deleted_bitmap.len();
+            if let Some(meta) = self.manifest.segments.iter_mut().find(|m| m.id == seg.id) {
+                if meta.deleted_count != actual_dc {
+                    info!(
+                        "Table '{}': reconcile: resyncing manifest seg {} deleted_count {} → {} (CDC tombstones since last flush)",
+                        self.name, seg.id, meta.deleted_count, actual_dc
+                    );
+                    meta.deleted_count = actual_dc;
+                    manifest_dirty = true;
+                }
+            }
+        }
+        if manifest_dirty {
+            if let Err(e) = self.save_manifest() {
+                warn!(
+                    "Table '{}': reconcile: save_manifest after dc resync failed ({})",
+                    self.name, e
+                );
+            }
+        }
+
         // Phase 1: collect every live (pk → [(seg_id, local_id), ...]) location.
         let mut all_locations: HashMap<String, Vec<(u64, u32)>> = HashMap::new();
 
