@@ -474,6 +474,38 @@ impl Table {
             }
         }
 
+        // After tombstoning, the in-memory segments and on-disk deleted.bitmap
+        // are up to date, but `manifest.segments[i].deleted_count` is the
+        // cached value from before. self_health and any other consumer that
+        // counts live rows via the manifest will keep reporting the stale
+        // (higher) count until the next flush rewrites it. Resync deleted_count
+        // for every immutable segment we touched and persist the manifest now.
+        if !orphans_by_seg.is_empty() {
+            let touched: std::collections::HashSet<u64> =
+                orphans_by_seg.keys().copied().collect();
+            let mut manifest_dirty = false;
+            for seg in &self.immutable_segments {
+                if !touched.contains(&seg.id) {
+                    continue;
+                }
+                if let Some(meta) = self.manifest.segments.iter_mut().find(|m| m.id == seg.id) {
+                    let new_dc = seg.deleted_bitmap.len();
+                    if meta.deleted_count != new_dc {
+                        meta.deleted_count = new_dc;
+                        manifest_dirty = true;
+                    }
+                }
+            }
+            if manifest_dirty {
+                if let Err(e) = self.save_manifest() {
+                    warn!(
+                        "Table '{}': reconcile: save_manifest after tombstoning failed ({}); deleted_count in manifest may lag until next flush.",
+                        self.name, e
+                    );
+                }
+            }
+        }
+
         // Phase 4: bring `primary_index` in line with the physical truth we
         // just established. Anything pointing at a now-tombstoned row gets
         // re-pointed at the winner; PKs that have a winner but weren't in
