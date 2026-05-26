@@ -349,28 +349,50 @@ impl Table {
         for seg in &self.immutable_segments {
             let bitmap_path = seg.path.join(format!("bitmaps_{}.dat", pk_field));
             if !bitmap_path.exists() {
+                warn!(
+                    "Table '{}': reconcile: seg {} has no bitmaps_{}.dat — skipping (rows here can't be deduped)",
+                    self.name, seg.id, pk_field
+                );
                 continue;
             }
             let file = match fs::File::open(&bitmap_path) {
                 Ok(f) => f,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(
+                        "Table '{}': reconcile: seg {} bitmap open failed ({:#}) — skipping",
+                        self.name, seg.id, e
+                    );
+                    continue;
+                }
             };
             let reader = BufReader::new(file);
             let bitmaps: HashMap<String, RoaringBitmap> = match bincode::deserialize_from(reader) {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(
+                        "Table '{}': reconcile: seg {} bitmap DESERIALIZE FAILED ({:#}) — skipping (rows here can't be deduped)",
+                        self.name, seg.id, e
+                    );
+                    continue;
+                }
             };
+            let mut seg_live_locations = 0usize;
             for (pk_val, bitmap) in &bitmaps {
                 for local_id in bitmap.iter() {
                     if seg.deleted_bitmap.contains(local_id) {
                         continue;
                     }
+                    seg_live_locations += 1;
                     all_locations
                         .entry(pk_val.clone())
                         .or_default()
                         .push((seg.id, local_id));
                 }
             }
+            debug!(
+                "Table '{}': reconcile: seg {} contributed {} live location(s) across {} distinct PK(s)",
+                self.name, seg.id, seg_live_locations, bitmaps.len()
+            );
         }
 
         // Active segment — bitmaps live in memory, not on disk yet.
@@ -394,6 +416,7 @@ impl Table {
         // a per-segment list of orphans to tombstone.
         let mut orphans_by_seg: HashMap<u64, Vec<u32>> = HashMap::new();
         let mut latest_per_pk: HashMap<String, (u64, u32)> = HashMap::new();
+        let mut dup_pks = 0usize;
         for (pk, locations) in &all_locations {
             // unwrap safe: vec was created via `or_default().push(...)` so non-empty
             let &latest = locations.iter().max().expect("locations vec non-empty");
@@ -401,11 +424,22 @@ impl Table {
             if locations.len() < 2 {
                 continue;
             }
+            dup_pks += 1;
+            info!(
+                "Table '{}': reconcile: PK {:?} has {} live locations: {:?} — keeping {:?}",
+                self.name, pk, locations.len(), locations, latest
+            );
             for &(seg_id, local_id) in locations {
                 if (seg_id, local_id) != latest {
                     orphans_by_seg.entry(seg_id).or_default().push(local_id);
                 }
             }
+        }
+        if dup_pks > 0 {
+            info!(
+                "Table '{}': reconcile: {} PK(s) have >1 live location; will tombstone {} segment(s)",
+                self.name, dup_pks, orphans_by_seg.len()
+            );
         }
 
         // Phase 3: mark + persist tombstones.
