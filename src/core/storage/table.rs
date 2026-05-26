@@ -377,22 +377,74 @@ impl Table {
                 }
             };
             let mut seg_live_locations = 0usize;
+            let mut seen_in_seg: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (pk_val, bitmap) in &bitmaps {
                 for local_id in bitmap.iter() {
                     if seg.deleted_bitmap.contains(local_id) {
                         continue;
                     }
                     seg_live_locations += 1;
+                    seen_in_seg.insert(local_id);
                     all_locations
                         .entry(pk_val.clone())
                         .or_default()
                         .push((seg.id, local_id));
                 }
             }
-            debug!(
-                "Table '{}': reconcile: seg {} contributed {} live location(s) across {} distinct PK(s)",
-                self.name, seg.id, seg_live_locations, bitmaps.len()
-            );
+
+            // Fallback: if the bitmap contributed fewer live locations than the
+            // manifest says are live, the bitmap is corrupt or truncated. This
+            // happens on segments written before v0.1.143 (active-segment
+            // rotation bug). Scan id.dat directly to recover the missing
+            // PK→local_id mappings so cross-segment dedup still works.
+            let expected_live = seg.record_count.saturating_sub(seg.deleted_bitmap.len());
+            if (seg_live_locations as u64) < expected_live {
+                let pk_fields = vec![pk_field.clone()];
+                if let Err(e) = seg.ensure_mmaps_batch(&pk_fields) {
+                    warn!(
+                        "Table '{}': reconcile: seg {} fallback mmap failed ({:#}) — {} live PK(s) unrecoverable",
+                        self.name, seg.id, e, expected_live - seg_live_locations as u64
+                    );
+                } else {
+                    let mut recovered = 0usize;
+                    for local_id in 0..(seg.record_count as u32) {
+                        if seg.deleted_bitmap.contains(local_id) {
+                            continue;
+                        }
+                        if seen_in_seg.contains(&local_id) {
+                            continue;
+                        }
+                        match seg.get_row_values(local_id, &pk_fields) {
+                            Ok(vals) => {
+                                if let Some(pk_val) = vals.into_iter().next() {
+                                    if !pk_val.is_empty() {
+                                        recovered += 1;
+                                        all_locations
+                                            .entry(pk_val)
+                                            .or_default()
+                                            .push((seg.id, local_id));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Table '{}': reconcile: seg {} local_id {} read failed ({:#})",
+                                    self.name, seg.id, local_id, e
+                                );
+                            }
+                        }
+                    }
+                    warn!(
+                        "Table '{}': reconcile: seg {} bitmap incomplete ({} keyed live, {} expected) — fallback scan recovered {} PK location(s)",
+                        self.name, seg.id, seg_live_locations, expected_live, recovered
+                    );
+                }
+            } else {
+                debug!(
+                    "Table '{}': reconcile: seg {} contributed {} live location(s) across {} distinct PK(s)",
+                    self.name, seg.id, seg_live_locations, bitmaps.len()
+                );
+            }
         }
 
         // Active segment — bitmaps live in memory, not on disk yet.
