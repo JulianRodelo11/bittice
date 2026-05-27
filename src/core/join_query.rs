@@ -206,8 +206,13 @@ pub fn execute_join_query(
             if !resolved_order_by.is_empty() {
                 current_rows.sort_by(|left, right| compare_rows(left, right, &resolved_order_by));
                 total_found = current_rows.len();
-                let capped_limit = limit.min(100);
-                let early_window = offset.saturating_add(capped_limit);
+                // Honor the caller's limit. The HTTP layer caps it at
+                // HARD_MAX_LIMIT (10_000) in server/mod.rs, so the worst case
+                // here is bounded. The previous .min(100) silently capped
+                // every joined saved op at 100 rows regardless of ?limit=N
+                // — diagnostic ops like list-recent-checks need thousands
+                // and were paginating only because of this clamp.
+                let early_window = offset.saturating_add(limit);
                 if early_window > 0 && current_rows.len() > early_window {
                     current_rows.truncate(early_window);
                 }
@@ -237,11 +242,16 @@ pub fn execute_join_query(
         current_rows.sort_by(|left, right| compare_rows(left, right, &resolved_order_by));
     }
 
-    let capped_limit = limit.min(100);
-    let paged_rows: Vec<&FlatRow> = if capped_limit == 0 {
+    // Same reasoning as the early-window block above: trust the caller's
+    // limit (HARD_MAX_LIMIT-bounded upstream). The previous .min(100) here
+    // truncated the actual response payload regardless of ?limit=N, so the
+    // HTTP layer's pagination metadata showed per_page=5000 while data
+    // arrived at 100 rows — the silent cap that forced the warmer Lambda to
+    // paginate aggressively.
+    let paged_rows: Vec<&FlatRow> = if limit == 0 {
         Vec::new()
     } else {
-        current_rows.iter().skip(offset).take(capped_limit).collect()
+        current_rows.iter().skip(offset).take(limit).collect()
     };
 
     let headers = projections.iter().map(|projection| projection.header.clone()).collect::<Vec<_>>();
