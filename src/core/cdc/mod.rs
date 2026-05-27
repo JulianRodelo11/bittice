@@ -321,7 +321,6 @@ impl CdcWorker {
                 info!(
                     "CDC: auto-compact {entity}/{mirror_table} removed {removed} segment(s) (live_rows={live}, had {segs})",
                 );
-                let _ = table.sync_manifest_deleted_counts();
             }
             Ok(_) => {}
             Err(e) => {

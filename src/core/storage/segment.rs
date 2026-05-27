@@ -61,7 +61,6 @@ impl Segment {
                 .unwrap_or_default()
                 .as_secs() as i64,
             record_count: self.record_count,
-            deleted_count: self.deleted_bitmap.len(),
             path: format!("seg_{:04}", self.id),
         }
     }

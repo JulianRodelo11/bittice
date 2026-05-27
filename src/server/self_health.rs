@@ -467,74 +467,80 @@ fn resolve_mirror_dir(data_root: &Path, entity: &str, table: &str) -> PathBuf {
     direct
 }
 
+/// Count live rows across every segment of a mirror table.
+///
+/// Reads ONLY from durable on-disk artifacts — never trusts manifest metadata
+/// for live counts. The manifest used to cache a `deleted_count` field that
+/// silently desynced from the real tombstone bitmap on every CDC delete; six
+/// different "resync" call sites existed to fight that drift before v0.1.157
+/// removed the cache entirely. Per segment:
+///   - record_count = `<pk_field>.offsets` size / 8 (one u64 offset per row)
+///   - deleted_count = len of the RoaringBitmap in `deleted.bitmap`
+/// Both files are durable and atomically written, so a transient mid-write
+/// read at worst lags one delete.
+///
+/// Cost per call: one stat + one bitmap deserialize per segment dir. For a
+/// 30-segment table with ~50-byte bitmaps that's well under 1ms.
 fn mirror_live_count(table_dir: &Path) -> Option<u64> {
     let manifest = table_dir.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest).ok()?;
     let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let segments = val.get("segments")?.as_array()?;
-    let mut live: i64 = 0;
-    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for seg in segments {
-        let rc = seg.get("record_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let dc = seg.get("deleted_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        live += (rc - dc).max(0);
-        if let Some(id) = seg.get("id").and_then(|v| v.as_u64()) {
-            seen_ids.insert(id);
+
+    // PK column name is per-table — read from manifest so this works for
+    // any customer schema (PK may be `id`, `uuid`, `customer_id`, …). The
+    // fallback below scans the segment dir for any `*.offsets` file; every
+    // column writes one u64 per row so any of them yields the same count.
+    let pk_field = val
+        .get("primary_key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let mut seg_ids: Vec<u64> = val
+        .get("segments")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("id").and_then(|v| v.as_u64()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(active_id) = val.get("active_segment_id").and_then(|v| v.as_u64()) {
+        if !seg_ids.contains(&active_id) {
+            seg_ids.push(active_id);
         }
     }
-    // Also include the active segment. Its rc/dc are not in manifest.segments
-    // (those are immutable only). Derive rc from the primary-key column's
-    // .offsets file size (8 bytes per row — same layout for every customer
-    // table because the segment writer always writes one u64 offset per row
-    // per column), and dc from deleted.bitmap on disk. Table::delete
-    // persists deleted.bitmap on every CDC delete event, so the on-disk
-    // view trails in-memory by at most one in-flight call. Without this,
-    // a freshly-compacted or freshly-rotated table whose only live rows
-    // live in active reads as 0 here — and self_health raises a
-    // false-positive drift incident against a mirror that actually matches
-    // source.
-    if let Some(active_id) = val.get("active_segment_id").and_then(|v| v.as_u64()) {
-        if !seen_ids.contains(&active_id) {
-            // The PK column name is per-table — read it from the manifest so
-            // this works for any customer schema (PK might be `id`, `uuid`,
-            // `customer_id`, etc.). Fall back to scanning the segment dir for
-            // any `*.offsets` file if the manifest has no primary_key set;
-            // every column writes one offset per row so any will yield the
-            // same record count.
-            let pk_field = val
-                .get("primary_key")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            let active_path = table_dir
-                .join("segments")
-                .join(format!("seg_{:04}", active_id));
-            let offsets_path = match pk_field {
-                Some(name) => Some(active_path.join(format!("{}.offsets", name))),
-                None => std::fs::read_dir(&active_path).ok().and_then(|entries| {
-                    entries.flatten().find_map(|e| {
-                        let name = e.file_name();
-                        let name = name.to_string_lossy();
-                        if name.ends_with(".offsets") {
-                            Some(e.path())
-                        } else {
-                            None
-                        }
-                    })
-                }),
-            };
-            if let Some(p) = offsets_path {
-                if let Ok(meta) = std::fs::metadata(&p) {
-                    let active_rc = (meta.len() / 8) as i64;
-                    let mut active_dc: i64 = 0;
-                    if let Ok(file) = std::fs::File::open(active_path.join("deleted.bitmap")) {
-                        if let Ok(bm) = roaring::RoaringBitmap::deserialize_from(file) {
-                            active_dc = bm.len() as i64;
-                        }
+
+    let segments_dir = table_dir.join("segments");
+    let mut live: i64 = 0;
+    for seg_id in seg_ids {
+        let seg_path = segments_dir.join(format!("seg_{:04}", seg_id));
+        let offsets_path = match pk_field.as_deref() {
+            Some(name) => seg_path.join(format!("{}.offsets", name)),
+            None => match std::fs::read_dir(&seg_path).ok().and_then(|entries| {
+                entries.flatten().find_map(|e| {
+                    if e.file_name().to_string_lossy().ends_with(".offsets") {
+                        Some(e.path())
+                    } else {
+                        None
                     }
-                    live += (active_rc - active_dc).max(0);
-                }
-            }
-        }
+                })
+            }) {
+                Some(p) => p,
+                None => continue,
+            },
+        };
+        let rc = match std::fs::metadata(&offsets_path) {
+            Ok(m) => (m.len() / 8) as i64,
+            Err(_) => continue,
+        };
+        let dc = match std::fs::File::open(seg_path.join("deleted.bitmap")) {
+            Ok(file) => roaring::RoaringBitmap::deserialize_from(file)
+                .map(|bm| bm.len() as i64)
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        live += (rc - dc).max(0);
     }
     Some(live as u64)
 }

@@ -10,8 +10,6 @@ pub struct SegmentMeta {
     pub min_max: HashMap<String, (String, String)>,
     pub created_at: i64,
     pub record_count: u64,
-    #[serde(default)]
-    pub deleted_count: u64,
     /// Path relative to table root where segment data is stored
     pub path: String,
 }

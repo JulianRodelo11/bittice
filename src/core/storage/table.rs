@@ -342,40 +342,6 @@ impl Table {
             self.manifest.primary_key.clone()
         };
 
-        // Phase 0: resync manifest.segments[i].deleted_count from each
-        // immutable segment's actual on-disk deleted_bitmap.
-        //
-        // The cached count gets set at segment creation (flush_active_segment
-        // calls to_meta()) but is NOT updated when subsequent CDC delete
-        // events tombstone rows in already-immutable segments. The result:
-        // self_health and any consumer that counts via manifest reports
-        // mirror has more live rows than it actually does (apparent drift),
-        // even though the data, primary_index, and deleted_bitmap on disk
-        // are all consistent. Resync here, once per open, so the manifest
-        // catches up before anything reads it.
-        let mut manifest_dirty = false;
-        for seg in &self.immutable_segments {
-            let actual_dc = seg.deleted_bitmap.len();
-            if let Some(meta) = self.manifest.segments.iter_mut().find(|m| m.id == seg.id) {
-                if meta.deleted_count != actual_dc {
-                    info!(
-                        "Table '{}': reconcile: resyncing manifest seg {} deleted_count {} → {} (CDC tombstones since last flush)",
-                        self.name, seg.id, meta.deleted_count, actual_dc
-                    );
-                    meta.deleted_count = actual_dc;
-                    manifest_dirty = true;
-                }
-            }
-        }
-        if manifest_dirty {
-            if let Err(e) = self.save_manifest() {
-                warn!(
-                    "Table '{}': reconcile: save_manifest after dc resync failed ({})",
-                    self.name, e
-                );
-            }
-        }
-
         // Phase 1: collect every live (pk → [(seg_id, local_id), ...]) location.
         let mut all_locations: HashMap<String, Vec<(u64, u32)>> = HashMap::new();
 
@@ -505,38 +471,6 @@ impl Table {
                     orphans.len(),
                     seg_id
                 );
-            }
-        }
-
-        // After tombstoning, the in-memory segments and on-disk deleted.bitmap
-        // are up to date, but `manifest.segments[i].deleted_count` is the
-        // cached value from before. self_health and any other consumer that
-        // counts live rows via the manifest will keep reporting the stale
-        // (higher) count until the next flush rewrites it. Resync deleted_count
-        // for every immutable segment we touched and persist the manifest now.
-        if !orphans_by_seg.is_empty() {
-            let touched: std::collections::HashSet<u64> =
-                orphans_by_seg.keys().copied().collect();
-            let mut manifest_dirty = false;
-            for seg in &self.immutable_segments {
-                if !touched.contains(&seg.id) {
-                    continue;
-                }
-                if let Some(meta) = self.manifest.segments.iter_mut().find(|m| m.id == seg.id) {
-                    let new_dc = seg.deleted_bitmap.len();
-                    if meta.deleted_count != new_dc {
-                        meta.deleted_count = new_dc;
-                        manifest_dirty = true;
-                    }
-                }
-            }
-            if manifest_dirty {
-                if let Err(e) = self.save_manifest() {
-                    warn!(
-                        "Table '{}': reconcile: save_manifest after tombstoning failed ({}); deleted_count in manifest may lag until next flush.",
-                        self.name, e
-                    );
-                }
             }
         }
 
@@ -1003,7 +937,6 @@ impl Table {
                 self.name, e
             );
         }
-        let _ = self.sync_manifest_deleted_counts();
         Ok(())
     }
 
@@ -1134,36 +1067,6 @@ impl Table {
         if let Some(writer) = &self.active_segment {
             if writer.segment.has_deletions() {
                 writer.segment.persist_deleted_bitmap()?;
-            }
-        }
-        self.sync_manifest_deleted_counts()?;
-        Ok(())
-    }
-
-    /// Keep `manifest.json` `deleted_count` aligned with on-disk `deleted.bitmap` files.
-    /// UPDATE paths tombstone old rows without rotating segments; manifest meta was only
-    /// snapshotted at rotation time, so external row-count tools otherwise over-count ghosts.
-    pub fn sync_manifest_deleted_counts(&mut self) -> Result<()> {
-        let segments_dir = self.base_path.join("segments");
-        for meta in &mut self.manifest.segments {
-            if let Some(seg) = self.immutable_segments.iter().find(|s| s.id == meta.id) {
-                meta.record_count = seg.record_count;
-                meta.deleted_count = seg.deleted_bitmap.len() as u64;
-                continue;
-            }
-            if let Some(writer) = &self.active_segment {
-                if writer.segment.id == meta.id {
-                    meta.record_count = writer.segment.record_count;
-                    meta.deleted_count = writer.segment.deleted_bitmap.len() as u64;
-                    continue;
-                }
-            }
-            let seg_path = segments_dir.join(format!("seg_{:04}", meta.id));
-            if seg_path.is_dir() {
-                if let Ok(seg) = Segment::load(&seg_path, Some(meta)) {
-                    meta.record_count = seg.record_count;
-                    meta.deleted_count = seg.deleted_bitmap.len() as u64;
-                }
             }
         }
         Ok(())
@@ -2485,7 +2388,6 @@ impl Table {
                     .unwrap_or_default()
                     .as_secs() as i64,
                 record_count: writer.segment.record_count,
-                deleted_count: 0,
                 path: format!("seg_{:04}", final_id),
             };
             let mut seg = Segment::load(&final_seg_path, Some(&meta))?;
