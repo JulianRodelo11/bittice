@@ -452,10 +452,39 @@ fn mirror_live_count(table_dir: &Path) -> Option<u64> {
     let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let segments = val.get("segments")?.as_array()?;
     let mut live: i64 = 0;
+    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for seg in segments {
         let rc = seg.get("record_count").and_then(|v| v.as_i64()).unwrap_or(0);
         let dc = seg.get("deleted_count").and_then(|v| v.as_i64()).unwrap_or(0);
         live += (rc - dc).max(0);
+        if let Some(id) = seg.get("id").and_then(|v| v.as_u64()) {
+            seen_ids.insert(id);
+        }
+    }
+    // Also include the active segment. Its rc/dc are not in manifest.segments
+    // (those are immutable only). Derive rc from id.offsets size (8 bytes per
+    // row) and dc from deleted.bitmap on disk (Table::delete persists the
+    // bitmap on every CDC delete, so the on-disk view trails the in-memory
+    // one by at most one in-flight call). Without this, a freshly-compacted
+    // or freshly-rotated table whose only live rows live in active reads as
+    // 0 here — and self_health raises a false-positive drift incident
+    // against a mirror that actually matches source.
+    if let Some(active_id) = val.get("active_segment_id").and_then(|v| v.as_u64()) {
+        if !seen_ids.contains(&active_id) {
+            let active_path = table_dir
+                .join("segments")
+                .join(format!("seg_{:04}", active_id));
+            if let Ok(meta) = std::fs::metadata(active_path.join("id.offsets")) {
+                let active_rc = (meta.len() / 8) as i64;
+                let mut active_dc: i64 = 0;
+                if let Ok(file) = std::fs::File::open(active_path.join("deleted.bitmap")) {
+                    if let Ok(bm) = roaring::RoaringBitmap::deserialize_from(file) {
+                        active_dc = bm.len() as i64;
+                    }
+                }
+                live += (active_rc - active_dc).max(0);
+            }
+        }
     }
     Some(live as u64)
 }
