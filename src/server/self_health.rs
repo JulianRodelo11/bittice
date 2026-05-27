@@ -36,7 +36,14 @@ use crate::core::control_plane::{
     TimingDiagnostics,
 };
 
-const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(60);
+// 300s, not 60s. The control plane runs on Lambda; every poll is a paid
+// invocation + 2 RDS SELECTs. Config changes here (self_health_enabled,
+// watch lists, auto_repair toggles) are operational toggles, not
+// urgencies — propagation in up to 5 min is fine. Cuts request load on
+// the control plane by 12x. ETag/304 means even when nothing changed the
+// roundtrip is cheap, but the Lambda still has to wake, query, and
+// return — so cadence dominates the cost.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(300);
 const CONFIG_INITIAL_BACKOFF_STEPS: &[u64] = &[5, 15, 45, 120, 300];
 
 // Audit / append-only tables that always drift when compared with COUNT(*).
@@ -104,34 +111,48 @@ async fn run(identity: Identity) {
         current.effective_config.self_health_enabled,
     );
 
-    // 2. Main loop: every interval, check; in between, refresh config every 60s.
+    // Two independent cadences:
+    //   - Config refresh:  every CONFIG_POLL_INTERVAL (300s). Each call hits
+    //                      the control plane Lambda + 2 RDS SELECTs, so we
+    //                      keep it slow. Operational toggles propagate within
+    //                      ~5 min — fine for self_health_enabled/watchlists.
+    //   - Drift check:     every effective_config.self_health_interval_secs.
+    //                      Decoupled from the config refresh so a 60s check
+    //                      interval is still honored (the loop ticks at 30s
+    //                      to give 30s scheduling resolution to whichever
+    //                      timer fires next).
+    let mut last_config_fetch = std::time::Instant::now();
     let mut last_check = std::time::Instant::now()
         .checked_sub(Duration::from_secs(
             current.effective_config.self_health_interval_secs,
         ))
         .unwrap_or_else(std::time::Instant::now);
+    let tick = Duration::from_secs(30);
 
     loop {
-        tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
+        tokio::time::sleep(tick).await;
 
-        // Refresh config (cheap with ETag/304).
-        match fetch_engine_config(
-            &identity.control_plane_url,
-            &identity.deployment_id,
-            &identity.instance_token,
-            Some(&current.config_version),
-        )
-        .await
-        {
-            Ok(ConfigFetch::Fresh(new_cfg)) => {
-                info!(
-                    "self_health: config updated (version {} → {})",
-                    current.config_version, new_cfg.config_version
-                );
-                current = new_cfg;
+        // Refresh config only when CONFIG_POLL_INTERVAL has elapsed.
+        if last_config_fetch.elapsed() >= CONFIG_POLL_INTERVAL {
+            match fetch_engine_config(
+                &identity.control_plane_url,
+                &identity.deployment_id,
+                &identity.instance_token,
+                Some(&current.config_version),
+            )
+            .await
+            {
+                Ok(ConfigFetch::Fresh(new_cfg)) => {
+                    info!(
+                        "self_health: config updated (version {} → {})",
+                        current.config_version, new_cfg.config_version
+                    );
+                    current = new_cfg;
+                }
+                Ok(ConfigFetch::NotModified) => {}
+                Err(e) => debug!("self_health: config refresh failed: {e:#}"),
             }
-            Ok(ConfigFetch::NotModified) => {}
-            Err(e) => debug!("self_health: config refresh failed: {e:#}"),
+            last_config_fetch = std::time::Instant::now();
         }
 
         let cfg = &current.effective_config;
