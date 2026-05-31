@@ -13,7 +13,14 @@ services:
   bittice:
     image: ${BITTICE_IMAGE:?set BITTICE_IMAGE in .env or environment}
     container_name: bittice
-    restart: always
+    # on-failure:10 instead of always — `always` would restart the engine
+    # in a tight loop (~5s apart) if it crashed on startup, leaking a Docker
+    # network namespace each time. On a 0.5 GB host that exhausted kernel
+    # resources within minutes and hung the OS for 2 days before we noticed
+    # (incident 2026-05-28). With the bounded count, the container parks
+    # after 10 crashes; CloudWatch + EC2 Instance Recovery alarms catch
+    # whatever made it unreachable.
+    restart: "on-failure:10"
     labels:
       - com.centurylinklabs.watchtower.enable=true
     ports:
