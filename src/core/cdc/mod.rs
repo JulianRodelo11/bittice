@@ -108,6 +108,13 @@ pub struct CdcWorker {
     startup_report_sent: AtomicBool,
     /// Per-mirror-table key `entity/table_dir`: row batches applied since last `flush_active_segment`.
     cdc_mirror_flush_ticks: Arc<RwLock<HashMap<String, u32>>>,
+    /// Per-mirror-table key `entity/table_dir`: monotonic time of the last successful buffer
+    /// flush. Used as a fallback flush trigger for low-traffic tables — without it, a table
+    /// that only receives one UPDATE per heartbeat (e.g. `deployments` at 5-min cadence) would
+    /// wait `mirror_flush_every_n_batches` × 5 min = hours before its buffered insert reaches
+    /// the offsets file. In that window, `mirror_live_count` reads a fresh `deleted.bitmap`
+    /// against a stale offsets size and reports false-positive drift.
+    cdc_mirror_flush_last: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     /// White-list of `schema.table` (lowercase) to mirror.  When `Some`, every other binlog
     /// table is skipped during bootstrap and live replication.  Built from `cdc_config.json`
     /// (`tables`, `scoped_sync`) or, if unset, from `.bittice_ops.json` when `BITTICE_CDC_SYNC_ONLY_OPS=1`.
@@ -197,6 +204,7 @@ impl CdcWorker {
             startup_report_tx,
             startup_report_sent: AtomicBool::new(false),
             cdc_mirror_flush_ticks: Arc::new(RwLock::new(HashMap::new())),
+            cdc_mirror_flush_last: Arc::new(RwLock::new(HashMap::new())),
             table_allowlist,
             schema_allowlist,
             table_allowlist_source,
@@ -3527,15 +3535,38 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 table.flush_active_segment()?;
             } else {
                 // Periodic lightweight buffer flush for durability (no bitmap rebuild).
+                //
+                // Two triggers, whichever fires first:
+                //   - batch-count: flush every `mirror_flush_every_n_batches` events.
+                //     Tuned for high-traffic tables (Balanced=32, Strict=1).
+                //   - time-based: flush if more than BITTICE_CDC_FLUSH_MAX_INTERVAL_SECS
+                //     have passed since the last flush on this table. Required for
+                //     low-traffic tables (heartbeat-driven, ~1 event/5 min); without
+                //     it the batch counter would take hours to reach the threshold,
+                //     during which deleted.bitmap is persisted eagerly but the
+                //     matching insert stays buffered → mirror_live_count sees rc<dc
+                //     and reports false drift.
                 let n_flush = crate::core::cdc_durability::mirror_flush_every_n_batches();
+                let max_interval_secs: u64 = std::env::var("BITTICE_CDC_FLUSH_MAX_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(30);
+                let max_interval = std::time::Duration::from_secs(max_interval_secs.max(1));
                 let do_buffer_flush = if n_flush <= 1 {
                     true
                 } else {
                     let k = format!("{}/{}", disk_entity, mirror_table);
+                    let now = std::time::Instant::now();
                     let mut ticks = self.cdc_mirror_flush_ticks.write().unwrap();
-                    let t = ticks.entry(k).or_insert(0);
+                    let t = ticks.entry(k.clone()).or_insert(0);
                     *t = t.saturating_add(1);
-                    if *t >= n_flush || applied >= 10_000 {
+                    let batch_trigger = *t >= n_flush || applied >= 10_000;
+                    let time_trigger = {
+                        let mut last = self.cdc_mirror_flush_last.write().unwrap();
+                        let entry = last.entry(k).or_insert(now);
+                        now.duration_since(*entry) >= max_interval
+                    };
+                    if batch_trigger || time_trigger {
                         *t = 0;
                         true
                     } else {
@@ -3544,6 +3575,11 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 };
                 if do_buffer_flush {
                     table.flush_active_segment_buffers()?;
+                    let k = format!("{}/{}", disk_entity, mirror_table);
+                    self.cdc_mirror_flush_last
+                        .write()
+                        .unwrap()
+                        .insert(k, std::time::Instant::now());
                 }
             }
             if op_label == "UPDATE" {
