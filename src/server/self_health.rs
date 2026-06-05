@@ -293,11 +293,11 @@ async fn run_check(
             let disk_entity = if sync_all { schema.to_lowercase() } else { entity.clone() };
             let mirror_dir = resolve_mirror_dir(data_root, &disk_entity, &table_sql);
 
-            let mirror_count_at = chrono::Utc::now();
-            let mirror_count = mirror_live_count(&mirror_dir).unwrap_or(0);
+            let mut mirror_count_at = chrono::Utc::now();
+            let mut mirror_count = mirror_live_count(&mirror_dir).unwrap_or(0);
 
-            let source_count_at = chrono::Utc::now();
-            let source_count = match mysql_count(&mut conn, sync_all, &database, &schema, &table_sql).await
+            let mut source_count_at = chrono::Utc::now();
+            let mut source_count = match mysql_count(&mut conn, sync_all, &database, &schema, &table_sql).await
             {
                 Ok(n) => n,
                 Err(e) => {
@@ -306,7 +306,44 @@ async fn run_check(
                 }
             };
 
-            let diff = source_count as i64 - mirror_count as i64;
+            let mut diff = source_count as i64 - mirror_count as i64;
+
+            // Drift revalidation. When self_health runs immediately after the
+            // engine's own heartbeat round-trip (heartbeat HTTP → control plane
+            // Lambda → RDS INSERT → binlog → engine CDC stream), the source
+            // COUNT(*) sees the new row before the binlog event has reached
+            // this engine's CDC reader. The mirror catches up within
+            // hundreds of ms. Without this revalidation, the first check
+            // opens a transient incident that auto-closes 5 min later — the
+            // user gets an email for a mirror that's actually fine.
+            //
+            // Recheck after a short delay; only the second reading defines
+            // the reported state. Both source and mirror are re-read so we
+            // don't carry a stale half from the first pass.
+            if diff != 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                mirror_count_at = chrono::Utc::now();
+                mirror_count = mirror_live_count(&mirror_dir).unwrap_or(mirror_count);
+                source_count_at = chrono::Utc::now();
+                source_count = match mysql_count(
+                    &mut conn, sync_all, &database, &schema, &table_sql,
+                ).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("self_health: COUNT({qkey}) revalidation failed: {e:#}");
+                        continue;
+                    }
+                };
+                let new_diff = source_count as i64 - mirror_count as i64;
+                if new_diff == 0 && diff != 0 {
+                    debug!(
+                        "self_health: {qkey} drift {diff} absorbed by 2s revalidation \
+                         (CDC lag race, not a real drift)"
+                    );
+                }
+                diff = new_diff;
+            }
+
             rows.push(TableConsistency {
                 table: qkey.clone(),
                 source_count,
