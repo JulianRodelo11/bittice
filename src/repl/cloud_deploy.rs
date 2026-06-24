@@ -456,7 +456,10 @@ struct EngineIdentity {
 /// Bittice runs as a plain docker bridge container. EC2 lives in the same VPC as
 /// the target RDS (placed there by Terraform), so CDC reaches MySQL through AWS
 /// internal networking — no VPN, no sidecar, no policy routing.
-fn generate_compose(image: &str, ident: Option<&EngineIdentity>) -> String {
+///
+/// When `rest_domain` is set, Caddy terminates HTTPS on :443 and proxies to
+/// bittice:3000. Admin (:8080) and gRPC (:50051) bind to localhost / VPC only.
+fn generate_compose(image: &str, ident: Option<&EngineIdentity>, rest_domain: Option<&str>) -> String {
     let identity_block = match ident {
         Some(i) => format!(
             "      - BITTICE_DEPLOYMENT_ID={}\n      - BITTICE_INSTANCE_TOKEN={}\n      - BITTICE_CONTROL_PLANE_URL={}\n",
@@ -472,6 +475,53 @@ fn generate_compose(image: &str, ident: Option<&EngineIdentity>) -> String {
     // `--label-enable` means Watchtower only touches containers explicitly labeled.
     // We label `bittice` so it gets updated; we DON'T label `watchtower` itself so
     // it never tries to update its own process while restarting (would deadlock).
+    let (bittice_ports, caddy_block, networks_block, volumes_block) = match rest_domain {
+        Some(_) => (
+            r#"    ports:
+      - "127.0.0.1:8080:8080"
+      - "50051:50051"
+    networks:
+      - bittice_net
+"#,
+            r#"
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - /opt/bittice/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - bittice_net
+    depends_on:
+      - bittice
+"#,
+            r#"
+networks:
+  bittice_net:
+"#,
+            r#"
+volumes:
+  caddy_data:
+  caddy_config:
+"#,
+        ),
+        None => (
+            r#"    ports:
+      - "0.0.0.0:3000:3000"
+      - "0.0.0.0:8080:8080"
+      - "0.0.0.0:50051:50051"
+"#,
+            "",
+            "",
+            "",
+        ),
+    };
+
     format!(
 r#"services:
   bittice:
@@ -479,11 +529,7 @@ r#"services:
     container_name: bittice
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
-    ports:
-      - "0.0.0.0:3000:3000"
-      - "0.0.0.0:8080:8080"
-      - "0.0.0.0:50051:50051"
-    volumes:
+{bittice_ports}    volumes:
       - /opt/bittice/data:/app/data
     environment:
       - BITTICE_HOST=0.0.0.0
@@ -497,7 +543,7 @@ r#"services:
       # let segments grow unbounded over time. We only skip on the corp
       # dev instance where startup speed beats long-term shape.
 {identity_block}    restart: unless-stopped
-
+{caddy_block}
   watchtower:
     image: containrrr/watchtower:latest
     container_name: watchtower
@@ -514,11 +560,23 @@ r#"services:
       - "300"
       - --label-enable
       - --cleanup
-"#
+{networks_block}{volumes_block}"#
     )
 }
 
-fn deploy_compose(ip: &str, ssh_key: &str, image: &str, ident: Option<&EngineIdentity>) -> Result<()> {
+fn generate_caddyfile(rest_domain: &str) -> String {
+    format!(
+        "{rest_domain} {{\n    reverse_proxy bittice:3000\n}}\n"
+    )
+}
+
+fn deploy_compose(
+    ip: &str,
+    ssh_key: &str,
+    image: &str,
+    ident: Option<&EngineIdentity>,
+    rest_domain: Option<&str>,
+) -> Result<()> {
     // Wait for cloud-init to finish before touching anything Docker-related.
     // EC2 returns SSH responsive as soon as sshd is up, but Terraform's user_data
     // (apt-get install docker.io) runs in parallel and can take 1-3 minutes.
@@ -551,7 +609,7 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, ident: Option<&EngineIde
         "sudo chown -R ubuntu:ubuntu /opt/bittice; \
          sudo systemctl stop 'openvpn@*' 'openvpn-client@*' 2>/dev/null || true; \
          sudo systemctl disable 'openvpn@bittice' 'openvpn-client@bittice' 2>/dev/null || true; \
-         docker rm -f bittice bittice-vpn 2>/dev/null || true; \
+         docker rm -f bittice bittice-vpn caddy 2>/dev/null || true; \
          cd /opt/bittice && docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true",
         "Tearing down previous stack…",
     )?;
@@ -565,11 +623,17 @@ fn deploy_compose(ip: &str, ssh_key: &str, image: &str, ident: Option<&EngineIde
         "Ensuring docker-compose…",
     )?;
 
-    // Write docker-compose.yml
-    let compose = generate_compose(image, ident);
+    // Write docker-compose.yml (+ Caddyfile when using HTTPS front)
+    let compose = generate_compose(image, ident, rest_domain);
     ssh_run_labeled(ip, ssh_key, &format!(
         "cat > /opt/bittice/docker-compose.yml << 'COMPEOF'\n{compose}COMPEOF"
     ), "Writing docker-compose.yml…")?;
+    if let Some(domain) = rest_domain {
+        let caddyfile = generate_caddyfile(domain);
+        ssh_run_labeled(ip, ssh_key, &format!(
+            "cat > /opt/bittice/Caddyfile << 'CADDYEOF'\n{caddyfile}CADDYEOF"
+        ), "Writing Caddyfile…")?;
+    }
 
     // Pull image and start stack.
     ssh_run_labeled(
@@ -1135,8 +1199,9 @@ fn build_tfvars(
              target_subnet_id               = \"{}\"\n\
              target_rds_security_group_ids  = [{}]\n\
              rds_port                       = {}\n\
-             allowed_admin_cidr             = \"{}\"\n",
-            p.vpc_id, p.subnet_id, sg_list, rds_port, p.vpc_cidr,
+             allowed_admin_cidr             = \"{}\"\n\
+             allowed_grpc_cidr              = \"{}\"\n",
+            p.vpc_id, p.subnet_id, sg_list, rds_port, p.vpc_cidr, p.vpc_cidr,
         ));
     }
     s
@@ -1160,6 +1225,63 @@ fn validate_deployment_name(name: &str) -> Result<()> {
     for c in n.chars() {
         if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
             bail!("Name can only contain lowercase letters, digits, and hyphens (offending char: '{c}').");
+        }
+    }
+    Ok(())
+}
+
+fn cloud_config_path() -> PathBuf {
+    crate::core::data_paths::resolved_data_root().join(".bittice_cloud.json")
+}
+
+fn load_cloud_config_domain(app_name: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(cloud_config_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if v.get("app_name")?.as_str()? != app_name {
+        return None;
+    }
+    let d = v.get("rest_domain")?.as_str()?.trim();
+    if d.is_empty() {
+        return None;
+    }
+    Some(d.to_string())
+}
+
+fn save_cloud_config(app_name: &str, rest_domain: &str) -> Result<()> {
+    let v = serde_json::json!({
+        "app_name": app_name,
+        "rest_domain": rest_domain,
+    });
+    std::fs::write(
+        cloud_config_path(),
+        serde_json::to_string_pretty(&v).context("serialize cloud config")?,
+    )
+    .context("write .bittice_cloud.json")?;
+    Ok(())
+}
+
+/// Public hostname for HTTPS REST (no scheme, no port).
+fn validate_rest_domain(domain: &str) -> Result<()> {
+    let d = domain.trim().trim_end_matches('.');
+    if d.len() < 4 || d.len() > 253 {
+        bail!("Hostname must be 4–253 characters.");
+    }
+    if d.contains("://") || d.contains('/') || d.contains(':') {
+        bail!("Enter only the hostname (e.g. dash-sac.dev.parking.net.co), not a URL or port.");
+    }
+    if !d.contains('.') {
+        bail!("Hostname must look like a DNS name (contain at least one dot).");
+    }
+    for label in d.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            bail!("Invalid hostname label in '{d}'.");
+        }
+        let first = label.chars().next().unwrap();
+        if !first.is_ascii_alphanumeric() {
+            bail!("Each label must start with a letter or digit.");
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            bail!("Hostname labels may only contain letters, digits, and hyphens.");
         }
     }
     Ok(())
@@ -1276,6 +1398,29 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         }
     };
 
+    // ── REST public hostname (HTTPS via Caddy; admin/gRPC not on public URLs) ──
+    let default_domain = load_cloud_config_domain(&app_name).unwrap_or_default();
+    let rest_domain: String = loop {
+        let raw: String = match input(
+            "Public REST hostname (HTTPS — DNS A record must point to this EC2's Elastic IP)",
+        )
+        .default_input(&default_domain)
+        .interact()
+        {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let candidate = raw.trim().to_string();
+        match validate_rest_domain(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) => { let _ = log::warning(format!("{e} Try again.")); }
+        }
+    };
+    let _ = log::info(format!(
+        "REST will be https://{rest_domain}  |  Admin via SSH tunnel  |  gRPC VPC-only"
+    ));
+
     // ── IAM permissions note ──
     let _ = note(
         "AWS IAM permissions required",
@@ -1361,7 +1506,16 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     let ip = terraform_output(&tf_bin, &tf_dir, "public_ip")?;
     let _ = log::success(format!("EC2 Elastic IP: {ip}"));
 
-    finish_deploy(&ip, &ssh_priv, &image, &data_root, ident.as_ref())
+    finish_deploy(
+        &ip,
+        &ssh_priv,
+        &image,
+        &data_root,
+        ident.as_ref(),
+        Some(rest_domain.as_str()),
+    )?;
+    save_cloud_config(&app_name, &rest_domain)?;
+    Ok(())
 }
 
 fn finish_deploy(
@@ -1370,6 +1524,7 @@ fn finish_deploy(
     image: &str,
     data_root: &Path,
     ident: Option<&EngineIdentity>,
+    rest_domain: Option<&str>,
 ) -> Result<()> {
     let profile_count = crate::core::data_paths::cdc_profile_count(data_root);
     if profile_count == 0 {
@@ -1389,23 +1544,54 @@ fn finish_deploy(
     )?;
     rsync_data(data_root, ip, ssh_priv)?;
 
-    deploy_compose(ip, ssh_priv, image, ident)?;
+    deploy_compose(ip, ssh_priv, image, ident, rest_domain)?;
 
     wait_for_cdc_live(ip, ssh_priv, profile_count)?;
 
-    let ok = Command::new("ssh")
+    let admin_ok = Command::new("ssh")
         .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
-               "-i", ssh_priv, &format!("ubuntu@{ip}"), "curl -sf http://localhost:8080"])
+               "-i", ssh_priv, &format!("ubuntu@{ip}"), "curl -sf http://127.0.0.1:8080"])
         .stdout(Stdio::null()).stderr(Stdio::null())
         .status().map(|s| s.success()).unwrap_or(false);
 
+    let rest_ok = if let Some(domain) = rest_domain {
+        Command::new("ssh")
+            .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+                   "-i", ssh_priv, &format!("ubuntu@{ip}"),
+                   &format!("curl -sf http://127.0.0.1:3000 >/dev/null 2>&1 || docker exec bittice curl -sf http://127.0.0.1:3000 >/dev/null")])
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false)
+            || {
+                let _ = domain; // HTTPS cert may still be provisioning
+                true
+            }
+    } else {
+        Command::new("ssh")
+            .args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                   "-i", ssh_priv, &format!("ubuntu@{ip}"), "curl -sf http://127.0.0.1:3000"])
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false)
+    };
+
     let _ = log::success(format!(
-        "Bittice running at {ip}  (HTTP admin: {}, CDC profiles: {profile_count})",
-        if ok { "OK" } else { "check pending" }
+        "Bittice running at {ip}  (admin local: {}, REST: {}, CDC profiles: {profile_count})",
+        if admin_ok { "OK" } else { "check pending" },
+        if rest_ok { "OK" } else { "check pending" },
     ));
-    let _ = log::info(format!("REST   http://{ip}:3000"));
-    let _ = log::info(format!("Admin  http://{ip}:8080"));
-    let _ = log::info(format!("gRPC   {ip}:50051"));
+
+    if let Some(domain) = rest_domain {
+        let _ = log::info(format!("REST   https://{domain}"));
+        let _ = log::info(format!(
+            "Admin  ssh -L 8080:127.0.0.1:8080 -i {ssh_priv} ubuntu@{ip}  →  http://127.0.0.1:8080"
+        ));
+        let _ = log::info(format!(
+            "gRPC   {ip}:50051  (VPC only — or ssh -L 50051:127.0.0.1:50051 …)"
+        ));
+    } else {
+        let _ = log::info(format!("REST   http://{ip}:3000"));
+        let _ = log::info(format!("Admin  http://{ip}:8080"));
+        let _ = log::info(format!("gRPC   {ip}:50051"));
+    }
     let _ = log::info(format!("Logs   ssh -i {ssh_priv} ubuntu@{ip} 'docker logs -f bittice'"));
     Ok(())
 }

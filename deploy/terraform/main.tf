@@ -38,16 +38,25 @@ resource "aws_security_group" "bittice" {
     cidr_blocks = [var.allowed_ssh_cidr]
   }
 
+  # REST is served on 443 via Caddy → bittice:3000 (no public :3000).
   ingress {
-    description = "REST API"
-    from_port   = 3000
-    to_port     = 3000
+    description = "HTTPS (REST via Caddy)"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
-    description = "Admin API"
+    description = "HTTP (ACME certificate issuance)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Admin API (VPC or SSH tunnel only)"
     from_port   = 8080
     to_port     = 8080
     protocol    = "tcp"
@@ -55,11 +64,11 @@ resource "aws_security_group" "bittice" {
   }
 
   ingress {
-    description = "gRPC"
+    description = "gRPC (VPC internal only)"
     from_port   = 50051
     to_port     = 50051
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.allowed_grpc_cidr]
   }
 
   egress {
