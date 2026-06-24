@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Option 1 edge layout: HTTPS REST on :443 (Caddy), admin via SSH tunnel, gRPC VPC-only.
+# Option 1 edge layout: HTTPS REST on :443 (Caddy), admin via SSH tunnel, gRPC public :50051.
 #
 # Run on EC2 (--local) after Terraform SG allows 443/80 and restricts 8080/50051:
 #   sudo ./setup-https-front.sh --domain dash-sac.dev.parking.net.co
@@ -28,7 +28,7 @@ Options:
 After running:
   REST   https://<domain>/
   Admin  ssh -L 8080:127.0.0.1:8080 ubuntu@<ip>  →  http://127.0.0.1:8080
-  gRPC   <private-ip>:50051 from VPC, or SSH -L 50051:127.0.0.1:50051
+  gRPC   dash-sac-grpc.dev.parking.net.co:50051 (public)
 EOF
 }
 
@@ -161,5 +161,5 @@ docker-compose up -d
 
 log "REST   https://${DOMAIN}/"
 log "Admin  ssh -L 8080:127.0.0.1:8080 ubuntu@<this-host>  →  http://127.0.0.1:8080"
-log "gRPC   :50051 from VPC only (security group must restrict to VPC CIDR)"
-log "Ensure SG allows 443/80 from internet and blocks public 3000/8080/50051."
+log "gRPC   dash-sac-grpc.dev.parking.net.co:50051 (public — ensure SG allows 50051)"
+log "Ensure SG allows 443/80/50051 from internet; 8080 VPC/tunnel only."

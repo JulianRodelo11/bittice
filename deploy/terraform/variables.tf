@@ -22,12 +22,6 @@ variable "allowed_admin_cidr" {
   description = "CIDR allowed for port 8080 (admin API) — VPC private range by default, never public"
   default     = "172.31.0.0/16"
 }
-
-variable "allowed_grpc_cidr" {
-  description = "CIDR allowed for port 50051 (gRPC) — VPC internal by default, not public internet"
-  default     = "172.31.0.0/16"
-}
-
 variable "app_name" {
   description = "Used for tagging and resource naming"
   default     = "bittice"

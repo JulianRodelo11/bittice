@@ -458,7 +458,7 @@ struct EngineIdentity {
 /// internal networking — no VPN, no sidecar, no policy routing.
 ///
 /// When `rest_domain` is set, Caddy terminates HTTPS on :443 and proxies to
-/// bittice:3000. Admin (:8080) and gRPC (:50051) bind to localhost / VPC only.
+/// bittice:3000. Admin (:8080) is localhost/VPC-only; gRPC (:50051) stays public.
 fn generate_compose(image: &str, ident: Option<&EngineIdentity>, rest_domain: Option<&str>) -> String {
     let identity_block = match ident {
         Some(i) => format!(
@@ -1199,9 +1199,8 @@ fn build_tfvars(
              target_subnet_id               = \"{}\"\n\
              target_rds_security_group_ids  = [{}]\n\
              rds_port                       = {}\n\
-             allowed_admin_cidr             = \"{}\"\n\
-             allowed_grpc_cidr              = \"{}\"\n",
-            p.vpc_id, p.subnet_id, sg_list, rds_port, p.vpc_cidr, p.vpc_cidr,
+             allowed_admin_cidr             = \"{}\"\n",
+            p.vpc_id, p.subnet_id, sg_list, rds_port, p.vpc_cidr,
         ));
     }
     s
@@ -1418,7 +1417,7 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         }
     };
     let _ = log::info(format!(
-        "REST will be https://{rest_domain}  |  Admin via SSH tunnel  |  gRPC VPC-only"
+        "REST will be https://{rest_domain}  |  Admin via SSH tunnel  |  gRPC public :50051"
     ));
 
     // ── IAM permissions note ──
@@ -1584,9 +1583,7 @@ fn finish_deploy(
         let _ = log::info(format!(
             "Admin  ssh -L 8080:127.0.0.1:8080 -i {ssh_priv} ubuntu@{ip}  →  http://127.0.0.1:8080"
         ));
-        let _ = log::info(format!(
-            "gRPC   {ip}:50051  (VPC only — or ssh -L 50051:127.0.0.1:50051 …)"
-        ));
+        let _ = log::info(format!("gRPC   dash-sac-grpc.dev.parking.net.co:50051  (or {ip}:50051)"));
     } else {
         let _ = log::info(format!("REST   http://{ip}:3000"));
         let _ = log::info(format!("Admin  http://{ip}:8080"));

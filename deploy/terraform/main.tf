@@ -64,11 +64,11 @@ resource "aws_security_group" "bittice" {
   }
 
   ingress {
-    description = "gRPC (VPC internal only)"
+    description = "gRPC (public)"
     from_port   = 50051
     to_port     = 50051
     protocol    = "tcp"
-    cidr_blocks = [var.allowed_grpc_cidr]
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {

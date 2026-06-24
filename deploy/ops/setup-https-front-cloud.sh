@@ -60,7 +60,7 @@ if [[ "${APPLY_TF}" -eq 1 ]]; then
   TF_BIN="${REPO_ROOT}/data/.terraform-bin/terraform"
   [[ -x "${TF_BIN}" ]] || TF_BIN="$(command -v terraform || true)"
   if [[ -x "${TF_BIN}" && -f "${TF_DIR}/terraform.tfstate" ]]; then
-    echo "[setup-https-front-cloud] terraform apply (SG: 443/80 public, 8080/50051 VPC)…" >&2
+    echo "[setup-https-front-cloud] terraform apply (SG: 443/80/50051 public, 8080 VPC)…" >&2
     "${TF_BIN}" -chdir="${TF_DIR}" apply -auto-approve
   else
     echo "[setup-https-front-cloud] WARN: terraform not found or no state — update SG manually" >&2
