@@ -146,11 +146,18 @@ if docker inspect bittice >/dev/null 2>&1; then
 fi
 
 log "Recreating stack (bittice + caddy + watchtower)…"
+# Host nginx (default on Ubuntu) binds :80 and blocks Caddy + ACME.
+if systemctl is-active nginx >/dev/null 2>&1; then
+  log "Stopping system nginx (conflicts with Caddy on :80)…"
+  systemctl stop nginx 2>/dev/null || true
+  systemctl disable nginx 2>/dev/null || true
+fi
+
 cd "${OPT_BITTICE}"
 docker-compose pull bittice 2>/dev/null || true
-docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true
+docker-compose down 2>/dev/null || true
 docker rm -f caddy 2>/dev/null || true
-(docker-compose up -d 2>/dev/null || docker compose up -d)
+docker-compose up -d
 
 log "REST   https://${DOMAIN}/"
 log "Admin  ssh -L 8080:127.0.0.1:8080 ubuntu@<this-host>  →  http://127.0.0.1:8080"
