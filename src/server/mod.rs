@@ -243,13 +243,11 @@ pub async fn start_all_servers(
     // snapshot (which may be 0 / restored from disk).
     op_counter::init(&crate::core::data_paths::resolved_data_root());
 
-    // Heartbeat to the Bittice control plane. Silent no-op when BITTICE_DEPLOYMENT_ID
-    // / BITTICE_INSTANCE_TOKEN / BITTICE_CONTROL_PLANE_URL aren't all set (= local mode).
+    // Heartbeat + self-health POST to the Bittice control plane. Disabled when
+    // control_plane_gate::ENABLED is false (local preview), even if deploy env vars are set.
     heartbeat::spawn_if_configured();
 
-    // Self-health (consistency checks + drift diagnostics, fully driven by
-    // GET /v1/config). Same identity gate as heartbeat — local-only deploys
-    // never call out.
+    // Self-health (consistency checks + drift diagnostics). Same gate as heartbeat.
     self_health::spawn_if_configured();
 
     // Convert entity_filter to lowercase and trim it

@@ -34,12 +34,6 @@ pub enum Commands {
     Uninstall,
     /// Run the interactive configuration wizard
     Setup,
-    /// Print the currently authenticated Bittice user (reads ~/.bittice/credentials.json).
-    /// You don't log in explicitly — the cloud-deploy wizard prompts for your API key
-    /// the first time and persists it for subsequent deploys.
-    Whoami,
-    /// Remove ~/.bittice/credentials.json. Next cloud deploy will prompt for the API key again.
-    Logout,
     /// Migrate exact_<field>.idx files from legacy/v1/v2 to v3 (mmap snapshot)
     MigrateExactIndex {
         /// Entity (schema) name. Mutually exclusive with --all.

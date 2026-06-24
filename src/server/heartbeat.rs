@@ -24,6 +24,10 @@ const INITIAL_DELAY: Duration = Duration::from_secs(10);
 /// process exits — never panics, never propagates network errors (it just
 /// logs and waits for the next tick).
 pub fn spawn_if_configured() {
+    if !crate::core::control_plane_gate::ENABLED {
+        debug!("Heartbeat: control plane disabled (local preview).");
+        return;
+    }
     let dep_id = match std::env::var("BITTICE_DEPLOYMENT_ID") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => {

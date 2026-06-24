@@ -19,6 +19,7 @@ pub mod core {
     pub mod uninstall;
     pub mod credentials;
     pub mod control_plane;
+    pub mod control_plane_gate;
     pub mod mirror_consistency;
     pub mod mirror_maintenance;
 }

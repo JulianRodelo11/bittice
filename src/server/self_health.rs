@@ -52,6 +52,10 @@ const BUILT_IN_AUDIT_DENYLIST: &[&str] = crate::core::mirror_consistency::AUDIT_
 /// Spawn the self-health loop. Returns immediately. No-op when identity env
 /// vars are missing (= local mode, exactly like `heartbeat.rs`).
 pub fn spawn_if_configured() {
+    if !crate::core::control_plane_gate::ENABLED {
+        debug!("self_health: control plane disabled (local preview).");
+        return;
+    }
     let Some(identity) = Identity::from_env() else {
         debug!("self_health: identity env vars not set — local mode, disabled.");
         return;

@@ -87,33 +87,6 @@ async fn main() -> Result<()> {
             Commands::Setup => {
                 let _ = bittice::repl::startup::run_startup_cliclack().await?;
             }
-            Commands::Whoami => {
-                use bittice::core::credentials;
-                // The credentials file only contains hints (last email + URL).
-                // API keys are never stored — they're prompted on every cloud deploy.
-                let hints = credentials::load().unwrap_or_default();
-                println!(
-                    "Last login (hint):  {}\n\
-                     Last user ID:       {}\n\
-                     Control plane URL:  {}\n\
-                     Hints file:         {}\n\n\
-                     (No API key is stored on this machine — the cloud-deploy wizard prompts for it on every deploy.)",
-                    hints.last_email.as_deref().unwrap_or("(never logged in)"),
-                    hints.last_user_id.as_deref().unwrap_or("—"),
-                    hints.control_plane_url,
-                    credentials::credentials_path()?.display(),
-                );
-            }
-            Commands::Logout => {
-                use bittice::core::credentials;
-                if credentials::clear()? {
-                    println!("✓ Profile hints cleared. (There was no stored API key — Bittice never saves it.)");
-                } else {
-                    println!("No profile hints to clear.");
-                }
-            }
-            // ── rest of commands below ──
-
             Commands::Cdc { url, entity, database, sync_all } => {
                 // Bittice does not manage tunnels: users with VPN-only MySQL
                 // must already have their OS-native VPN client up before running this.

@@ -1165,6 +1165,7 @@ fn validate_deployment_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cloud deploy + control-plane API key auth. Off during local-first preview.
 pub async fn run_cloud_deploy_wizard() -> Result<()> {
     let _ = log::info("Provisions a cloud VM via Terraform and runs the Bittice engine container.");
     let _ = log::info("Terraform is downloaded automatically if not already cached.");
@@ -1305,13 +1306,9 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     };
     if go == 255 { return Ok(()); }
 
-    // ── register deployment with the control plane (auth + billing entry point) ──
-    // We do this BEFORE `terraform apply` so the EC2 already knows its
-    // deployment_id / instance_token via env vars when the engine first boots.
-    // Authentication: the wizard prompts for your API key right now. The key
-    // is NEVER saved to disk; it lives only in this process for one deploy.
-    let auth = ensure_authenticated().await?;
-    let ident: EngineIdentity = {
+    // ── optional control-plane registration (API key + deployment id) ──
+    let ident: Option<EngineIdentity> = if crate::core::control_plane_gate::REPORTING_ENABLED {
+        let auth = ensure_authenticated().await?;
         let s = spinner();
         s.start("Registering deployment with control plane…");
         let req = crate::core::control_plane::CreateDeploymentRequest {
@@ -1329,15 +1326,18 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         };
         let resp = crate::core::control_plane::create_deployment(&auth.api_key, &req).await?;
         s.stop(format!("Deployment registered: {} (user: {})", resp.deployment_id, auth.email));
-        EngineIdentity {
+        Some(EngineIdentity {
             deployment_id: resp.deployment_id,
             instance_token: resp.instance_token,
             control_plane_url: auth.control_plane_url.clone(),
-        }
+        })
+    } else {
+        let _ = log::info(
+            "Skipping control-plane registration (no API key). \
+             The VM runs the engine only — no heartbeat or drift reports to Bittice."
+        );
+        None
     };
-    // After this point the api_key drops out of scope and is freed; only the
-    // short-lived instance_token (which is bound to *this* deployment only)
-    // continues to live in the EC2's container env.
 
     // ── write terraform files ──
     let ws = spinner();
@@ -1361,7 +1361,7 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     let ip = terraform_output(&tf_bin, &tf_dir, "public_ip")?;
     let _ = log::success(format!("EC2 Elastic IP: {ip}"));
 
-    finish_deploy(&ip, &ssh_priv, &image, &data_root, Some(&ident))
+    finish_deploy(&ip, &ssh_priv, &image, &data_root, ident.as_ref())
 }
 
 fn finish_deploy(
