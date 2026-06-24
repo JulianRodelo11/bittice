@@ -448,6 +448,15 @@ impl Table {
             );
         }
 
+        // Flush uncommitted column data before mmap reads on the active segment.
+        // Without this, reconcile sees empty PK values (same failure mode as
+        // get_row_as_map) and groups unrelated rows under PK "".
+        if let Some(writer) = &mut self.active_segment {
+            if writer.segment.record_count > 0 && writer.dirty {
+                writer.flush_buffers()?;
+            }
+        }
+
         if let Some(writer) = &self.active_segment {
             if writer.segment.record_count > 0 {
                 let _ = writer.segment.ensure_mmaps_batch(&pk_cols);
@@ -455,13 +464,20 @@ impl Table {
                     if writer.segment.deleted_bitmap.contains(local_id) {
                         continue;
                     }
-                    if let Ok(Some(pk_val)) =
-                        self.resolve_row_pk_from_segment_row(&writer.segment, local_id)
-                    {
-                        all_locations
-                            .entry(pk_val)
-                            .or_default()
-                            .push((writer.segment.id, local_id));
+                    match self.resolve_row_pk_from_segment_row(&writer.segment, local_id) {
+                        Ok(Some(pk_val)) if !pk_val.is_empty() => {
+                            all_locations
+                                .entry(pk_val)
+                                .or_default()
+                                .push((writer.segment.id, local_id));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                "Table '{}': reconcile: active seg {} local_id {} read failed ({:#})",
+                                self.name, writer.segment.id, local_id, e
+                            );
+                        }
                     }
                 }
             }
