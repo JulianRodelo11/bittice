@@ -124,10 +124,10 @@ run_check_mirror() {
   img="$(docker inspect "${CONTAINER}" --format '{{.Config.Image}}' 2>/dev/null || true)"
   [[ -z "${img}" ]] && img="ghcr.io/julianrodelo11/bittice:stable"
   log "check-mirror (${when})…"
-  local -a cmd=(check-mirror --entity "${ENTITY}")
-  for t in "${TABLES[@]}"; do
-    cmd+=(--table "${t}")
-  done
+  local -a cmd=(check-mirror --entity "${ENTITY}" --revalidate)
+  if [[ ${#TABLES[@]} -eq 1 ]]; then
+    cmd+=(--table "${TABLES[0]}")
+  fi
   docker run --rm --network host \
     -v "${DATA_ROOT}:/app/data" \
     -e BITTICE_DATA_ROOT=/app/data \
