@@ -76,6 +76,21 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         all_tables: bool,
     },
+    /// Compare MySQL row counts with Bittice mirror live rows (drift check).
+    CheckMirror {
+        /// Profile folder under data/profiles/ (e.g. bittice_host).
+        #[arg(short, long)]
+        entity: Option<String>,
+        /// Bootstrapped table key (e.g. db_beparking_dev.BpCliente).
+        #[arg(short, long)]
+        table: Option<String>,
+        /// Re-read counts after 2s when drift is detected (absorbs CDC lag).
+        #[arg(long, default_value_t = false)]
+        revalidate: bool,
+        /// Output JSON instead of a table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Migrate primary.idx from legacy/v1 format to v2 (hash-based)
     MigratePrimaryIndex {
         /// Entity (schema) name. Mutually exclusive with --all.

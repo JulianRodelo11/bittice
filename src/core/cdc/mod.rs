@@ -1323,46 +1323,36 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             let table_lock = self.table_manager.get_table(&disk_entity, table_name)?;
             let mut table = table_lock.write().unwrap();
 
-            // FullSnapshot must start from an empty mirror. The
-            // primary_index-based idempotency guard in `Table::insert` is
-            // load-bearing — but it depends on the index being fully
-            // rehydrated before the first row arrives. If it isn't (e.g.
-            // because we got here via a cascade of DDL-triggered restarts
-            // and the active segment hadn't been sealed), the lookup misses,
-            // the insert appends without tombstoning the stale row, and we
-            // accumulate duplicates that surface as drift_incidents with
-            // diff < 0. Wiping unconditionally at the start of FullSnapshot
-            // eliminates the dependency: bootstrap always begins clean.
-            //
-            // No-op on a brand new table (nothing to delete). Negligible
-            // cost on existing tables (`delete_all_rows` tombstones the
-            // primary_index entries and persists the deleted bitmaps).
-            if mode == BootstrapMode::FullSnapshot {
-                table.delete_all_rows()?;
-            }
-
             // Save the original fields in the manifest
             let _ = table.set_original_fields(cols.clone());
 
             let pk_query = format!(
                 "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
                  WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
-                 AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX LIMIT 1",
+                 AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX",
                 Self::mysql_string_literal(&schema_mysql),
                 Self::mysql_string_literal(table_name)
             );
-            let pk_col: Option<String> = conn.query_first(pk_query).await?;
+            let pk_cols: Vec<String> = conn.query(pk_query).await.unwrap_or_default();
 
-            if let Some(col) = pk_col {
-                table.manifest.primary_key = col.clone();
-                state.pk_map.insert(qkey.clone(), col);
+            if !pk_cols.is_empty() {
+                table.manifest.primary_key_columns = pk_cols.clone();
+                table.manifest.primary_key = pk_cols[0].clone();
+                state.pk_map.insert(qkey.clone(), pk_cols.join(","));
                 debug!(
-                    "CDC: Detected PK='{}' for table '{}'",
-                    table.manifest.primary_key, qkey
+                    "CDC: Detected PK columns {:?} for table '{}'",
+                    pk_cols, qkey
                 );
             } else if let Some(pk_cand) = cols.iter().find(|c| c.ends_with("_id") || *c == "id") {
                 table.manifest.primary_key = pk_cand.clone();
+                table.manifest.primary_key_columns = vec![pk_cand.clone()];
                 state.pk_map.insert(qkey.clone(), pk_cand.clone());
+            }
+            table.save_manifest()?;
+
+            // FullSnapshot must start from an empty mirror (see prepare_for_full_snapshot).
+            if mode == BootstrapMode::FullSnapshot {
+                table.prepare_for_full_snapshot()?;
             }
 
             let mut count = 0usize;
@@ -1522,6 +1512,10 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         struct ManifestStub {
             #[serde(default)]
             original_fields: Vec<String>,
+            #[serde(default)]
+            primary_key: String,
+            #[serde(default)]
+            primary_key_columns: Vec<String>,
         }
 
         let mut to_invalidate: Vec<String> = Vec::new();
@@ -1541,9 +1535,9 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
             // field is empty, treat as "no recorded schema" — drop and re-bootstrap
             // (safer than guessing).
             let manifest_path = self.mirror_table_dir(&schema_name, &table_name).join("manifest.json");
-            let recorded: Vec<String> = match std::fs::read_to_string(&manifest_path) {
+            let manifest_stub: ManifestStub = match std::fs::read_to_string(&manifest_path) {
                 Ok(s) => match serde_json::from_str::<ManifestStub>(&s) {
-                    Ok(m) => m.original_fields,
+                    Ok(m) => m,
                     Err(e) => {
                         self.log_warn(format!(
                             "CDC: validate_schemas: manifest for '{}' is unreadable ({}); will re-bootstrap.",
@@ -1562,14 +1556,32 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
                     continue;
                 }
             };
+            let recorded: Vec<String> = manifest_stub.original_fields;
 
-            // Fetch current schema from source.
+            // Fetch current schema from source. qkeys store lowercased schema names;
+            // resolve the real MySQL schema folder so information_schema matches on
+            // servers with lower_case_table_names=0 (e.g. SmartInvoicing vs smartinvoicing).
+            let schema_mysql = if self.sync_all_databases {
+                match Self::resolve_mysql_schema_folder_name(conn, &schema_name).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.log_warn(format!(
+                            "CDC: validate_schemas: cannot resolve schema for '{}' ({}); skipping check.",
+                            qkey, e
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                schema_name.clone()
+            };
+
             let live_rows: Vec<(String,)> = match conn
                 .exec(
                     "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                      ORDER BY ORDINAL_POSITION",
-                    (schema_name.as_str(), table_name.as_str()),
+                    (schema_mysql.as_str(), table_name.as_str()),
                 )
                 .await
             {
@@ -1605,6 +1617,63 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
                     qkey, recorded, live
                 ));
                 to_invalidate.push(qkey.clone());
+                continue;
+            }
+
+            let mut recorded_pk_cols = if !manifest_stub.primary_key_columns.is_empty() {
+                manifest_stub.primary_key_columns.clone()
+            } else if !manifest_stub.primary_key.is_empty() && manifest_stub.primary_key != "PK" {
+                vec![manifest_stub.primary_key.clone()]
+            } else {
+                Vec::new()
+            };
+            if recorded_pk_cols.is_empty() {
+                if let Some(pk_entry) = state.pk_map.get(&qkey) {
+                    recorded_pk_cols = pk_entry
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+
+            let live_pk_rows: Vec<(String,)> = match conn
+                .exec(
+                    "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                     AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX",
+                    (schema_mysql.as_str(), table_name.as_str()),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    self.log_warn(format!(
+                        "CDC: validate_schemas: cannot fetch PK columns for '{}' ({}); skipping PK check.",
+                        qkey, e
+                    ));
+                    continue;
+                }
+            };
+            let live_pk: Vec<String> = live_pk_rows.into_iter().map(|t| t.0).collect();
+
+            if live_pk.is_empty() {
+                continue;
+            }
+
+            let pk_same = !recorded_pk_cols.is_empty()
+                && recorded_pk_cols.len() == live_pk.len()
+                && recorded_pk_cols
+                    .iter()
+                    .zip(live_pk.iter())
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b));
+            if !pk_same {
+                self.log_warn(format!(
+                    "CDC: validate_schemas: '{}' PK drift detected — \
+                     mirror_pk={:?} live_pk={:?} — will re-bootstrap.",
+                    qkey, recorded_pk_cols, live_pk
+                ));
+                to_invalidate.push(qkey.clone());
             }
         }
 
@@ -1624,6 +1693,16 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
 
             // Wipe on-disk mirror dir so the bootstrap loop produces a clean
             // snapshot (otherwise it would skip the table as "already done").
+            let disk_entity = if self.sync_all_databases {
+                schema_name.to_lowercase()
+            } else {
+                self.entity.clone()
+            };
+            let mirror_table = Self::resolve_mirror_table_dir(&disk_entity, &table_name);
+            // Evict any in-memory copy first — startup compact may have opened the
+            // table moments earlier; deleting the dir while it stays cached makes
+            // the next bootstrap write into a stale base_path (ENOENT on save).
+            self.table_manager.close_table(&disk_entity, &mirror_table);
             let mirror_path = self.mirror_table_dir(&schema_name, &table_name);
             if mirror_path.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&mirror_path) {
@@ -3111,13 +3190,47 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         }
     }
 
+    fn pk_columns_from_state(pk_map: &HashMap<String, String>, qkey: &str) -> Vec<String> {
+        pk_map
+            .get(qkey)
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["PK".to_string()])
+    }
+
+    fn row_pk_from_parsed_row(
+        data: &HashMap<String, String>,
+        pk_columns: &[String],
+    ) -> Option<String> {
+        if pk_columns.len() == 1 && pk_columns[0] == "PK" {
+            return data
+                .get("PK")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        let mut parts = Vec::with_capacity(pk_columns.len());
+        for col in pk_columns {
+            let v = data.get(col)?.trim().to_string();
+            if v.is_empty() {
+                return None;
+            }
+            parts.push(v);
+        }
+        Some(parts.join("\u{1f}"))
+    }
+
     fn apply_binlog_write_rows<'a>(
         &self,
         rows: RowsEventRows<'a>,
         qkey: &str,
         disk_entity: &str,
         table_name: &str,
-        _pk_field: &str,
+        _pk_columns: &[String],
         table: &mut Table,
     ) -> Result<usize> {
         debug!("CDC: Received Write event for table '{}'", qkey);
@@ -3151,7 +3264,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         rows: RowsEventRows<'a>,
         qkey: &str,
         mirror_table: &str,
-        pk_field: &str,
+        pk_columns: &[String],
     ) -> Result<Vec<(String, HashMap<String, String>)>> {
         let mut deltas = Vec::new();
         for row_pair in rows {
@@ -3165,32 +3278,33 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 self.parse_row(Row::try_from(after_row).map_err(|e| anyhow::anyhow!("{:?}", e))?, qkey)?;
 
             // With `binlog_row_image=MINIMAL` (RDS default), UPDATE after-images list only columns that
-            // changed; unchanged primary-key columns live in the before-image only.
+            // changed; unchanged PK columns may live in the before-image only.
             if let Some(before_row) = before_opt {
                 let before_map =
                     self.parse_row(Row::try_from(before_row).map_err(|e| anyhow::anyhow!("{:?}", e))?, qkey)?;
-                let pk_missing_or_empty = delta
-                    .get(pk_field)
-                    .map(|s| s.trim().is_empty())
-                    .unwrap_or(true);
-                if pk_missing_or_empty {
-                    if let Some(pk_val) = before_map.get(pk_field).cloned().filter(|s| !s.trim().is_empty()) {
-                        delta.insert(pk_field.to_string(), pk_val);
+                for col in pk_columns {
+                    let missing = delta
+                        .get(col)
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true);
+                    if missing {
+                        if let Some(pk_val) = before_map.get(col).cloned().filter(|s| !s.trim().is_empty()) {
+                            delta.insert(col.clone(), pk_val);
+                        }
                     }
                 }
             }
 
-            let Some(pk_val) = delta.get(pk_field).cloned().filter(|s| !s.trim().is_empty()) else {
+            let Some(pk_val) = Self::row_pk_from_parsed_row(&delta, pk_columns) else {
                 warn!(
-                    "CDC: Skipped UPDATE on '{}' — primary key '{}' missing from binlog row pair \
+                    "CDC: Skipped UPDATE on '{}' — primary key {:?} missing from binlog row pair \
                      (often MINIMAL row image + composite PK / PK detection mismatch). Table '{}'.",
-                    qkey, pk_field, mirror_table
+                    qkey, pk_columns, mirror_table
                 );
                 continue;
             };
 
-            let pk_trim = pk_val.trim().to_string();
-            deltas.push((pk_trim, delta));
+            deltas.push((pk_val, delta));
         }
         Ok(deltas)
     }
@@ -3204,14 +3318,15 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         qkey: &str,
         disk_entity: &str,
         mirror_table: &str,
-        pk_field: &str,
+        pk_columns: &[String],
         table: &mut Table,
     ) -> Result<usize> {
         let mut applied = 0usize;
         let mut hydrate_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let hydrate_pk_field = pk_columns.first().map(String::as_str).unwrap_or("PK");
 
         for (pk_trim, delta) in deltas {
-            let pk_val_display = delta.get(pk_field).cloned().unwrap_or_else(|| pk_trim.clone());
+            let pk_val_display = pk_trim.clone();
 
             let mut lookup_candidates = vec![pk_val_display.clone(), pk_trim.clone()];
             if let Ok(n) = pk_trim.parse::<i64>() {
@@ -3241,7 +3356,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                     Some(cached.clone())
                 } else {
                     match self
-                        .fetch_full_row_mysql(pool, schema, mysql_table, qkey, pk_field, &pk_trim)
+                        .fetch_full_row_mysql(pool, schema, mysql_table, qkey, hydrate_pk_field, &pk_trim)
                         .await
                     {
                         Ok(Some(m)) => {
@@ -3311,7 +3426,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         qkey: &str,
         disk_entity: &str,
         table_name: &str,
-        pk_field: &str,
+        pk_columns: &[String],
         table: &mut Table,
     ) -> Result<usize> {
         let mut applied = 0usize;
@@ -3319,8 +3434,8 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
             if let Ok((Some(binlog_row), _)) = row_pair {
                 let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                 let data = self.parse_row(row, qkey)?;
-                if let Some(pk_val) = data.get(pk_field) {
-                    table.delete(pk_val)?;
+                if let Some(pk_val) = Self::row_pk_from_parsed_row(&data, pk_columns) {
+                    table.delete(&pk_val)?;
                     applied += 1;
                 }
             }
@@ -3394,12 +3509,12 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         };
         let mut table = table_lock.write().unwrap();
 
-        let pk_field = state
-            .pk_map
-            .get(&qkey)
+        let pk_columns = Self::pk_columns_from_state(&state.pk_map, &qkey);
+        table.manifest.primary_key_columns = pk_columns.clone();
+        table.manifest.primary_key = pk_columns
+            .first()
             .cloned()
             .unwrap_or_else(|| "PK".to_string());
-        table.manifest.primary_key = pk_field.clone();
 
         let is_write = matches!(
             &rows_data,
@@ -3413,7 +3528,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                     &qkey,
                     &disk_entity,
                     &mirror_table,
-                    &pk_field,
+                    &pk_columns,
                     &mut table,
                 )?,
                 "INSERT",
@@ -3424,14 +3539,14 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                     &qkey,
                     &disk_entity,
                     &mirror_table,
-                    &pk_field,
+                    &pk_columns,
                     &mut table,
                 )?,
                 "INSERT",
             ),
             RowsEventData::UpdateRowsEvent(ev) => {
                 let deltas =
-                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_field)?;
+                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_columns)?;
                 (
                     self.apply_binlog_update_deltas(
                         pool,
@@ -3441,7 +3556,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                         &qkey,
                         &disk_entity,
                         &mirror_table,
-                        &pk_field,
+                        &pk_columns,
                         &mut table,
                     )
                     .await?,
@@ -3450,7 +3565,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
             }
             RowsEventData::UpdateRowsEventV1(ev) => {
                 let deltas =
-                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_field)?;
+                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_columns)?;
                 (
                     self.apply_binlog_update_deltas(
                         pool,
@@ -3460,7 +3575,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                         &qkey,
                         &disk_entity,
                         &mirror_table,
-                        &pk_field,
+                        &pk_columns,
                         &mut table,
                     )
                     .await?,
@@ -3469,7 +3584,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
             }
             RowsEventData::PartialUpdateRowsEvent(ev) => {
                 let deltas =
-                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_field)?;
+                    self.extract_binlog_update_deltas(ev.rows(&tm_owned), &qkey, &mirror_table, &pk_columns)?;
                 (
                     self.apply_binlog_update_deltas(
                         pool,
@@ -3479,7 +3594,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                         &qkey,
                         &disk_entity,
                         &mirror_table,
-                        &pk_field,
+                        &pk_columns,
                         &mut table,
                     )
                     .await?,
@@ -3492,7 +3607,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                     &qkey,
                     &disk_entity,
                     &mirror_table,
-                    &pk_field,
+                    &pk_columns,
                     &mut table,
                 )?,
                 "DELETE",
@@ -3503,7 +3618,7 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                     &qkey,
                     &disk_entity,
                     &mirror_table,
-                    &pk_field,
+                    &pk_columns,
                     &mut table,
                 )?,
                 "DELETE",

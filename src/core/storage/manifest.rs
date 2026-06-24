@@ -27,9 +27,12 @@ pub struct Manifest {
     /// Fields present in the original source data
     #[serde(default)]
     pub original_fields: Vec<String>,
-    /// Field name used as primary key
+    /// Field name used as primary key (legacy: first column when composite).
     #[serde(default)]
     pub primary_key: String,
+    /// Full MySQL PRIMARY KEY column list in ordinal order (composite keys).
+    #[serde(default)]
+    pub primary_key_columns: Vec<String>,
 }
 
 impl Manifest {
@@ -41,6 +44,7 @@ impl Manifest {
             version: 1,
             original_fields: Vec::new(),
             primary_key: "PK".to_string(),
+            primary_key_columns: Vec::new(),
         }
     }
 

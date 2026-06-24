@@ -209,6 +209,48 @@ async fn main() -> Result<()> {
                     println!("{entity}/{tbl}: compacted {removed} segment(s)");
                 }
             }
+            Commands::CheckMirror { entity, table, revalidate, json } => {
+                let opts = bittice::core::mirror_consistency::CheckMirrorOptions {
+                    entity_filter: entity,
+                    table_filter: table,
+                    revalidate,
+                };
+                let rows =
+                    bittice::core::mirror_consistency::check_mirror_consistency(opts).await?;
+                if rows.is_empty() {
+                    anyhow::bail!(
+                        "no bootstrapped tables to check — sync first or adjust --entity / --table"
+                    );
+                }
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    println!(
+                        "{:<20} {:<40} {:>8} {:>8} {:>8} {}",
+                        "PROFILE", "TABLE", "MYSQL", "MIRROR", "DIFF", "OK"
+                    );
+                    for r in &rows {
+                        let status = if r.ok { "OK" } else { "DRIFT" };
+                        println!(
+                            "{:<20} {:<40} {:>8} {:>8} {:>8} {}",
+                            r.profile, r.table, r.source_count, r.mirror_count, r.diff, status
+                        );
+                    }
+                    let drift = rows.iter().filter(|r| !r.ok).count();
+                    println!();
+                    if drift == 0 {
+                        println!("{} table(s) — all counts match", rows.len());
+                    } else {
+                        println!(
+                            "{drift}/{} table(s) with drift (positive DIFF = mirror missing rows)",
+                            rows.len()
+                        );
+                    }
+                }
+                if rows.iter().any(|r| !r.ok) {
+                    std::process::exit(1);
+                }
+            }
             Commands::MigratePrimaryIndex { entity, table, all, dry_run, keep_backup, force } => {
                 if all {
                     let data_root = bittice::core::data_paths::resolved_data_root();

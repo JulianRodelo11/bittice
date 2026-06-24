@@ -572,6 +572,7 @@ fn compact_startup_ops_tables(table_manager: &TableManager) {
             Ok(Err(e)) => warn!("Startup compact: {} error: {:#}", key, e),
             Err(e) => warn!("Startup compact: {} lock error: {}", key, e),
         }
+        table_manager.close_table(entity, table_name);
     }
     if compacted > 0 {
         info!("Startup compact: finished — {} table(s) compacted.", compacted);

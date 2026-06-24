@@ -110,6 +110,82 @@ impl Table {
         self.immutable_segments.len()
     }
 
+    /// Ordered PK columns from manifest (falls back to legacy `primary_key`).
+    pub fn pk_columns(&self) -> Vec<String> {
+        if !self.manifest.primary_key_columns.is_empty() {
+            return self.manifest.primary_key_columns.clone();
+        }
+        if self.manifest.primary_key.is_empty() || self.manifest.primary_key == "PK" {
+            vec!["PK".to_string()]
+        } else {
+            vec![self.manifest.primary_key.clone()]
+        }
+    }
+
+    pub(crate) const PK_COMPOSITE_SEP: char = '\u{1f}';
+
+    /// Stable mirror row id: single PK value, or `col1\u{1f}col2\u{1f}...` for composite keys.
+    pub fn row_pk_value(&self, row: &HashMap<String, String>) -> String {
+        let cols = self.pk_columns();
+        if cols.len() == 1 && cols[0] == "PK" {
+            return row
+                .get("PK")
+                .cloned()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        }
+        cols.iter()
+            .map(|c| {
+                row.get(c)
+                    .map(|v| v.nfc().collect::<String>())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(&Self::PK_COMPOSITE_SEP.to_string())
+    }
+
+    fn composite_pk_from_eq_filters(&self, filters: &[Filter]) -> Option<String> {
+        let cols = self.pk_columns();
+        if cols.len() <= 1 {
+            return None;
+        }
+        let mut parts = Vec::with_capacity(cols.len());
+        for col in &cols {
+            let f = filters.iter().find(|f| {
+                f.field == *col && f.op == crate::core::types::ComparisonOp::Eq
+            })?;
+            parts.push(f.value.nfc().collect::<String>());
+        }
+        Some(parts.join(&Self::PK_COMPOSITE_SEP.to_string()))
+    }
+
+    /// Read the stable mirror PK for a row at `(segment, local_id)`.
+    fn resolve_row_pk_from_segment_row(
+        &self,
+        seg: &crate::core::storage::segment::Segment,
+        local_id: u32,
+    ) -> Result<Option<String>> {
+        let pk_cols = self.pk_columns();
+        if pk_cols.is_empty() {
+            return Ok(None);
+        }
+        let vals = seg.get_row_values(local_id, &pk_cols)?;
+        if vals.len() != pk_cols.len() {
+            return Ok(None);
+        }
+        if pk_cols.len() == 1 && pk_cols[0] == "PK" {
+            return Ok(vals.into_iter().next());
+        }
+        let mut row = HashMap::with_capacity(pk_cols.len());
+        for (col, val) in pk_cols.iter().zip(vals) {
+            row.insert(col.clone(), val);
+        }
+        Ok(Some(self.row_pk_value(&row)))
+    }
+
+    fn field_is_pk_column(&self, field: &str) -> bool {
+        self.pk_columns().iter().any(|c| c == field)
+    }
+
     pub fn close(&mut self) -> Result<()> {
         // If this instance was discarded (lost a concurrent open race in TableManager), skip all
         // disk writes — the winning instance owns the on-disk state.
@@ -286,35 +362,27 @@ impl Table {
     /// `replay_wal`'s idempotent insert can correctly recognize rows that
     /// are already on disk and skip re-appending them.
     fn sync_primary_index_to_active_bitmaps(&mut self) {
-        let pk_field = if self.manifest.primary_key.is_empty() {
-            "PK".to_string()
-        } else {
-            self.manifest.primary_key.clone()
+        let Some(writer) = &self.active_segment else {
+            return;
         };
-        let (seg_id, additions): (u64, Vec<(String, u32)>) = match &self.active_segment {
-            Some(writer) => {
-                let pk_bitmaps = match writer.bitmaps.get(&pk_field) {
-                    Some(b) => b,
-                    None => return,
-                };
-                let mut adds: Vec<(String, u32)> = Vec::new();
-                for (pk_val, bitmap) in pk_bitmaps {
-                    // A PK may appear at multiple local_ids if the segment had
-                    // an in-place update before the crash. Pick the highest —
-                    // that is the latest write. Older locations will be
-                    // tombstoned later by reconcile_orphan_rows.
-                    if let Some(max_local) = bitmap.iter().max() {
-                        if writer.segment.deleted_bitmap.contains(max_local) {
-                            continue;
-                        }
-                        adds.push((pk_val.clone(), max_local));
-                    }
-                }
-                (writer.segment.id, adds)
+        let seg_id = writer.segment.id;
+        if writer.segment.record_count == 0 {
+            return;
+        }
+        let pk_cols = self.pk_columns();
+        let _ = writer.segment.ensure_mmaps_batch(&pk_cols);
+        let mut adds: Vec<(String, u32)> = Vec::new();
+        for local_id in 0..(writer.segment.record_count as u32) {
+            if writer.segment.deleted_bitmap.contains(local_id) {
+                continue;
             }
-            None => return,
-        };
-        for (pk, local_id) in additions {
+            let Ok(Some(pk_val)) = self.resolve_row_pk_from_segment_row(&writer.segment, local_id)
+            else {
+                continue;
+            };
+            adds.push((pk_val, local_id));
+        }
+        for (pk, local_id) in adds {
             if self.primary_index.get(&pk).is_none() {
                 self.primary_index.insert(&pk, (seg_id, local_id));
             }
@@ -336,30 +404,18 @@ impl Table {
     /// location" really is the most-recent version regardless of how stale
     /// `primary_index` got.
     pub fn reconcile_orphan_rows(&mut self) -> Result<()> {
-        let pk_field = if self.manifest.primary_key.is_empty() {
-            "PK".to_string()
-        } else {
-            self.manifest.primary_key.clone()
-        };
+        let pk_cols = self.pk_columns();
 
         // Phase 1: collect every live (pk → [(seg_id, local_id), ...]) location.
         let mut all_locations: HashMap<String, Vec<(u64, u32)>> = HashMap::new();
 
-        // Immutable segments — read PKs straight from id.dat (the durable
-        // source of truth), not bitmaps_<pk>.dat. Earlier versions trusted
-        // the bitmap, but segments written before v0.1.143 can have a bitmap
-        // that either omits live local_ids or maps them to the wrong PK
-        // string — same entry-count, wrong key — and that silently breaks
-        // cross-segment dedup. Scanning id.dat is bounded (one pk read per
-        // live row, once at startup) and bulletproof.
-        let pk_fields = vec![pk_field.clone()];
         for seg in &self.immutable_segments {
             if seg.record_count == 0 {
                 continue;
             }
-            if let Err(e) = seg.ensure_mmaps_batch(&pk_fields) {
+            if let Err(e) = seg.ensure_mmaps_batch(&pk_cols) {
                 warn!(
-                    "Table '{}': reconcile: seg {} id.dat mmap failed ({:#}) — rows here can't be deduped",
+                    "Table '{}': reconcile: seg {} PK column mmap failed ({:#}) — rows here can't be deduped",
                     self.name, seg.id, e
                 );
                 continue;
@@ -369,18 +425,15 @@ impl Table {
                 if seg.deleted_bitmap.contains(local_id) {
                     continue;
                 }
-                match seg.get_row_values(local_id, &pk_fields) {
-                    Ok(vals) => {
-                        if let Some(pk_val) = vals.into_iter().next() {
-                            if !pk_val.is_empty() {
-                                seg_live_locations += 1;
-                                all_locations
-                                    .entry(pk_val)
-                                    .or_default()
-                                    .push((seg.id, local_id));
-                            }
-                        }
+                match self.resolve_row_pk_from_segment_row(seg, local_id) {
+                    Ok(Some(pk_val)) if !pk_val.is_empty() => {
+                        seg_live_locations += 1;
+                        all_locations
+                            .entry(pk_val)
+                            .or_default()
+                            .push((seg.id, local_id));
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         warn!(
                             "Table '{}': reconcile: seg {} local_id {} read failed ({:#})",
@@ -395,16 +448,18 @@ impl Table {
             );
         }
 
-        // Active segment — bitmaps live in memory, not on disk yet.
         if let Some(writer) = &self.active_segment {
-            if let Some(pk_bitmaps) = writer.bitmaps.get(&pk_field) {
-                for (pk_val, bitmap) in pk_bitmaps {
-                    for local_id in bitmap.iter() {
-                        if writer.segment.deleted_bitmap.contains(local_id) {
-                            continue;
-                        }
+            if writer.segment.record_count > 0 {
+                let _ = writer.segment.ensure_mmaps_batch(&pk_cols);
+                for local_id in 0..(writer.segment.record_count as u32) {
+                    if writer.segment.deleted_bitmap.contains(local_id) {
+                        continue;
+                    }
+                    if let Ok(Some(pk_val)) =
+                        self.resolve_row_pk_from_segment_row(&writer.segment, local_id)
+                    {
                         all_locations
-                            .entry(pk_val.clone())
+                            .entry(pk_val)
                             .or_default()
                             .push((writer.segment.id, local_id));
                     }
@@ -584,8 +639,8 @@ impl Table {
                         }
                     }
                 }
-                WalOperation::Update { id, data, seg_id, local_id } => {
-                    let mut row_data: HashMap<String, String> = serde_json::from_slice(&data)
+                WalOperation::Update { id: _, data, seg_id, local_id } => {
+                    let row_data: HashMap<String, String> = serde_json::from_slice(&data)
                         .unwrap_or_default();
                     // Mark the old version dead at its known location.
                     if let Some(writer) = &mut self.active_segment {
@@ -599,18 +654,7 @@ impl Table {
                             seg.persist_deleted_bitmap()?;
                         }
                     }
-                    let pk_field = if self.manifest.primary_key.is_empty() {
-                        "PK"
-                    } else {
-                        &self.manifest.primary_key
-                    };
-                    if let Some(pk_raw) = row_data.get(pk_field).cloned() {
-                        let normalized: String = pk_raw.nfc().collect();
-                        if normalized != pk_raw {
-                            row_data.insert(pk_field.to_string(), normalized);
-                        }
-                    }
-                    let pk_val = row_data.get(pk_field).cloned().unwrap_or_else(|| id.clone());
+                    let pk_val = self.row_pk_value(&row_data);
                     // Same idempotency check as Insert.
                     if let Some((cur_seg, cur_local)) = self.primary_index.get(&pk_val) {
                         if cur_seg != seg_id || cur_local != local_id {
@@ -730,23 +774,17 @@ impl Table {
     /// Reads PK values from segments directly rather than from primary_index,
     /// so this works even after the index representation changes (e.g. hashed keys).
     pub fn delete_all_rows(&mut self) -> Result<()> {
-        let pk_field = if self.manifest.primary_key.is_empty() {
-            "PK".to_string()
-        } else {
-            self.manifest.primary_key.clone()
-        };
-        let pk_fields = vec![pk_field.clone()];
+        let pk_cols = self.pk_columns();
 
         // Collect PKs from all immutable segments.
         let mut all_pks: Vec<String> = Vec::new();
         for seg in &self.immutable_segments {
-            let _ = seg.ensure_mmaps_batch(&pk_fields);
+            let _ = seg.ensure_mmaps_batch(&pk_cols);
             for local_id in 0u32..seg.record_count as u32 {
                 if seg.deleted_bitmap.contains(local_id) {
                     continue;
                 }
-                let vals = seg.get_row_values(local_id, &pk_fields)?;
-                if let Some(pk) = vals.into_iter().next() {
+                if let Some(pk) = self.resolve_row_pk_from_segment_row(seg, local_id)? {
                     all_pks.push(pk);
                 }
             }
@@ -755,13 +793,12 @@ impl Table {
         // Collect PKs from the active segment.
         if let Some(writer) = &self.active_segment {
             let seg = &writer.segment;
-            let _ = seg.ensure_mmaps_batch(&pk_fields);
+            let _ = seg.ensure_mmaps_batch(&pk_cols);
             for local_id in 0u32..seg.record_count as u32 {
                 if seg.deleted_bitmap.contains(local_id) {
                     continue;
                 }
-                let vals = seg.get_row_values(local_id, &pk_fields)?;
-                if let Some(pk) = vals.into_iter().next() {
+                if let Some(pk) = self.resolve_row_pk_from_segment_row(seg, local_id)? {
                     all_pks.push(pk);
                 }
             }
@@ -773,25 +810,44 @@ impl Table {
         self.flush_active_segment()
     }
 
+    /// Wipe on-disk segments and indexes so a CDC FullSnapshot starts from a
+    /// clean slate. Unlike `delete_all_rows`, this removes stale segment dirs
+    /// left by prior bootstraps — critical for composite-PK tables where old
+    /// segments would otherwise confuse `reconcile_orphan_rows`.
+    pub fn prepare_for_full_snapshot(&mut self) -> Result<()> {
+        let segments_dir = self.base_path.join("segments");
+        if segments_dir.exists() {
+            fs::remove_dir_all(&segments_dir)?;
+        }
+        fs::create_dir_all(&segments_dir)?;
+        self.immutable_segments.clear();
+        self.primary_index = PrimaryIndex::new();
+        self.exact_index_cache.write().unwrap().clear();
+        let exact_dir = self.exact_index_dir();
+        if exact_dir.exists() {
+            fs::remove_dir_all(&exact_dir)?;
+        }
+        self.active_segment = None;
+        self.manifest.segments.clear();
+        self.manifest.active_segment_id = 0;
+        self.manifest.last_sequence_number += 1;
+        self.ensure_active_segment()?;
+        self.save_primary_index()?;
+        self.wal.truncate()?;
+        Ok(())
+    }
+
     pub fn insert(&mut self, row_data: HashMap<String, String>) -> Result<()> {
-        let pk_field_owned = if self.manifest.primary_key.is_empty() {
-            "PK".to_string()
-        } else {
-            self.manifest.primary_key.clone()
-        };
-        // Normalize PK value to NFC before storing, so canonically equivalent
-        // strings (e.g. NFC vs NFD) are stored identically and hash consistently.
         let mut row_data = row_data;
-        if let Some(pk_val) = row_data.get(&pk_field_owned).cloned() {
-            let normalized: String = pk_val.nfc().collect();
-            if normalized != pk_val {
-                row_data.insert(pk_field_owned.clone(), normalized);
+        for col in self.pk_columns() {
+            if let Some(pk_val) = row_data.get(&col).cloned() {
+                let normalized: String = pk_val.nfc().collect();
+                if normalized != pk_val {
+                    row_data.insert(col.clone(), normalized);
+                }
             }
         }
-        let id = row_data
-            .get(&pk_field_owned)
-            .cloned()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = self.row_pk_value(&row_data);
 
         // ── Idempotency guard ───────────────────────────────────────────────
         // Binlog events can be re-delivered to the motor after a crash that
@@ -879,23 +935,14 @@ impl Table {
             map.insert(f.clone(), vals.get(i).cloned().unwrap_or_default());
         }
 
-        // Collision verification: after reading the row, confirm the PK stored
-        // in the row matches the requested PK (under canonical_bytes). A mismatch
-        // means two distinct PKs hashed to the same u128 bucket — astronomically
-        // unlikely with xxh3_128 but checked for correctness.
-        let pk_field = if self.manifest.primary_key.is_empty() {
-            "PK"
-        } else {
-            &self.manifest.primary_key
-        };
-        if let Some(actual_pk) = map.get(pk_field) {
-            if canonical_bytes(actual_pk) != canonical_bytes(pk_val) {
-                warn!(
-                    "Hash collision detected in get_row_as_map: requested={:?}, actual={:?}",
-                    pk_val, actual_pk
-                );
-                return Ok(None);
-            }
+        // Collision verification: confirm the row's stable PK matches the lookup key.
+        let actual_pk = self.row_pk_value(&map);
+        if canonical_bytes(&actual_pk) != canonical_bytes(pk_val) {
+            warn!(
+                "Hash collision detected in get_row_as_map: requested={:?}, actual={:?}",
+                pk_val, actual_pk
+            );
+            return Ok(None);
         }
 
         Ok(Some(map))
@@ -945,7 +992,7 @@ impl Table {
         self.save_manifest()
     }
 
-    fn save_manifest(&self) -> Result<()> {
+    pub(crate) fn save_manifest(&self) -> Result<()> {
         // Each call uses a unique temp filename so that two concurrent callers (e.g. a discard
         // race that somehow slipped past the TableManager per-key lock) never share the same
         // manifest.tmp inode and interleave bytes.  The rename is always same-device (same dir)
@@ -1020,6 +1067,13 @@ impl Table {
 
     pub fn flush_active_segment(&mut self) -> Result<()> {
         if let Some(mut writer) = self.active_segment.take() {
+            // Sealing an empty active segment only adds a manifest entry with no
+            // `.dat` files. Those ghost segments accumulate (especially on 0-row
+            // bootstraps) until startup compact tries to read them and fails.
+            if writer.segment.record_count == 0 {
+                self.active_segment = Some(writer);
+                return Ok(());
+            }
             writer.flush()?;
             // The throttle in `SegmentWriter::flush` (`flush_count % N == 0`)
             // is for mid-segment rewrites only — at rotation we MUST persist
@@ -1194,14 +1248,11 @@ impl Table {
         let mut segment_tasks: Vec<&Segment> = self.immutable_segments.iter().collect();
         if let Some(writer) = &self.active_segment { segment_tasks.push(&writer.segment); }
         let filter_start = std::time::Instant::now();
-        let pk_field = if self.manifest.primary_key.is_empty() { "PK" } else { &self.manifest.primary_key };
+        let pk_cols = self.pk_columns();
+        let pk_field = pk_cols.first().map(String::as_str).unwrap_or("PK");
 
-        // Normalize PK filter values to NFC so that canonically equivalent
-        // strings (e.g. "café" NFC vs NFD) match correctly. Without this,
-        // a query with NFD form would fail candidate_matches_filters even
-        // though the row was stored with NFC form (same canonical_bytes hash).
         for filter in final_filters.iter_mut() {
-            if filter.field == pk_field {
+            if self.field_is_pk_column(&filter.field) {
                 filter.value = filter.value.nfc().collect();
                 if let Some(ref mut v) = filter.value_to {
                     *v = v.nfc().collect();
@@ -1212,11 +1263,38 @@ impl Table {
             }
         }
 
-        let pk_filter = final_filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::Eq);
-        let pk_in_filter = final_filters.iter().find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::In);
-        let segment_matches = if let Some(f) = pk_filter {
-            let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
-            if use_index {
+        let composite_pk = self.composite_pk_from_eq_filters(&final_filters);
+        let pk_filter = if composite_pk.is_some() {
+            None
+        } else if pk_cols.len() == 1 {
+            final_filters
+                .iter()
+                .find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::Eq)
+        } else {
+            None
+        };
+        let pk_in_filter = if pk_cols.len() == 1 {
+            final_filters
+                .iter()
+                .find(|f| f.field == pk_field && f.op == crate::core::types::ComparisonOp::In)
+        } else {
+            None
+        };
+        let segment_matches = if let Some(composite) = composite_pk {
+            if let Some((seg_id, local_id)) = self.primary_index.get(&composite) {
+                let candidate = (seg_id, local_id);
+                if self.candidate_matches_filters(candidate, &final_filters, &final_filters_op)? {
+                    let mut bm = RoaringBitmap::new();
+                    bm.insert(local_id);
+                    vec![(seg_id, bm)]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        } else if let Some(f) = pk_filter {
+            if final_filters.len() == 1 {
                 if let Some((seg_id, local_id)) = self.primary_index.get(&f.value) {
                     let candidate = (seg_id, local_id);
                     if self.candidate_matches_filters(candidate, &final_filters, &final_filters_op)? {
@@ -1226,8 +1304,38 @@ impl Table {
                     } else {
                         vec![]
                     }
-                } else { vec![] }
-            } else { self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)? }
+                } else {
+                    vec![]
+                }
+            } else if final_filters_op == LogicalOp::And {
+                if let Some(exact_matches) =
+                    self.exact_matches_for_eq_filters(&final_filters, pk_field)?
+                {
+                    let remaining_filters: Vec<Filter> = final_filters
+                        .iter()
+                        .filter(|filter| {
+                            !self.field_is_pk_column(&filter.field)
+                                || filter.op != crate::core::types::ComparisonOp::Eq
+                        })
+                        .filter(|filter| filter.op != crate::core::types::ComparisonOp::In)
+                        .cloned()
+                        .collect();
+                    if remaining_filters.is_empty() {
+                        exact_matches
+                    } else {
+                        let scanned = self.scan_segments_parallel(
+                            &segment_tasks,
+                            &remaining_filters,
+                            &LogicalOp::And,
+                        )?;
+                        intersect_segment_matches(exact_matches, scanned)
+                    }
+                } else {
+                    self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)?
+                }
+            } else {
+                self.scan_segments_parallel(&segment_tasks, &final_filters, &final_filters_op)?
+            }
         } else if let Some(f) = pk_in_filter {
             let use_index = final_filters.len() == 1 || final_filters_op == LogicalOp::And;
             if use_index {
@@ -1527,7 +1635,7 @@ impl Table {
     /// in `BITTICE_SKIP_EXACT_INDEX_FIELDS` (comma-separated) when those fields are only
     /// queried as ranges, not Eq.
     fn should_skip_exact_index(&self, field: &str) -> bool {
-        if !self.manifest.primary_key.is_empty() && field == self.manifest.primary_key {
+        if self.field_is_pk_column(field) {
             return true;
         }
         if let Ok(list) = std::env::var("BITTICE_SKIP_EXACT_INDEX_FIELDS") {
@@ -1866,7 +1974,7 @@ impl Table {
         Ok(())
     }
 
-    fn exact_matches_for_eq_filters(&self, filters: &[Filter], _pk_field: &str) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
+    fn exact_matches_for_eq_filters(&self, filters: &[Filter], pk_field: &str) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
         let eq_filters: Vec<&Filter> = filters.iter()
             .filter(|filter| {
                 (filter.op == crate::core::types::ComparisonOp::Eq
@@ -1883,6 +1991,11 @@ impl Table {
         let mut exact_matches: Option<Vec<(u64, RoaringBitmap)>> = None;
 
         for filter in eq_filters {
+            // PK columns have no exact index (see should_skip_exact_index); they are
+            // validated via remaining_filters + scan after other Eq columns narrow candidates.
+            if filter.field == pk_field || self.field_is_pk_column(&filter.field) {
+                continue;
+            }
             let current_matches = if filter.op == crate::core::types::ComparisonOp::In {
                 self.exact_matches_for_in_filter(filter)?
             } else {
@@ -2170,6 +2283,46 @@ impl Table {
         Vec::new()
     }
 
+    /// Remove immutable segment entries whose directories have no `.dat` files and
+    /// no live rows remain. Returns the number of ghost segments purged.
+    fn compact_purge_ghost_segments(&mut self, old_count: usize) -> Result<usize> {
+        info!(
+            "Table '{}': compact() purging {} ghost segment(s) (manifest entries without .dat files, 0 live rows).",
+            self.name, old_count
+        );
+        let segments_dir = self.base_path.join("segments");
+        let old_ids: Vec<u64> = self.immutable_segments.iter().map(|s| s.id).collect();
+        for old_id in &old_ids {
+            let old_seg_path = segments_dir.join(format!("seg_{:04}", old_id));
+            if old_seg_path.exists() {
+                fs::remove_dir_all(&old_seg_path)?;
+            }
+            self.manifest.remove_segment(*old_id);
+        }
+        // Drop the active segment dir too — it may be another empty shell.
+        let active_id = self.manifest.active_segment_id;
+        let active_seg_path = segments_dir.join(format!("seg_{:04}", active_id));
+        if active_seg_path.exists() {
+            fs::remove_dir_all(&active_seg_path)?;
+        }
+        self.immutable_segments.clear();
+        self.primary_index = PrimaryIndex::new();
+        self.exact_index_cache.write().unwrap().clear();
+        let exact_dir = self.exact_index_dir();
+        if exact_dir.exists() {
+            let _ = fs::remove_dir_all(&exact_dir);
+        }
+        self.active_segment = None;
+        self.manifest.active_segment_id = 0;
+        self.manifest.last_sequence_number += 1;
+        self.ensure_active_segment()?;
+        self.save_manifest()?;
+        self.save_primary_index()?;
+        self.wal.flush_writes()?;
+        self.wal.truncate()?;
+        Ok(old_count)
+    }
+
     pub fn compact(&mut self) -> Result<usize> {
         // 1. Flush active segment so every row is in an immutable segment —
         // but only if there's actually something to flush. Calling
@@ -2183,6 +2336,12 @@ impl Table {
         }
 
         let old_count = self.immutable_segments.len();
+
+        // Self-heal mirrors whose manifest lists segments but none have `.dat`
+        // files (common after interrupted compacts or legacy empty-segment rotation).
+        if old_count > 0 && self.live_row_count() == 0 && self.discover_segment_fields().is_empty() {
+            return self.compact_purge_ghost_segments(old_count);
+        }
 
         // 2. Skip-early check.
         let target_rows: u64 = std::env::var("BITTICE_COMPACT_SEGMENT_ROWS")
@@ -2223,13 +2382,18 @@ impl Table {
         // forever on the corrupted table.
         let fields = self.discover_segment_fields();
         if fields.is_empty() {
+            if self.live_row_count() == 0 {
+                return self.compact_purge_ghost_segments(old_count);
+            }
             anyhow::bail!(
                 "Table '{}': compact aborted — could not read any segment directory \
-                 ({} segments listed in manifest but none have on-disk .dat files). \
+                 ({} segments listed in manifest but none have on-disk .dat files) \
+                 while {} live row(s) remain in primary_index. \
                  Mirror metadata is out of sync with disk; delete the table mirror \
                  to let CDC re-bootstrap, or restore from backup.",
                 self.name,
-                old_count
+                old_count,
+                self.live_row_count()
             );
         }
 
@@ -2244,12 +2408,6 @@ impl Table {
         // Choose starting ID well past all existing segment IDs to avoid collisions.
         let max_existing_id = self.immutable_segments.iter().map(|s| s.id).max().unwrap_or(0);
         let mut next_new_id = max_existing_id + 1_000_000;
-
-        let pk_field = if self.manifest.primary_key.is_empty() {
-            "PK".to_string()
-        } else {
-            self.manifest.primary_key.clone()
-        };
 
         // pk_val -> (new_seg_id, new_local_id)
         let mut new_primary_index = PrimaryIndex::new();
@@ -2308,12 +2466,8 @@ impl Table {
                 writer.append_record(&row_map)?;
                 current_row_count += 1;
 
-                // Get PK value directly from the row data.
-                // pk_field is always in fields (derived from segment directory),
-                // so row_map always contains it.
-                if let Some(pk_val) = row_map.get(&pk_field) {
-                    new_primary_index.insert(pk_val, (new_seg_id, new_local_id));
-                }
+                let pk_val = self.row_pk_value(&row_map);
+                new_primary_index.insert(&pk_val, (new_seg_id, new_local_id));
             }
         }
 

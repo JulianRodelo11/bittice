@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
+use mysql_async::Conn;
 use tracing::{debug, info, warn};
 
 use crate::core::control_plane::{
@@ -47,14 +47,7 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(300);
 const CONFIG_INITIAL_BACKOFF_STEPS: &[u64] = &[5, 15, 45, 120, 300];
 
 // Audit / append-only tables that always drift when compared with COUNT(*).
-// Hardcoded as a built-in safety net — comparing `consistency_checks` to itself
-// is meaningless (every cron INSERT adds RDS rows the CDC has yet to copy).
-const BUILT_IN_AUDIT_DENYLIST: &[&str] = &[
-    "bittice.consistency_checks",
-    "bittice.drift_incidents",
-    "bittice.drift_diagnostics",
-    "bittice.schema_migrations",
-];
+const BUILT_IN_AUDIT_DENYLIST: &[&str] = crate::core::mirror_consistency::AUDIT_DENYLIST;
 
 /// Spawn the self-health loop. Returns immediately. No-op when identity env
 /// vars are missing (= local mode, exactly like `heartbeat.rs`).
@@ -268,7 +261,7 @@ async fn run_check(
 
         // One MySQL connection per profile per tick — matches the v2 Python
         // shape that avoided host_cache 1129 from N× short-lived connects.
-        let mut conn = match connect_source(&cfg_json).await {
+        let mut conn = match crate::core::mirror_consistency::connect_source(&cfg_json).await {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -289,15 +282,21 @@ async fn run_check(
                 continue;
             }
 
-            let (schema, table_sql) = parse_qkey(sync_all, &database, qkey);
+            let (schema, table_sql) =
+                crate::core::mirror_consistency::parse_qkey(sync_all, &database, qkey);
             let disk_entity = if sync_all { schema.to_lowercase() } else { entity.clone() };
-            let mirror_dir = resolve_mirror_dir(data_root, &disk_entity, &table_sql);
+            let mirror_dir =
+                crate::core::mirror_consistency::resolve_mirror_dir(data_root, &disk_entity, &table_sql);
 
             let mut mirror_count_at = chrono::Utc::now();
-            let mut mirror_count = mirror_live_count(&mirror_dir).unwrap_or(0);
+            let mut mirror_count =
+                crate::core::mirror_consistency::mirror_live_count(&mirror_dir).unwrap_or(0);
 
             let mut source_count_at = chrono::Utc::now();
-            let mut source_count = match mysql_count(&mut conn, sync_all, &database, &schema, &table_sql).await
+            let mut source_count = match crate::core::mirror_consistency::mysql_count(
+                &mut conn, sync_all, &database, &schema, &table_sql,
+            )
+            .await
             {
                 Ok(n) => n,
                 Err(e) => {
@@ -323,9 +322,10 @@ async fn run_check(
             if diff != 0 {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 mirror_count_at = chrono::Utc::now();
-                mirror_count = mirror_live_count(&mirror_dir).unwrap_or(mirror_count);
+                mirror_count =
+                    crate::core::mirror_consistency::mirror_live_count(&mirror_dir).unwrap_or(mirror_count);
                 source_count_at = chrono::Utc::now();
-                source_count = match mysql_count(
+                source_count = match crate::core::mirror_consistency::mysql_count(
                     &mut conn, sync_all, &database, &schema, &table_sql,
                 ).await {
                     Ok(n) => n,
@@ -454,15 +454,6 @@ fn read_json(path: &Path) -> Result<serde_json::Value> {
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
-fn parse_qkey(sync_all: bool, database: &str, qkey: &str) -> (String, String) {
-    if sync_all {
-        if let Some((s, t)) = qkey.split_once('.') {
-            return (s.to_string(), t.to_string());
-        }
-    }
-    (database.to_string(), qkey.to_string())
-}
-
 fn should_skip(qkey: &str, cfg: &EffectiveEngineConfig) -> bool {
     if BUILT_IN_AUDIT_DENYLIST.contains(&qkey) {
         return true;
@@ -476,174 +467,6 @@ fn should_skip(qkey: &str, cfg: &EffectiveEngineConfig) -> bool {
         return !allow.iter().any(|a| a == qkey);
     }
     false
-}
-
-fn resolve_mirror_dir(data_root: &Path, entity: &str, table: &str) -> PathBuf {
-    let primary = data_root.join("mirror").join(entity);
-    let direct = primary.join(table);
-    if direct.is_dir() {
-        return direct;
-    }
-    // Case-insensitive fallback (MySQL is by default case-insensitive on table names).
-    if primary.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&primary) {
-            for e in entries.flatten() {
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                    && e.file_name().to_string_lossy().eq_ignore_ascii_case(table)
-                {
-                    return e.path();
-                }
-            }
-        }
-    }
-    // Legacy layout (pre-mirror/ split). Mirrors the Python helper.
-    let legacy = data_root.join(entity).join(table);
-    if legacy.is_dir() {
-        return legacy;
-    }
-    direct
-}
-
-/// Count live rows across every segment of a mirror table.
-///
-/// Reads ONLY from durable on-disk artifacts — never trusts manifest metadata
-/// for live counts. The manifest used to cache a `deleted_count` field that
-/// silently desynced from the real tombstone bitmap on every CDC delete; six
-/// different "resync" call sites existed to fight that drift before v0.1.157
-/// removed the cache entirely. Per segment:
-///   - record_count = `<pk_field>.offsets` size / 8 (one u64 offset per row)
-///   - deleted_count = len of the RoaringBitmap in `deleted.bitmap`
-/// Both files are durable and atomically written, so a transient mid-write
-/// read at worst lags one delete.
-///
-/// Cost per call: one stat + one bitmap deserialize per segment dir. For a
-/// 30-segment table with ~50-byte bitmaps that's well under 1ms.
-fn mirror_live_count(table_dir: &Path) -> Option<u64> {
-    let manifest = table_dir.join("manifest.json");
-    let raw = std::fs::read_to_string(&manifest).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
-
-    // PK column name is per-table — read from manifest so this works for
-    // any customer schema (PK may be `id`, `uuid`, `customer_id`, …). The
-    // fallback below scans the segment dir for any `*.offsets` file; every
-    // column writes one u64 per row so any of them yields the same count.
-    let pk_field = val
-        .get("primary_key")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-
-    let mut seg_ids: Vec<u64> = val
-        .get("segments")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.get("id").and_then(|v| v.as_u64()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(active_id) = val.get("active_segment_id").and_then(|v| v.as_u64()) {
-        if !seg_ids.contains(&active_id) {
-            seg_ids.push(active_id);
-        }
-    }
-
-    let segments_dir = table_dir.join("segments");
-    let mut live: i64 = 0;
-    for seg_id in seg_ids {
-        let seg_path = segments_dir.join(format!("seg_{:04}", seg_id));
-        let offsets_path = match pk_field.as_deref() {
-            Some(name) => seg_path.join(format!("{}.offsets", name)),
-            None => match std::fs::read_dir(&seg_path).ok().and_then(|entries| {
-                entries.flatten().find_map(|e| {
-                    if e.file_name().to_string_lossy().ends_with(".offsets") {
-                        Some(e.path())
-                    } else {
-                        None
-                    }
-                })
-            }) {
-                Some(p) => p,
-                None => continue,
-            },
-        };
-        let rc = match std::fs::metadata(&offsets_path) {
-            Ok(m) => (m.len() / 8) as i64,
-            Err(_) => continue,
-        };
-        let dc = match std::fs::File::open(seg_path.join("deleted.bitmap")) {
-            Ok(file) => roaring::RoaringBitmap::deserialize_from(file)
-                .map(|bm| bm.len() as i64)
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
-        live += (rc - dc).max(0);
-    }
-    Some(live as u64)
-}
-
-async fn connect_source(cfg_json: &serde_json::Value) -> Result<Conn> {
-    let host = cfg_json.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let port = cfg_json.get("port").and_then(|v| v.as_u64()).unwrap_or(3306) as u16;
-    let user = cfg_json.get("user").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let pass = cfg_json
-        .get("pass")
-        .or_else(|| cfg_json.get("password"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if host.is_empty() || user.is_empty() {
-        anyhow::bail!("cdc_config.json missing host/user");
-    }
-
-    let mut builder = OptsBuilder::default()
-        .ip_or_hostname(host.clone())
-        .tcp_port(port)
-        .user(Some(user))
-        .pass(Some(pass));
-
-    if host.contains("rds.amazonaws.com") || host.ends_with(".amazonaws.com") {
-        // RDS terminates TLS. Same heuristic + same trust posture as the Python
-        // reporter that ran for months: opportunistic TLS, no cert chain
-        // verification (pymysql `ssl={'ssl':{}}` defaults). The threat model
-        // for engine ⇄ same-VPC RDS is interception by another instance
-        // already inside the VPC — out of scope here. If a future config
-        // needs strict verification it goes through engine_configs, not env.
-        builder = builder.ssl_opts(
-            SslOpts::default()
-                .with_danger_accept_invalid_certs(true)
-                .with_danger_skip_domain_validation(true),
-        );
-    }
-
-    let opts: Opts = builder.into();
-    let conn = Conn::new(opts).await.with_context(|| format!("connect to {host}"))?;
-    Ok(conn)
-}
-
-async fn mysql_count(
-    conn: &mut Conn,
-    sync_all: bool,
-    database: &str,
-    schema: &str,
-    table: &str,
-) -> Result<u64> {
-    let ident = |s: &str| s.replace('`', "``");
-    let sql = if sync_all {
-        format!("SELECT COUNT(*) FROM `{}`.`{}`", ident(schema), ident(table))
-    } else {
-        // Set the active database explicitly. Cheaper than a full sql_use_db
-        // round-trip on every call but `USE` is fine over mysql_async.
-        let use_sql = format!("USE `{}`", ident(database));
-        conn.query_drop(use_sql).await?;
-        format!("SELECT COUNT(*) FROM `{}`", ident(table))
-    };
-    let n: u64 = conn
-        .query_first(sql)
-        .await?
-        .ok_or_else(|| anyhow!("COUNT returned no row"))?;
-    Ok(n)
 }
 
 async fn capture_source_diagnostics(conn: &mut Conn) -> Result<SourceDiagnostics> {

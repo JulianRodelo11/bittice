@@ -805,9 +805,18 @@ fn fetch_join_rows(
         }
 
         let mut rows = Vec::new();
+        let mut seen_fingerprints = HashSet::new();
         for filters in filter_sets {
-            let mut batch = fetch_rows_from_table(&table, &join.alias, fields, &filters, None)?;
-            rows.append(&mut batch);
+            let batch = fetch_rows_from_table(&table, &join.alias, fields, &filters, None)?;
+            for row in batch {
+                // Many base rows can share the same join key (e.g. pa.usuarioProductoId).
+                // Lookup batches re-fetch the identical joined row once per key; appending
+                // blindly makes build_join_index treat one target row as N matches and fans
+                // out a 1:1 inner join into a cartesian product.
+                if seen_fingerprints.insert(flat_row_fingerprint(&row)) {
+                    rows.push(row);
+                }
+            }
         }
         Ok(rows)
     } else {
@@ -1569,6 +1578,16 @@ fn compose_key<'a>(row: &FlatRow, fields: impl Iterator<Item = &'a QualifiedFiel
         values.push(normalize_join_key_fragment(&raw));
     }
     Some(values.join(&JOIN_SEPARATOR.to_string()))
+}
+
+/// Stable fingerprint of a fetched join row (all qualified columns).
+fn flat_row_fingerprint(row: &FlatRow) -> String {
+    let mut keys: Vec<_> = row.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|key| format!("{key}={}", row.get(key).map(|s| s.as_str()).unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join(&JOIN_SEPARATOR.to_string())
 }
 
 fn qualify(alias: &str, field: &str) -> String {
