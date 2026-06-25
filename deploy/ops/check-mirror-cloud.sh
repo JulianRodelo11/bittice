@@ -6,7 +6,9 @@
 #   export AWS_PROFILE=deploy-goparking
 #   ./deploy/ops/check-mirror-cloud.sh
 #   ./deploy/ops/check-mirror-cloud.sh --entity bittice_host --revalidate
-#   ./deploy/ops/check-mirror-cloud.sh --ip 100.52.37.147 --table db_beparking_dev.BpCliente
+#   ./deploy/ops/check-mirror-cloud.sh --ip 100.52.37.147 --table BpCliente
+#   ./deploy/ops/check-mirror-cloud.sh --table beparking.BpCliente
+#   ./deploy/ops/check-mirror-cloud.sh --table attendant/pagos
 #
 # Run on the EC2 itself (e.g. after scp to /opt/bittice/ops/):
 #   ./check-mirror-cloud.sh --local --entity bittice_host
@@ -42,7 +44,10 @@ Options:
   --ip <addr>          EC2 public IP (skip AWS/terraform lookup).
   --app-name <name>    EC2 Name tag / terraform app_name (default: dash-sac-dev).
   --entity <profile>   data/profiles/<profile>/ (default: all profiles).
-  --table <qkey>       Bootstrapped table key, e.g. db_beparking_dev.BpCliente.
+  --table <filter>     Table filter (repeatable via extra args). Examples:
+                         BpCliente              — any bootstrapped schema
+                         beparking.BpCliente    — partial schema match
+                         db_beparking_prod.BpCliente — full bootstrapped key
   --revalidate         Re-read counts after 2s when drift is detected.
   --json               JSON output.
   -h, --help           Show this help.

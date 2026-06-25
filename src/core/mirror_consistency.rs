@@ -32,7 +32,7 @@ pub struct TableConsistencyRow {
 #[derive(Debug, Clone, Default)]
 pub struct CheckMirrorOptions {
     pub entity_filter: Option<String>,
-    pub table_filter: Option<String>,
+    pub table_filter: Option<Vec<String>>,
     /// Re-read counts after 2s when the first pass shows drift (absorbs CDC lag races).
     pub revalidate: bool,
 }
@@ -59,11 +59,13 @@ pub async fn check_mirror_consistency(opts: CheckMirrorOptions) -> Result<Vec<Ta
         .map(|e| e.trim().to_lowercase())
         .filter(|e| !e.is_empty());
 
-    let table_filter = opts
+    let table_filters: Vec<String> = opts
         .table_filter
-        .as_ref()
+        .unwrap_or_default()
+        .into_iter()
         .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty());
+        .filter(|t| !t.is_empty())
+        .collect();
 
     let mut rows = Vec::new();
 
@@ -131,10 +133,12 @@ pub async fn check_mirror_consistency(opts: CheckMirrorOptions) -> Result<Vec<Ta
             if AUDIT_DENYLIST.contains(&qkey.as_str()) {
                 continue;
             }
-            if let Some(ref tf) = table_filter {
-                if !qkey.eq_ignore_ascii_case(tf) {
-                    continue;
-                }
+            if !table_filters.is_empty()
+                && !table_filters
+                    .iter()
+                    .any(|tf| matches_table_filter(qkey, tf))
+            {
+                continue;
             }
 
             let (schema, table_sql) = parse_qkey(sync_all, &database, qkey);
@@ -203,6 +207,51 @@ fn discover_profiles(data_root: &Path) -> Vec<ProfileEntry> {
 fn read_json(path: &Path) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+fn qkey_table(qkey: &str) -> &str {
+    qkey.rsplit_once('.').map(|(_, table)| table).unwrap_or(qkey)
+}
+
+fn qkey_schema(qkey: &str) -> Option<&str> {
+    qkey.rsplit_once('.').map(|(schema, _)| schema)
+}
+
+/// Whether a bootstrapped `schema.table` key matches a user `--table` filter.
+///
+/// Supports:
+/// - Full key: `db_beparking_prod.BpCliente`
+/// - Table only: `BpCliente` (any bootstrapped schema with that table name)
+/// - Partial schema + table: `beparking.BpCliente` or `attendant/pagos`
+///   (schema matched as case-insensitive substring of the bootstrapped schema)
+pub fn matches_table_filter(qkey: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    if qkey.eq_ignore_ascii_case(filter) {
+        return true;
+    }
+
+    let filter = filter.replace('/', ".");
+
+    if let Some((filter_schema, filter_table)) = filter.rsplit_once('.') {
+        if filter_schema.is_empty() {
+            return qkey_table(qkey).eq_ignore_ascii_case(filter_table);
+        }
+        let Some(qkey_schema) = qkey_schema(qkey) else {
+            return false;
+        };
+        if !qkey_table(qkey).eq_ignore_ascii_case(filter_table) {
+            return false;
+        }
+        qkey_schema.eq_ignore_ascii_case(filter_schema)
+            || qkey_schema
+                .to_ascii_lowercase()
+                .contains(&filter_schema.to_ascii_lowercase())
+    } else {
+        qkey_table(qkey).eq_ignore_ascii_case(&filter)
+    }
 }
 
 pub fn parse_qkey(sync_all: bool, database: &str, qkey: &str) -> (String, String) {
@@ -398,4 +447,48 @@ pub async fn mysql_count(
         .await?
         .ok_or_else(|| anyhow::anyhow!("COUNT returned no row"))?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_filter_full_qkey() {
+        assert!(matches_table_filter(
+            "db_beparking_prod.BpCliente",
+            "db_beparking_prod.BpCliente"
+        ));
+        assert!(matches_table_filter(
+            "db_beparking_prod.BpCliente",
+            "DB_BEPARKING_PROD.bpcliente"
+        ));
+    }
+
+    #[test]
+    fn table_filter_table_only() {
+        assert!(matches_table_filter("db_beparking_prod.BpCliente", "BpCliente"));
+        assert!(matches_table_filter("db_beparking_dev.BpCliente", "bpcliente"));
+        assert!(!matches_table_filter("db_beparking_prod.BpBono", "BpCliente"));
+    }
+
+    #[test]
+    fn table_filter_partial_schema() {
+        assert!(matches_table_filter(
+            "db_beparking_prod.BpCliente",
+            "beparking.BpCliente"
+        ));
+        assert!(matches_table_filter(
+            "db_attendant_prod.pagos",
+            "attendant.pagos"
+        ));
+        assert!(matches_table_filter(
+            "db_attendant_prod.pagos",
+            "attendant/pagos"
+        ));
+        assert!(!matches_table_filter(
+            "db_inside_prod.pagos",
+            "attendant.pagos"
+        ));
+    }
 }

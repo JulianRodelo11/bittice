@@ -12,6 +12,10 @@ import struct
 import sys
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from table_qkey import DEFAULT_ATTENDANT_DRIFT_PATTERNS, resolve_table_filters
+
 try:
     import mysql.connector
     import pyroaring
@@ -91,7 +95,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Diagnose mirror drift by PK diff")
     parser.add_argument("--data-root", default=os.environ.get("BITTICE_DATA_ROOT", "/opt/bittice/data"))
     parser.add_argument("--profile", default="bittice_host")
-    parser.add_argument("--table", action="append", dest="tables", help="schema.table (repeatable)")
+    parser.add_argument(
+        "--table",
+        action="append",
+        dest="tables",
+        help="Table filter: BpCliente, beparking.BpCliente, schema.table (repeatable)",
+    )
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -107,12 +116,10 @@ def main() -> int:
 
     state_path = data_root / "profiles" / args.profile / "cdc_state.json"
     bootstrapped = json.loads(state_path.read_text()).get("bootstrapped_tables", [])
-    targets = args.tables or [
-        t
-        for t in bootstrapped
-        if t.startswith("db_attendant_dev.")
-        and t.split(".", 1)[1] in ("pagos", "entradaVehiculos", "transacciones")
-    ]
+    if args.tables:
+        targets = resolve_table_filters(bootstrapped, args.tables)
+    else:
+        targets = resolve_table_filters(bootstrapped, list(DEFAULT_ATTENDANT_DRIFT_PATTERNS))
     if not targets:
         targets = bootstrapped
 

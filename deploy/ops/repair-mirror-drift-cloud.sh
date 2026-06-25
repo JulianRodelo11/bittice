@@ -3,7 +3,7 @@
 #
 #   export AWS_PROFILE=deploy-goparking
 #   ./deploy/ops/repair-mirror-drift-cloud.sh --entity bittice_host --yes
-#   ./deploy/ops/repair-mirror-drift-cloud.sh --entity bittice_host --yes --table db_attendant_dev.pagos
+#   ./deploy/ops/repair-mirror-drift-cloud.sh --entity parking_host --yes --table pagos
 #
 set -euo pipefail
 
@@ -87,6 +87,7 @@ scp -o StrictHostKeyChecking=no \
     -i "${SSH_KEY}" \
     "${SCRIPT_DIR}/repair-mirror-drift.sh" \
     "${SCRIPT_DIR}/diagnose-mirror-drift.py" \
+    "${SCRIPT_DIR}/table_qkey.py" \
     "${SSH_USER}@${TARGET_IP}:${REMOTE_OPS}/"
 
 ssh -o StrictHostKeyChecking=no \

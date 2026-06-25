@@ -75,9 +75,10 @@ pub enum Commands {
         /// Profile folder under data/profiles/ (e.g. bittice_host).
         #[arg(short, long)]
         entity: Option<String>,
-        /// Bootstrapped table key (e.g. db_beparking_dev.BpCliente).
+        /// Table filter: full key (db_beparking_prod.BpCliente), table only (BpCliente),
+        /// or partial schema + table (beparking.BpCliente, attendant/pagos). Repeatable.
         #[arg(short, long)]
-        table: Option<String>,
+        table: Vec<String>,
         /// Re-read counts after 2s when drift is detected (absorbs CDC lag).
         #[arg(long, default_value_t = false)]
         revalidate: bool,

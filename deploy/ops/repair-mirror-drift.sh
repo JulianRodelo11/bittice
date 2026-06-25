@@ -8,17 +8,17 @@
 # fix, UPDATE-heavy tables will drift again.
 #
 # On EC2 (local):
-#   sudo ./repair-mirror-drift.sh --entity bittice_host --yes \
-#     --table db_attendant_dev.pagos \
-#     --table db_attendant_dev.entradaVehiculos \
-#     --table db_attendant_dev.transacciones
+#   sudo ./repair-mirror-drift.sh --entity parking_host --yes \
+#     --table attendant.pagos \
+#     --table attendant.entradaVehiculos \
+#     --table attendant.transacciones
 #
 # Dry run:
-#   ./repair-mirror-drift.sh --entity bittice_host --dry-run --table db_attendant_dev.pagos
+#   ./repair-mirror-drift.sh --entity parking_host --dry-run --table pagos
 #
 # From laptop (SSH):
 #   export AWS_PROFILE=deploy-goparking
-#   ./deploy/ops/repair-mirror-drift-cloud.sh --entity bittice_host --yes
+#   ./deploy/ops/repair-mirror-drift-cloud.sh --entity parking_host --yes
 #
 set -euo pipefail
 
@@ -37,11 +37,13 @@ usage() {
 Usage: repair-mirror-drift.sh --entity <profile> [options]
 
 Required:
-  --entity <profile>     Profile folder under data/profiles/ (e.g. bittice_host).
+  --entity <profile>     Profile folder under data/profiles/ (e.g. parking_host).
 
 Options:
-  --table <qkey>         Bootstrapped table key (repeatable), e.g. db_attendant_dev.pagos.
-                         Default: the three db_attendant_dev drift tables if none given.
+  --table <filter>       Table filter (repeatable). Same rules as check-mirror:
+                         pagos, attendant.pagos, db_attendant_prod.pagos, etc.
+                         Default: attendant.pagos, attendant.entradaVehiculos,
+                         attendant.transacciones (resolved against bootstrapped_tables).
   --dry-run              Print actions without modifying state or restarting.
   --yes                  Skip confirmation prompt.
   --diagnose             Run PK diff (diagnose-mirror-drift.py) before repair.
@@ -74,11 +76,13 @@ if [[ -z "${ENTITY}" ]]; then
 fi
 
 if [[ ${#TABLES[@]} -eq 0 ]]; then
-  TABLES=(
-    db_attendant_dev.pagos
-    db_attendant_dev.entradaVehiculos
-    db_attendant_dev.transacciones
+  TABLE_PATTERNS=(
+    attendant.pagos
+    attendant.entradaVehiculos
+    attendant.transacciones
   )
+else
+  TABLE_PATTERNS=("${TABLES[@]}")
 fi
 
 PROFILE_DIR="${DATA_ROOT}/profiles/${ENTITY}"
@@ -87,6 +91,30 @@ CFG_PATH="${PROFILE_DIR}/cdc_config.json"
 
 if [[ ! -f "${STATE_PATH}" || ! -f "${CFG_PATH}" ]]; then
   echo "repair-mirror-drift: missing profile under ${PROFILE_DIR}" >&2
+  exit 1
+fi
+
+TABLES=()
+while IFS= read -r qkey; do
+  [[ -n "${qkey}" ]] && TABLES+=("${qkey}")
+done < <(
+  python3 - "${STATE_PATH}" "${SCRIPT_DIR}" "${TABLE_PATTERNS[@]}" <<'PY'
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[2])
+from table_qkey import DEFAULT_ATTENDANT_DRIFT_PATTERNS, resolve_table_filters
+
+state_path = Path(sys.argv[1])
+patterns = sys.argv[3:] or list(DEFAULT_ATTENDANT_DRIFT_PATTERNS)
+bootstrapped = json.loads(state_path.read_text()).get("bootstrapped_tables", [])
+for q in resolve_table_filters(bootstrapped, patterns):
+    print(q)
+PY
+)
+
+if [[ ${#TABLES[@]} -eq 0 ]]; then
+  echo "repair-mirror-drift: no bootstrapped tables matched filters: ${TABLE_PATTERNS[*]}" >&2
   exit 1
 fi
 
@@ -125,9 +153,9 @@ run_check_mirror() {
   [[ -z "${img}" ]] && img="ghcr.io/julianrodelo11/bittice:stable"
   log "check-mirror (${when})…"
   local -a cmd=(check-mirror --entity "${ENTITY}" --revalidate)
-  if [[ ${#TABLES[@]} -eq 1 ]]; then
-    cmd+=(--table "${TABLES[0]}")
-  fi
+  for t in "${TABLES[@]}"; do
+    cmd+=(--table "${t}")
+  done
   docker run --rm --network host \
     -v "${DATA_ROOT}:/app/data" \
     -e BITTICE_DATA_ROOT=/app/data \

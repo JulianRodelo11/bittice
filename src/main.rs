@@ -185,7 +185,11 @@ async fn main() -> Result<()> {
             Commands::CheckMirror { entity, table, revalidate, json } => {
                 let opts = bittice::core::mirror_consistency::CheckMirrorOptions {
                     entity_filter: entity,
-                    table_filter: table,
+                    table_filter: if table.is_empty() {
+                        None
+                    } else {
+                        Some(table)
+                    },
                     revalidate,
                 };
                 let rows =
