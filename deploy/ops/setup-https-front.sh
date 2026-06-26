@@ -111,6 +111,8 @@ services:
       - BITTICE_WARM_INDICES_ONLY=1
       - BITTICE_QUERY_OPEN_LAZY=1
       - BITTICE_BUFFER_POOL_MB=1024
+      - BITTICE_CDC_SYNC_ONLY_OPS=1
+      - BITTICE_CDC_SKIP_MIRROR_RESYNC_ON_GAP=1
     restart: unless-stopped
     networks:
       - bittice_net

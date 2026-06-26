@@ -221,10 +221,14 @@ pub struct MyDatabase {
 }
 
 impl MyDatabase {
-    pub fn new(table_manager: Arc<TableManager>, entity_filter: Option<String>) -> Self {
+    pub fn new(
+        table_manager: Arc<TableManager>,
+        entity_filter: Option<String>,
+        ops_cache: crate::server::SharedOpsCache,
+    ) -> Self {
         Self { 
             table_manager: table_manager.clone(),
-            ops_cache: Arc::new(RwLock::new(None)),
+            ops_cache,
             entity_filter,
             auth_service: crate::core::auth::AuthService::new(table_manager),
         }
@@ -1461,7 +1465,8 @@ impl Database for MyDatabase {
 pub async fn start_grpc_server(port: u16, entity_filter: Option<String>) -> anyhow::Result<()> {
     let table_manager = Arc::new(TableManager::new());
     let never = Arc::new(Notify::new());
-    start_grpc_server_with_manager(port, table_manager, entity_filter, None, never).await
+    let ops_cache = Arc::new(RwLock::new(None));
+    start_grpc_server_with_manager(port, table_manager, entity_filter, None, never, ops_cache).await
 }
 
 pub async fn start_grpc_server_with_manager(
@@ -1470,11 +1475,12 @@ pub async fn start_grpc_server_with_manager(
     entity_filter: Option<String>,
     _log_tx: Option<mpsc::Sender<String>>,
     shutdown: Arc<Notify>,
+    ops_cache: crate::server::SharedOpsCache,
 ) -> anyhow::Result<()> {
     let host = std::env::var("BITTICE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let addr = format!("{}:{}", host, port).parse()?;
     
-    let db = MyDatabase::new(table_manager, entity_filter);
+    let db = MyDatabase::new(table_manager, entity_filter, ops_cache);
     
     info!("gRPC Server listening on {}", addr);
 

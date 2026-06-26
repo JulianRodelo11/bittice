@@ -541,6 +541,8 @@ r#"services:
       - BITTICE_WARM_INDICES_ONLY=1
       - BITTICE_QUERY_OPEN_LAZY=1
       - BITTICE_BUFFER_POOL_MB=1024
+      - BITTICE_CDC_SYNC_ONLY_OPS=1
+      - BITTICE_CDC_SKIP_MIRROR_RESYNC_ON_GAP=1
       # NOTE: BITTICE_SKIP_STARTUP_COMPACT is intentionally NOT set here.
       # Compact folds the mini-segment explosion from CDC write paths into a
       # small number of large segments; skipping it on customer instances would

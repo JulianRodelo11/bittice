@@ -233,8 +233,22 @@ impl CdcWorker {
         Ok(schemas)
     }
 
-    /// Profile `scoped_sync` / `tables` in `cdc_config.json` take precedence over the ops env whitelist.
+    /// Profile `scoped_sync` / `tables` in `cdc_config.json` take precedence over the ops env
+    /// whitelist unless `BITTICE_CDC_SYNC_ONLY_OPS=1`, which intersects the profile list with
+    /// tables referenced in `.bittice_ops.json`.
     fn build_sync_allowlists(
+        entity: &str,
+        database: &str,
+    ) -> (
+        Option<Arc<HashSet<String>>>,
+        Option<Arc<HashSet<String>>>,
+        Option<&'static str>,
+    ) {
+        let (tables, schemas, source) = Self::build_sync_allowlists_raw(entity, database);
+        Self::apply_ops_sync_table_filter(tables, schemas, source)
+    }
+
+    fn build_sync_allowlists_raw(
         entity: &str,
         database: &str,
     ) -> (
@@ -286,6 +300,48 @@ impl CdcWorker {
             None
         };
         (ops, None, source)
+    }
+
+    fn apply_ops_sync_table_filter(
+        table_allowlist: Option<Arc<HashSet<String>>>,
+        schema_allowlist: Option<Arc<HashSet<String>>>,
+        source: Option<&'static str>,
+    ) -> (
+        Option<Arc<HashSet<String>>>,
+        Option<Arc<HashSet<String>>>,
+        Option<&'static str>,
+    ) {
+        if !Self::env_truthy("BITTICE_CDC_SYNC_ONLY_OPS") {
+            return (table_allowlist, schema_allowlist, source);
+        }
+        let Some(ops) = Self::build_ops_table_allowlist() else {
+            return (table_allowlist, schema_allowlist, source);
+        };
+        let filtered = match table_allowlist {
+            Some(profile) => Self::intersect_table_allowlists(&profile, &ops),
+            None => ops,
+        };
+        (
+            Some(filtered),
+            schema_allowlist,
+            Some("BITTICE_CDC_SYNC_ONLY_OPS"),
+        )
+    }
+
+    fn intersect_table_allowlists(
+        profile: &HashSet<String>,
+        ops: &HashSet<String>,
+    ) -> Arc<HashSet<String>> {
+        let inter: HashSet<String> = profile
+            .iter()
+            .filter(|k| ops.contains(k.as_str()))
+            .cloned()
+            .collect();
+        if inter.is_empty() {
+            Arc::new(ops.clone())
+        } else {
+            Arc::new(inter)
+        }
     }
 
     fn allowlist_log_label(&self) -> &'static str {
@@ -3852,5 +3908,40 @@ if this persists, verify ROW-format binlog and run a current Bittice build (WRIT
             map.insert(col_name, val_str);
         }
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod sync_only_ops_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn intersect_drops_profile_tables_not_in_ops() {
+        let profile: HashSet<String> = [
+            "db_beparking_prod.bpvehiculo",
+            "db_beparking_prod.bppuentossobrantes",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let ops: HashSet<String> = ["db_beparking_prod.bpvehiculo"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let out = CdcWorker::intersect_table_allowlists(&profile, &ops);
+        assert_eq!(out.len(), 1);
+        assert!(out.contains("db_beparking_prod.bpvehiculo"));
+    }
+
+    #[test]
+    fn intersect_empty_profile_fallback_to_ops() {
+        let profile = HashSet::new();
+        let ops: HashSet<String> = ["db_attendant_prod.pagos"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let out = CdcWorker::intersect_table_allowlists(&profile, &ops);
+        assert_eq!(out.len(), 1);
     }
 }

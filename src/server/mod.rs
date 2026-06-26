@@ -20,6 +20,9 @@ use axum::extract::Request;
 use std::sync::{Arc};
 use std::time::Instant;
 use tokio::sync::{RwLock as TokioRwLock, Notify};
+
+/// Shared saved-ops cache for HTTP and gRPC (invalidated together on `/_config/reload`).
+pub type SharedOpsCache = Arc<TokioRwLock<Option<(Instant, Arc<Vec<crate::core::saved_queries::SavedOperation>>)>>>;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -314,20 +317,30 @@ pub async fn start_all_servers(
 
     crate::server::auto_update_hint::spawn_if_configured();
 
+    let shared_ops_cache: SharedOpsCache = Arc::new(TokioRwLock::new(None));
+
     let http_tm = table_manager.clone();
     let http_filter = entity_filter.clone();
     let http_active = active_workers.clone();
     let sn_http = shutdown_notify.clone();
+    let http_ops_cache = shared_ops_cache.clone();
     tokio::spawn(async move {
-        start_server(http_tm, http_filter, http_active, sn_http).await;
+        start_server(http_tm, http_filter, http_active, sn_http, http_ops_cache).await;
     });
 
     let grpc_tm = table_manager.clone();
     let grpc_filter = entity_filter.clone();
     let sn_grpc = shutdown_notify.clone();
     tokio::spawn(async move {
-        let _ = grpc::start_grpc_server_with_manager(50051, grpc_tm, grpc_filter, None, sn_grpc)
-            .await;
+        let _ = grpc::start_grpc_server_with_manager(
+            50051,
+            grpc_tm,
+            grpc_filter,
+            None,
+            sn_grpc,
+            shared_ops_cache,
+        )
+        .await;
     });
 
     if shutdown_on_ctrl_c {
@@ -679,11 +692,12 @@ pub async fn start_server(
     table_manager: Arc<TableManager>, 
     entity_filter: Option<String>, 
     active_workers: Arc<StdRwLock<HashSet<String>>>,
-    shutdown_notify: Arc<Notify>
+    shutdown_notify: Arc<Notify>,
+    ops_cache: SharedOpsCache,
 ) {
     let state = Arc::new(ServerState {
         table_manager: table_manager.clone(),
-        ops_cache: Arc::new(TokioRwLock::new(None)),
+        ops_cache,
         entity_filter: entity_filter.clone(),
         auth_service: crate::core::auth::AuthService::new(table_manager),
         active_workers,
@@ -898,6 +912,10 @@ async fn handle_request(
 
     if path == "/_config/reload" {
         info!("Hot-reloading configuration from disk...");
+        {
+            let mut cache = state.ops_cache.write().await;
+            *cache = None;
+        }
         state
             .table_manager
             .refresh_query_priority_keys_from_ops(state.entity_filter.clone());

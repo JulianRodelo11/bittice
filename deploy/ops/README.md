@@ -12,6 +12,8 @@ más.
 
 | File | Purpose |
 |------|---------|
+| `ops-ram-plan.py` / `ops-ram-plan.sh` | Derive tables + warm fields from `.bittice_ops.json`; compare CDC bootstrap gaps; `--apply` POSTs `/_config/reload`. |
+| `ops-ram-plan-cloud.sh` | Run `ops-ram-plan` on EC2 via SSH. |
 | `repair-mirror.sh` | Manual segment compaction — escape hatch when a table has bloat that auto-repair can't resolve. |
 | `flush-mysql-host-cache.sh` | Manual `TRUNCATE performance_schema.host_cache` on the source RDS. Use when error 1129 ("Host is blocked") shows up in the engine logs. |
 | `ensure-rds-max-connect-errors.sh` | One-time setter for `max_connect_errors=1000000` on the source RDS parameter group. Prevention against 1129. |
