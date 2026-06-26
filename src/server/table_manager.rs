@@ -144,6 +144,11 @@ impl TableManager {
         }
     }
 
+    pub fn is_table_open(&self, entity: &str, table_name: &str) -> bool {
+        let key = format!("{}/{}", entity, table_name);
+        self.tables.read().unwrap().contains_key(&key)
+    }
+
     pub fn get_table(&self, entity: &str, table_name: &str) -> anyhow::Result<Arc<RwLock<Table>>> {
         let key = format!("{}/{}", entity, table_name);
 

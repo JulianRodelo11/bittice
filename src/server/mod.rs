@@ -5,6 +5,7 @@ pub mod auto_update_hint;
 pub mod heartbeat;
 pub mod op_counter;
 pub mod self_health;
+pub mod warm;
 
 use axum::{
     debug_handler,
@@ -715,23 +716,8 @@ pub async fn start_server(
         internal_bind
     );
 
-    // Warm cache in background so public REST (:3000) is not blocked for minutes on large mirrors.
-    let warm_state = state.clone();
-    tokio::spawn(async move {
-        let warmed = warm_saved_query_targets(warm_state.clone()).await;
-        if warmed > 0 {
-            debug!("Startup: Warmed {} tables in background", warmed);
-        }
-        loop {
-            let start = std::time::Instant::now();
-            let warmed = warm_saved_query_targets(warm_state.clone()).await;
-            let elapsed = start.elapsed().as_millis();
-            if warmed > 0 && elapsed > 100 {
-                debug!("Maintenance: Warmed {} tables in {}ms", warmed, elapsed);
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
-        }
-    });
+    // Warm cache in background (P0 filters first; P1 skips huge tables).
+    warm::spawn_background_warm(state.clone());
 
     let public_bind = resolve_http_public_bind();
 
@@ -1717,114 +1703,6 @@ fn value_to_f64(value: &serde_json::Value) -> Option<f64> {
         serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
     }
-}
-
-fn split_alias_field(value: &str, base_alias: &str) -> Option<(String, String)> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "*" {
-        return None;
-    }
-
-    let mut parts = trimmed.splitn(2, '.');
-    let first = parts.next()?.trim();
-    match parts.next().map(str::trim) {
-        Some(field) if !field.is_empty() => Some((first.to_string(), field.to_string())),
-        _ => Some((base_alias.to_string(), first.to_string())),
-    }
-}
-
-fn collect_warm_targets(ops: &[SavedOperation]) -> HashMap<(String, String), std::collections::HashSet<String>> {
-    let mut targets: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
-
-    for op in ops {
-        if let SavedOperation::Read(q) = op {
-            let base_alias = q.base_alias();
-            for f in &q.selected_fields {
-                if f != "*" {
-                    if let Some((alias, field)) = split_alias_field(f, &base_alias) {
-                        if alias == base_alias {
-                            targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
-                        }
-                    }
-                }
-            }
-            for s in &q.select {
-                if let Some((alias, field)) = split_alias_field(&s.field, &base_alias) {
-                    if alias == base_alias {
-                        targets.entry((q.entity.clone(), q.table.clone())).or_default().insert(field);
-                    }
-                }
-            }
-            for f in &q.filters {
-                if f.field != "?" {
-                    if let Some((alias, field)) = split_alias_field(&f.field, &base_alias) {
-                        let target_table = if alias == base_alias {
-                            Some((q.entity.clone(), q.table.clone()))
-                        } else {
-                            q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (join.entity.clone().unwrap_or_else(|| q.entity.clone()), join.table.clone()))
-                        };
-                        if let Some(key) = target_table {
-                            targets.entry(key).or_default().insert(field);
-                        }
-                    }
-                }
-            }
-            for o in &q.order_by {
-                if let Some((alias, field)) = split_alias_field(&o.field, &base_alias) {
-                    let target_table = if alias == base_alias {
-                        Some((q.entity.clone(), q.table.clone()))
-                    } else {
-                        q.joins.iter().find(|join| join.alias.as_deref().unwrap_or(join.table.as_str()) == alias).map(|join| (join.entity.clone().unwrap_or_else(|| q.entity.clone()), join.table.clone()))
-                    };
-                    if let Some(key) = target_table {
-                        targets.entry(key).or_default().insert(field);
-                    }
-                }
-            }
-            for join in &q.joins {
-                let join_alias = join.alias.as_deref().unwrap_or(join.table.as_str()).to_string();
-                let join_entity = join.entity.clone().unwrap_or_else(|| q.entity.clone());
-                let join_entry = targets.entry((join_entity, join.table.clone())).or_default();
-                for cond in &join.on {
-                    if let Some((alias, field)) = split_alias_field(&cond.left, &base_alias) {
-                        if alias == join_alias {
-                            join_entry.insert(field);
-                        }
-                    }
-                    if let Some((alias, field)) = split_alias_field(&cond.right, &base_alias) {
-                        if alias == join_alias {
-                            join_entry.insert(field);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    targets
-}
-
-async fn warm_saved_query_targets(state: Arc<ServerState>) -> usize {
-    let Ok(ops) = crate::core::saved_queries::load_operations_with_filter(state.entity_filter.clone()) else {
-        return 0;
-    };
-    let targets = collect_warm_targets(&ops);
-    if targets.is_empty() {
-        return 0;
-    }
-
-    tokio::task::spawn_blocking(move || {
-        let mut warmed_count = 0;
-        for ((entity, table_name), fields_set) in targets {
-            if let Ok(table_lock) = state.table_manager.get_table(&entity, &table_name) {
-                let fields: Vec<String> = fields_set.into_iter().collect();
-                let table = table_lock.read().unwrap();
-                let _ = table.warm_up(&fields);
-                warmed_count += 1;
-            }
-        }
-        warmed_count
-    }).await.unwrap_or(0)
 }
 
 async fn run_query_page(

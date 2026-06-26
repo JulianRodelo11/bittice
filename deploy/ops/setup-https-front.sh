@@ -107,6 +107,7 @@ services:
       - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
       - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
+      - BITTICE_WARM_MAX_TABLE_MB=500
     restart: unless-stopped
     networks:
       - bittice_net
