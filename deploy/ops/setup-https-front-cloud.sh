@@ -2,7 +2,9 @@
 # Apply HTTPS-front compose on cloud EC2 + remind to terraform apply for SG.
 #
 #   export AWS_PROFILE=deploy-goparking
-#   ./deploy/ops/setup-https-front-cloud.sh --domain dash-sac.dev.parking.net.co
+#   ./deploy/ops/setup-https-front-cloud.sh \
+#     --domain dash-sac.prod.parking.net.co \
+#     --grpc-domain dash-sac-grpc.prod.parking.net.co
 #
 set -euo pipefail
 
@@ -17,14 +19,16 @@ TF_DIR="${BITTICE_TF_DIR:-${REPO_ROOT}/data/terraform}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 IP=""
 DOMAIN=""
+GRPC_DOMAIN=""
 APPLY_TF=0
 
 usage() {
   cat <<'EOF'
-Usage: setup-https-front-cloud.sh --domain <hostname> [options]
+Usage: setup-https-front-cloud.sh --domain <rest-host> --grpc-domain <grpc-host> [options]
 
 Options:
   --domain <host>       REST hostname (required)
+  --grpc-domain <host>  gRPC hostname (required unless in data/.bittice_cloud.json)
   --ip <addr>           EC2 public IP
   --app-name <name>     EC2 Name tag (default: dash-sac-dev)
   --apply-terraform     Run terraform apply (updates security group to 443/80)
@@ -35,6 +39,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain) DOMAIN="${2:?}"; shift 2 ;;
+    --grpc-domain) GRPC_DOMAIN="${2:?}"; shift 2 ;;
     --ip) IP="${2:?}"; shift 2 ;;
     --app-name) APP_NAME="${2:?}"; shift 2 ;;
     --apply-terraform) APPLY_TF=1; shift ;;
@@ -44,6 +49,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${DOMAIN}" ]] || { usage; exit 1; }
+
+if [[ -z "${GRPC_DOMAIN}" && -f "${REPO_ROOT}/data/.bittice_cloud.json" ]]; then
+  GRPC_DOMAIN="$(python3 - "${REPO_ROOT}/data/.bittice_cloud.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("grpc_domain") or "")
+PY
+)"
+fi
+
+[[ -n "${GRPC_DOMAIN}" ]] || { echo "setup-https-front-cloud: --grpc-domain is required" >&2; usage; exit 1; }
 
 resolve_ip() {
   if [[ -n "${IP}" ]]; then echo "${IP}"; return; fi
@@ -72,7 +87,8 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "${SSH_KEY}" 
 scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "${SSH_KEY}" \
   "${SCRIPT_DIR}/setup-https-front.sh" "${SSH_USER}@${TARGET_IP}:${REMOTE_OPS}/"
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "${SSH_KEY}" "${SSH_USER}@${TARGET_IP}" \
-  "chmod +x '${REMOTE_OPS}/setup-https-front.sh' && sudo '${REMOTE_OPS}/setup-https-front.sh' --domain '${DOMAIN}'"
+  "chmod +x '${REMOTE_OPS}/setup-https-front.sh' && sudo '${REMOTE_OPS}/setup-https-front.sh' --domain '${DOMAIN}' --grpc-domain '${GRPC_DOMAIN}'"
 
 echo "[setup-https-front-cloud] REST → https://${DOMAIN}/" >&2
+echo "[setup-https-front-cloud] gRPC → ${GRPC_DOMAIN}:50051" >&2
 echo "[setup-https-front-cloud] Admin → ssh -L 8080:127.0.0.1:8080 -i ${SSH_KEY} ${SSH_USER}@${TARGET_IP}" >&2

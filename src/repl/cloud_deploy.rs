@@ -1234,22 +1234,31 @@ fn cloud_config_path() -> PathBuf {
 }
 
 fn load_cloud_config_domain(app_name: &str) -> Option<String> {
+    load_cloud_config_field(app_name, "rest_domain")
+}
+
+fn load_cloud_config_grpc_domain(app_name: &str) -> Option<String> {
+    load_cloud_config_field(app_name, "grpc_domain")
+}
+
+fn load_cloud_config_field(app_name: &str, field: &str) -> Option<String> {
     let raw = std::fs::read_to_string(cloud_config_path()).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     if v.get("app_name")?.as_str()? != app_name {
         return None;
     }
-    let d = v.get("rest_domain")?.as_str()?.trim();
+    let d = v.get(field)?.as_str()?.trim();
     if d.is_empty() {
         return None;
     }
     Some(d.to_string())
 }
 
-fn save_cloud_config(app_name: &str, rest_domain: &str) -> Result<()> {
+fn save_cloud_config(app_name: &str, rest_domain: &str, grpc_domain: &str) -> Result<()> {
     let v = serde_json::json!({
         "app_name": app_name,
         "rest_domain": rest_domain,
+        "grpc_domain": grpc_domain,
     });
     std::fs::write(
         cloud_config_path(),
@@ -1259,8 +1268,17 @@ fn save_cloud_config(app_name: &str, rest_domain: &str) -> Result<()> {
     Ok(())
 }
 
-/// Public hostname for HTTPS REST (no scheme, no port).
-fn validate_rest_domain(domain: &str) -> Result<()> {
+/// Suggested default when the user has not configured gRPC DNS before.
+pub fn suggest_grpc_domain(rest_domain: &str) -> String {
+    let rest = rest_domain.trim().trim_end_matches('.');
+    match rest.split_once('.') {
+        Some((first, rest_labels)) => format!("{first}-grpc.{rest_labels}"),
+        None => format!("{rest}-grpc"),
+    }
+}
+
+/// Public hostname (REST HTTPS or gRPC); no scheme, no port.
+fn validate_public_hostname(domain: &str) -> Result<()> {
     let d = domain.trim().trim_end_matches('.');
     if d.len() < 4 || d.len() > 253 {
         bail!("Hostname must be 4–253 characters.");
@@ -1284,6 +1302,23 @@ fn validate_rest_domain(domain: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn prompt_public_hostname(label: &str, default: &str) -> Result<String> {
+    loop {
+        let raw: String = match input(label).default_input(default).interact() {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(String::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let candidate = raw.trim().to_string();
+        match validate_public_hostname(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) => {
+                let _ = log::warning(format!("{e} Try again."));
+            }
+        }
+    }
 }
 
 /// Cloud deploy + control-plane API key auth. Off during local-first preview.
@@ -1397,27 +1432,29 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         }
     };
 
-    // ── REST public hostname (HTTPS via Caddy; admin/gRPC not on public URLs) ──
-    let default_domain = load_cloud_config_domain(&app_name).unwrap_or_default();
-    let rest_domain: String = loop {
-        let raw: String = match input(
-            "Public REST hostname (HTTPS — DNS A record must point to this EC2's Elastic IP)",
-        )
-        .default_input(&default_domain)
-        .interact()
-        {
-            Ok(s) => s,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        let candidate = raw.trim().to_string();
-        match validate_rest_domain(&candidate) {
-            Ok(()) => break candidate,
-            Err(e) => { let _ = log::warning(format!("{e} Try again.")); }
-        }
-    };
+    // ── REST public hostname (HTTPS via Caddy; admin not on public URL) ──
+    let default_rest = load_cloud_config_domain(&app_name).unwrap_or_default();
+    let rest_domain = prompt_public_hostname(
+        "Public REST hostname (HTTPS — DNS A record must point to this EC2's Elastic IP)",
+        &default_rest,
+    )?;
+    if rest_domain.is_empty() {
+        return Ok(());
+    }
+
+    // ── gRPC public hostname (DNS A → same Elastic IP, port 50051) ──
+    let default_grpc = load_cloud_config_grpc_domain(&app_name)
+        .unwrap_or_else(|| suggest_grpc_domain(&rest_domain));
+    let grpc_domain = prompt_public_hostname(
+        "Public gRPC hostname (DNS A record must point to this EC2's Elastic IP; clients use :50051)",
+        &default_grpc,
+    )?;
+    if grpc_domain.is_empty() {
+        return Ok(());
+    }
+
     let _ = log::info(format!(
-        "REST will be https://{rest_domain}  |  Admin via SSH tunnel  |  gRPC public :50051"
+        "REST will be https://{rest_domain}  |  gRPC {grpc_domain}:50051  |  Admin via SSH tunnel"
     ));
 
     // ── IAM permissions note ──
@@ -1505,6 +1542,8 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
     let ip = terraform_output(&tf_bin, &tf_dir, "public_ip")?;
     let _ = log::success(format!("EC2 Elastic IP: {ip}"));
 
+    save_cloud_config(&app_name, &rest_domain, &grpc_domain)?;
+
     finish_deploy(
         &ip,
         &ssh_priv,
@@ -1512,8 +1551,8 @@ pub async fn run_cloud_deploy_wizard() -> Result<()> {
         &data_root,
         ident.as_ref(),
         Some(rest_domain.as_str()),
+        Some(grpc_domain.as_str()),
     )?;
-    save_cloud_config(&app_name, &rest_domain)?;
     Ok(())
 }
 
@@ -1524,6 +1563,7 @@ fn finish_deploy(
     data_root: &Path,
     ident: Option<&EngineIdentity>,
     rest_domain: Option<&str>,
+    grpc_domain: Option<&str>,
 ) -> Result<()> {
     let profile_count = crate::core::data_paths::cdc_profile_count(data_root);
     if profile_count == 0 {
@@ -1583,7 +1623,11 @@ fn finish_deploy(
         let _ = log::info(format!(
             "Admin  ssh -L 8080:127.0.0.1:8080 -i {ssh_priv} ubuntu@{ip}  →  http://127.0.0.1:8080"
         ));
-        let _ = log::info(format!("gRPC   dash-sac-grpc.dev.parking.net.co:50051  (or {ip}:50051)"));
+        if let Some(grpc) = grpc_domain {
+            let _ = log::info(format!("gRPC   {grpc}:50051  (or {ip}:50051)"));
+        } else {
+            let _ = log::info(format!("gRPC   {ip}:50051"));
+        }
     } else {
         let _ = log::info(format!("REST   http://{ip}:3000"));
         let _ = log::info(format!("Admin  http://{ip}:8080"));
@@ -1595,4 +1639,25 @@ fn finish_deploy(
 
 fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
+}
+
+#[cfg(test)]
+mod grpc_domain_tests {
+    use super::suggest_grpc_domain;
+
+    #[test]
+    fn suggest_grpc_from_prod_rest() {
+        assert_eq!(
+            suggest_grpc_domain("dash-sac.prod.parking.net.co"),
+            "dash-sac-grpc.prod.parking.net.co"
+        );
+    }
+
+    #[test]
+    fn suggest_grpc_from_dev_rest() {
+        assert_eq!(
+            suggest_grpc_domain("dash-sac.dev.parking.net.co"),
+            "dash-sac-grpc.dev.parking.net.co"
+        );
+    }
 }

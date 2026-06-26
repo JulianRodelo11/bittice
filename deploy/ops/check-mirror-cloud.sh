@@ -19,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-APP_NAME="${BITTICE_APP_NAME:-dash-sac-dev}"
+APP_NAME=""
 SSH_KEY="${BITTICE_SSH_KEY:-${HOME}/.bittice/ssh/bittice_id_ed25519}"
 SSH_USER="${BITTICE_SSH_USER:-ubuntu}"
 DATA_ROOT="${BITTICE_DATA_ROOT:-/opt/bittice/data}"
@@ -42,8 +42,8 @@ Usage: check-mirror-cloud.sh [options] [-- check-mirror-args...]
 Options:
   --local              Run on this machine (EC2). Skip AWS/SSH.
   --ip <addr>          EC2 public IP (skip AWS/terraform lookup).
-  --app-name <name>    EC2 Name tag / terraform app_name (default: dash-sac-dev).
-  --entity <profile>   data/profiles/<profile>/ (default: all profiles).
+  --app-name <name>    EC2 Name tag (default: from .bittice_cloud.json or terraform.tfvars).
+  --entity <profile>   CDC profile under data/profiles/ (e.g. parking_host), NOT the EC2 name.
   --table <filter>     Table filter (repeatable via extra args). Examples:
                          BpCliente              — any bootstrapped schema
                          beparking.BpCliente    — partial schema match
@@ -78,6 +78,12 @@ while [[ $# -gt 0 ]]; do
     *) EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
+
+# shellcheck source=cloud_common.sh
+source "${SCRIPT_DIR}/cloud_common.sh"
+if [[ -z "${APP_NAME}" ]]; then
+  APP_NAME="$(resolve_default_app_name "${REPO_ROOT}")"
+fi
 
 run_check_mirror_on_host() {
   local img="${IMAGE}"
@@ -144,7 +150,7 @@ resolve_ip() {
     return 0
   fi
 
-  echo "[check-mirror-cloud] could not resolve EC2 IP (tag Name=${APP_NAME}). Use --ip or fix AWS_PROFILE." >&2
+  echo "[check-mirror-cloud] could not resolve EC2 IP (tag Name=${APP_NAME}). Use --app-name dash-sac-prod, --ip, or fix AWS_PROFILE." >&2
   return 1
 }
 

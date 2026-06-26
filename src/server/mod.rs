@@ -715,17 +715,13 @@ pub async fn start_server(
         internal_bind
     );
 
-    let initial_warmed = warm_saved_query_targets(state.clone()).await;
-    if initial_warmed > 0 {
-        debug!(
-            "Startup: Warmed {} tables before serving requests",
-            initial_warmed
-        );
-    }
-
-    // --- CACHE WARMING & MAINTENANCE ---
+    // Warm cache in background so public REST (:3000) is not blocked for minutes on large mirrors.
     let warm_state = state.clone();
     tokio::spawn(async move {
+        let warmed = warm_saved_query_targets(warm_state.clone()).await;
+        if warmed > 0 {
+            debug!("Startup: Warmed {} tables in background", warmed);
+        }
         loop {
             let start = std::time::Instant::now();
             let warmed = warm_saved_query_targets(warm_state.clone()).await;

@@ -2,39 +2,47 @@
 # Option 1 edge layout: HTTPS REST on :443 (Caddy), admin via SSH tunnel, gRPC public :50051.
 #
 # Run on EC2 (--local) after Terraform SG allows 443/80 and restricts 8080/50051:
-#   sudo ./setup-https-front.sh --domain dash-sac.dev.parking.net.co
+#   sudo ./setup-https-front.sh \
+#     --domain dash-sac.prod.parking.net.co \
+#     --grpc-domain dash-sac-grpc.prod.parking.net.co
 #
 # From laptop (updates compose on EC2; run `terraform apply` separately for SG):
-#   export AWS_PROFILE=deploy-goparking
-#   ./deploy/ops/setup-https-front-cloud.sh --domain dash-sac.dev.parking.net.co
+#   export AWS_PROFILE=deploy-goparking-prod
+#   ./deploy/ops/setup-https-front-cloud.sh \
+#     --domain dash-sac.prod.parking.net.co \
+#     --grpc-domain dash-sac-grpc.prod.parking.net.co
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_ROOT="${BITTICE_DATA_ROOT:-/opt/bittice/data}"
 DOMAIN=""
+GRPC_DOMAIN=""
 DRY_RUN=0
 IMAGE="${BITTICE_IMAGE:-ghcr.io/julianrodelo11/bittice:stable}"
 
 usage() {
   cat <<'EOF'
-Usage: setup-https-front.sh --domain <hostname> [options]
+Usage: setup-https-front.sh --domain <rest-host> --grpc-domain <grpc-host> [options]
 
 Options:
-  --domain <host>     Public REST hostname (DNS A → this EC2), e.g. dash-sac.dev.parking.net.co
-  --dry-run           Print compose/Caddyfile only
+  --domain <host>       Public REST hostname (DNS A → this EC2)
+  --grpc-domain <host>  Public gRPC hostname (DNS A → this EC2; clients use :50051)
+                        Optional if data/.bittice_cloud.json has grpc_domain
+  --dry-run             Print compose/Caddyfile only
   -h, --help
 
 After running:
   REST   https://<domain>/
   Admin  ssh -L 8080:127.0.0.1:8080 ubuntu@<ip>  →  http://127.0.0.1:8080
-  gRPC   dash-sac-grpc.dev.parking.net.co:50051 (public)
+  gRPC   <grpc-domain>:50051 (public)
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain) DOMAIN="${2:?}"; shift 2 ;;
+    --grpc-domain) GRPC_DOMAIN="${2:?}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -47,10 +55,26 @@ if [[ -z "${DOMAIN}" ]]; then
   exit 1
 fi
 
-if [[ "${DOMAIN}" == *"://"* || "${DOMAIN}" == *"/"* || "${DOMAIN}" == *":"* ]]; then
-  echo "setup-https-front: use hostname only (no scheme or port)" >&2
+if [[ -z "${GRPC_DOMAIN}" && -f "${DATA_ROOT}/.bittice_cloud.json" ]]; then
+  GRPC_DOMAIN="$(python3 - "${DATA_ROOT}/.bittice_cloud.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("grpc_domain") or "")
+PY
+)"
+fi
+
+if [[ -z "${GRPC_DOMAIN}" ]]; then
+  echo "setup-https-front: --grpc-domain is required (or set grpc_domain in ${DATA_ROOT}/.bittice_cloud.json)" >&2
+  usage
   exit 1
 fi
+
+for host in "${DOMAIN}" "${GRPC_DOMAIN}"; do
+  if [[ "${host}" == *"://"* || "${host}" == *"/"* || "${host}" == *":"* ]]; then
+    echo "setup-https-front: use hostname only (no scheme or port): ${host}" >&2
+    exit 1
+  fi
+done
 
 OPT_BITTICE="/opt/bittice"
 CADDYFILE="${OPT_BITTICE}/Caddyfile"
@@ -131,6 +155,7 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
   write_compose
   echo "--- ${CADDYFILE} ---"; cat "${CADDYFILE}"
   echo "--- ${COMPOSE} ---"; cat "${COMPOSE}"
+  echo "gRPC   ${GRPC_DOMAIN}:50051"
   exit 0
 fi
 
@@ -146,7 +171,6 @@ if docker inspect bittice >/dev/null 2>&1; then
 fi
 
 log "Recreating stack (bittice + caddy + watchtower)…"
-# Host nginx (default on Ubuntu) binds :80 and blocks Caddy + ACME.
 if systemctl is-active nginx >/dev/null 2>&1; then
   log "Stopping system nginx (conflicts with Caddy on :80)…"
   systemctl stop nginx 2>/dev/null || true
@@ -161,5 +185,5 @@ docker-compose up -d
 
 log "REST   https://${DOMAIN}/"
 log "Admin  ssh -L 8080:127.0.0.1:8080 ubuntu@<this-host>  →  http://127.0.0.1:8080"
-log "gRPC   dash-sac-grpc.dev.parking.net.co:50051 (public — ensure SG allows 50051)"
+log "gRPC   ${GRPC_DOMAIN}:50051 (public — ensure SG allows 50051)"
 log "Ensure SG allows 443/80/50051 from internet; 8080 VPC/tunnel only."
