@@ -165,13 +165,13 @@ pub fn execute_join_query(
     )?;
     let t_base_ms = t_base_start.elapsed().as_secs_f64() * 1000.0;
     let base_row_count = current_rows.len();
-    let mut join_timings: Vec<(String, f64, f64, f64, usize)> = Vec::new();
+    let mut join_timings: Vec<(String, f64, f64, f64, f64, usize)> = Vec::new();
 
     for (idx, join) in joins.iter().enumerate() {
         let join_fields = sorted_join_fetch_fields(needed_fields.get(&join.alias), join)?;
         let join_pushdown_filters = collect_pushdown_filters(&resolved_filters, resolved_filter_tree.as_ref(), &join.alias);
         let t_fetch = Instant::now();
-        let join_rows = fetch_join_rows(
+        let fetch_result = fetch_join_rows(
             join,
             &join_fields,
             &current_rows,
@@ -179,6 +179,7 @@ pub fn execute_join_query(
             table_manager.clone(),
         )?;
         let fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
+        let join_rows = fetch_result.rows;
         let fetched_count = join_rows.len();
         let t_idx = Instant::now();
         let join_index = build_join_index(&join_rows, &join.conditions);
@@ -186,7 +187,14 @@ pub fn execute_join_query(
         let t_apply = Instant::now();
         current_rows = apply_join(current_rows, join, &join_index)?;
         let apply_ms = t_apply.elapsed().as_secs_f64() * 1000.0;
-        join_timings.push((join.alias.clone(), fetch_ms, index_ms, apply_ms, fetched_count));
+        join_timings.push((
+            join.alias.clone(),
+            fetch_ms,
+            fetch_result.open_ms,
+            index_ms,
+            apply_ms,
+            fetched_count,
+        ));
         available_aliases.insert(join.alias.clone());
 
         // If all filter/order aliases are already available and only LEFT joins remain,
@@ -276,10 +284,11 @@ pub fn execute_join_query(
         t_base_ms,
         base_row_count,
     );
-    for (alias, fetch_ms, index_ms, apply_ms, fetched) in &join_timings {
+    for (alias, fetch_ms, open_ms, index_ms, apply_ms, fetched) in &join_timings {
+        let lookup_ms = (*fetch_ms - *open_ms).max(0.0);
         debug.push_str(&format!(
-            " | join '{}' fetch={:.1}ms (rows={}) idx={:.1}ms apply={:.1}ms",
-            alias, fetch_ms, fetched, index_ms, apply_ms
+            " | join '{}' fetch={:.1}ms open={:.1}ms lookup={:.1}ms (rows={}) idx={:.1}ms apply={:.1}ms",
+            alias, fetch_ms, open_ms, lookup_ms, fetched, index_ms, apply_ms
         ));
     }
 
@@ -778,29 +787,34 @@ fn collect_pushdown_filters(
         .collect()
 }
 
+struct JoinFetchResult {
+    rows: Vec<FlatRow>,
+    open_ms: f64,
+}
+
 fn fetch_join_rows(
     join: &ResolvedJoin,
     fields: &[String],
     current_rows: &[FlatRow],
     pushdown_filters: &[Filter],
     table_manager: Arc<TableManager>,
-) -> Result<Vec<FlatRow>> {
+) -> Result<JoinFetchResult> {
     let lookup_filters = build_join_lookup_filters(current_rows, join, pushdown_filters);
 
     if let Some(filter_sets) = lookup_filters {
         let t_get = Instant::now();
         let table_lock = table_manager.get_table_for_query(&join.entity, &join.table)?;
-        let get_ms = t_get.elapsed().as_secs_f64() * 1000.0;
+        let open_ms = t_get.elapsed().as_secs_f64() * 1000.0;
         let t_lock = Instant::now();
         // Read lock: search/get_rows_batch only need &Table; using a write lock here forced
         // every join lookup to wait behind CDC writes on hot tables, turning
         // sub-100ms queries into multi-second ones under streaming load.
         let table = table_lock.read().unwrap();
         let lock_ms = t_lock.elapsed().as_secs_f64() * 1000.0;
-        if get_ms > 5.0 || lock_ms > 5.0 {
+        if open_ms > 5.0 || lock_ms > 5.0 {
             tracing::warn!(
                 "join: get_table {}/{} get={:.1}ms lock={:.1}ms",
-                join.entity, join.table, get_ms, lock_ms
+                join.entity, join.table, open_ms, lock_ms
             );
         }
 
@@ -819,9 +833,9 @@ fn fetch_join_rows(
                 }
             }
         }
-        Ok(rows)
+        Ok(JoinFetchResult { rows, open_ms })
     } else {
-        fetch_table_rows(
+        let rows = fetch_table_rows(
             &join.entity,
             &join.table,
             &join.alias,
@@ -829,7 +843,8 @@ fn fetch_join_rows(
             pushdown_filters,
             table_manager,
             None,
-        )
+        )?;
+        Ok(JoinFetchResult { rows, open_ms: 0.0 })
     }
 }
 

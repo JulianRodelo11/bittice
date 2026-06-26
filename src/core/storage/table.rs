@@ -2183,19 +2183,24 @@ impl Table {
 
     fn exact_matches_for_in_filter(&self, filter: &Filter) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
         let values = crate::core::types::list_values(&filter.value, &filter.value_options);
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let immutable_index = self.load_exact_index(&filter.field)?;
+        self.exact_matches_for_values_with_index(&filter.field, &values, &immutable_index)
+    }
+
+    fn exact_matches_for_values_with_index(
+        &self,
+        field: &str,
+        values: &[String],
+        immutable_index: &Arc<StdRwLock<ExactIndex>>,
+    ) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
         let mut found_any = false;
         let mut combined: HashMap<u64, RoaringBitmap> = HashMap::new();
 
-        for value in &values {
-            let single = Filter {
-                field: filter.field.clone(),
-                op: crate::core::types::ComparisonOp::Eq,
-                value: value.clone(),
-                value_to: None,
-                value_options: vec![],
-                field_type: filter.field_type,
-            };
-            if let Some(matches) = self.exact_matches_for_field_value(&single)? {
+        for value in values {
+            if let Some(matches) = self.exact_matches_one_value(field, value, immutable_index)? {
                 found_any = true;
                 for (seg_id, bitmap) in matches {
                     let entry = combined.entry(seg_id).or_insert_with(RoaringBitmap::new);
@@ -2205,7 +2210,10 @@ impl Table {
         }
 
         if found_any {
-            let result: Vec<(u64, RoaringBitmap)> = combined.into_iter().filter(|(_, bm)| !bm.is_empty()).collect();
+            let result: Vec<(u64, RoaringBitmap)> = combined
+                .into_iter()
+                .filter(|(_, bm)| !bm.is_empty())
+                .collect();
             if result.is_empty() {
                 Ok(Some(Vec::new()))
             } else {
@@ -2218,12 +2226,22 @@ impl Table {
 
     fn exact_matches_for_field_value(&self, filter: &Filter) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
         let immutable_index = self.load_exact_index(&filter.field)?;
+        self.exact_matches_one_value(&filter.field, &filter.value, &immutable_index)
+    }
+
+    /// Lookup one value against an already-loaded exact index (no disk / cache re-entry).
+    fn exact_matches_one_value(
+        &self,
+        field: &str,
+        value: &str,
+        immutable_index: &Arc<StdRwLock<ExactIndex>>,
+    ) -> Result<Option<Vec<(u64, RoaringBitmap)>>> {
         let mut matches = Vec::new();
         let mut found_exact_key = false;
 
         {
             let guard = immutable_index.read().unwrap();
-            if let Some(entries) = guard.get(&filter.value) {
+            if let Some(entries) = guard.get(value) {
                 found_exact_key = true;
                 for (segment_id, bitmap) in entries.iter() {
                     let live_bitmap = self.live_bitmap_for_segment(*segment_id, bitmap);
@@ -2235,8 +2253,8 @@ impl Table {
         }
 
         if let Some(writer) = &self.active_segment {
-            if let Some(field_bitmaps) = writer.bitmaps.get(&filter.field) {
-                if let Some(bitmap) = field_bitmaps.get(&filter.value) {
+            if let Some(field_bitmaps) = writer.bitmaps.get(field) {
+                if let Some(bitmap) = field_bitmaps.get(value) {
                     found_exact_key = true;
                     let mut live_bitmap = bitmap.clone();
                     if !writer.segment.deleted_bitmap.is_empty() {
