@@ -789,7 +789,7 @@ fn fetch_join_rows(
 
     if let Some(filter_sets) = lookup_filters {
         let t_get = Instant::now();
-        let table_lock = table_manager.get_table(&join.entity, &join.table)?;
+        let table_lock = table_manager.get_table_for_query(&join.entity, &join.table)?;
         let get_ms = t_get.elapsed().as_secs_f64() * 1000.0;
         let t_lock = Instant::now();
         // Read lock: search/get_rows_batch only need &Table; using a write lock here forced
@@ -882,7 +882,7 @@ fn fetch_table_rows(
     table_manager: Arc<TableManager>,
     auth_context: Option<&AuthContext>,
 ) -> Result<Vec<FlatRow>> {
-    let table_lock = table_manager.get_table(entity, table_name)?;
+    let table_lock = table_manager.get_table_for_query(entity, table_name)?;
     let table = table_lock.read().unwrap();
     fetch_rows_from_table(&table, alias, fields, filters, auth_context)
 }
@@ -894,6 +894,12 @@ fn fetch_rows_from_table(
     filters: &[Filter],
     auth_context: Option<&AuthContext>,
 ) -> Result<Vec<FlatRow>> {
+    if let Some(probe_rows) = table.probe_fetch_rows(fields, filters)? {
+        return Ok(probe_rows
+            .into_iter()
+            .map(|batch_row| flat_row_from_batch(alias, fields, &batch_row))
+            .collect());
+    }
 
     let mut rows = Vec::new();
     let mut offset = 0;
@@ -925,11 +931,7 @@ fn fetch_rows_from_table(
         }
 
         for batch_row in &batch_rows {
-            let mut mapped = FlatRow::with_capacity(fields.len());
-            for (index, field) in fields.iter().enumerate() {
-                mapped.insert(qualify(alias, field), batch_row.get(index).cloned().unwrap_or_default());
-            }
-            rows.push(mapped);
+            rows.push(flat_row_from_batch(alias, fields, batch_row));
         }
 
         offset += batch_rows.len();
@@ -948,6 +950,17 @@ fn fetch_rows_from_table(
     }
 
     Ok(rows)
+}
+
+fn flat_row_from_batch(alias: &str, fields: &[String], batch_row: &[String]) -> FlatRow {
+    let mut mapped = FlatRow::with_capacity(fields.len());
+    for (index, field) in fields.iter().enumerate() {
+        mapped.insert(
+            qualify(alias, field),
+            batch_row.get(index).cloned().unwrap_or_default(),
+        );
+    }
+    mapped
 }
 
 fn build_join_index<'a>(rows: &'a [FlatRow], conditions: &[ResolvedJoinCondition]) -> HashMap<String, Vec<&'a FlatRow>> {

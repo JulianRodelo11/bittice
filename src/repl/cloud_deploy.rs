@@ -538,6 +538,9 @@ r#"services:
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
       - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
       - BITTICE_WARM_MAX_TABLE_MB=500
+      - BITTICE_WARM_INDICES_ONLY=1
+      - BITTICE_QUERY_OPEN_LAZY=1
+      - BITTICE_BUFFER_POOL_MB=1024
       # NOTE: BITTICE_SKIP_STARTUP_COMPACT is intentionally NOT set here.
       # Compact folds the mini-segment explosion from CDC write paths into a
       # small number of large segments; skipping it on customer instances would

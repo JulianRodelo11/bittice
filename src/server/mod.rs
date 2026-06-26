@@ -1737,7 +1737,7 @@ async fn run_query_page(
         }
 
         let t0 = std::time::Instant::now();
-        let table_res = state_search.table_manager.get_table(&query_entity, &query_table);
+        let table_res = state_search.table_manager.get_table_for_query(&query_entity, &query_table);
         let t1 = std::time::Instant::now();
         match table_res {
             Ok(table_lock) => {
@@ -1808,7 +1808,7 @@ async fn materialize_query_rows(
         let table = query.table.clone();
         let h_inner = headers.to_vec();
         tokio::task::spawn_blocking(move || {
-            let t_lock = tm.get_table(&entity, &table).unwrap();
+            let t_lock = tm.get_table_for_query(&entity, &table).unwrap();
             let t = t_lock.read().unwrap();
             t.get_rows_batch(&h_inner, &ids)
         }).await.unwrap().unwrap_or_default()

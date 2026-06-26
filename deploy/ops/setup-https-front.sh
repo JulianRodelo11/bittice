@@ -108,6 +108,9 @@ services:
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
       - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
       - BITTICE_WARM_MAX_TABLE_MB=500
+      - BITTICE_WARM_INDICES_ONLY=1
+      - BITTICE_QUERY_OPEN_LAZY=1
+      - BITTICE_BUFFER_POOL_MB=1024
     restart: unless-stopped
     networks:
       - bittice_net

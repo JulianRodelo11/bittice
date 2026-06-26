@@ -17,6 +17,14 @@ pub struct TableUpdateEvent {
 
 const DEFAULT_MAX_OPEN_TABLES: usize = 50;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAccessMode {
+    /// CDC writes and admin paths: full WAL replay + reconcile.
+    Full,
+    /// Saved-op reads: skip WAL replay when WAL is empty (`Table::open_for_query`).
+    Query,
+}
+
 pub struct TableManager {
     pub tables: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
     pub events_tx: broadcast::Sender<TableUpdateEvent>,
@@ -150,6 +158,25 @@ impl TableManager {
     }
 
     pub fn get_table(&self, entity: &str, table_name: &str) -> anyhow::Result<Arc<RwLock<Table>>> {
+        self.get_table_with_mode(entity, table_name, TableAccessMode::Full)
+    }
+
+    /// Opens tables for HTTP/gRPC saved-op reads. Uses lazy query open when `BITTICE_QUERY_OPEN_LAZY=1`.
+    pub fn get_table_for_query(&self, entity: &str, table_name: &str) -> anyhow::Result<Arc<RwLock<Table>>> {
+        let mode = if crate::core::warm_config::query_open_lazy_enabled() {
+            TableAccessMode::Query
+        } else {
+            TableAccessMode::Full
+        };
+        self.get_table_with_mode(entity, table_name, mode)
+    }
+
+    pub fn get_table_with_mode(
+        &self,
+        entity: &str,
+        table_name: &str,
+        mode: TableAccessMode,
+    ) -> anyhow::Result<Arc<RwLock<Table>>> {
         let key = format!("{}/{}", entity, table_name);
 
         // Fast path: table is already in the cache.
@@ -179,18 +206,32 @@ impl TableManager {
 
         let entity_path = crate::core::data_paths::mirror_entity_dir(entity);
         let t_open = std::time::Instant::now();
-        let mut new_table = Table::open(&entity_path, table_name).with_context(|| {
-            format!(
-                "mirror Table::open entity_dir={:?} table_dir={}",
-                entity_path.display(),
-                table_name
-            )
-        })?;
+        let mut new_table = match mode {
+            TableAccessMode::Full => Table::open(&entity_path, table_name).with_context(|| {
+                format!(
+                    "mirror Table::open entity_dir={:?} table_dir={}",
+                    entity_path.display(),
+                    table_name
+                )
+            })?,
+            TableAccessMode::Query => Table::open_for_query(&entity_path, table_name).with_context(|| {
+                format!(
+                    "mirror Table::open_for_query entity_dir={:?} table_dir={}",
+                    entity_path.display(),
+                    table_name
+                )
+            })?,
+        };
         let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
         if open_ms > 50.0 {
+            let label = if mode == TableAccessMode::Query {
+                "Table::open_for_query SLOW"
+            } else {
+                "Table::open SLOW"
+            };
             warn!(
-                "Table::open SLOW {}/{} took {:.1}ms — table was evicted from cache",
-                entity, table_name, open_ms
+                "{} {}/{} took {:.1}ms — table was evicted from cache",
+                label, entity, table_name, open_ms
             );
         }
         self.open_count.fetch_add(1, Ordering::Relaxed);

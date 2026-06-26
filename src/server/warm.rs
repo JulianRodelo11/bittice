@@ -102,10 +102,12 @@ pub fn spawn_background_warm(state: Arc<ServerState>) {
         let cfg = WarmConfig::from_env();
         if !cfg.skip_tables.is_empty() || cfg.max_table_mb > 0 {
             info!(
-                "Warm: skip_tables={} max_table_mb={} maintenance_secs={}",
+                "Warm: skip_tables={} max_table_mb={} maintenance_secs={} indices_only={} prefetch={}",
                 cfg.skip_tables.len(),
                 cfg.max_table_mb,
-                cfg.maintenance_secs
+                cfg.maintenance_secs,
+                crate::core::warm_config::warm_indices_only_enabled(),
+                crate::core::warm_config::warm_prefetch_enabled(),
             );
         }
 

@@ -7,3 +7,4 @@ pub mod primary_index_io;
 pub mod segment;
 pub mod wal;
 pub mod table;
+pub mod buffer_pool;

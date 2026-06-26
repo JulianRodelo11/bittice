@@ -355,6 +355,59 @@ impl Table {
         Ok(table)
     }
 
+    /// Query-optimized open: same as [`open`] but skips WAL replay and reconcile when the WAL is empty
+    /// (steady-state mirrors). Falls back to full open when WAL has unreplayed entries.
+    pub fn open_for_query(base_path: &Path, name: &str) -> Result<Self> {
+        let table_path = base_path.join(name);
+        let wal_path = table_path.join("wal.log");
+        if wal_path.exists() {
+            let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+            if wal_len > 0 {
+                return Self::open(base_path, name);
+            }
+        }
+
+        if !table_path.exists() {
+            fs::create_dir_all(&table_path).context("Failed to create table directory")?;
+        }
+        let segments_dir = table_path.join("segments");
+        if !segments_dir.exists() {
+            fs::create_dir_all(&segments_dir).context("Failed to create segments directory")?;
+        }
+        let manifest_path = table_path.join("manifest.json");
+        let manifest: Manifest = if manifest_path.exists() {
+            let file = fs::File::open(&manifest_path)?;
+            let reader = std::io::BufReader::new(file);
+            serde_json::from_reader(reader)?
+        } else {
+            Manifest::new()
+        };
+        let wal = Wal::open(&wal_path)?;
+        let mut table = Table {
+            name: name.to_string(),
+            base_path: table_path,
+            manifest,
+            active_segment: None,
+            immutable_segments: Vec::new(),
+            wal,
+            primary_index: PrimaryIndex::new(),
+            exact_index_cache: StdRwLock::new(HashMap::new()),
+            flush_count_since_index_save: 0,
+            discarded: false,
+        };
+        table.load_segments()?;
+        table.ensure_active_segment()?;
+        table.load_primary_index()?;
+        table.sync_primary_index_to_active_bitmaps();
+        if !table.manifest.primary_key.is_empty() {
+            let stale = table.exact_index_path(&table.manifest.primary_key);
+            if stale.exists() {
+                let _ = fs::remove_file(&stale);
+            }
+        }
+        Ok(table)
+    }
+
     /// For every PK present in the active segment's rehydrated bitmaps that
     /// isn't yet in primary_index, register it. This bridges the gap between
     /// the persisted primary_index (saved periodically) and the active
@@ -1154,18 +1207,109 @@ impl Table {
     }
 
     pub fn warm_up(&self, fields: &[String]) -> Result<()> {
+        self.warm_up_indices(fields)?;
+        if crate::core::warm_config::warm_prefetch_enabled() {
+            self.prefetch_field_data(fields)?;
+        }
+        Ok(())
+    }
+
+    /// Load exact indexes and segment bitmaps only (no column data mmap prefetch).
+    pub fn warm_up_indices(&self, fields: &[String]) -> Result<()> {
         for field in fields {
             let _ = self.load_exact_index(field);
         }
         self.immutable_segments.par_iter().for_each(|seg| {
-            let _ = seg.prefetch_fields(fields);
             let _ = seg.warm_up_indices(fields);
         });
         if let Some(writer) = &self.active_segment {
-            let _ = writer.segment.prefetch_fields(fields);
             let _ = writer.segment.warm_up_indices(fields);
         }
         Ok(())
+    }
+
+    fn prefetch_field_data(&self, fields: &[String]) -> Result<()> {
+        self.immutable_segments.par_iter().for_each(|seg| {
+            let est = fields
+                .iter()
+                .filter_map(|f| {
+                    let dat = seg.path.join(format!("{f}.dat"));
+                    std::fs::metadata(dat).ok().map(|m| m.len())
+                })
+                .sum::<u64>();
+            if crate::core::storage::buffer_pool::prefetch_budget_available(est) {
+                let _ = seg.prefetch_fields(fields);
+                crate::core::storage::buffer_pool::record_prefetch(est);
+            }
+        });
+        if let Some(writer) = &self.active_segment {
+            let est = fields
+                .iter()
+                .filter_map(|f| {
+                    let dat = writer.segment.path.join(format!("{f}.dat"));
+                    std::fs::metadata(dat).ok().map(|m| m.len())
+                })
+                .sum::<u64>();
+            if crate::core::storage::buffer_pool::prefetch_budget_available(est) {
+                let _ = writer.segment.prefetch_fields(fields);
+                crate::core::storage::buffer_pool::record_prefetch(est);
+            }
+        }
+        Ok(())
+    }
+
+    /// DuckDB-style point lookup via exact indexes + narrow segment scan (zone maps apply per segment).
+    /// Returns `Ok(None)` when the fast path does not apply — caller should fall back to `search`.
+    pub fn probe_fetch_rows(
+        &self,
+        fields: &[String],
+        filters: &[Filter],
+    ) -> Result<Option<Vec<Vec<String>>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        let pk_cols = self.pk_columns();
+        let pk_field = pk_cols.first().map(String::as_str).unwrap_or("PK");
+        let mut segment_tasks: Vec<&Segment> = self.immutable_segments.iter().collect();
+        if let Some(writer) = &self.active_segment {
+            segment_tasks.push(&writer.segment);
+        }
+
+        let segment_matches = if let Some(exact_matches) =
+            self.exact_matches_for_eq_filters(filters, pk_field)?
+        {
+            let remaining_filters: Vec<Filter> = filters
+                .iter()
+                .filter(|filter| {
+                    filter.op != crate::core::types::ComparisonOp::Eq
+                        && filter.op != crate::core::types::ComparisonOp::In
+                })
+                .cloned()
+                .collect();
+            if remaining_filters.is_empty() {
+                exact_matches
+            } else {
+                let scanned = self.scan_segments_parallel(
+                    &segment_tasks,
+                    &remaining_filters,
+                    &LogicalOp::And,
+                )?;
+                intersect_segment_matches(exact_matches, scanned)
+            }
+        } else {
+            return Ok(None);
+        };
+
+        let mut ids: Vec<(u64, u32)> = Vec::new();
+        for (seg_id, bitmap) in segment_matches {
+            for local_id in bitmap {
+                ids.push((seg_id, local_id));
+            }
+        }
+        if ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        self.get_rows_batch(fields, &ids).map(Some)
     }
 
     pub fn get_rows_batch(&self, fields: &[String], ids: &[(u64, u32)]) -> Result<Vec<Vec<String>>> {

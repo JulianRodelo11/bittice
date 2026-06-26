@@ -22,6 +22,7 @@ pub mod core {
     pub mod control_plane_gate;
     pub mod mirror_consistency;
     pub mod mirror_maintenance;
+    pub mod warm_config;
 }
 
 pub mod commands {}

@@ -661,7 +661,7 @@ async fn execute_query_result_internal(
     }
 
     tokio::task::spawn_blocking(move || {
-        if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
+        if let Ok(table_arc) = table_manager.get_table_for_query(&entity, &table_name) {
             let mut table = table_arc.write().unwrap();
             let _ = table.reload_if_needed();
 
@@ -985,7 +985,7 @@ impl Database for MyDatabase {
 
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || {
-                if let Ok(table_arc) = table_manager.get_table(&entity, &table_name) {
+                if let Ok(table_arc) = table_manager.get_table_for_query(&entity, &table_name) {
                     let mut table = table_arc.write().unwrap();
                     let _ = table.reload_if_needed();
                     table.search(&fields, &filters, &filters_op, &[], &order_by, limit, offset, auth_ctx.as_ref())
