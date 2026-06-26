@@ -835,6 +835,14 @@ fn fetch_join_rows(
         }
         Ok(JoinFetchResult { rows, open_ms })
     } else {
+        if join.count_matches_as.is_some()
+            || (join.sum_matches_field.is_some() && join.sum_matches_as.is_some())
+        {
+            tracing::warn!(
+                "aggregate join '{}' on {}/{} has no ON conditions — full table fetch",
+                join.alias, join.entity, join.table
+            );
+        }
         let rows = fetch_table_rows(
             &join.entity,
             &join.table,
@@ -863,10 +871,18 @@ fn build_join_lookup_filters(
     for row in current_rows {
         let mut filters = Vec::with_capacity(join.conditions.len() + pushdown_filters.len());
         let mut key_parts = Vec::with_capacity(join.conditions.len());
+        let mut skip_row = false;
 
         for condition in &join.conditions {
-            let value_raw = row.get(&condition.existing_side.qualified)?.clone();
-            let value = normalize_join_key_fragment(&value_raw);
+            let Some(value_raw) = row.get(&condition.existing_side.qualified) else {
+                // LEFT join: base row with no match on the prior alias — skip, do not
+                // abort the whole lookup.  Previously `?` here returned None from this
+                // function, which fetch_join_rows treated as "no ON conditions" and fell
+                // back to a full-table scan (e.g. all 17k bonosBeParking rows per request).
+                skip_row = true;
+                break;
+            };
+            let value = normalize_join_key_fragment(value_raw);
             key_parts.push(format!("{}={}", condition.joining_side.field, value));
             filters.push(Filter {
                 field: condition.joining_side.field.clone(),
@@ -876,6 +892,10 @@ fn build_join_lookup_filters(
                 field_type: None,
                 value_options: vec![],
             });
+        }
+
+        if skip_row {
+            continue;
         }
 
         filters.extend_from_slice(pushdown_filters);
@@ -1711,5 +1731,81 @@ mod tests {
         ];
         let out = coalesce_join_lookup_filters(sets);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn enrichment_bbp_aggregate_join_resolves_with_conditions() {
+        let json = include_str!("testdata/enrichment_plate.json");
+        let query: SavedQuery = serde_json::from_str(json).expect("parse enrichment query");
+        let resolved = resolve_joins(&query, "tr").expect("resolve joins");
+        let bbp = resolved.iter().find(|j| j.alias == "bbp").expect("bbp join");
+        assert!(!bbp.conditions.is_empty(), "bbp join must have ON conditions for keyed lookup");
+        assert_eq!(bbp.conditions[0].joining_side.field, "beparkingId");
+        assert_eq!(bbp.conditions[0].existing_side.field, "beParkingId");
+    }
+
+    #[test]
+    fn build_join_lookup_skips_rows_missing_left_join_key() {
+        let join = ResolvedJoin {
+            entity: "db".into(),
+            table: "bonosBeParking".into(),
+            alias: "bbp".into(),
+            kind: JoinKind::Left,
+            conditions: vec![ResolvedJoinCondition {
+                existing_side: QualifiedField {
+                    alias: "bp".into(),
+                    field: "beParkingId".into(),
+                    qualified: "bp.beParkingId".into(),
+                },
+                joining_side: QualifiedField {
+                    alias: "bbp".into(),
+                    field: "beparkingId".into(),
+                    qualified: "bbp.beparkingId".into(),
+                },
+            }],
+            count_matches_as: Some("CantidadBonos".into()),
+            sum_matches_field: Some("descuentoBono".into()),
+            sum_matches_as: Some("TotalDescuentoBonos".into()),
+        };
+        let mut with_key = FlatRow::new();
+        with_key.insert("bp.beParkingId".into(), "42".into());
+        let without_key = FlatRow::new();
+        let filter_sets = build_join_lookup_filters(&[with_key, without_key], &join, &[])
+            .expect("conditions present");
+        assert_eq!(filter_sets.len(), 1);
+        assert_eq!(filter_sets[0][0].field, "beparkingId");
+        assert_eq!(filter_sets[0][0].value, "42");
+    }
+
+    #[test]
+    fn build_join_lookup_does_not_return_none_when_first_row_missing_key() {
+        let join = ResolvedJoin {
+            entity: "db".into(),
+            table: "bonosBeParking".into(),
+            alias: "bbp".into(),
+            kind: JoinKind::Left,
+            conditions: vec![ResolvedJoinCondition {
+                existing_side: QualifiedField {
+                    alias: "bp".into(),
+                    field: "beParkingId".into(),
+                    qualified: "bp.beParkingId".into(),
+                },
+                joining_side: QualifiedField {
+                    alias: "bbp".into(),
+                    field: "beparkingId".into(),
+                    qualified: "bbp.beparkingId".into(),
+                },
+            }],
+            count_matches_as: Some("CantidadBonos".into()),
+            sum_matches_field: None,
+            sum_matches_as: None,
+        };
+        let without_key = FlatRow::new();
+        let mut with_key = FlatRow::new();
+        with_key.insert("bp.beParkingId".into(), "99".into());
+        let filter_sets = build_join_lookup_filters(&[without_key, with_key], &join, &[])
+            .expect("must not return None — that triggered full-table scan");
+        assert_eq!(filter_sets.len(), 1);
+        assert_eq!(filter_sets[0][0].value, "99");
     }
 }
