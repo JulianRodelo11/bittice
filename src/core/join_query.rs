@@ -105,6 +105,7 @@ pub fn execute_join_query(
     offset: usize,
     auth_context: Option<&AuthContext>,
 ) -> Result<QueryResult> {
+    let _join_permit = crate::core::join_concurrency::acquire_join_permit();
     if !query.is_multi_table() {
         bail!("join executor requires a multi-table query");
     }

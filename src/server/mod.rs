@@ -6,6 +6,7 @@ pub mod heartbeat;
 pub mod op_counter;
 pub mod self_health;
 pub mod warm;
+pub mod response_cache;
 
 use axum::{
     debug_handler,
@@ -663,6 +664,7 @@ fn run_cdc_staged_sequential(
 pub struct ServerState {
     pub table_manager: Arc<TableManager>,
     pub ops_cache: Arc<TokioRwLock<Option<(Instant, Arc<Vec<SavedOperation>>)>>>,
+    pub response_cache: Arc<response_cache::ResponseCache>,
     pub entity_filter: Option<String>,
     pub auth_service: crate::core::auth::AuthService,
     pub active_workers: Arc<StdRwLock<HashSet<String>>>,
@@ -698,10 +700,18 @@ pub async fn start_server(
     let state = Arc::new(ServerState {
         table_manager: table_manager.clone(),
         ops_cache,
+        response_cache: Arc::new(response_cache::ResponseCache::from_env()),
         entity_filter: entity_filter.clone(),
         auth_service: crate::core::auth::AuthService::new(table_manager),
         active_workers,
     });
+    if state.response_cache.enabled() {
+        info!(
+            "Response cache enabled (TTL={}s, ops={})",
+            std::env::var("BITTICE_RESPONSE_CACHE_TTL_SECS").unwrap_or_default(),
+            std::env::var("BITTICE_RESPONSE_CACHE_OPS").unwrap_or_default()
+        );
+    }
 
     // Authentication middleware (applied per-router; state is Arc-cloned)
     let app_internal = Router::new()
@@ -916,6 +926,7 @@ async fn handle_request(
             let mut cache = state.ops_cache.write().await;
             *cache = None;
         }
+        state.response_cache.clear();
         state
             .table_manager
             .refresh_query_priority_keys_from_ops(state.entity_filter.clone());
@@ -1043,27 +1054,46 @@ async fn handle_request(
 
             match (method, op) {
                 (Method::GET, SavedOperation::Read(ref q)) => {
+                    if effective_auth_ctx.is_none()
+                        && state.response_cache.is_cacheable_op(&op_name)
+                    {
+                        if let Some(cached) = state.response_cache.get(&op_name, &query_params) {
+                            return (StatusCode::OK, Json(cached)).into_response();
+                        }
+                    }
                     let read_result = if let Some(crate::core::saved_queries::SavedExecutionProfile::Split(profile)) = &q.execution_profile {
                         execute_split_enrichment_read(
                             q,
                             profile,
-                            query_params,
-                            state,
+                            query_params.clone(),
+                            state.clone(),
                             start_total,
                             ops_load_ms,
                             effective_auth_ctx.as_ref(),
                         )
                         .await
                     } else {
-                        execute_read_operation(q, query_params, state, start_total, ops_load_ms, effective_auth_ctx.as_ref()).await
+                        execute_read_operation(q, query_params.clone(), state.clone(), start_total, ops_load_ms, effective_auth_ctx.as_ref()).await
                     };
                     match read_result {
-                        Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+                        Ok(val) => {
+                            if effective_auth_ctx.is_none()
+                                && state.response_cache.is_cacheable_op(&op_name)
+                            {
+                                state.response_cache.put(&op_name, &query_params, val.clone());
+                            }
+                            (StatusCode::OK, Json(val)).into_response()
+                        }
                         Err((status, val)) => (status, Json(val)).into_response(),
                     }
                 },
                 (Method::GET, SavedOperation::Batch(ref b)) => {
-                    handle_batch(b, query_params, state).await.into_response()
+                    if state.response_cache.is_cacheable_op(&op_name) {
+                        if let Some(cached) = state.response_cache.get(&op_name, &query_params) {
+                            return (StatusCode::OK, Json(cached)).into_response();
+                        }
+                    }
+                    handle_batch(b, query_params, state, Some(op_name.as_str())).await.into_response()
                 },
                 (Method::POST, SavedOperation::Insert(ref i)) => {
                     let payload: HashMap<String, String> = serde_json::from_slice(&body).unwrap_or_default();
@@ -1085,6 +1115,7 @@ async fn handle_batch(
     batch: &crate::core::saved_queries::SavedBatch,
     params: HashMap<String, String>,
     state: Arc<ServerState>,
+    cache_op_name: Option<&str>,
 ) -> impl IntoResponse {
     let mut results = serde_json::Map::new();
     let ops = {
@@ -1164,6 +1195,9 @@ async fn handle_batch(
                 Ok(value) => value,
                 Err(error) => return Json(serde_json::json!({ "error": error })),
             };
+            if let Some(name) = cache_op_name {
+                state.response_cache.put(name, &params, merged.clone());
+            }
             return Json(merged);
         }
         _ => {}
