@@ -806,7 +806,8 @@ fn fetch_join_rows(
 
         let mut rows = Vec::new();
         let mut seen_fingerprints = HashSet::new();
-        for filters in filter_sets {
+        let coalesced = coalesce_join_lookup_filters(filter_sets);
+        for filters in coalesced {
             let batch = fetch_rows_from_table(&table, &join.alias, fields, &filters, None)?;
             for row in batch {
                 // Many base rows can share the same join key (e.g. pa.usuarioProductoId).
@@ -871,6 +872,57 @@ fn build_join_lookup_filters(
     }
 
     Some(filter_sets)
+}
+
+/// Merge N per-row Eq lookups into one `In` filter when only the join key differs.
+fn coalesce_join_lookup_filters(filter_sets: Vec<Vec<Filter>>) -> Vec<Vec<Filter>> {
+    if filter_sets.len() <= 1 {
+        return filter_sets;
+    }
+    let template = &filter_sets[0];
+    'candidate: for vary_idx in 0..template.len() {
+        let vary = &template[vary_idx];
+        if vary.op != ComparisonOp::Eq {
+            continue;
+        }
+        let mut values = Vec::with_capacity(filter_sets.len());
+        let mut seen_values = HashSet::new();
+        for fs in &filter_sets {
+            if fs.len() != template.len() {
+                continue 'candidate;
+            }
+            for (i, f) in fs.iter().enumerate() {
+                if i == vary_idx {
+                    if f.field != vary.field || f.op != ComparisonOp::Eq {
+                        continue 'candidate;
+                    }
+                    if seen_values.insert(f.value.clone()) {
+                        values.push(f.value.clone());
+                    }
+                } else if f.field != template[i].field
+                    || f.op != template[i].op
+                    || f.value != template[i].value
+                    || f.value_to != template[i].value_to
+                {
+                    continue 'candidate;
+                }
+            }
+        }
+        if values.is_empty() {
+            continue;
+        }
+        let mut merged = template.clone();
+        merged[vary_idx] = Filter {
+            field: vary.field.clone(),
+            op: ComparisonOp::In,
+            value: values[0].clone(),
+            value_to: None,
+            field_type: vary.field_type,
+            value_options: values,
+        };
+        return vec![merged];
+    }
+    filter_sets
 }
 
 fn fetch_table_rows(
@@ -1605,4 +1657,44 @@ fn flat_row_fingerprint(row: &FlatRow) -> String {
 
 fn qualify(alias: &str, field: &str) -> String {
     format!("{}.{}", alias, field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eq_filter(field: &str, value: &str) -> Filter {
+        Filter {
+            field: field.to_string(),
+            op: ComparisonOp::Eq,
+            value: value.to_string(),
+            value_to: None,
+            field_type: None,
+            value_options: vec![],
+        }
+    }
+
+    #[test]
+    fn coalesce_merges_varying_join_key_into_in() {
+        let push = eq_filter("Estado", "A");
+        let sets = vec![
+            vec![eq_filter("entradaVehiculoId", "1"), push.clone()],
+            vec![eq_filter("entradaVehiculoId", "2"), push.clone()],
+            vec![eq_filter("entradaVehiculoId", "3"), push],
+        ];
+        let merged = coalesce_join_lookup_filters(sets);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0][0].op, ComparisonOp::In);
+        assert_eq!(merged[0][0].value_options, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn coalesce_keeps_separate_when_pushdown_differs() {
+        let sets = vec![
+            vec![eq_filter("entradaVehiculoId", "1"), eq_filter("Estado", "A")],
+            vec![eq_filter("entradaVehiculoId", "2"), eq_filter("Estado", "B")],
+        ];
+        let out = coalesce_join_lookup_filters(sets);
+        assert_eq!(out.len(), 2);
+    }
 }
