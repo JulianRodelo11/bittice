@@ -282,6 +282,10 @@ pub async fn start_all_servers(
     // --- STARTUP CONSISTENCY CHECK: validate mirror vs MySQL, repair drifted tables only ---
     if startup_consistency_check_enabled() {
         let _ = run_startup_consistency_repair(entity_filter.clone()).await;
+        // After repair, block HTTP until CDC resume gap is fully caught up.
+        // Without this, HTTP opens immediately serving potentially stale data while
+        // CDC replays missed binlog events in background.
+        std::env::set_var("BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP", "1");
     }
 
     // --- AUTO-START CDC WORKERS (sequential: HTTP only after each profile signals Phase 4) ---
