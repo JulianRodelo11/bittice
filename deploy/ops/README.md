@@ -17,7 +17,7 @@ más.
 | `repair-mirror.sh` | Manual segment compaction — escape hatch when a table has bloat that auto-repair can't resolve. |
 | `flush-mysql-host-cache.sh` | Manual `TRUNCATE performance_schema.host_cache` on the source RDS. Use when error 1129 ("Host is blocked") shows up in the engine logs. |
 | `ensure-rds-max-connect-errors.sh` | One-time setter for `max_connect_errors=1000000` on the source RDS parameter group. Prevention against 1129. |
-| `setup-flush-lambda.sh` + `lambda_flush_host_cache.py` | Lambda-in-VPC that the motor can invoke to flush `host_cache` (no longer needed by the motor itself, kept as manual recovery). |
+| `setup-flush-lambda.sh` + `lambda_flush_host_cache.py` | VPC Lambda to flush `host_cache`. Set `BITTICE_OPS_FLUSH_URL` / `BITTICE_OPS_FLUSH_SECRET` on the engine (see `flush-lambda.env`) — CDC invokes it on MySQL 1129 during connect retry. |
 
 ## Drift visibility
 

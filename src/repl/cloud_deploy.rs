@@ -537,6 +537,7 @@ r#"services:
       - BITTICE_CDC_HEALTH_CHECK_MAX_FAILURES=0
       - BITTICE_CDC_HEALTH_CHECK_INTERVAL_SECS=300
       - BITTICE_CDC_STREAM_SILENCE_TIMEOUT_SECS=90
+      - BITTICE_CDC_CONNECT_MAX_ATTEMPTS=5
       - BITTICE_WARM_MAX_TABLE_MB=500
       - BITTICE_WARM_INDICES_ONLY=1
       - BITTICE_QUERY_OPEN_LAZY=1
@@ -684,22 +685,20 @@ fn wait_for_cdc_live(ip: &str, ssh_key: &str, expected_profiles: usize) -> Resul
             ));
             return Ok(());
         }
-        if logs.contains("staged startup aborted")
-            || (logs.contains("CDC worker") && logs.contains("failed"))
-            || logs.contains("request_engine_shutdown_from_cdc")
-        {
+        if logs.contains("request_engine_shutdown_from_cdc") {
             ws.stop("CDC failed during startup.");
             let net_hint = if logs.contains("Connection timed out")
                 || logs.contains("Connection timeout")
+                || logs.contains("(1129)")
             {
-                "\n\nLikely cause: the Bittice SG cannot reach the RDS on its MySQL port.\n\
-                 Check that AmazonRDSReadOnlyAccess + AmazonEC2FullAccess gave Terraform permission to add \
-                 the inbound rule on the RDS SG, and that the RDS is in the same VPC the wizard placed Bittice in."
+                "\n\nLikely cause: the Bittice SG cannot reach the RDS on its MySQL port, or RDS blocked the host (1129).\n\
+                 Check RDS SG inbound from the Bittice SG, flush-hosts / reboot RDS if needed, and ensure \
+                 `max_connect_errors` is raised (deploy/ops/ensure-rds-max-connect-errors.sh)."
             } else {
                 ""
             };
             bail!(
-                "CDC did not start on the server.{net_hint}\n\
+                "CDC shut down the engine.{net_hint}\n\
                  ssh -i {ssh_key} ubuntu@{ip} 'docker logs bittice 2>&1 | tail -n 80'"
             );
         }
@@ -709,6 +708,17 @@ fn wait_for_cdc_live(ip: &str, ssh_key: &str, expected_profiles: usize) -> Resul
     }
 
     ws.stop("CDC did not reach Phase 4 in time.");
+    let health = ssh_capture(
+        ip,
+        ssh_key,
+        "curl -sf -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health 2>/dev/null || echo 000",
+    );
+    if health.trim() == "200" {
+        let _ = log::warning(
+            "HTTP is up but CDC did not reach Phase 4 within the wait window — static mirror with background CDC retry.",
+        );
+        return Ok(());
+    }
     bail!(
         "Timed out waiting for live CDC ({} profile(s)). The API may serve a static mirror only.\n\
          ssh -i {ssh_key} ubuntu@{ip} 'docker logs -f bittice'",

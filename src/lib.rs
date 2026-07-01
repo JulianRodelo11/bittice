@@ -14,6 +14,7 @@ pub mod core {
     pub mod expression;
     pub mod cdc;
     pub mod cdc_durability;
+    pub mod mysql_host_cache;
     pub mod migrate_primary_index;
     pub mod migrate_exact_index;
     pub mod update;

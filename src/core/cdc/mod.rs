@@ -123,6 +123,13 @@ pub struct CdcWorker {
     schema_allowlist: Option<Arc<HashSet<String>>>,
     /// Human-readable source for startup logs (`profile config` vs env ops).
     table_allowlist_source: Option<&'static str>,
+    /// Set to `true` when Phase 4 live replication starts; used to avoid engine
+    /// shutdown on startup connect failures (1129 crash loops).
+    reached_live: Option<Arc<AtomicBool>>,
+    /// When true, keep retrying MySQL connect with backoff (deferred CDC recovery).
+    infinite_connect_retries: bool,
+    /// Overrides [`Self::default_connect_attempt_limit`] when `Some`.
+    connect_attempt_limit: Option<u32>,
 }
 
 // Last successful auto-compact per table, used to throttle subsequent
@@ -182,6 +189,34 @@ impl CdcWorker {
         exit_after_cdc_ready: bool,
         startup_report_tx: Option<std::sync::mpsc::Sender<CdcStartupReport>>,
     ) -> Self {
+        Self::with_manager_and_log_ex(
+            url,
+            entity,
+            database,
+            table_manager,
+            log_tx,
+            sync_all_databases,
+            exit_after_cdc_ready,
+            startup_report_tx,
+            None,
+            false,
+            None,
+        )
+    }
+
+    pub fn with_manager_and_log_ex(
+        url: String,
+        entity: String,
+        database: String,
+        table_manager: Arc<TableManager>,
+        log_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        sync_all_databases: bool,
+        exit_after_cdc_ready: bool,
+        startup_report_tx: Option<std::sync::mpsc::Sender<CdcStartupReport>>,
+        reached_live: Option<Arc<AtomicBool>>,
+        infinite_connect_retries: bool,
+        connect_attempt_limit: Option<u32>,
+    ) -> Self {
         let state_path = crate::core::data_paths::profile_dir(&entity)
             .join("cdc_state.json")
             .to_string_lossy()
@@ -208,7 +243,23 @@ impl CdcWorker {
             table_allowlist,
             schema_allowlist,
             table_allowlist_source,
+            reached_live,
+            infinite_connect_retries,
+            connect_attempt_limit,
         }
+    }
+
+    fn default_connect_attempt_limit() -> Option<u32> {
+        std::env::var("BITTICE_CDC_CONNECT_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| {
+                if v.eq_ignore_ascii_case("infinite") || v == "0" {
+                    None
+                } else {
+                    v.parse().ok()
+                }
+            })
+            .or(Some(5))
     }
 
     /// List base tables in a MySQL schema (for setup wizard table selection).
@@ -653,6 +704,11 @@ impl CdcWorker {
     }
 
     fn emit_startup_report(&self, outcome: CdcStartupOutcome) {
+        if matches!(&outcome, CdcStartupOutcome::LiveReplication) {
+            if let Some(flag) = &self.reached_live {
+                flag.store(true, Ordering::Release);
+            }
+        }
         if let Some(tx) = &self.startup_report_tx {
             if self
                 .startup_report_sent
@@ -1989,6 +2045,110 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         }
     }
 
+    async fn try_mysql_connect_once(
+        &self,
+        opts_with_keepalive: Opts,
+        opts_without_keepalive: Opts,
+    ) -> Result<(Pool, Conn)> {
+        let mut pool = Pool::new(opts_with_keepalive);
+        match tokio::time::timeout(std::time::Duration::from_secs(30), pool.get_conn()).await {
+            Ok(Ok(c)) => Ok((pool, c)),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("os error 22") || msg.contains("Invalid argument") {
+                    self.log_warn(
+                        "CDC: MySQL connect failed with TCP keepalive enabled (os error 22). Retrying without keepalive."
+                            .to_string(),
+                    );
+                    pool = Pool::new(opts_without_keepalive);
+                    match tokio::time::timeout(std::time::Duration::from_secs(30), pool.get_conn()).await
+                    {
+                        Ok(Ok(c2)) => Ok((pool, c2)),
+                        Ok(Err(e2)) => Err(e2.into()),
+                        Err(_) => Err(anyhow::anyhow!("Connection timeout")),
+                    }
+                } else {
+                    Err(e.into())
+                }
+            }
+            Err(_) => Err(anyhow::anyhow!("Connection timeout")),
+        }
+    }
+
+    async fn connect_mysql_with_retry(
+        &self,
+        final_url: &str,
+    ) -> Result<(Pool, Conn)> {
+        let raw_opts = match Opts::from_url(final_url) {
+            Ok(o) => o,
+            Err(e) => {
+                self.log_error(format!("Invalid URL: {}", e));
+                return Err(e.into());
+            }
+        };
+        let opts_with_keepalive: Opts = OptsBuilder::from_opts(raw_opts.clone())
+            .tcp_keepalive(Some(30u32))
+            .into();
+        let opts_without_keepalive: Opts = OptsBuilder::from_opts(raw_opts).into();
+
+        let limit = if self.infinite_connect_retries {
+            None
+        } else {
+            self.connect_attempt_limit
+                .or_else(Self::default_connect_attempt_limit)
+        };
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt = attempt.saturating_add(1);
+            match self
+                .try_mysql_connect_once(opts_with_keepalive.clone(), opts_without_keepalive.clone())
+                .await
+            {
+                Ok(pair) => return Ok(pair),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let blocked = crate::core::mysql_host_cache::is_mysql_host_blocked_error(&msg);
+                    let retryable =
+                        crate::core::mysql_host_cache::is_transient_mysql_connect_error(&msg);
+
+                    if blocked {
+                        self.log_warn(format!(
+                            "CDC: MySQL host blocked (1129) on connect attempt {attempt}: {msg}"
+                        ));
+                        crate::core::mysql_host_cache::maybe_flush_host_cache().await;
+                    } else if retryable {
+                        self.log_warn(format!(
+                            "CDC: transient MySQL connect failure on attempt {attempt}: {msg}"
+                        ));
+                    } else {
+                        self.log_error(format!("CDC: Connection failed: {msg}"));
+                        return Err(e);
+                    }
+
+                    if let Some(max) = limit {
+                        if attempt >= max {
+                            self.log_error(format!(
+                                "CDC: MySQL connect gave up after {max} attempt(s): {msg}"
+                            ));
+                            return Err(e);
+                        }
+                    }
+
+                    let delay =
+                        crate::core::mysql_host_cache::connect_backoff_secs(attempt, blocked);
+                    self.log_info(format!(
+                        "CDC: retrying MySQL connect in {delay}s (attempt {attempt}{})…",
+                        limit
+                            .map(|m| format!("/{m}"))
+                            .unwrap_or_else(|| " — infinite retry".to_string())
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+            }
+        }
+    }
+
     async fn run_impl(&self) -> Result<()> {
         let data_root = crate::core::data_paths::resolved_data_root();
         let root_disp = std::fs::canonicalize(&data_root).unwrap_or_else(|_| data_root.clone());
@@ -2031,47 +2191,12 @@ if binlog updates stall on RDS/Aurora, grant privileges to read gtid_executed or
         };
         let health_host = raw_opts.ip_or_hostname().to_string();
         let health_port = raw_opts.tcp_port();
-        let opts_with_keepalive: Opts = OptsBuilder::from_opts(raw_opts.clone())
-            .tcp_keepalive(Some(30u32))
-            .into();
-        let opts_without_keepalive: Opts = OptsBuilder::from_opts(raw_opts).into();
-        let mut pool = Pool::new(opts_with_keepalive);
-        self.log_info(format!("CDC: Connecting to MySQL at {}...", final_url.split('@').last().unwrap_or("unknown")));
+        self.log_info(format!(
+            "CDC: Connecting to MySQL at {}...",
+            final_url.split('@').last().unwrap_or("unknown")
+        ));
 
-        let mut conn = match tokio::time::timeout(std::time::Duration::from_secs(30), pool.get_conn()).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains("os error 22") || msg.contains("Invalid argument") {
-                    self.log_warn(
-                        "CDC: MySQL connect failed with TCP keepalive enabled (os error 22). Retrying without keepalive."
-                            .to_string(),
-                    );
-                    pool = Pool::new(opts_without_keepalive);
-                    match tokio::time::timeout(std::time::Duration::from_secs(30), pool.get_conn()).await {
-                        Ok(Ok(c2)) => c2,
-                        Ok(Err(e2)) => {
-                            self.log_error(format!("CDC: Connection failed after keepalive fallback: {}", e2));
-                            return Err(e2.into());
-                        }
-                        Err(_) => {
-                            self.log_error(
-                                "CDC: Connection timed out after 30 seconds (after keepalive fallback). Check network/firewall."
-                                    .to_string(),
-                            );
-                            return Err(anyhow::anyhow!("Connection timeout"));
-                        }
-                    }
-                } else {
-                    self.log_error(format!("CDC: Connection failed: {}", e));
-                    return Err(e.into());
-                }
-            }
-            Err(_) => {
-                self.log_error("CDC: Connection timed out after 30 seconds. Check network/firewall.".to_string());
-                return Err(anyhow::anyhow!("Connection timeout"));
-            }
-        };
+        let (pool, mut conn) = self.connect_mysql_with_retry(&final_url).await?;
 
         self.log_info("CDC: Successfully connected. Checking Binlog status...".to_string());
         let d = crate::core::cdc_durability::durability();

@@ -300,16 +300,21 @@ pub async fn start_all_servers(
             );
             let tm = table_manager.clone();
             let aw = active_workers.clone();
-            match tokio::task::spawn_blocking(move || run_cdc_staged_sequential(tm, aw, specs)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    error!("CDC: staged startup aborted: {:#}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    error!("CDC: staged startup task join failed: {}", e);
-                    return Err(anyhow::anyhow!("staged CDC join failed: {}", e));
-                }
+            let staged = tokio::task::spawn_blocking(move || {
+                run_cdc_staged_sequential(tm, aw, specs)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("staged CDC join failed: {}", e))?;
+            if !staged.deferred.is_empty() {
+                warn!(
+                    "CDC: {} profile(s) deferred — HTTP/gRPC will serve static mirror until background CDC reconnects.",
+                    staged.deferred.len()
+                );
+                spawn_deferred_cdc_retries(
+                    staged.deferred,
+                    table_manager.clone(),
+                    active_workers.clone(),
+                );
             }
         }
     } else {
@@ -371,6 +376,12 @@ struct CdcSpawnSpec {
     sync_all: bool,
     cleanup_single_db_lock: Option<String>,
     db_name_for_log: String,
+    infinite_connect_retries: bool,
+    connect_attempt_limit: Option<u32>,
+}
+
+struct StagedCdcStartupResult {
+    deferred: Vec<CdcSpawnSpec>,
 }
 
 /// Build launch plans for every CDC profile that should auto-start (same rules as historical `scan_and_start_cdc`).
@@ -494,6 +505,8 @@ Mirror '{}' will stay static unless you enable sync_all_databases on one profile
                 Some(single_db_lock_key)
             },
             db_name_for_log,
+            infinite_connect_retries: false,
+            connect_attempt_limit: None,
         });
     }
 
@@ -506,10 +519,29 @@ fn spawn_cdc_worker_thread(
     active_workers: Arc<StdRwLock<HashSet<String>>>,
     startup_report_tx: Option<mpsc::Sender<crate::core::cdc::CdcStartupReport>>,
 ) {
+    let reached_live = Arc::new(AtomicBool::new(false));
+    spawn_cdc_worker_thread_inner(
+        spec,
+        table_manager,
+        active_workers,
+        startup_report_tx,
+        Some(reached_live.clone()),
+    );
+}
+
+fn spawn_cdc_worker_thread_inner(
+    spec: CdcSpawnSpec,
+    table_manager: Arc<TableManager>,
+    active_workers: Arc<StdRwLock<HashSet<String>>>,
+    startup_report_tx: Option<mpsc::Sender<crate::core::cdc::CdcStartupReport>>,
+    reached_live: Option<Arc<AtomicBool>>,
+) {
 
     let cleanup_entity_key = spec.entity_key.clone();
     let cleanup_single_db_lock = spec.cleanup_single_db_lock.clone();
     let cleanup_active_workers = active_workers.clone();
+    let infinite_connect_retries = spec.infinite_connect_retries;
+    let connect_attempt_limit = spec.connect_attempt_limit;
 
     {
         let mut active = active_workers.write().unwrap();
@@ -523,7 +555,7 @@ fn spawn_cdc_worker_thread(
 
     let h = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let worker = crate::core::cdc::CdcWorker::with_manager_and_log(
+        let worker = crate::core::cdc::CdcWorker::with_manager_and_log_ex(
             spec.url,
             spec.entity,
             spec.worker_db,
@@ -532,13 +564,27 @@ fn spawn_cdc_worker_thread(
             spec.sync_all,
             false,
             startup_report_tx,
+            reached_live.clone(),
+            infinite_connect_retries,
+            connect_attempt_limit,
         );
         if let Err(e) = rt.block_on(worker.run()) {
             error!("CDC: Worker for '{}' failed: {:#}", db_name_for_log, e);
-            crate::server::request_engine_shutdown_from_cdc(&format!(
-                "CDC worker '{}' failed: {:#}",
-                db_name_for_log, e
-            ));
+            let shutdown = reached_live
+                .as_ref()
+                .map(|l| l.load(AtomicOrdering::Acquire))
+                .unwrap_or(true);
+            if shutdown {
+                crate::server::request_engine_shutdown_from_cdc(&format!(
+                    "CDC worker '{}' failed: {:#}",
+                    db_name_for_log, e
+                ));
+            } else {
+                warn!(
+                    "CDC: Worker for '{}' failed before live replication; engine continues on static mirror.",
+                    db_name_for_log
+                );
+            }
         }
         let mut active = cleanup_active_workers.write().unwrap();
         active.remove(&cleanup_entity_key);
@@ -598,9 +644,10 @@ fn run_cdc_staged_sequential(
     table_manager: Arc<TableManager>,
     active_workers: Arc<StdRwLock<HashSet<String>>>,
     specs: Vec<CdcSpawnSpec>,
-) -> anyhow::Result<()> {
+) -> StagedCdcStartupResult {
     use crate::core::cdc::CdcStartupOutcome;
 
+    let mut deferred = Vec::new();
     let total = specs.len();
     for (idx, spec) in specs.into_iter().enumerate() {
         info!(
@@ -627,7 +674,7 @@ fn run_cdc_staged_sequential(
             spec.entity
         );
         let (tx, rx) = mpsc::channel();
-        spawn_cdc_worker_thread(spec, table_manager.clone(), active_workers.clone(), Some(tx));
+        spawn_cdc_worker_thread(spec.clone(), table_manager.clone(), active_workers.clone(), Some(tx));
         match rx.recv() {
             Ok(report) => match report.outcome {
                 CdcStartupOutcome::LiveReplication => {
@@ -641,24 +688,86 @@ fn run_cdc_staged_sequential(
                     );
                 }
                 CdcStartupOutcome::StaticMirror => {
-                    anyhow::bail!(
-                        "CDC profile '{}' reported static mirror; engine exits on any CDC degradation.",
+                    warn!(
+                        "CDC: Profile '{}' could not reach live replication; deferring and serving static mirror.",
                         report.entity
                     );
+                    println!(
+                        "\x1b[90m│\x1b[0m  \x1b[33m▲\x1b[0m  '{}': static mirror — background CDC retry scheduled.",
+                        report.entity
+                    );
+                    deferred.push(spec);
                 }
                 CdcStartupOutcome::Failed(msg) => {
-                    anyhow::bail!(
-                        "CDC profile '{}' failed during startup: {}",
+                    warn!(
+                        "CDC: Profile '{}' failed during startup ({}); deferring and serving static mirror.",
                         report.entity, msg
                     );
+                    println!(
+                        "\x1b[90m│\x1b[0m  \x1b[33m▲\x1b[0m  '{}': startup failed — background CDC retry scheduled.",
+                        report.entity
+                    );
+                    deferred.push(spec);
                 }
             },
             Err(_) => {
-                anyhow::bail!("CDC worker for staged profile exited without a readiness report.");
+                warn!(
+                    "CDC: Worker for staged profile '{}' exited without a readiness report; deferring.",
+                    spec.entity
+                );
+                deferred.push(spec);
             }
         }
     }
-    Ok(())
+    StagedCdcStartupResult { deferred }
+}
+
+fn spawn_deferred_cdc_retries(
+    deferred: Vec<CdcSpawnSpec>,
+    table_manager: Arc<TableManager>,
+    active_workers: Arc<StdRwLock<HashSet<String>>>,
+) {
+    for mut spec in deferred {
+        spec.infinite_connect_retries = true;
+        spec.connect_attempt_limit = None;
+        let tm = table_manager.clone();
+        let aw = active_workers.clone();
+        let entity = spec.entity.clone();
+        std::thread::spawn(move || {
+            let mut idle_secs = 60u64;
+            loop {
+                info!(
+                    "CDC: background retry for deferred profile '{}' (next attempt in {}s)…",
+                    entity, idle_secs
+                );
+                std::thread::sleep(std::time::Duration::from_secs(idle_secs));
+                let (tx, rx) = mpsc::channel();
+                spawn_cdc_worker_thread(spec.clone(), tm.clone(), aw.clone(), Some(tx));
+                match rx.recv() {
+                    Ok(report) if matches!(report.outcome, crate::core::cdc::CdcStartupOutcome::LiveReplication) => {
+                        info!(
+                            "CDC: deferred profile '{}' is now live after background retry.",
+                            entity
+                        );
+                        break;
+                    }
+                    Ok(report) => {
+                        warn!(
+                            "CDC: deferred profile '{}' background attempt ended with {:?}; will retry.",
+                            entity, report.outcome
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            "CDC: deferred profile '{}' worker exited without report; will retry.",
+                            entity
+                        );
+                    }
+                }
+                idle_secs = (idle_secs.saturating_mul(2)).min(600);
+            }
+        });
+    }
 }
 
 pub struct ServerState {
