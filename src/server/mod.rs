@@ -279,6 +279,11 @@ pub async fn start_all_servers(
         info!("Startup compact: skipped (BITTICE_SKIP_STARTUP_COMPACT=1).");
     }
 
+    // --- STARTUP CONSISTENCY CHECK: validate mirror vs MySQL, repair drifted tables only ---
+    if startup_consistency_check_enabled() {
+        let _ = run_startup_consistency_repair(entity_filter.clone()).await;
+    }
+
     // --- AUTO-START CDC WORKERS (sequential: HTTP only after each profile signals Phase 4) ---
     if cdc_autostart_enabled() {
         let specs = collect_cdc_spawn_specs(&entity_filter, &active_workers);
@@ -788,6 +793,195 @@ pub fn scan_and_start_cdc(
     for spec in specs {
         spawn_cdc_worker_thread(spec, table_manager.clone(), active_workers.clone(), None);
     }
+}
+
+fn startup_consistency_check_enabled() -> bool {
+    std::env::var("BITTICE_STARTUP_CONSISTENCY_CHECK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Runs `check-mirror` against every bootstrapped table before CDC opens HTTP.
+/// Tables with non-trivial drift have their bootstrap state invalidated so CDC
+/// re-bootstraps them from MySQL (non-aggressive — only drifted tables are repaired).
+async fn run_startup_consistency_repair(entity_filter: Option<String>) -> anyhow::Result<()> {
+    use crate::core::mirror_consistency;
+
+    let opts = mirror_consistency::CheckMirrorOptions {
+        entity_filter,
+        table_filter: None,
+        revalidate: true,
+    };
+
+    let rows = match mirror_consistency::check_mirror_consistency(opts).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Startup consistency check: mirror_consistency failed ({:#}); skipping repair, CDC will start normally.", e);
+            return Ok(());
+        }
+    };
+
+    if rows.is_empty() {
+        info!("Startup consistency check: no bootstrapped tables — skipping.");
+        return Ok(());
+    }
+
+    // Only repair tables where drift exceeds a reasonable threshold.
+    // Small diffs (≤10 rows) can be timing artifacts between MySQL COUNT and mirror read.
+    let drifted: Vec<_> = rows
+        .iter()
+        .filter(|r| !r.ok && (r.diff.abs() > 10))
+        .collect();
+
+    if drifted.is_empty() {
+        let tiny = rows.iter().filter(|r| !r.ok).count();
+        if tiny > 0 {
+            info!(
+                "Startup consistency check: {} table(s) with trivial drift (≤10 rows) — skipping repair.",
+                tiny
+            );
+        }
+        info!(
+            "Startup consistency check: all {} table(s) match MySQL.",
+            rows.len()
+        );
+        return Ok(());
+    }
+
+    warn!(
+        "Startup consistency check: {} of {} table(s) have drift — repairing...",
+        drifted.len(),
+        rows.len()
+    );
+    for row in &drifted {
+        info!(
+            "  DRIFT {}: mysql={} mirror={} diff={}",
+            row.table, row.source_count, row.mirror_count, row.diff
+        );
+    }
+
+    let data_root = crate::core::data_paths::resolved_data_root();
+
+    // Group drifted tables by profile
+    let mut by_profile: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for row in &drifted {
+        by_profile
+            .entry(row.profile.clone())
+            .or_default()
+            .push(row.table.clone());
+    }
+
+    for (profile, tables) in &by_profile {
+        let state_path = crate::core::data_paths::profile_dir(profile).join("cdc_state.json");
+        let cfg_path = crate::core::data_paths::profile_dir(profile).join("cdc_config.json");
+
+        let Ok(cfg_raw) = std::fs::read_to_string(&cfg_path) else {
+            warn!("  skip {}: cannot read cdc_config.json", profile);
+            continue;
+        };
+        let Ok(cfg_json): Result<serde_json::Value, _> =
+            serde_json::from_str(&cfg_raw)
+        else {
+            warn!("  skip {}: invalid cdc_config.json", profile);
+            continue;
+        };
+        let Ok(state_raw) = std::fs::read_to_string(&state_path) else {
+            warn!("  skip {}: cannot read cdc_state.json", profile);
+            continue;
+        };
+        let Ok(mut state_json): Result<serde_json::Value, _> =
+            serde_json::from_str(&state_raw)
+        else {
+            warn!("  skip {}: invalid cdc_state.json", profile);
+            continue;
+        };
+
+        let sync_all = cfg_json
+            .get("sync_all_databases")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let database = cfg_json
+            .get("database")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let entity = cfg_json
+            .get("entity")
+            .and_then(|v| v.as_str())
+            .unwrap_or(profile);
+
+        let mut removed = 0usize;
+
+        if let Some(bootstrapped) = state_json.get_mut("bootstrapped_tables") {
+            if let Some(arr) = bootstrapped.as_array_mut() {
+                let before = arr.len();
+                arr.retain(|v| {
+                    let qkey = v.as_str().unwrap_or("");
+                    !tables.iter().any(|t| t == qkey)
+                });
+                removed = before - arr.len();
+            }
+        }
+
+        if let Some(pk_map) = state_json.get_mut("pk_map") {
+            if let Some(obj) = pk_map.as_object_mut() {
+                for table in tables {
+                    obj.remove(table);
+                }
+            }
+        }
+
+        if let Ok(json_str) = serde_json::to_string_pretty(&state_json) {
+            if let Err(e) = std::fs::write(&state_path, &json_str) {
+                error!(
+                    "Startup consistency repair: write {} failed: {}",
+                    state_path.display(),
+                    e
+                );
+            }
+        }
+
+        for qkey in tables {
+            let (schema, table) =
+                mirror_consistency::parse_qkey(sync_all, database, qkey);
+            let disk_entity = if sync_all {
+                schema.to_lowercase()
+            } else {
+                entity.to_string()
+            };
+            let mirror_dir = mirror_consistency::resolve_mirror_dir(
+                &data_root, &disk_entity, &table,
+            );
+
+            if mirror_dir.exists() {
+                info!(
+                    "  Remove mirror dir: {}",
+                    mirror_dir.display()
+                );
+                if let Err(e) = std::fs::remove_dir_all(&mirror_dir) {
+                    error!(
+                        "  Failed to remove {}: {}",
+                        mirror_dir.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "  {}: invalidated {}/{} drifted table(s) — CDC will re-bootstrap them.",
+            profile,
+            removed,
+            drifted.len()
+        );
+    }
+
+    warn!(
+        "Startup consistency repair complete: {} table(s) invalidated. CDC will re-bootstrap from MySQL.",
+        drifted.len()
+    );
+
+    Ok(())
 }
 
 fn cdc_autostart_enabled() -> bool {
