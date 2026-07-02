@@ -3405,13 +3405,37 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
         Some(parts.join("\u{1f}"))
     }
 
+    /// Notificación para `SubscribeUpdates`: PK + columnas cambiadas.
+    fn emit_subscribe_update_event(
+        &self,
+        entity: &str,
+        table_name: &str,
+        event_type: &str,
+        pk: &str,
+        fields: &HashMap<String, String>,
+    ) {
+        let (cols, vals): (Vec<String>, Vec<String>) = fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .unzip();
+        let _ = self.table_manager.events_tx.send(TableUpdateEvent {
+            entity: entity.to_string(),
+            table_name: table_name.to_string(),
+            event_type: event_type.to_string(),
+            pk: pk.to_string(),
+            row: vec![],
+            columns: cols,
+            col_values: vals,
+        });
+    }
+
     fn apply_binlog_write_rows<'a>(
         &self,
         rows: RowsEventRows<'a>,
         qkey: &str,
         disk_entity: &str,
         table_name: &str,
-        _pk_columns: &[String],
+        pk_columns: &[String],
         table: &mut Table,
     ) -> Result<usize> {
         debug!("CDC: Received Write event for table '{}'", qkey);
@@ -3425,17 +3449,17 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
             };
             let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
             let data = self.parse_row(row, qkey)?;
-            table.insert(data)?;
-            applied += 1;
-        }
-        if applied > 0 {
-            let _ = self.table_manager.events_tx.send(TableUpdateEvent {
-                entity: disk_entity.to_string(),
-                table_name: table_name.to_string(),
-                event_type: "INSERT".to_string(),
-                pk: String::new(),
-                row: vec![applied.to_string()],
-            });
+            if let Some(pk_val) = Self::row_pk_from_parsed_row(&data, pk_columns) {
+                table.insert(data.clone())?;
+                self.emit_subscribe_update_event(
+                    disk_entity,
+                    table_name,
+                    "INSERT",
+                    &pk_val,
+                    &data,
+                );
+                applied += 1;
+            }
         }
         Ok(applied)
     }
@@ -3583,20 +3607,18 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
 
             let storage_pk = storage_pk.unwrap_or_else(|| pk_trim.clone());
 
+            self.emit_subscribe_update_event(
+                disk_entity,
+                mirror_table,
+                "UPDATE",
+                &storage_pk,
+                &delta,
+            );
             for (k, v) in delta {
                 merged.insert(k, v);
             }
             table.update(&storage_pk, merged)?;
             applied += 1;
-        }
-        if applied > 0 {
-            let _ = self.table_manager.events_tx.send(TableUpdateEvent {
-                entity: disk_entity.to_string(),
-                table_name: mirror_table.to_string(),
-                event_type: "UPDATE".to_string(),
-                pk: String::new(),
-                row: vec![applied.to_string()],
-            });
         }
         Ok(applied)
     }
@@ -3616,19 +3638,17 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
                 let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
                 let data = self.parse_row(row, qkey)?;
                 if let Some(pk_val) = Self::row_pk_from_parsed_row(&data, pk_columns) {
+                    self.emit_subscribe_update_event(
+                        disk_entity,
+                        table_name,
+                        "DELETE",
+                        &pk_val,
+                        &HashMap::new(),
+                    );
                     table.delete(&pk_val)?;
                     applied += 1;
                 }
             }
-        }
-        if applied > 0 {
-            let _ = self.table_manager.events_tx.send(TableUpdateEvent {
-                entity: disk_entity.to_string(),
-                table_name: table_name.to_string(),
-                event_type: "DELETE".to_string(),
-                pk: String::new(),
-                row: vec![applied.to_string()],
-            });
         }
         Ok(applied)
     }

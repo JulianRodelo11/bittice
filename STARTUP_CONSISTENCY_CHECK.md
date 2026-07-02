@@ -1,4 +1,4 @@
-# BITTICE_STARTUP_CONSISTENCY_CHECK — v0.1.173
+# BITTICE_STARTUP_CONSISTENCY_CHECK — v0.1.174
 
 ## Qué hace
 
@@ -15,7 +15,7 @@ docker run ... \
   ...
 ```
 
-## Flujo
+## Flujo (v0.1.174)
 
 ```
 Arranque
@@ -23,33 +23,38 @@ Arranque
   ├─ BITTICE_STARTUP_CONSISTENCY_CHECK=1 ?
   │   │
   │   ├─ Sí → Para cada perfil CDC:
-  │   │        1. Lee cdc_config.json + cdc_state.json
-  │   │        2. Conecta a MySQL y hace COUNT(*) por tabla
-  │   │        3. Cuenta filas vivas en mirror (offsets - deleted.bitmap)
-  │   │        4. Si |diff| > threshold → invalida bootstrap de esa tabla:
-  │   │           - La quita de bootstrapped_tables en cdc_state.json
-  │   │           - Borra el directorio mirror/<entity>/<table>
-  │   │        5. Si |diff| ≤ threshold → la deja intacta
-  │   │        6. Si no se puede conectar a MySQL → log warn, sigue sin reparar
+  │   │        1. Conecta a MySQL, COUNT(*) por tabla
+  │   │        2. Cuenta filas mirror (offsets - deleted)
+  │   │        3. Si |diff| > threshold → invalida bootstrap
+  │   │        4. Si |diff| ≤ threshold → intacta
+  │   │        5. Activa BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1
   │   │
   │   └─ No → salta
   │
   ├─ CDC autostart (staged, secuencial)
   │   │
-  │   └─ Tablas intactas → CDC arranca directo desde binlog position
-  │       Tablas invalidadas → CDC hace SELECT * completo (re-bootstrap)
+  │   ├─ Tablas intactas → CDC arranca desde binlog position
+  │   ├─ Tablas invalidadas → CDC re-bootstrap (SELECT *)
+  │   │
+  │   └─ Resume gap? 
+  │       ├─ Sí + BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1
+  │       │   → HTTP BLOQUEADO hasta catch-up completo ⏳
+  │       └─ No → HTTP abre inmediatamente
   │
-  └─ HTTP/gRPC abren
+  └─ HTTP/gRPC abren solo cuando todo está en sync ✓
 ```
 
-## Casos de uso
+**Diferencia clave v0.1.174 vs v0.1.173**: en .174, `BITTICE_STARTUP_CONSISTENCY_CHECK=1` activa automáticamente `BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1`. HTTP no abre hasta que CDC esté 100% al día con el binlog.
+
+## Casos de uso (v0.1.174)
 
 | Escenario | Comportamiento |
 |---|---|
-| Reinicio normal, todo en sync | Validación rápida, 0 reparaciones, CDC directo |
-| Hubo caída, 3 tablas con drift | Solo esas 3 se re-bootstrapean, las otras 19 intactas |
+| Reinicio normal, todo en sync | Validación, 0 reparaciones, CDC directo, HTTP abre ✓ |
+| Hubo caída, 3 tablas con drift | Solo esas 3 se re-bootstrapean. HTTP **bloqueado** hasta que CDC alcance el binlog actual ✓ |
+| Binlog gap detectado | CDC aplica eventos pendientes. HTTP **bloqueado** hasta catch-up completo ✓ |
 | No hay conexión a MySQL | Log warn, arranca con mirror estático |
-| Primer arranque (bootstrapped_tables=0) | Salta (no hay nada que validar) |
+| Primer arranque (bootstrapped_tables=0) | Bootstrap completo. HTTP **bloqueado** hasta terminar ✓ |
 
 ## Código
 

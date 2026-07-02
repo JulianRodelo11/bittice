@@ -13,6 +13,10 @@ pub struct TableUpdateEvent {
     pub event_type: String,
     pub pk: String,
     pub row: Vec<String>,
+    /// Column names from the affected row (same length as `col_values`).
+    pub columns: Vec<String>,
+    /// Column values from the affected row (same length as `columns`).
+    pub col_values: Vec<String>,
 }
 
 const DEFAULT_MAX_OPEN_TABLES: usize = 50;

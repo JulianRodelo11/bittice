@@ -211,6 +211,113 @@ fn subscribe_resolve_event_alias(
     None
 }
 
+/// Check whether a CDC event's row data satisfies the saved query's filter conditions.
+/// Uses the request `params` to resolve filter values, then compares against the event's
+/// column values. Returns `true` if the event should be forwarded to the subscriber.
+fn subscribe_event_matches_query(
+    query: &SavedQuery,
+    params: &HashMap<String, String>,
+    event_columns: &[String],
+    event_values: &[String],
+) -> bool {
+    use crate::core::types::compare_filter_value;
+
+    // Build a lookup: column_name → value (case-insensitive keys)
+    let col_map: HashMap<String, &str> = event_columns
+        .iter()
+        .zip(event_values.iter())
+        .map(|(c, v)| (c.to_lowercase(), v.as_str()))
+        .collect();
+
+    // Resolve a filter value from params or literal
+    let resolve_val = |raw: &str| -> Option<String> {
+        if let Some(key) = raw.strip_prefix('$') {
+            let k = key.split('|').next().unwrap_or("");
+            params.get(k).cloned()
+        } else {
+            Some(raw.to_string())
+        }
+    };
+
+    // Check a single filter condition against event row data.
+    // The filter field may be qualified (alias.field) — strip alias prefix.
+    let filter_matches = |f: &crate::core::saved_queries::SavedFilter| -> bool {
+        let field_name = f
+            .field
+            .rsplit_once('.')
+            .map(|(_, col)| col)
+            .unwrap_or(&f.field)
+            .to_lowercase();
+
+        let actual = match col_map.get(&field_name) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        let expected = match resolve_val(&f.value) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        let value_to = f.value_to.as_deref().and_then(|v| resolve_val(v));
+
+        let values_list: Vec<String> = f
+            .values
+            .iter()
+            .filter_map(|v| resolve_val(v))
+            .collect();
+
+        let op = crate::core::types::ComparisonOp::from_str(&f.op);
+
+        compare_filter_value(
+            actual,
+            op,
+            &expected,
+            value_to.as_deref(),
+            &values_list,
+            f.field_type,
+        )
+    };
+
+    // Match filter tree (supports AND/OR groups)
+    fn match_group(
+        group: &crate::core::saved_queries::SavedFilterGroup,
+        filter_matches: &dyn Fn(&crate::core::saved_queries::SavedFilter) -> bool,
+    ) -> bool {
+        let op = match group.op.as_str() {
+            "OR" | "or" | "Or" => crate::core::types::LogicalOp::Or,
+            _ => crate::core::types::LogicalOp::And,
+        };
+        match op {
+            crate::core::types::LogicalOp::And => group.filters.iter().all(|node| match node {
+                crate::core::saved_queries::SavedFilterTreeNode::Condition(f) => filter_matches(f),
+                crate::core::saved_queries::SavedFilterTreeNode::Group(g) => match_group(g, filter_matches),
+            }),
+            crate::core::types::LogicalOp::Or => group.filters.iter().any(|node| match node {
+                crate::core::saved_queries::SavedFilterTreeNode::Condition(f) => filter_matches(f),
+                crate::core::saved_queries::SavedFilterTreeNode::Group(g) => match_group(g, filter_matches),
+            }),
+        }
+    }
+
+    // Check filter_tree if present
+    if let Some(ref tree) = query.filter_tree {
+        return match tree {
+            crate::core::saved_queries::SavedFilterTreeNode::Condition(f) => filter_matches(f),
+            crate::core::saved_queries::SavedFilterTreeNode::Group(g) => match_group(g, &filter_matches),
+        };
+    }
+
+    // Check legacy filters (all must match)
+    for f in &query.filters {
+        if !filter_matches(f) {
+            return false;
+        }
+    }
+
+    true
+}
+
 const BATCH_SIZE: usize = 1000;
 
 pub struct MyDatabase {
@@ -1376,7 +1483,7 @@ impl Database for MyDatabase {
 
         let ops = self.get_operations().await;
 
-        let alias_map = if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
+        let (query, alias_map) = if let Some(op) = ops.iter().find(|o| o.name() == query_name) {
             if let SavedOperation::Read(q) = op {
                 if q.response_grouping.is_some() {
                     return Err(Status::invalid_argument(
@@ -1388,7 +1495,7 @@ impl Database for MyDatabase {
                         "Collect aggregation is currently supported only by the REST API",
                     ));
                 }
-                subscribe_join_alias_map(q)
+                (q.clone(), subscribe_join_alias_map(q))
             } else {
                 return Err(Status::not_found(
                     "Query found but it is not a 'read' operation",
@@ -1401,18 +1508,22 @@ impl Database for MyDatabase {
             )));
         };
 
+        let params = req.params.clone();
+
         let table_manager = Arc::clone(&self.table_manager);
         let mut events_rx = table_manager.events_tx.subscribe();
         let (tx, rx) = mpsc::channel(100);
 
         tokio::spawn(async move {
+            let has_filters = !query.filters.is_empty() || query.filter_tree.is_some();
             debug!(
-                "gRPC: Client subscribed to '{}' (joined_tables={:?})",
+                "gRPC: Client subscribed to '{}' (joined_tables={:?}, has_filters={})",
                 query_name,
                 alias_map
                     .iter()
                     .map(|(a, e, t)| format!("{}:{}.{}", a, e, t))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                has_filters,
             );
 
             loop {
@@ -1425,13 +1536,26 @@ impl Database for MyDatabase {
                             continue;
                         }
 
+                        // Row-level filter: skip events that don't match the query's WHERE clause.
+                        if has_filters
+                            && !subscribe_event_matches_query(
+                                &query,
+                                &params,
+                                &event.columns,
+                                &event.col_values,
+                            )
+                        {
+                            continue;
+                        }
+
                         let proto_event = bittice_proto::UpdateEvent {
                             r#type: event.event_type.clone(),
                             table: event.table_name.clone(),
                             row: Some(bittice_proto::Row {
-                                values: event.row.clone(),
+                                values: event.col_values.clone(),
                             }),
                             pk: event.pk.clone(),
+                            columns: event.columns.clone(),
                         };
                         if tx.send(Ok(proto_event)).await.is_err() {
                             break;

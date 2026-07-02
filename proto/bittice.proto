@@ -26,8 +26,9 @@ message SubscribeRequest {
 message UpdateEvent {
   string type = 1; // "INSERT", "UPDATE", "DELETE"
   string table = 2;
-  Row row = 3;     // Valores según el mirror de `table` (vacío en algunos DELETE)
-  string pk = 4;   // PK según la tabla del evento
+  Row row = 3;     // Column values of the modified row (same order as `columns`)
+  string pk = 4;   // PK of the modified row
+  repeated string columns = 5; // Column names (same length as row.values)
 }
 
 message SavedQueryRequest {
