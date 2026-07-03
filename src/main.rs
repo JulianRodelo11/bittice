@@ -22,8 +22,7 @@ fn docker_engine_deploy_locked() -> bool {
     std::path::Path::new("/.dockerenv").exists() && env_truthy("BITTICE_ENGINE_ONLY")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // rustls 0.23 panics on the first TLS handshake when multiple crypto
     // providers are linked but none is registered as process default. Both
     // `aws-lc-rs` and `ring` end up in the dep tree (reqwest + mysql_async).
@@ -35,6 +34,27 @@ async fn main() -> Result<()> {
     if !env_truthy("BITTICE_NO_RLIMIT") {
         bittice::core::fd_limits::raise_fd_limits();
     }
+
+    // Cap the blocking thread pool used by tokio::task::spawn_blocking.
+    // The default (512) causes scheduler thrashing on small burstable instances
+    // when many CPU-bound queries run concurrently. One saved-op read can
+    // consume two blocking slots (search + materialize), so 16 slots supports
+    // roughly eight concurrent queries without oversubscribing two CPU cores.
+    let max_blocking_threads = std::env::var("BITTICE_MAX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(16);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(max_blocking_threads)
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {e}"))?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let env_entity = std::env::var("BITTICE_ENTITY").ok().filter(|s| !s.trim().is_empty());
     let args_len = std::env::args().len();
     let is_docker_env = std::path::Path::new("/.dockerenv").exists();

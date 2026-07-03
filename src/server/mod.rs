@@ -20,7 +20,7 @@ use axum::{
 use axum::extract::Request;
 use std::sync::{Arc};
 use std::time::Instant;
-use tokio::sync::{RwLock as TokioRwLock, Notify};
+use tokio::sync::{RwLock as TokioRwLock, Notify, Semaphore};
 
 /// Shared saved-ops cache for HTTP and gRPC (invalidated together on `/_config/reload`).
 pub type SharedOpsCache = Arc<TokioRwLock<Option<(Instant, Arc<Vec<crate::core::saved_queries::SavedOperation>>)>>>;
@@ -786,6 +786,9 @@ pub struct ServerState {
     pub entity_filter: Option<String>,
     pub auth_service: crate::core::auth::AuthService,
     pub active_workers: Arc<StdRwLock<HashSet<String>>>,
+    /// Global concurrency limit for public query requests. Keeps CPU-bound work
+    /// from oversubscribing small hosts; overflow returns 503 immediately.
+    pub query_concurrency: Arc<Semaphore>,
 }
 
 pub fn scan_and_start_cdc(
@@ -998,12 +1001,17 @@ fn cdc_autostart_enabled() -> bool {
 }
 
 pub async fn start_server(
-    table_manager: Arc<TableManager>, 
-    entity_filter: Option<String>, 
+    table_manager: Arc<TableManager>,
+    entity_filter: Option<String>,
     active_workers: Arc<StdRwLock<HashSet<String>>>,
     shutdown_notify: Arc<Notify>,
     ops_cache: SharedOpsCache,
 ) {
+    let max_concurrent_queries: usize = std::env::var("BITTICE_MAX_CONCURRENT_QUERIES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8);
+
     let state = Arc::new(ServerState {
         table_manager: table_manager.clone(),
         ops_cache,
@@ -1011,6 +1019,7 @@ pub async fn start_server(
         entity_filter: entity_filter.clone(),
         auth_service: crate::core::auth::AuthService::new(table_manager),
         active_workers,
+        query_concurrency: Arc::new(Semaphore::new(max_concurrent_queries)),
     });
     if state.response_cache.enabled() {
         info!(
@@ -1019,6 +1028,10 @@ pub async fn start_server(
             std::env::var("BITTICE_RESPONSE_CACHE_OPS").unwrap_or_default()
         );
     }
+    info!(
+        "Public query concurrency limit: {} concurrent request(s)",
+        max_concurrent_queries
+    );
 
     // Authentication middleware (applied per-router; state is Arc-cloned)
     let app_internal = Router::new()
@@ -1065,6 +1078,12 @@ pub async fn start_server(
         .layer(axum::middleware::from_fn(count_billable_request))
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
+        // Global concurrency gate for CPU-bound query work. Applied last so it
+        // runs before auth/tracing/panic handling on the public query router.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            query_concurrency_middleware,
+        ))
         .with_state(state.clone());
 
     let listener_public = match tokio::net::TcpListener::bind(&public_bind).await {
@@ -1119,6 +1138,31 @@ pub async fn count_billable_request(request: Request, next: Next) -> Response {
         op_counter::bump(op_counter::OpType::Unary);
     }
     response
+}
+
+/// Public-query concurrency gate. CPU-bound saved-op reads are limited so
+/// small hosts do not oversubscribe their cores. Excess requests receive
+/// 503 immediately rather than queueing behind slow work.
+pub async fn query_concurrency_middleware(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match state.query_concurrency.try_acquire() {
+        Ok(permit) => {
+            let response = next.run(request).await;
+            drop(permit);
+            response
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Server busy",
+                "retry_after_ms": 500
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[debug_handler]
