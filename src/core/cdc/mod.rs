@@ -3450,15 +3450,43 @@ Set BITTICE_STAGED_WAIT_FOR_RESUME_CATCHUP=1 to block until fully caught up.",
             let row = Row::try_from(binlog_row).map_err(|e| anyhow::anyhow!("{:?}", e))?;
             let data = self.parse_row(row, qkey)?;
             if let Some(pk_val) = Self::row_pk_from_parsed_row(&data, pk_columns) {
-                table.insert(data.clone())?;
-                self.emit_subscribe_update_event(
-                    disk_entity,
-                    table_name,
-                    "INSERT",
-                    &pk_val,
-                    &data,
-                );
+                // MySQL can emit a WriteRowsEvent for a PK that already exists in the
+                // mirror (REPLACE, INSERT ... ON DUPLICATE KEY UPDATE, or a re-delivered
+                // event after a crash). Treat it as an UPDATE so we never create duplicate
+                // physical rows for the same PK.
+                let already_exists = table.get_row_as_map(&pk_val)?.is_some();
+                if already_exists {
+                    table.update(&pk_val, data.clone())?;
+                    self.emit_subscribe_update_event(
+                        disk_entity,
+                        table_name,
+                        "UPDATE",
+                        &pk_val,
+                        &data,
+                    );
+                } else {
+                    table.insert(data.clone())?;
+                    self.emit_subscribe_update_event(
+                        disk_entity,
+                        table_name,
+                        "INSERT",
+                        &pk_val,
+                        &data,
+                    );
+                }
                 applied += 1;
+            }
+        }
+        // Defensive: a WriteRowsEvent for an existing PK that was missed by
+        // get_row_as_map (e.g. primary_index lag) can still leave duplicate live
+        // rows. Reconcile cleans up any duplicate PKs after the batch.
+        if applied > 0 {
+            if let Err(e) = table.reconcile_orphan_rows() {
+                warn!(
+                    "CDC: reconcile_orphan_rows after WriteRowsEvent on '{}' failed ({}); \
+                     mirror may retain duplicate PKs until next update.",
+                    qkey, e
+                );
             }
         }
         Ok(applied)
